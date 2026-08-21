@@ -1,0 +1,13 @@
+# Salidas y archivos temporales
+resultado.json
+FudoPrintDoctor-*.json
+*.log
+*.exe
+*.zip
+
+# Editores / SO
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+*~

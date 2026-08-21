@@ -1,0 +1,86 @@
+# Guía rápida para asesores
+
+## Cómo se corre
+
+1. Copiar la carpeta a la PC del cliente (Escritorio o Descargas).
+2. Doble clic en **`1-Diagnosticar.cmd`**. No cambia nada, solo mira.
+3. Leer el bloque **QUE HACER AHORA**.
+4. Si el diagnóstico apunta a algo que el motor puede arreglar solo, doble clic en
+   **`2-Diagnosticar-y-reparar.cmd`** (pide permisos de administrador).
+5. Si hay que escalar, adjuntar el JSON: la ruta aparece al final del resumen, o usar
+   `3-Para-el-agente.cmd` que lo deja como `resultado.json` al lado del script.
+
+Si Windows muestra "Windows protegió tu PC" al abrir el `.cmd`: *Más información* → *Ejecutar
+de todas formas*. Es porque el archivo viene de internet, no porque tenga algo raro.
+
+## Cómo leer el resumen
+
+**IMPRESORAS CONECTADAS** es lo primero que hay que mirar.
+
+- `0` → no es un problema de software. Revisar energía, cable y puerto USB antes de seguir.
+- La térmica aparece con `-> SIN cola en Windows` → está conectada pero no instalada.
+- Aparece `Impresora generica [VID_xxxx]` → Windows la ve pero no sabe qué es. Normal en
+  térmicas chinas (XPrinter, 3nStar, Rongta). El driver `Genérico / Solo texto` es el correcto.
+
+**CHEQUEOS** es un semáforo por área:
+
+| | Significado |
+|---|---|
+| `OK` | Nada que hacer acá |
+| `REPARADO` | El motor lo arregló en esta corrida |
+| `REVISAR` | Hay algo que requiere una acción humana |
+| `FALLA` | Está roto y bloquea la impresión |
+| `-` | No se pudo evaluar (por ejemplo, porque una capa anterior falló) |
+
+**QUE HACER AHORA** viene ordenado: lo de abajo (hardware, sistema) antes que lo de arriba
+(configuración de Fudo), y cada paso dice quién lo ejecuta:
+
+- `[cliente]` → algo físico en el local, o una acción en su antivirus.
+- `[asesor]` → vos, en la PC o en la web app de Fudo.
+- `[soporte]` → escalar a Soporte Producto con el JSON.
+
+## Los tres casos más comunes
+
+**1. La Nativa bloqueada por el antivirus** (~46% de los casos del registro real).
+El motor restaura la App Nativa de la cuarentena de Defender y agrega exclusiones de ruta y
+proceso. Con McAfee o Avast **no** se puede automatizar: hay que excluirla a mano en el AV.
+Nunca desactivar el antivirus completo: solo excluir.
+
+**2. Se reconectó a otro puerto USB.**
+La cola de Windows sigue apuntando al puerto viejo y los trabajos se acumulan sin salir. El
+motor lo detecta comparando el puerto de la cola contra el puerto donde el device está realmente
+enumerado, y prueba los candidatos con un ticket real.
+
+**3. El hardware imprime pero la comanda no sale.**
+Si `Prueba de impresion` dice `OK` y salió el ticket, el problema está en la configuración de
+Fudo, no en la PC:
+
+- Impresora registrada con la interfaz correcta (USB o Directo Ethernet)
+- **Cocina/área asignada a la impresora** — sin esto no imprime ninguna comanda
+- Categorías y subcategorías con cocina asignada
+- Salas tildadas, si el local trabaja con salas
+
+Artículos: [áreas y cocinas](https://soporte.fu.do/es/articles/11730815) ·
+[USB](https://soporte.fu.do/es/articles/11730817) ·
+[Ethernet](https://soporte.fu.do/es/articles/11730816) ·
+[instalación](https://soporte.fu.do/es/articles/16419361)
+
+## Cosas para tener en cuenta
+
+- **Ticket de prueba**: sin `-DryRun` el motor manda un ticket ESC/POS real. Avisarle al cliente
+  que va a salir un papel.
+- **Cola trabada**: limpiarla borra los trabajos pendientes. Si hay comandas sin imprimir en la
+  cola, se pierden (hay que volver a mandarlas desde Fudo).
+- **Cola `FUDO-TEST-*`**: si el motor la creó, queda instalada. Borrarla cuando se instale la
+  definitiva: `Remove-Printer -Name "FUDO-TEST-USB001"`.
+- **Impresora de red**: si la IP cambió por DHCP, el motor escanea la subred buscando el
+  puerto 9100 y sugiere la nueva IP, pero **no** la cambia en Fudo. Eso se hace en la web app.
+- **Sin permisos de administrador** algunas reparaciones fallan (spooler, drivers). El launcher
+  `2-*` los pide solo.
+
+## Cuándo escalar
+
+- El resumen dice `FALLA` en `Hardware conectado` y ya se probó otro cable y otro puerto.
+- La prueba física falla con la impresora bien conectada (posible falla de hardware: hacer el
+  self-test de la impresora — apagar, mantener FEED, encender).
+- Aparece `Motor (fallas internas)` en los chequeos: es un bug, va a Soporte Producto con el JSON.

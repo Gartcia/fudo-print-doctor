@@ -1,0 +1,48 @@
+name: self-test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  selftest:
+    name: Self-test en Windows
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # El script corre en las PCs de los clientes con el PowerShell que trae Windows.
+      - name: Windows PowerShell 5.1
+        shell: cmd
+        run: |
+          powershell -NoProfile -ExecutionPolicy Bypass -File .\FudoPrintDoctor.ps1 -SelfTest
+          if errorlevel 1 exit /b 1
+
+      - name: PowerShell 7
+        shell: pwsh
+        run: |
+          ./FudoPrintDoctor.ps1 -SelfTest
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Sintaxis (parser)
+        shell: pwsh
+        run: |
+          $errs = $null; $toks = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path ./FudoPrintDoctor.ps1), [ref]$toks, [ref]$errs)
+          if ($errs) { $errs | ForEach-Object { "L$($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
+          "Parser OK ($($toks.Count) tokens)"
+
+  analyzer:
+    name: PSScriptAnalyzer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - shell: pwsh
+        run: |
+          Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck
+          $r = Invoke-ScriptAnalyzer -Path ./FudoPrintDoctor.ps1 -Severity Error,Warning `
+                 -ExcludeRule PSAvoidUsingWriteHost,PSUseShouldProcessForStateChangingFunctions,PSAvoidUsingEmptyCatchBlock
+          if ($r) { $r | Format-Table -AutoSize | Out-String | Write-Host }
+          if (@($r | Where-Object Severity -eq 'Error').Count -gt 0) { exit 1 }
