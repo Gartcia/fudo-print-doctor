@@ -45,6 +45,11 @@
     Patron de nombre del proceso/servicio de la App Nativa de Fudo (para chequear prerequisito).
     Default cubre variantes conocidas; ajustar segun el binario real.
 
+.PARAMETER AllowQueuePurge
+    Decide sin preguntar si se limpia la cola de impresion (unica accion irreversible).
+    Si no se pasa: en consola interactiva se le pregunta al asesor; en modo no interactivo
+    (agente, -Quiet, -Json, salida redirigida) NO se aplica y queda como accion pendiente.
+
 .PARAMETER SkipIrreversible
     No aplica las remediaciones marcadas como irreversibles (hoy: limpiar la cola de impresion,
     que descarta los trabajos pendientes). Todo lo demas se sigue reparando.
@@ -100,6 +105,14 @@ CONTRATO DE SALIDA (v1.1)
     diagnosis.nextActions[] (que hacer / quien lo hace / articulo), engineErrors[], checks[], telemetry.
 
 CHANGELOG
+    1.5  - Un solo punto de entrada: FudoPrintDoctor.cmd (doble clic). Los 4 launchers anteriores
+             confundian mas de lo que ayudaban.
+           - La decision sobre la unica accion irreversible (limpiar la cola) ya no vive en el
+             launcher sino en el script: si hay un humano en la consola se le pregunta; si corre
+             un agente no se aplica y queda como accion pendiente en el JSON con el comando exacto.
+             Se puede forzar con -AllowQueuePurge $true/$false.
+           - FIX: $PSBoundParameters dentro de una funcion no es el del script, asi que
+             -KeepTestPrinter:$false nunca borraba la cola de prueba.
     1.4  - FIX importante de deteccion: se tomaba cualquier dispositivo USB por impresora.
              El token 'POS' de la lista de marcas matcheaba 'USB Com-POS-ite Device' y 'Generic'
              matcheaba 'Generic USB Hub'. Ahora hay un clasificador explicito
@@ -171,12 +184,17 @@ param(
     [string]$ClientId = '',
     [bool]$InstallGenericDriver = $true,
     [switch]$SkipIrreversible,
+    [bool]$AllowQueuePurge,
     [switch]$KeepTestPrinter,
     [string]$JsonOut,
     [switch]$Quiet,
     [switch]$Json,
     [switch]$SelfTest
 )
+
+# Que parametros paso el invocador de verdad (dentro de una funcion $PSBoundParameters es
+# el de la funcion, no el del script: hay que capturarlo aca).
+$script:BoundParams = $PSBoundParameters
 
 $ErrorActionPreference = 'Stop'
 # IMPORTANTE: -Version 2.0 hace que acceder a .Count sobre $null o sobre un escalar
@@ -194,7 +212,7 @@ $script:StartTime    = Get-Date
 $script:Diagnostics  = [ordered]@{}   # datos crudos recolectados
 $script:Errors       = New-Object System.Collections.ArrayList   # fallas internas del motor
 $script:TestPrintersCreated = New-Object System.Collections.ArrayList   # colas temporales creadas por el motor
-$script:SchemaVersion = '1.4'
+$script:SchemaVersion = '1.5'
 $script:JsonBegin    = '<<<FUDO_JSON_BEGIN>>>'
 $script:JsonEnd      = '<<<FUDO_JSON_END>>>'
 $script:AutoJsonPath = ''
@@ -336,6 +354,40 @@ function Invoke-Step {
     }
 }
 
+function Test-IsInteractiveConsole {
+    <# Hay un humano mirando esta consola? (no redirigida, no -Quiet, no -Json) #>
+    if ($Quiet -or $Json) { return $false }
+    try {
+        if ([Console]::IsOutputRedirected -or [Console]::IsInputRedirected) { return $false }
+    } catch { return $false }
+    return $true
+}
+
+function Confirm-Irreversible {
+    <#
+      Decide si se aplica una remediacion que no se puede deshacer (hoy: purgar la cola).
+      Orden de decision:
+        -SkipIrreversible            -> no
+        -AllowQueuePurge $true/$false -> lo que diga el invocador
+        consola interactiva          -> se le pregunta al asesor
+        no interactiva (agente)      -> NO se aplica, queda como accion pendiente en el JSON
+    #>
+    param([string]$Description, [string]$Impact = '')
+    if ($SkipIrreversible) { return $false }
+    if ($script:BoundParams -and $script:BoundParams.ContainsKey('AllowQueuePurge')) { return [bool]$AllowQueuePurge }
+    if (-not (Test-IsInteractiveConsole)) { return $false }
+
+    [Console]::Error.WriteLine('')
+    [Console]::Error.WriteLine('  ------------------------------------------------------------')
+    [Console]::Error.WriteLine("  Hace falta una accion que NO se puede deshacer:")
+    [Console]::Error.WriteLine("    $Description")
+    if ($Impact) { [Console]::Error.WriteLine("    Consecuencia: $Impact") }
+    [Console]::Error.WriteLine('  ------------------------------------------------------------')
+    $ans = ''
+    try { $ans = Read-Host '  Aplicar? (s = si / cualquier otra tecla = no)' } catch { return $false }
+    return ($ans -match '(?i)^\s*(s|si|sí|y|yes)\s*$')
+}
+
 function Invoke-Remediation {
     <#
       Envuelve una remediacion respetando DryRun/AutoFix.
@@ -348,7 +400,8 @@ function Invoke-Remediation {
         [string]$Target,
         [string]$Before = '',
         [string]$After = '',
-        [bool]$Reversible = $true
+        [bool]$Reversible = $true,
+        [string]$Impact = ''
     )
     if (-not $AutoFix) {
         return @{ applied = $false; note = "auto-fix deshabilitado: $Description" }
@@ -357,9 +410,11 @@ function Invoke-Remediation {
         Write-DoctorLog -Level 'INFO' -Message "DRY-RUN: aplicaria -> $Description"
         return @{ applied = $false; note = "dry-run: $Description" }
     }
-    if ($SkipIrreversible -and -not $Reversible) {
-        Write-DoctorLog -Level 'WARN' -Message "OMITIDA (irreversible, -SkipIrreversible): $Description"
-        return @{ applied = $false; note = "omitida por -SkipIrreversible (irreversible): $Description" }
+    if (-not $Reversible) {
+        if (-not (Confirm-Irreversible -Description $Description -Impact $Impact)) {
+            Write-DoctorLog -Level 'WARN' -Message "NO aplicada (irreversible, sin confirmacion): $Description"
+            return @{ applied = $false; note = "pendiente de confirmacion (irreversible): $Description" }
+        }
     }
     try {
         $result = & $Fix
@@ -1428,8 +1483,9 @@ function Test-Layer2-Queue {
     $isStuck = (@($stuck).Count -gt 0) -or (@($jobs).Count -ge 3)
 
     if ($isStuck) {
-        $rem = Invoke-Remediation -Description "Limpiar cola trabada ($(@($jobs).Count) trabajos)" -Type 'queue.purge' -Target $Printer.Name `
-            -Before "$(@($jobs).Count) jobs" -After '0 jobs' -Reversible $false -Fix {
+        $rem = Invoke-Remediation -Description "Limpiar cola trabada ($(@($jobs).Count) trabajos) en '$($Printer.Name)'" -Type 'queue.purge' -Target $Printer.Name `
+            -Before "$(@($jobs).Count) jobs" -After '0 jobs' -Reversible $false `
+            -Impact 'se descartan las comandas que estan esperando en la cola; hay que volver a imprimirlas desde Fudo' -Fix {
                 try {
                     if ($Wmi) { $null = Invoke-CimMethod -InputObject $Wmi -MethodName 'CancelAllJobs' -ErrorAction Stop; 'CancelAllJobs() OK' }
                     else { Get-PrintJob -PrinterName $Printer.Name | Remove-PrintJob -ErrorAction SilentlyContinue; 'Remove-PrintJob OK' }
@@ -1440,7 +1496,11 @@ function Test-Layer2-Queue {
         Add-Check -Id 'queue.health' -Layer 2 -Name 'Cola de impresion trabada' -Status $(if($rem.applied){'fixed'}else{'warn'}) -RootCauseCandidate $true `
             -Evidence @{ jobs = @($jobs).Count; stuck = @($stuck).Count; statuses = @($jobs | ForEach-Object { [string]$_.JobStatus }) } `
             -ActionTaken $rem.note -Reversible $false `
-            -Recommendation 'Un trabajo trabado bloquea toda la cola: las comandas nuevas no salen hasta limpiarla.'
+            -Recommendation $(if ($rem.applied) {
+                    'Un trabajo trabado bloquea toda la cola: se limpio. Volver a imprimir desde Fudo las comandas que estaban esperando.'
+                } else {
+                    "Un trabajo trabado bloquea toda la cola: las comandas nuevas no salen hasta limpiarla. Limpiarla descarta los $(@($jobs).Count) trabajos pendientes (hay que reimprimirlos desde Fudo). Para hacerlo: correr el script en la consola y responder 's' cuando pregunte, o pasar -AllowQueuePurge `$true, o a mano: Get-PrintJob -PrinterName '$($Printer.Name)' | Remove-PrintJob"
+                })
     } else {
         Add-Check -Id 'queue.health' -Layer 2 -Name 'Cola de impresion' -Status 'warn' `
             -Evidence @{ jobs = @($jobs).Count; note = 'trabajos presentes pero no evidentemente trabados' }
@@ -2105,7 +2165,7 @@ function Invoke-FudoPrintDoctor {
     # Colas temporales: se conservan por defecto (sirven para reprobar); -KeepTestPrinter:$false las borra.
     if (@($script:TestPrintersCreated).Count -gt 0) {
         $names = @($script:TestPrintersCreated)
-        if ($PSBoundParameters.ContainsKey('KeepTestPrinter') -and -not $KeepTestPrinter) {
+        if ($script:BoundParams -and $script:BoundParams.ContainsKey('KeepTestPrinter') -and -not $KeepTestPrinter) {
             foreach ($n in $names) { try { Remove-Printer -Name $n -ErrorAction SilentlyContinue } catch {} }
             Add-Check -Id 'printer.testCleanup' -Layer 1 -Name 'Cola de prueba eliminada' -Status 'ok' -Evidence @{ removed = $names }
         } else {
@@ -2393,6 +2453,27 @@ function Invoke-SelfTest {
     Assert-Eq 'S18 omite la irreversible' $false $r18a.applied
     Assert-Eq 'S18 aplica la reversible' $true $r18b.applied
     $SkipIrreversible = $script:SkipIrreversibleBackup
+
+    # Escenario 19: modo agente (no interactivo) NO aplica la irreversible y la deja pendiente
+    Reset-State
+    $qBackup = $Quiet; $bpBackup = $script:BoundParams
+    $Quiet = $true                      # fuerza no-interactivo de forma determinista
+    $script:BoundParams = @{}
+    $r19 = Invoke-Remediation -Description 'purga' -Type 'queue.purge' -Target 'X' -Reversible $false -Impact 'se pierden comandas' -Fix { 'purgado' }
+    Assert-Eq 'S19 no aplica sin confirmacion' $false $r19.applied
+    Assert-Eq 'S19 queda como pendiente' $true ([bool]($r19.note -match 'pendiente de confirmacion'))
+
+    # Escenario 20: -AllowQueuePurge $true la aplica sin preguntar
+    Reset-State
+    $script:BoundParams = @{ 'AllowQueuePurge' = $true }
+    $AllowQueuePurge = $true
+    $r20 = Invoke-Remediation -Description 'purga' -Type 'queue.purge' -Target 'X' -Reversible $false -Fix { 'purgado' }
+    Assert-Eq 'S20 aplica con flag explicito' $true $r20.applied
+    $script:BoundParams = @{ 'AllowQueuePurge' = $false }
+    $AllowQueuePurge = $false
+    $r20b = Invoke-Remediation -Description 'purga' -Type 'queue.purge' -Target 'X' -Reversible $false -Fix { 'purgado' }
+    Assert-Eq 'S20 respeta el flag en false' $false $r20b.applied
+    $Quiet = $qBackup; $script:BoundParams = $bpBackup
 
     Write-Host ""
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)

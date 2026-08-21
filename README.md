@@ -11,19 +11,14 @@ los casos seguros. Lo que no puede resolver solo, lo devuelve como próximos pas
 
 ## Uso rápido (asesores)
 
-Descargar la carpeta y hacer doble clic:
+Copiar la carpeta a la PC del cliente y **doble clic en `FudoPrintDoctor.cmd`**. Eso es todo.
 
-| Archivo | Qué hace |
-|---|---|
-| `1-Diagnosticar.cmd` | Solo diagnostica. **No toca nada** en la PC. |
-| `2-Diagnosticar-y-reparar.cmd` | Diagnostica **y** repara, salteando lo irreversible. Se eleva a administrador solo. Es el que hay que usar. |
-| `3-Para-el-agente.cmd` | Igual que el 2 pero además deja `resultado.json` al lado del script. |
-| `4-Reparar-todo-incluida-la-cola.cmd` | Agrega la limpieza de la cola de impresión, que **descarta las comandas pendientes**. Solo si hay una cola trabada. |
-
-No hace falta diagnosticar antes de reparar: el 2 hace las dos cosas en la misma corrida y el
-diagnóstico completo queda igual en el JSON. Cada reparación se registra en `actionsApplied[]`
-con su antes/después y si es reversible. Lo único que no se puede deshacer es la purga de la cola,
-y por eso el launcher 2 la saltea (`-SkipIrreversible`).
+- Se eleva a administrador solo.
+- Muestra qué va a hacer y espera un Enter antes de tocar nada.
+- Diagnostica y repara en la misma corrida. No hace falta un paso previo de diagnóstico.
+- Lo único que no se puede deshacer —limpiar la cola de impresión, que descarta las comandas
+  pendientes— **te lo pregunta** antes de hacerlo.
+- Deja `resultado.json` al lado del script para adjuntar al caso.
 
 Lo que se ve en pantalla:
 
@@ -124,11 +119,35 @@ Si hay hardware conectado sin cola, el motor instala el driver que corresponda y
 `FUDO-TEST-<puerto>` para poder hacer la prueba física. Queda instalada y se reporta con el
 comando de limpieza; `-KeepTestPrinter:$false` la borra al final.
 
+## Qué repara y qué pregunta
+
+Cada reparación pasa por el mismo envoltorio, que respeta `-DryRun` / `-AutoFix`, registra
+antes/después en `actionsApplied[]` y declara si es reversible.
+
+| Reparación | Reversible | Pregunta |
+|---|---|---|
+| Iniciar/reiniciar el Spooler | sí | no |
+| Sacar de offline / reanudar pausada | sí | no |
+| Restaurar la Nativa de cuarentena + exclusiones de Defender | sí | no |
+| Reasignar el puerto USB (revierte si ninguno imprime) | sí | no |
+| Instalar driver + cola `FUDO-TEST-<puerto>` | sí (`Remove-Printer`) | no |
+| **Limpiar la cola de impresión** | **no** — se pierden las comandas pendientes | **sí** |
+
+La única pregunta es la última, y solo cuando hay una cola trabada. Si el script corre sin humano
+(agente, `-Quiet`, `-Json`, salida redirigida) no la aplica: la deja en `nextActions` con el
+comando exacto para hacerla. Se puede decidir de antemano con `-AllowQueuePurge $true` / `$false`.
+
+No se automatiza nunca: desactivar el antivirus (solo exclusiones de ruta y proceso), tocar
+antivirus de terceros como McAfee o Avast, ni cambiar la configuración de Fudo.
+
 ## Uso desde un agente
 
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File .\FudoPrintDoctor.ps1 -Json -CaseId "IC-12345" -ClientId "local-987"
 ```
+
+Variantes útiles: `-DryRun` (no toca nada), `-AllowQueuePurge $true` (limpiar la cola sin
+preguntar), `-PrinterName "<cola>"` para forzar el objetivo.
 
 - **stdout**: solo el JSON, entre `<<<FUDO_JSON_BEGIN>>>` y `<<<FUDO_JSON_END>>>`.
 - **stderr**: resumen humano y logs. `-Quiet` lo silencia.
@@ -150,13 +169,14 @@ Contrato completo del JSON: [`docs/contrato-json.md`](docs/contrato-json.md).
 | `-DryRun` | off | No modifica nada; registra qué haría |
 | `-TestPrint` | `$true` | Emitir ticket ESC/POS de prueba |
 | `-InstallGenericDriver` | `$true` | Instalar driver y cola de prueba si el hardware está sin instalar |
-| `-SkipIrreversible` | off | Repara todo menos lo que no se puede deshacer (hoy: purgar la cola) |
+| `-AllowQueuePurge` | pregunta | Limpiar la cola sin preguntar (`$true`) o nunca (`$false`) |
+| `-SkipIrreversible` | off | No aplica nada irreversible, sin preguntar |
 | `-KeepTestPrinter` | conserva | `:$false` borra la cola `FUDO-TEST-*` al terminar |
 | `-CaseId` / `-ClientId` | vacío | Solo correlación de telemetría; no afecta el diagnóstico |
 | `-JsonOut` | — | Volcar el JSON a un archivo |
 | `-Json` / `-Quiet` | off | Forzar JSON a stdout / silenciar el resumen |
 | `-Verbose` | off | Lista todos los chequeos en pantalla |
-| `-SelfTest` | off | Corre los 47 asserts de la lógica de decisión. No toca la PC. |
+| `-SelfTest` | off | Corre los 51 asserts de la lógica de decisión. No toca la PC. |
 
 ## Desarrollo
 
@@ -181,7 +201,7 @@ Ver también [`docs/arquitectura-capas.md`](docs/arquitectura-capas.md) y
 
 No se publica ejecutable. `ps2exe` empaqueta el script sin compilarlo y, sin firma digital,
 Defender/McAfee y SmartScreen lo bloquean — justo el problema que este script viene a resolver.
-Los `.cmd` de doble clic dan la misma experiencia sin ese riesgo. Si en algún momento hay
+El `.cmd` de doble clic da la misma experiencia sin ese riesgo. Si en algún momento hay
 certificado de code signing, `tools/build-exe.ps1` deja el camino armado.
 
 ## Estado

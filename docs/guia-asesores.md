@@ -3,15 +3,15 @@
 ## Cómo se corre
 
 1. Copiar la carpeta a la PC del cliente (Escritorio o Descargas).
-2. Doble clic en **`2-Diagnosticar-y-reparar.cmd`**: diagnostica y repara en la misma corrida.
-   Pide permisos de administrador y avisa qué va a hacer antes de arrancar. **No** borra los
-   trabajos de la cola.
-   - Si preferís mirar antes de tocar, **`1-Diagnosticar.cmd`** no cambia nada.
-   - Si hay una cola trabada con comandas viejas y hay que limpiarla,
-     **`4-Reparar-todo-incluida-la-cola.cmd`** (ojo: las comandas pendientes se pierden).
-3. Leer el bloque **QUE HACER AHORA**.
-5. Si hay que escalar, adjuntar el JSON: la ruta aparece al final del resumen, o usar
-   `3-Para-el-agente.cmd` que lo deja como `resultado.json` al lado del script.
+2. Doble clic en **`FudoPrintDoctor.cmd`**.
+3. Pide permisos de administrador y muestra qué va a hacer. Enter para arrancar.
+4. Leer el bloque **QUE HACER AHORA**.
+5. Para escalar, adjuntar el `resultado.json` que queda al lado del script.
+
+Un solo archivo hace todo: diagnostica y repara en la misma corrida. Lo único que puede llegar a
+preguntarte es si limpiar la cola de impresión cuando hay comandas trabadas, porque eso las
+descarta y hay que volver a imprimirlas desde Fudo. Cualquier otra reparación es reversible y se
+aplica sola.
 
 Si Windows muestra "Windows protegió tu PC" al abrir el `.cmd`: *Más información* → *Ejecutar
 de todas formas*. Es porque el archivo viene de internet, no porque tenga algo raro.
@@ -75,9 +75,9 @@ Artículos: [áreas y cocinas](https://soporte.fu.do/es/articles/11730815) ·
 
 - **Ticket de prueba**: sin `-DryRun` el motor manda un ticket ESC/POS real. Avisarle al cliente
   que va a salir un papel.
-- **Cola trabada**: limpiarla borra los trabajos pendientes. Si hay comandas sin imprimir en la
-  cola, se pierden (hay que volver a mandarlas desde Fudo). Es la única reparación irreversible,
-  y por eso vive en un launcher aparte.
+- **Cola trabada**: cuando el script pregunta si limpiarla, tené en cuenta que los trabajos
+  pendientes se descartan. Si eran comandas que el cliente necesita, hay que volver a imprimirlas
+  desde Fudo. Es la única reparación irreversible.
 - **Cola `FUDO-TEST-*`**: si el motor la creó, queda instalada. Borrarla cuando se instale la
   definitiva: `Remove-Printer -Name "FUDO-TEST-USB001"`.
 - **Impresora de red**: si la IP cambió por DHCP, el motor escanea la subred buscando el

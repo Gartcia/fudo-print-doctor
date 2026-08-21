@@ -2,6 +2,20 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [1.5] - 2026-08-21
+
+### Cambiado
+- **Un solo punto de entrada**: `FudoPrintDoctor.cmd`. Los cuatro launchers anteriores confundían
+  más de lo que ayudaban: había que elegir entre "diagnosticar", "reparar", "reparar todo" y "para
+  el agente" antes de saber qué estaba pasando.
+- La decisión sobre la única acción irreversible (limpiar la cola) se movió del launcher al script:
+  si hay un humano en la consola se le pregunta; si corre un agente no se aplica y queda como
+  acción pendiente en el JSON con el comando exacto. Se fuerza con `-AllowQueuePurge $true/$false`.
+
+### Corregido
+- `$PSBoundParameters` dentro de una función no es el del script, así que `-KeepTestPrinter:$false`
+  nunca borraba la cola de prueba.
+
 ## [1.4] - 2026-08-21
 
 ### Corregido
