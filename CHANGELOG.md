@@ -2,6 +2,32 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [1.7] - 2026-08-21
+
+### Corregido
+- **Una impresora desenchufada seguía figurando como conectada.** El registro `Enum\USBPRINT` es
+  histórico: guarda toda impresora que estuvo conectada alguna vez. Ahora se cruza contra los
+  dispositivos realmente presentes (`Win32_PnPEntity` / `Get-PnpDevice -PresentOnly`). Si la
+  presencia no se puede verificar, no se afirma que esté desconectada.
+- Ya no se "repara" el modo offline de una impresora desenchufada: el offline es consecuencia de
+  la desconexión, y repararlo enmascaraba el problema real (y volvía a ponerse offline).
+- La prueba física no corre sobre un puerto sin hardware, y cuando corre verifica que el ticket
+  haya **salido** de la cola: `WritePrinter` OK solo significa que el spooler lo aceptó.
+
+### Agregado
+- Checks `hw.disconnected` ("instalada pero DESCONECTADA, estaba en USB00x") y
+  `printer.disconnected` (la cola apunta a un puerto sin dispositivo).
+- Sección `DESCONECTADAS` en el resumen, con el puerto donde estaba cada una.
+- `diagnostics.impresorasDesconectadas[]` y `diagnostics.presenciaVerificada`.
+- Categoría `hardware.desconectada`.
+
+## [1.6] - 2026-08-21
+
+### Agregado
+- Progreso en vivo en la consola: una línea por etapa con `[n/9]`, resultado, color y duración, y
+  detalle de lo que está haciendo mientras corre. Solo cuando hay un humano mirando; en modo
+  agente no cambia nada.
+
 ## [1.5] - 2026-08-21
 
 ### Cambiado

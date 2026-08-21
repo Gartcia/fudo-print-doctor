@@ -15,6 +15,9 @@ Copiar la carpeta a la PC del cliente y **doble clic en `FudoPrintDoctor.cmd`**.
 
 - Se eleva a administrador solo.
 - Muestra qué va a hacer y espera un Enter antes de tocar nada.
+- **Muestra el progreso en vivo**: una línea por etapa con `[n/9]`, el resultado y cuánto tardó,
+  y el detalle de lo que está haciendo mientras corre (buscando la Nativa, consultando el
+  antivirus, escaneando la subred, enviando el ticket…).
 - Diagnostica y repara en la misma corrida. No hace falta un paso previo de diagnóstico.
 - Lo único que no se puede deshacer —limpiar la cola de impresión, que descarta las comandas
   pendientes— **te lo pregunta** antes de hacerlo.
@@ -87,6 +90,16 @@ Mouse, teclados, hubs, `USB Composite Device`, audio, cámaras y almacenamiento 
 quedan auditables en `hardware.usbDevicesRejected` con el motivo. Cuando la certeza no es alta, el
 resumen lo dice para que el asesor confirme que esa es la comandera.
 
+**Presente vs. histórico.** El registro `Enum\USBPRINT` guarda toda impresora que estuvo
+conectada alguna vez, así que se cruza contra los dispositivos realmente presentes
+(`Win32_PnPEntity` / `Get-PnpDevice -PresentOnly`). Una impresora desenchufada aparece como
+**DESCONECTADA**, con el puerto donde estaba, en vez de figurar como conectada. Si la presencia no
+se puede verificar, el motor no afirma que esté desconectada.
+
+Cuando la cola apunta a un puerto sin dispositivo, tampoco se "repara" el offline —que es
+consecuencia, no causa— ni se corre la prueba física, porque un ticket enviado a un puerto sin
+hardware se encola y devolvería un falso OK.
+
 Después enumera las impresoras físicas con tres fuentes en cascada:
 
 1. `HKLM\SYSTEM\CurrentControlSet\Enum\USBPRINT` → `Device Parameters\PortName`.
@@ -133,6 +146,10 @@ antes/después en `actionsApplied[]` y declara si es reversible.
 | Instalar driver + cola `FUDO-TEST-<puerto>` | sí (`Remove-Printer`) | no |
 | **Limpiar la cola de impresión** | **no** — se pierden las comandas pendientes | **sí** |
 
+La prueba física verifica además que el ticket **haya salido de la cola**: `WritePrinter` OK solo
+significa que el spooler lo aceptó, no que el papel salió. Si el trabajo queda encolado, el
+resultado es "la impresora no está respondiendo" y no un OK de hardware.
+
 La única pregunta es la última, y solo cuando hay una cola trabada. Si el script corre sin humano
 (agente, `-Quiet`, `-Json`, salida redirigida) no la aplica: la deja en `nextActions` con el
 comando exacto para hacerla. Se puede decidir de antemano con `-AllowQueuePurge $true` / `$false`.
@@ -176,7 +193,7 @@ Contrato completo del JSON: [`docs/contrato-json.md`](docs/contrato-json.md).
 | `-JsonOut` | — | Volcar el JSON a un archivo |
 | `-Json` / `-Quiet` | off | Forzar JSON a stdout / silenciar el resumen |
 | `-Verbose` | off | Lista todos los chequeos en pantalla |
-| `-SelfTest` | off | Corre los 51 asserts de la lógica de decisión. No toca la PC. |
+| `-SelfTest` | off | Corre los 60 asserts de la lógica de decisión. No toca la PC. |
 
 ## Desarrollo
 

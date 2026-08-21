@@ -105,6 +105,23 @@ CONTRATO DE SALIDA (v1.1)
     diagnosis.nextActions[] (que hacer / quien lo hace / articulo), engineErrors[], checks[], telemetry.
 
 CHANGELOG
+    1.7  - FIX: una impresora DESENCHUFADA seguia figurando como conectada. El registro
+             Enum\USBPRINT es historico (guarda toda impresora que estuvo conectada alguna vez),
+             asi que ahora se cruza contra los dispositivos realmente presentes
+             (Win32_PnPEntity / Get-PnpDevice -PresentOnly). Si no se puede verificar la
+             presencia, no se afirma que este desconectada.
+           - Nuevos checks: hw.disconnected ('instalada pero DESCONECTADA, estaba en USB00x') y
+             printer.disconnected (la cola apunta a un puerto sin dispositivo). En ese caso ya no
+             se 'repara' el offline de una impresora desenchufada, que es lo que enmascaraba el
+             problema real.
+           - La prueba fisica no corre sobre un puerto sin hardware, y cuando corre verifica que
+             el ticket haya SALIDO de la cola: WritePrinter OK solo significa que el spooler lo
+             acepto, no que el papel salio.
+           - Categoria nueva hardware.desconectada.
+    1.6  - Progreso en vivo en la consola: una linea por etapa con [n/9], resultado, color y
+             cuanto tardo, y detalle de lo que esta haciendo mientras corre (buscando la Nativa,
+             consultando el antivirus, escaneando la subred, enviando el ticket...).
+             Solo cuando hay un humano mirando: en modo agente no cambia nada.
     1.5  - Un solo punto de entrada: FudoPrintDoctor.cmd (doble clic). Los 4 launchers anteriores
              confundian mas de lo que ayudaban.
            - La decision sobre la unica accion irreversible (limpiar la cola) ya no vive en el
@@ -212,10 +229,30 @@ $script:StartTime    = Get-Date
 $script:Diagnostics  = [ordered]@{}   # datos crudos recolectados
 $script:Errors       = New-Object System.Collections.ArrayList   # fallas internas del motor
 $script:TestPrintersCreated = New-Object System.Collections.ArrayList   # colas temporales creadas por el motor
-$script:SchemaVersion = '1.5'
+$script:SchemaVersion = '1.7'
 $script:JsonBegin    = '<<<FUDO_JSON_BEGIN>>>'
 $script:JsonEnd      = '<<<FUDO_JSON_END>>>'
 $script:AutoJsonPath = ''
+# Progreso en vivo: titulo humano de cada etapa. Las etapas sin titulo no se muestran.
+$script:StepPlan = [ordered]@{
+    'layer0.environment'        = 'Entorno de Windows'
+    'layer0b.nativeApp'         = 'App Nativa de Fudo y antivirus'
+    'layer1a.hardwareInventory' = 'Impresoras conectadas'
+    'layer1.resolvePrinter'     = 'Impresora en Windows'
+    'layer1.printerState'       = 'Estado de la impresora'
+    'layer2.queue'              = 'Cola de trabajos'
+    'layer3.usbPort'            = 'Puerto USB'
+    'layer3.network'            = 'Conexion de red'
+    'layer4.hardwarePrint'      = 'Prueba de impresion'
+    'layer5.fudoConfig'         = 'Configuracion de Fudo'
+}
+$script:StepTotal   = 9      # usb y red son excluyentes
+$script:StepIndex   = 0
+$script:StepLabel   = ''
+$script:StepNote    = ''
+$script:LiveWidth   = 76
+$script:PresentIds   = $null   # cache de InstanceIds de dispositivos PRESENTES
+$script:PresentIdsOk = $false  # pudimos determinar la presencia?
 
 # Conocido: marcas de impresoras termicas/POS (art. 16419361 + registro real de asesores)
 # Marcas reales de termicas/POS (art. 16419361 + registro de asesores).
@@ -289,6 +326,36 @@ function Add-Action {
     [void]$script:Actions.Add($a)
 }
 
+function Write-LiveStatus {
+    <# Reescribe la linea actual de progreso (solo si hay un humano mirando). #>
+    param([string]$Text)
+    if (-not (Test-IsInteractiveConsole)) { return }
+    $line = '  ' + $Text
+    if ($line.Length -gt $script:LiveWidth) { $line = $line.Substring(0, $script:LiveWidth - 1) + '.' }
+    Write-Host ("`r" + $line + (' ' * [Math]::Max(0, $script:LiveWidth - $line.Length))) -NoNewline
+}
+
+function Complete-LiveStatus {
+    <# Cierra la linea de progreso de la etapa con su resultado y color. #>
+    param([string]$Text, [string]$Color = 'Gray')
+    if (-not (Test-IsInteractiveConsole)) { return }
+    $line = '  ' + $Text
+    Write-Host ("`r" + $line + (' ' * [Math]::Max(0, $script:LiveWidth - $line.Length))) -ForegroundColor $Color
+}
+
+function Write-StepDetail {
+    <# Detalle de lo que se esta haciendo AHORA dentro de la etapa en curso. #>
+    param([string]$Text)
+    if (-not $script:StepLabel) { return }
+    Write-LiveStatus ("$($script:StepLabel) - $Text")
+}
+
+function Set-StepNote {
+    <# Dato corto que se muestra al cerrar la etapa (ej: '2 impresoras'). #>
+    param([string]$Text)
+    $script:StepNote = $Text
+}
+
 function Add-EngineError {
     param([string]$Step, [string]$Message, [string]$Type = '', [string]$At = '', [string]$Hint = '')
     $e = [ordered]@{
@@ -338,8 +405,36 @@ function Invoke-Step {
       Registra el detalle en $script:Errors + un check 'skipped' y devuelve $null.
     #>
     param([string]$Name, [scriptblock]$Body)
+
+    $title = ''
+    if ($script:StepPlan.Contains($Name)) { $title = [string]$script:StepPlan[$Name] }
+    $checksBefore = @($script:Checks).Count
+    $t0 = Get-Date
+    if ($title) {
+        $script:StepIndex++
+        $script:StepNote  = ''
+        $script:StepLabel = ("[{0}/{1}] {2}" -f $script:StepIndex, $script:StepTotal, $title)
+        Write-LiveStatus ($script:StepLabel + '...')
+    }
+
     try {
-        return (& $Body)
+        $result = (& $Body)
+        if ($title) {
+            $nuevos = @()
+            if (@($script:Checks).Count -gt $checksBefore) { $nuevos = @($script:Checks)[$checksBefore..(@($script:Checks).Count - 1)] }
+            $estado = 'sin datos'; $color = 'DarkGray'
+            if     (@($nuevos | Where-Object { $_.status -eq 'fail'  }).Count -gt 0) { $estado = 'FALLA';    $color = 'Red' }
+            elseif (@($nuevos | Where-Object { $_.status -eq 'warn'  }).Count -gt 0) { $estado = 'revisar';  $color = 'Yellow' }
+            elseif (@($nuevos | Where-Object { $_.status -eq 'fixed' }).Count -gt 0) { $estado = 'reparado'; $color = 'Green' }
+            elseif (@($nuevos | Where-Object { $_.status -eq 'ok'    }).Count -gt 0) { $estado = 'ok';       $color = 'Green' }
+            elseif (@($nuevos | Where-Object { $_.status -eq 'skipped'}).Count -gt 0){ $estado = 'omitido';  $color = 'DarkGray' }
+            $ms = [int]((Get-Date) - $t0).TotalMilliseconds
+            $dots = '.' * [Math]::Max(3, 44 - $script:StepLabel.Length)
+            $extra = $(if ($script:StepNote) { " ($($script:StepNote))" } else { '' })
+            Complete-LiveStatus ("$($script:StepLabel) $dots $estado$extra  ${ms}ms") $color
+            $script:StepLabel = ''
+        }
+        return $result
     } catch {
         $hint = Get-ErrorHint -ErrorRecord $_
         $at = ''
@@ -350,13 +445,18 @@ function Invoke-Step {
         Add-Check -Id ("engine." + $Name) -Layer 9 -Name ("Etapa '" + $Name + "' fallo internamente") -Status 'skipped' `
             -Evidence @{ error = [string]$_.Exception.Message; at = $at } `
             -Recommendation $(if ($hint) { $hint } else { 'Etapa omitida por una falla interna; el resto del diagnostico continuo. Adjuntar el JSON al escalamiento.' })
+        if ($title) {
+            $dots = '.' * [Math]::Max(3, 44 - $script:StepLabel.Length)
+            Complete-LiveStatus ("$($script:StepLabel) $dots error interno") 'Red'
+            $script:StepLabel = ''
+        }
         return $null
     }
 }
 
 function Test-IsInteractiveConsole {
     <# Hay un humano mirando esta consola? (no redirigida, no -Quiet, no -Json) #>
-    if ($Quiet -or $Json) { return $false }
+    if ($Quiet -or $Json -or $SelfTest) { return $false }
     try {
         if ([Console]::IsOutputRedirected -or [Console]::IsInputRedirected) { return $false }
     } catch { return $false }
@@ -576,6 +676,7 @@ function Test-Layer0-Environment {
 # Estrategia: exclusiones quirurgicas (ruta + proceso) en vez de desactivar el antivirus.
 # ---------------------------------------------------------------------------
 function Find-FudoNativeInstall {
+    Write-StepDetail 'buscando la instalacion de la App Nativa'
     $paths = @()
     if ($FudoNativePath) { $paths += $FudoNativePath }
     $roots = @($env:LOCALAPPDATA, $env:APPDATA, ${env:ProgramFiles}, ${env:ProgramFiles(x86)}, "$env:LOCALAPPDATA\Programs")
@@ -610,6 +711,7 @@ function Find-FudoNativeInstall {
 }
 
 function Get-AntivirusState {
+    Write-StepDetail 'consultando Defender y antivirus de terceros'
     $state = [ordered]@{ defender = $null; thirdParty = @(); realTime = $null; fudoThreats = @() }
     # Defender status
     try {
@@ -902,6 +1004,36 @@ function Test-IsPosPrinter {
 # LAYER 1a - INVENTARIO DE HARDWARE (Administrador de dispositivos + puertos)
 # Se corre ANTES de elegir impresora: primero saber si hay fierro conectado.
 # ---------------------------------------------------------------------------
+function Get-PresentDeviceIds {
+    <#
+      InstanceIds de los dispositivos PRESENTES ahora mismo.
+      Clave: el registro Enum\USBPRINT guarda TODA impresora que estuvo conectada alguna vez,
+      asi que sin este cruce una impresora desenchufada sigue figurando como conectada.
+    #>
+    if ($null -ne $script:PresentIds) { return $script:PresentIds }
+    $set = @{}
+    $ok = $false
+    try {
+        foreach ($d in @(Get-CimInstance Win32_PnPEntity -ErrorAction Stop)) {
+            $id = [string]$d.PNPDeviceID
+            if ($id) { $set[$id.ToUpper()] = $true }
+        }
+        $ok = $true
+    } catch {}
+    if (-not $ok) {
+        try {
+            foreach ($d in @(Get-PnpDevice -PresentOnly -ErrorAction Stop)) {
+                $id = [string]$d.InstanceId
+                if ($id) { $set[$id.ToUpper()] = $true }
+            }
+            $ok = $true
+        } catch {}
+    }
+    $script:PresentIdsOk = $ok
+    $script:PresentIds   = $set
+    return $set
+}
+
 function Get-CompatibleIdList {
     <# CompatibleIDs del device. La clase USB 07h ('USB\Class_07') es la senal canonica de impresora. #>
     param($WmiEntity, [string]$InstanceId)
@@ -972,8 +1104,10 @@ function Get-UsbPrintDevices {
       Todo candidato pasa por Test-IsPrinterDevice; los descartados quedan registrados
       en $script:Diagnostics['descartadosNoImpresora'] para poder auditar la decision.
     #>
-    $devices  = @()
-    $rejected = @()
+    Write-StepDetail 'leyendo el Administrador de dispositivos'
+    $devices       = @()
+    $rejected      = @()
+    $desconectadas = @()
 
     # (1) Registro USBPRINT: mapeo device -> PortName
     try {
@@ -995,11 +1129,27 @@ function Get-UsbPrintDevices {
                         }
                     }
                     if ($desc -match ';') { $desc = ($desc -split ';')[-1] }
-                    $devices += [ordered]@{
-                        source = 'registry.USBPRINT'; name = $desc
-                        instanceId = ('USBPRINT\' + $hw.PSChildName + '\' + $inst.PSChildName)
-                        portName = $portName; status = 'enumerado'; problem = 0
-                        deteccion = 'interfaz USBPRINT (usbprint.sys)'; certeza = 'alta'
+                    $instId = ('USBPRINT\' + $hw.PSChildName + '\' + $inst.PSChildName)
+
+                    # El registro es historico: solo cuenta si el device esta PRESENTE ahora
+                    $presentes = Get-PresentDeviceIds
+                    $estaPresente = $true
+                    if ($script:PresentIdsOk) { $estaPresente = [bool]$presentes.ContainsKey($instId.ToUpper()) }
+
+                    if ($estaPresente) {
+                        $devices += [ordered]@{
+                            source = 'registry.USBPRINT'; name = $desc
+                            instanceId = $instId
+                            portName = $portName; status = 'enumerado'; problem = 0
+                            deteccion = 'interfaz USBPRINT (usbprint.sys)'; certeza = 'alta'
+                        }
+                    } else {
+                        $desconectadas += [ordered]@{
+                            nombre = $(if ($desc) { $desc } else { 'Impresora sin identificar' })
+                            puerto = $portName
+                            instanceId = $instId
+                            motivo = 'figura instalada en el registro de Windows pero el dispositivo no esta presente'
+                        }
                     }
                 }
             }
@@ -1055,6 +1205,8 @@ function Get-UsbPrintDevices {
     }
 
     $script:Diagnostics['descartadosNoImpresora'] = @($rejected)
+    $script:Diagnostics['impresorasDesconectadas'] = @($desconectadas)
+    $script:Diagnostics['presenciaVerificada']     = [bool]$script:PresentIdsOk
 
     # Dedup por instanceId, priorizando la entrada que trae portName
     $byId = [ordered]@{}
@@ -1150,7 +1302,10 @@ function New-FudoTestPrinter {
         $match = @($script:Diagnostics['printersConnected'] | Where-Object { $_.puerto -eq $PortName -and $_.driverNombre }) | Select-Object -First 1
         if ($match) { $drv = [string]$match.driverNombre }
     }
-    if (-not $drv) { $drv = Install-GenericTextDriver }
+    if (-not $drv) {
+        Write-StepDetail 'instalando el driver de texto generico'
+        $drv = Install-GenericTextDriver
+    }
     if (-not $drv) { throw "No se pudo instalar el driver generico de texto (necesario para la prueba de impresion)." }
 
     $name = 'FUDO-TEST-' + ($PortName -replace '[^A-Za-z0-9]', '')
@@ -1176,6 +1331,23 @@ function New-FudoTestPrinter {
         return $name
     }
     return ''
+}
+
+function Test-PortHasLiveDevice {
+    <#
+      El puerto USB00x tiene un dispositivo PRESENTE detras?
+      Devuelve $true si no se puede afirmar lo contrario (nunca inventa una desconexion).
+    #>
+    param([string]$PortName)
+    if (-not $PortName) { return $true }
+    if ($PortName -notmatch '^(?i)USB\d+') { return $true }     # solo aplica a puertos USB fisicos
+    if (-not $script:PresentIdsOk) { return $true }             # no pudimos verificar presencia
+    $live = @()
+    if ($script:Diagnostics.Contains('livePorts')) { $live = @($script:Diagnostics['livePorts'] | Where-Object { $_ }) }
+    $hwCount = 0
+    if ($script:Diagnostics.Contains('hwDeviceCount')) { $hwCount = [int]$script:Diagnostics['hwDeviceCount'] }
+    if (@($live).Count -eq 0 -and $hwCount -gt 0) { return $true }  # hay hardware pero sin mapeo de puerto
+    return ([bool](@($live) -contains $PortName))
 }
 
 function Test-Layer1a-HardwareInventory {
@@ -1218,16 +1390,34 @@ function Test-Layer1a-HardwareInventory {
     $script:Diagnostics['livePorts']      = $devPorts
     $script:Diagnostics['hwDeviceCount']  = (@($devices).Count + @($problems).Count)
 
+    # 1a.1c Impresoras que Windows conoce pero que NO estan conectadas ahora
+    $desconectadas = @()
+    if ($script:Diagnostics.Contains('impresorasDesconectadas')) { $desconectadas = @($script:Diagnostics['impresorasDesconectadas']) }
+    if (@($desconectadas).Count -gt 0) {
+        $detalle = @($desconectadas | ForEach-Object { $_.nombre + $(if ($_.puerto) { " (estaba en $($_.puerto))" } else { '' }) })
+        Add-Check -Id 'hw.disconnected' -Layer 1 -Name ('Impresora instalada pero DESCONECTADA: ' + ($detalle -join ' | ')) `
+            -Status $(if (@($identified).Count -eq 0) { 'fail' } else { 'warn' }) -RootCauseCandidate (@($identified).Count -eq 0) -Plane 'hardware' `
+            -Evidence @{ desconectadas = $desconectadas; conectadasAhora = @($identified).Count } `
+            -ArticleRef 'https://soporte.fu.do/es/articles/11730817' `
+            -Recommendation ("Windows tiene instalada esta impresora pero el dispositivo no esta presente: esta apagada o desenchufada. " +
+                             "Conectarla al MISMO puerto USB donde estaba" + $(if (@($desconectadas)[0].puerto) { " ($(@($desconectadas)[0].puerto))" } else { '' }) +
+                             ", encenderla y volver a correr el diagnostico. Si se conecta en otro puerto USB, el motor va a reasignar la cola.")
+    }
+
     # 1a.1 Hay una impresora fisica conectada?
     if (@($devices).Count -eq 0 -and @($problems).Count -eq 0) {
-        Add-Check -Id 'hw.deviceConnected' -Layer 1 -Name 'Ninguna impresora fisica conectada (Administrador de dispositivos)' -Status 'fail' -RootCauseCandidate $true -Plane 'hardware' `
-            -Evidence @{ usbPrintDevices = 0; usbPortsHuerfanos = $usbPorts } `
+        $yaSabemos = @()
+        if ($script:Diagnostics.Contains('impresorasDesconectadas')) { $yaSabemos = @($script:Diagnostics['impresorasDesconectadas']) }
+        Add-Check -Id 'hw.deviceConnected' -Layer 1 -Name 'Ninguna impresora fisica conectada (Administrador de dispositivos)' -Status 'fail' -RootCauseCandidate (@($yaSabemos).Count -eq 0) -Plane 'hardware' `
+            -Evidence @{ usbPrintDevices = 0; usbPortsHuerfanos = $usbPorts
+                         conocidasDesconectadas = @($(if ($script:Diagnostics.Contains('impresorasDesconectadas')) { $script:Diagnostics['impresorasDesconectadas'] } else { @() })) } `
             -ArticleRef 'https://soporte.fu.do/es/articles/11730817' `
             -Recommendation ('Windows NO ve ninguna impresora conectada por USB. Antes de tocar software: 1) que la impresora este encendida (luz fija, no roja); 2) probar OTRO puerto USB de la PC, directo (sin hub); 3) probar otro cable USB; 4) hacer el self-test de la impresora (apagar, mantener FEED, encender) para confirmar que el fierro funciona. ' +
                              $(if (@($usbPorts).Count -gt 0) { "Ojo: existen puertos $($usbPorts -join ', ') en Windows pero son huerfanos (quedaron de una instalacion previa, no tienen device detras)." } else { '' }))
         return
     }
 
+    Set-StepNote ("$(@($identified).Count) impresora(s)")
     $cant = @($identified).Count
     $descartados = @()
     if ($script:Diagnostics.Contains('descartadosNoImpresora')) { $descartados = @($script:Diagnostics['descartadosNoImpresora']) }
@@ -1425,6 +1615,24 @@ function Test-Layer1-PrinterState {
         workOffline = $workOffline; printerState = $printerState; printerStatus = $printerStatus
     }
 
+    # 1.0 La cola apunta a un puerto sin hardware presente => esta desconectada.
+    # Sin esto se "repara" el offline de una impresora desenchufada, que vuelve a ponerse offline.
+    $portLive = Test-PortHasLiveDevice -PortName ([string]$Printer.PortName)
+    if (-not $portLive) {
+        $conocida = @()
+        if ($script:Diagnostics.Contains('impresorasDesconectadas')) { $conocida = @($script:Diagnostics['impresorasDesconectadas']) }
+        Add-Check -Id 'printer.disconnected' -Layer 1 -Name "La impresora '$($Printer.Name)' esta desconectada (puerto $($Printer.PortName) sin dispositivo)" `
+            -Status 'fail' -RootCauseCandidate $true -Plane 'hardware' `
+            -Evidence @{ printer = [string]$Printer.Name; port = [string]$Printer.PortName; workOffline = $workOffline
+                         livePorts = @($(if ($script:Diagnostics.Contains('livePorts')) { $script:Diagnostics['livePorts'] } else { @() }))
+                         conocidasDesconectadas = $conocida } `
+            -ArticleRef 'https://soporte.fu.do/es/articles/11730817' `
+            -Recommendation ("La cola '$($Printer.Name)' apunta a $($Printer.PortName), pero ahi no hay ningun dispositivo conectado. " +
+                             'Encender la impresora y conectar el cable USB (probar el mismo puerto de la PC y, si no, otro directo sin hub). ' +
+                             'No tiene sentido tocar el estado de la cola hasta que el hardware aparezca.')
+        return $wmi
+    }
+
     # 1.1 Impresora en 'Usar impresora sin conexion' / offline
     if ($workOffline) {
         $rem = Invoke-Remediation -Description 'Quitar modo offline (Usar impresora sin conexion) + reactivar' -Type 'printer.online' -Target $Printer.Name `
@@ -1465,8 +1673,10 @@ function Test-Layer1-PrinterState {
 function Test-Layer2-Queue {
     param($Printer, $Wmi)
     if ($null -eq $Printer) { return }
+    Write-StepDetail 'revisando trabajos en cola'
     $jobs = @()
     try { $jobs = @(Get-PrintJob -PrinterName $Printer.Name -ErrorAction Stop) } catch {}
+    Set-StepNote ("$(@($jobs).Count) trabajo(s)")
     $script:Diagnostics['queueDepth'] = @($jobs).Count
 
     if (@($jobs).Count -eq 0) {
@@ -1611,8 +1821,10 @@ function Test-Layer3-Network {
     }
     $script:Diagnostics['printerIp'] = $ip
 
+    Write-StepDetail "haciendo ping a $ip"
     $pingOk = $false
     try { $pingOk = Test-Connection -ComputerName $ip -Count 2 -Quiet -ErrorAction Stop } catch {}
+    Write-StepDetail ("probando el puerto $Port en " + $ip)
     $portOk = $false
     try {
         $t = Test-NetConnection -ComputerName $ip -Port $Port -WarningAction SilentlyContinue -ErrorAction Stop
@@ -1639,6 +1851,7 @@ function Test-Layer3-Network {
     $discovered = @()
     try {
         $prefix = ($ip -split '\.')[0..2] -join '.'
+        Write-StepDetail ("impresora inalcanzable: escaneando $prefix.1-254 buscando el puerto $Port")
         $localIps = @()
         try { $localIps = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object { $_.IPAddress }) } catch {}
         # Escaneo acotado y en paralelo liviano (1..254) del puerto 9100
@@ -1693,6 +1906,7 @@ function Test-Layer4-HardwarePrint {
         $ip = $script:Diagnostics['printerIp']
         if (-not $ip) { Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica (TCP 9100)' -Status 'skipped' -Evidence @{ note = 'sin IP' }; return }
         try {
+            Write-StepDetail ("enviando ticket de prueba a " + $ip + ":" + $Port)
             $ok = Send-EscPosOverTcp -Ip $ip -TcpPort $Port
             Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica ESC/POS por red' -Status $(if($ok){'ok'}else{'fail'}) -RootCauseCandidate (-not $ok) `
                 -Plane 'hardware' -Evidence @{ ip = $ip; port = $Port; sent = $ok } `
@@ -1709,6 +1923,13 @@ function Test-Layer4-HardwarePrint {
                 -Recommendation 'No hay una impresora fisica instalada para probar: resolver primero la capa 1 (hardware/instalacion).'
             return
         }
+        if (-not (Test-PortHasLiveDevice -PortName ([string]$Printer.PortName))) {
+            Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica de impresion' -Status 'skipped' -Plane 'hardware' `
+                -Evidence @{ printer = [string]$Printer.Name; port = [string]$Printer.PortName } `
+                -Recommendation ("No se prueba: en $($Printer.PortName) no hay ningun dispositivo conectado. " +
+                                 'Enviar un ticket ahi solo lo dejaria encolado y daria un falso OK de hardware.')
+            return
+        }
         $v = Test-IsVirtualPrinter $Printer
         if ($v.isVirtual) {
             Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica de impresion' -Status 'skipped' -Plane 'hardware' `
@@ -1717,11 +1938,35 @@ function Test-Layer4-HardwarePrint {
             return
         }
         try {
+            Write-StepDetail "enviando ticket de prueba a '$($Printer.Name)'"
             Initialize-RawPrinterHelper
             $bytes = [System.Text.Encoding]::GetEncoding(437).GetBytes((Get-EscPosTestTicket -Caption 'FUDO HW TEST'))
             $ok = [FudoRawPrinter]::SendBytes($Printer.Name, $bytes)
+
+            # WritePrinter OK solo significa "el spooler lo acepto". Si el trabajo sigue en la
+            # cola despues de un momento, el papel NO salio.
+            $quedoEnCola = $false
+            if ($ok) {
+                Write-StepDetail 'verificando que el ticket haya salido'
+                Start-Sleep -Milliseconds 1800
+                try {
+                    $pend = @(Get-PrintJob -PrinterName $Printer.Name -ErrorAction SilentlyContinue |
+                              Where-Object { [string]$_.DocumentName -match '(?i)fudo print doctor' })
+                    $quedoEnCola = (@($pend).Count -gt 0)
+                } catch {}
+            }
+            if ($quedoEnCola) {
+                Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica ESC/POS por USB (RAW)' -Status 'fail' -RootCauseCandidate $true `
+                    -Plane 'hardware' -Evidence @{ printer = $Printer.Name; sent = $true; quedoEnCola = $true } `
+                    -ArticleRef 'https://soporte.fu.do/es/articles/11730817' `
+                    -Recommendation ('El ticket entro a la cola pero no se imprimio: la impresora no esta respondiendo. ' +
+                                     'Revisar que este encendida, con papel, la tapa cerrada y el cable USB firme. ' +
+                                     'Si la luz esta en rojo o titilando, es falla de hardware o falta de papel.')
+                return
+            }
+
             Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica ESC/POS por USB (RAW)' -Status $(if($ok){'ok'}else{'fail'}) -RootCauseCandidate (-not $ok) `
-                -Plane 'hardware' -Evidence @{ printer = $Printer.Name; sent = $ok } `
+                -Plane 'hardware' -Evidence @{ printer = $Printer.Name; sent = $ok; quedoEnCola = $false } `
                 -ArticleRef 'https://soporte.fu.do/es/articles/12044021' `
                 -Recommendation $(if($ok){'El hardware imprime OK: si la comanda no sale, revisar config de Fudo (area/cocina/sala). Si imprime en blanco, revisar rollo/papel al reves.'}else{'El envio RAW fallo: revisar puerto/driver/cable.'})
         } catch {
@@ -1879,6 +2124,8 @@ function Get-Category {
     # Categorizacion para telemetria / Contact Rate por causa
     $rc = [string]$Diag.rootCause
     switch -Regex ($rc) {
+        'DESCONECTADA|esta desconectada|sin dispositivo' { return 'hardware.desconectada' }
+        'no esta respondiendo|quedo en la cola' { return 'hardware' }
         'Ninguna impresora fisica|no conectada|Administrador de dispositivos|sin hardware detectado' { return 'hardware.no_conectada' }
         'virtual' { return 'os.impresora_virtual' }
         'sin driver|driver generico|no instalada|cola de prueba|driver instalado' { return 'os.driver_faltante' }
@@ -1928,6 +2175,7 @@ function Get-AreaStatus {
     if (@($mine | Where-Object { $_.status -eq 'warn' }).Count  -gt 0) { return 'REVISAR' }
     if (@($mine | Where-Object { $_.status -eq 'fixed' }).Count -gt 0) { return 'REPARADO' }
     if (@($mine | Where-Object { $_.status -eq 'ok' }).Count    -gt 0) { return 'OK' }
+    if (@($mine | Where-Object { $_.status -eq 'skipped' }).Count -gt 0) { return 'omitido' }
     return '-'
 }
 
@@ -2001,6 +2249,16 @@ function Build-HumanSummary {
 
     if (@($desc).Count -gt 0) {
         Add-Line ("    (se descartaron " + @($desc).Count + " dispositivos USB que no son impresoras: mouse, hubs, etc.)")
+    }
+    $off = @()
+    if ($script:Diagnostics.Contains('impresorasDesconectadas')) { $off = @($script:Diagnostics['impresorasDesconectadas']) }
+    if (@($off).Count -gt 0) {
+        Add-Line ''
+        Add-Line ("  DESCONECTADAS (instaladas en Windows, sin hardware presente): " + @($off).Count)
+        foreach ($o in $off) {
+            Add-Line ("    - " + [string]$o.nombre + $(if ($o.puerto) { "  [estaba en $($o.puerto)]" } else { '' }))
+        }
+        Add-Line '      -> encender la impresora y conectar el USB, preferentemente en el mismo puerto'
     }
 
     # --- semaforo por area
@@ -2133,6 +2391,12 @@ function Test-Preflight {
 function Invoke-FudoPrintDoctor {
     Write-DoctorLog -Level 'INFO' -Message "Inicio FudoPrintDoctor (AutoFix=$AutoFix, DryRun=$DryRun, Interface=$Interface)"
 
+    if (Test-IsInteractiveConsole) {
+        Write-Host ''
+        Write-Host '  Revisando la cadena de impresion...' -ForegroundColor Cyan
+        Write-Host ''
+    }
+
     $badArgs = @(Test-Preflight)
     if (@($badArgs).Count -gt 0) {
         foreach ($b in $badArgs) {
@@ -2174,6 +2438,8 @@ function Invoke-FudoPrintDoctor {
                 -Recommendation ("Queda instalada la cola de prueba " + ($names -join ', ') + ". Borrarla cuando se instale la definitiva: Remove-Printer -Name '" + (@($names)[0]) + "'")
         }
     }
+
+    if (Test-IsInteractiveConsole) { Write-Host '' }
 
     $diag = Resolve-Diagnosis
     $durationMs = [int]((Get-Date) - $script:StartTime).TotalMilliseconds
@@ -2474,6 +2740,47 @@ function Invoke-SelfTest {
     $r20b = Invoke-Remediation -Description 'purga' -Type 'queue.purge' -Target 'X' -Reversible $false -Fix { 'purgado' }
     Assert-Eq 'S20 respeta el flag en false' $false $r20b.applied
     $Quiet = $qBackup; $script:BoundParams = $bpBackup
+
+    # Escenario 21: impresora desenchufada -> NO figura como conectada, si como desconectada
+    Reset-State
+    $script:PresentIdsOk = $true
+    function Get-UsbPrintDevices {
+        # el registro tenia la XPrinter en USB002, pero el device ya no esta presente
+        $script:Diagnostics['impresorasDesconectadas'] = @(
+            [ordered]@{ nombre='XPrinter XP-410B'; puerto='USB002'; instanceId='USBPRINT\XPRINTER\7&1'
+                        motivo='figura instalada en el registro de Windows pero el dispositivo no esta presente' })
+        return @()
+    }
+    function Get-ProblemPrinterDevices { @() }
+    function Get-PrinterPort { @([pscustomobject]@{ Name='USB002'; Description='USB' }) }
+    function Get-Printer { @([pscustomobject]@{ Name='FUDO-TEST-USB002'; DriverName='Generic / Text Only'; PortName='USB002' }) }
+    Test-Layer1a-HardwareInventory
+    Assert-Eq 'S21 hardware en fail' 'fail' (Get-CheckById 'hw.deviceConnected').status
+    Assert-Eq 'S21 avisa que esta desconectada' $true ([bool]((Get-CheckById 'hw.disconnected') -ne $null))
+    Assert-Eq 'S21 dice el puerto donde estaba' $true ([bool]((Get-CheckById 'hw.disconnected').name -match 'USB002'))
+    Assert-Eq 'S21 categoria' 'hardware.desconectada' (Get-Category -Diag (Resolve-Diagnosis))
+
+    # Escenario 22: la cola apunta a un puerto sin device -> no se toca el offline
+    Reset-State
+    $script:PresentIdsOk = $true
+    $script:Diagnostics['livePorts'] = @()
+    $script:Diagnostics['hwDeviceCount'] = 0
+    Assert-Eq 'S22 puerto sin device' $false (Test-PortHasLiveDevice -PortName 'USB002')
+    Assert-Eq 'S22 puerto no USB no se juzga' $true (Test-PortHasLiveDevice -PortName 'PORTPROMPT:')
+    $script:Diagnostics['livePorts'] = @('USB001')
+    $script:Diagnostics['hwDeviceCount'] = 1
+    Assert-Eq 'S22 puerto con device' $true (Test-PortHasLiveDevice -PortName 'USB001')
+    $script:PresentIdsOk = $false
+    Assert-Eq 'S22 sin poder verificar no afirma' $true (Test-PortHasLiveDevice -PortName 'USB002')
+    $script:PresentIdsOk = $true
+
+    # Escenario 23: la prueba fisica no corre sobre un puerto sin hardware
+    Reset-State
+    $script:PresentIdsOk = $true
+    $script:Diagnostics['livePorts'] = @()
+    $script:Diagnostics['hwDeviceCount'] = 0
+    Test-Layer4-HardwarePrint -Printer ([pscustomobject]@{ Name='FUDO-TEST-USB002'; DriverName='Generic / Text Only'; PortName='USB002' }) -DetectedInterface 'USB'
+    Assert-Eq 'S23 no da falso OK de hardware' 'skipped' (Get-CheckById 'hw.testprint').status
 
     Write-Host ""
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)

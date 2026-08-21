@@ -133,6 +133,21 @@ Un nodo por chequeo del árbol de diagnóstico.
 | `articleRef` | Artículo del Help Center |
 | `recommendation` | Qué hacer |
 
+Checks de hardware y conexión:
+
+| Check | Cuándo aparece |
+|---|---|
+| `hw.deviceConnected` | Windows no ve ninguna impresora física |
+| `hw.disconnected` | La impresora está instalada pero el dispositivo no está presente (desenchufada o apagada). El evidence trae el puerto donde estaba. |
+| `printer.disconnected` | La cola objetivo apunta a un puerto USB sin dispositivo |
+| `hw.driverMissing` | Dispositivo presente con código 28 (sin driver) |
+| `hw.notInstalled` | Dispositivo presente sin cola de impresión |
+| `hw.testprint` | Prueba física. `evidence.quedoEnCola: true` = el ticket entró al spooler pero no se imprimió |
+
+`diagnostics.impresorasDesconectadas[]` lista las instaladas sin hardware presente, y
+`diagnostics.presenciaVerificada` dice si se pudo determinar la presencia real de dispositivos
+(si es `false`, el motor no afirma desconexiones).
+
 Checks principales: `env.spooler`, `nativa.installed`, `nativa.defenderQuarantine`,
 `nativa.thirdPartyAV`, `hw.deviceConnected`, `hw.driverPlan`, `hw.driverMissing`,
 `hw.notInstalled`, `printer.exists`, `printer.virtualTarget`, `printer.autodetect`,
@@ -156,7 +171,7 @@ Checks principales: `env.spooler`, `nativa.installed`, `nativa.defenderQuarantin
 
 Categorías: `nativa.antivirus`, `nativa.antivirus_3p`, `nativa.install`, `os.spooler`,
 `os.queue`, `os.printer_state`, `os.usb_port`, `os.driver_faltante`, `os.impresora_virtual`,
-`net.ip`, `hardware`, `hardware.no_conectada`, `fudo_config`, `unknown`.
+`net.ip`, `hardware`, `hardware.no_conectada`, `hardware.desconectada`, `fudo_config`, `unknown`.
 Sirven para medir Contact Rate por causa.
 
 ## Errores del motor

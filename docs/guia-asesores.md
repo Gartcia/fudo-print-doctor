@@ -18,12 +18,28 @@ de todas formas*. Es porque el archivo viene de internet, no porque tenga algo r
 
 ## Cómo leer el resumen
 
+Mientras corre vas viendo cada etapa con su resultado, así que no te quedás esperando en la nada:
+
+```
+  [1/9] Entorno de Windows .................... ok  220ms
+  [2/9] App Nativa de Fudo y antivirus ........ revisar  310ms
+  [3/9] Impresoras conectadas ................. FALLA  480ms
+```
+
 **IMPRESORAS CONECTADAS** es lo primero que hay que mirar.
 
 - `0` → no es un problema de software. Revisar energía, cable y puerto USB antes de seguir.
 - Si abajo del nombre dice `deteccion: ... (certeza baja)` → Windows no confirma que sea una
   impresora, solo lo sugiere el nombre. Confirmá que ese sea el equipo antes de instalarle nada.
 - Los mouse, teclados y hubs USB no aparecen: se descartan y quedan en el JSON con el motivo.
+
+**DESCONECTADAS** aparece cuando Windows tiene la impresora instalada pero el equipo no está
+enchufado o está apagado. Es distinto de "no hay impresoras": acá sabemos cuál era y en qué puerto
+estaba. Conectarla **al mismo puerto**, encenderla y volver a correr. Si se conecta en otro puerto,
+el motor reasigna la cola solo.
+
+Ojo con esto: la cola de Windows (incluida una `FUDO-TEST-*`) sigue existiendo aunque la impresora
+no esté. Que aparezca en *Dispositivos e impresoras* no significa que esté conectada.
 - La térmica aparece con `-> SIN cola en Windows` → está conectada pero no instalada.
 - Aparece `Impresora generica [VID_xxxx]` → Windows la ve pero no sabe qué es. Normal en
   térmicas chinas (XPrinter, 3nStar, Rongta). El driver `Genérico / Solo texto` es el correcto.
