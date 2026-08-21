@@ -2,6 +2,40 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [1.9] - 2026-08-21
+
+### Corregido
+- **Se diagnosticaba la impresora equivocada.** En un local con caja y cocina, el motor tomaba la
+  primera cola que encontraba: en un caso real eligió COCINA (que funcionaba) y devolvió "todo ok"
+  mientras CAJA estaba offline, con el puerto muerto y **1440 trabajos encolados**. Ahora se evalúan
+  todas las colas reales con un puntaje de severidad y se diagnostica la que falla. Las sanas se
+  listan como "funcionando — no se toca".
+- Contradicción en el resumen: la misma impresora podía aparecer a la vez como conectada y como
+  desconectada (venía de dos fuentes con `InstanceId` distinto). Se deduplica por puerto y por
+  nombre del equipo, y las entradas históricas se nombran con la cola de Windows que usa ese puerto.
+- `No Printer Attached`, `Printer` y similares son etiquetas del driver, no modelos: cuando el
+  device no dice nada útil se muestra el nombre de la cola.
+
+### Agregado
+- **Reconexión guiada**: cuando la cola apunta a un puerto muerto, el motor espera a que se
+  desenchufe y se vuelva a enchufar el USB, detecta el puerto nuevo, apunta la cola ahí, prueba un
+  ticket y, si hace falta, recrea la cola. Es la secuencia que resolvió el caso real.
+- `Repair-QueueRecreate`: reemplazo seguro de una cola rota. Crea una cola temporal, comprueba que
+  imprima, y solo entonces borra la vieja y renombra la nueva con el mismo nombre (Fudo encuentra la
+  impresora por nombre). Nunca deja al cliente sin cola.
+- Resumen reorganizado: primero las impresoras instaladas en Windows con estado y síntomas, después
+  el hardware conectado.
+- Mensaje específico con decenas de trabajos acumulados: las comandas llegan desde Fudo, el problema
+  está en la impresora o su cola.
+- Parámetros `-WaitReconnect`, `-ReconnectTimeoutSec`.
+
+## [1.8] - 2026-08-21
+
+### Agregado
+- Distribución y actualización: `VERSION` publicado en el repo, `Actualizar-FudoPrintDoctor.cmd`
+  para que el asesor tenga siempre la última, aviso en el resumen cuando corre una versión vieja,
+  `-CheckUpdate` y `-NoUpdateCheck`. El launcher del cliente descarga el `.ps1` si falta.
+
 ## [1.7] - 2026-08-21
 
 ### Corregido

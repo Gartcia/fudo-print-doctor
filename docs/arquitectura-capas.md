@@ -11,7 +11,7 @@ tanto como los chequeos.
  2  Cola de trabajos           un job trabado bloquea todo lo que viene
  1  Cola de Windows            existe, no es virtual, no está offline ni pausada
  1a Hardware                   ¿hay algo conectado? ¿en qué puerto? ¿con driver?
- 0b App Nativa + antivirus     causa #1 del registro real de casos
+ 0b App Nativa + antivirus     causa muy frecuente en la practica
  0  Entorno                    Windows, admin, servicio Spooler
 ```
 

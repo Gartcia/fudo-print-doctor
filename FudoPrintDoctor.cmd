@@ -34,6 +34,24 @@ echo  ================================================================
 pause >nul
 echo.
 
+if exist "%~dp0FudoPrintDoctor.ps1" goto correr
+
+echo  No encuentro FudoPrintDoctor.ps1 al lado de este archivo.
+echo  Intento descargarlo...
+echo.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "try { [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12 } catch {}; Invoke-WebRequest -Uri 'https://raw.githubusercontent.com/Gartcia/fudo-print-doctor/main/FudoPrintDoctor.ps1' -UseBasicParsing -TimeoutSec 60 -OutFile '%~dp0FudoPrintDoctor.ps1'"
+if not exist "%~dp0FudoPrintDoctor.ps1" (
+  echo.
+  echo  No se pudo descargar y no esta en la carpeta. Esta PC puede no
+  echo  tener internet. Copiar tambien el archivo FudoPrintDoctor.ps1
+  echo  junto a este .cmd y volver a intentar.
+  echo.
+  pause
+  exit /b 1
+)
+echo.
+
+:correr
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0FudoPrintDoctor.ps1" -JsonOut "%~dp0resultado.json"
 set FPD_EXIT=%errorlevel%
 

@@ -172,7 +172,7 @@ Checks principales: `env.spooler`, `nativa.installed`, `nativa.defenderQuarantin
 Categorías: `nativa.antivirus`, `nativa.antivirus_3p`, `nativa.install`, `os.spooler`,
 `os.queue`, `os.printer_state`, `os.usb_port`, `os.driver_faltante`, `os.impresora_virtual`,
 `net.ip`, `hardware`, `hardware.no_conectada`, `hardware.desconectada`, `fudo_config`, `unknown`.
-Sirven para medir Contact Rate por causa.
+Sirven para agrupar los casos por causa y medir cuales son los mas frecuentes.
 
 ## Errores del motor
 

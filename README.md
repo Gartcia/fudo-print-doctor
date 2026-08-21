@@ -9,6 +9,20 @@ los casos seguros. Lo que no puede resolver solo, lo devuelve como próximos pas
 - **Compatible** con Windows PowerShell 5.1 (el que ya viene en Windows) y PowerShell 7+.
 - **Dos salidas**: resumen corto para humanos en pantalla, JSON completo para el agente.
 
+## Descargar
+
+Sin instalar nada, sin cuenta de GitHub:
+
+- **Última versión (ZIP)**: [Code → Download ZIP](https://github.com/Gartcia/fudo-print-doctor/archive/refs/heads/main.zip)
+- **Mantenerlo al día**: guardá `Actualizar-FudoPrintDoctor.cmd` en una carpeta y hacé doble clic
+  cuando quieras la versión nueva. Baja el motor y el launcher, y te dice qué versión quedó.
+
+El script avisa solo si está corriendo una versión vieja. `-CheckUpdate` compara contra la
+publicada y termina; `-NoUpdateCheck` desactiva el chequeo.
+
+Para trabajar en la PC de un cliente, copiale **dos archivos**: `FudoPrintDoctor.cmd` y
+`FudoPrintDoctor.ps1`. Si solo copiaste el `.cmd` y esa PC tiene internet, él baja el `.ps1` solo.
+
 ## Uso rápido (asesores)
 
 Copiar la carpeta a la PC del cliente y **doble clic en `FudoPrintDoctor.cmd`**. Eso es todo.
@@ -65,9 +79,9 @@ Lo que se ve en pantalla:
 | Capa | Qué mira |
 |---|---|
 | 0 | Windows, permisos de administrador, servicio Spooler |
-| 0b | App Nativa de Fudo instalada y corriendo; Defender/antivirus de terceros (causa #1 del registro real) |
+| 0b | App Nativa de Fudo instalada y corriendo; Defender/antivirus de terceros |
 | **1a** | **Hardware**: qué impresoras hay físicamente conectadas, en qué puerto, con o sin driver |
-| 1 | Cola de Windows: descarta impresoras virtuales, instala driver si falta |
+| 1 | Colas de Windows: descarta virtuales, **evalúa todas** y diagnostica la que falla, instala driver si falta |
 | 2 | Cola de trabajos trabada |
 | 3 | Puerto USB desmapeado / IP de la impresora Ethernet |
 | 4 | Prueba física ESC/POS contra el hardware (aísla hardware vs configuración) |
@@ -110,6 +124,33 @@ Después enumera las impresoras físicas con tres fuentes en cascada:
 Con eso distingue tres cosas que a ojo se confunden: **puertos USB00x huérfanos** (restos de
 instalaciones viejas, sin nada detrás), **device presente sin driver** (código 28 del
 Administrador de dispositivos) y **device presente sin cola de impresión**.
+
+### Varias impresoras en el mismo local
+
+Un local típico tiene caja y cocina. El motor evalúa **todas** las colas reales —puerto, offline,
+pausada, trabajos en cola, si el puerto tiene hardware presente— les asigna un puntaje de
+severidad y diagnostica **la que está fallando**, no la primera que encuentra. Las sanas se listan
+como "funcionando — no se toca" y no se les aplica ninguna reparación.
+
+```
+  IMPRESORAS INSTALADAS EN WINDOWS: 2
+  >> CAJA  [USB003]  NO IMPRIME
+         - 1440 trabajos encolados (el mas viejo del 20/08 20:17)
+         - el puerto USB003 no tiene ningun dispositivo conectado
+         - marcada como sin conexion (offline)
+     COCINA  [USB001]  funcionando -- no se toca
+```
+
+### Reconexión guiada del USB
+
+El caso más común de "estaba instalada y dejó de imprimir" se resuelve desenchufando y volviendo a
+enchufar el cable USB: Windows re-enumera el dispositivo y le asigna un puerto. El motor acompaña
+esa secuencia: espera la reconexión (hasta `-ReconnectTimeoutSec`, 120 s por defecto), detecta el
+puerto nuevo, apunta la cola ahí, manda un ticket de prueba y —si la cola quedó rota— la recrea.
+
+El reemplazo de una cola es seguro: primero crea una cola temporal y **comprueba que imprima**, y
+solo entonces borra la vieja y renombra la nueva **con el mismo nombre**, porque Fudo encuentra la
+impresora por nombre. Nunca deja al cliente sin cola.
 
 ### Impresoras virtuales
 
@@ -187,13 +228,16 @@ Contrato completo del JSON: [`docs/contrato-json.md`](docs/contrato-json.md).
 | `-TestPrint` | `$true` | Emitir ticket ESC/POS de prueba |
 | `-InstallGenericDriver` | `$true` | Instalar driver y cola de prueba si el hardware está sin instalar |
 | `-AllowQueuePurge` | pregunta | Limpiar la cola sin preguntar (`$true`) o nunca (`$false`) |
+| `-WaitReconnect` | pregunta | Esperar la reconexión del USB sin preguntar (`$true`) o nunca (`$false`) |
+| `-ReconnectTimeoutSec` | `120` | Cuánto esperar la reconexión |
+| `-CheckUpdate` / `-NoUpdateCheck` | off | Comparar con la versión publicada / no chequear |
 | `-SkipIrreversible` | off | No aplica nada irreversible, sin preguntar |
 | `-KeepTestPrinter` | conserva | `:$false` borra la cola `FUDO-TEST-*` al terminar |
 | `-CaseId` / `-ClientId` | vacío | Solo correlación de telemetría; no afecta el diagnóstico |
 | `-JsonOut` | — | Volcar el JSON a un archivo |
 | `-Json` / `-Quiet` | off | Forzar JSON a stdout / silenciar el resumen |
 | `-Verbose` | off | Lista todos los chequeos en pantalla |
-| `-SelfTest` | off | Corre los 60 asserts de la lógica de decisión. No toca la PC. |
+| `-SelfTest` | off | Corre los 69 asserts de la lógica de decisión. No toca la PC. |
 
 ## Desarrollo
 

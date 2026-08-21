@@ -26,7 +26,11 @@ Mientras corre vas viendo cada etapa con su resultado, así que no te quedás es
   [3/9] Impresoras conectadas ................. FALLA  480ms
 ```
 
-**IMPRESORAS CONECTADAS** es lo primero que hay que mirar.
+**IMPRESORAS INSTALADAS EN WINDOWS** es lo primero que hay que mirar. La que tiene `>>` adelante es
+la que el motor diagnostica: la que está fallando. Las que dicen "funcionando — no se toca" quedan
+intactas, así no rompemos la cocina mientras arreglamos la caja.
+
+**HARDWARE DE IMPRESION CONECTADO** es lo que Windows ve enchufado, con el puerto de cada uno.
 
 - `0` → no es un problema de software. Revisar energía, cable y puerto USB antes de seguir.
 - Si abajo del nombre dice `deteccion: ... (certeza baja)` → Windows no confirma que sea una
@@ -61,9 +65,24 @@ no esté. Que aparezca en *Dispositivos e impresoras* no significa que esté con
 - `[asesor]` → vos, en la PC o en la web app de Fudo.
 - `[soporte]` → escalar a Soporte Producto con el JSON.
 
+## Caso: estaba instalada y dejó de imprimir
+
+Síntoma típico: la cola tiene decenas o cientos de trabajos acumulados, dice "sin conexión" y su
+puerto no tiene nada conectado. Eso confirma que **las comandas llegan desde Fudo** y se traban en
+Windows.
+
+Lo que lo resuelve casi siempre: con la impresora encendida, **desenchufar el cable USB y volver a
+enchufarlo**. Windows la re-detecta y le asigna un puerto nuevo. Si corrés el script y le decís que
+sí cuando pregunta si espera la reconexión, él detecta el puerto nuevo, apunta la cola ahí, tira un
+ticket de prueba y —si la cola quedó rota— la recrea con el mismo nombre.
+
+El nombre se mantiene a propósito: Fudo encuentra la impresora por nombre, así que una cola nueva
+llamada distinto obliga a reconfigurar en la web app. Igual, después de recrear conviene verificar
+en Fudo que la impresora siga con su cocina/área asignada.
+
 ## Los tres casos más comunes
 
-**1. La Nativa bloqueada por el antivirus** (~46% de los casos del registro real).
+**1. La Nativa bloqueada por el antivirus.**
 El motor restaura la App Nativa de la cuarentena de Defender y agrega exclusiones de ruta y
 proceso. Con McAfee o Avast **no** se puede automatizar: hay que excluirla a mano en el AV.
 Nunca desactivar el antivirus completo: solo excluir.

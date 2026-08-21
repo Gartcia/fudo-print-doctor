@@ -45,6 +45,21 @@
     Patron de nombre del proceso/servicio de la App Nativa de Fudo (para chequear prerequisito).
     Default cubre variantes conocidas; ajustar segun el binario real.
 
+.PARAMETER WaitReconnect
+    Cuando la impresora esta desconectada, esperar a que alguien desenchufe y vuelva a enchufar
+    el USB, detectar el puerto nuevo y seguir la reparacion sola. Si no se pasa: en consola
+    interactiva se pregunta; en modo agente no se espera.
+
+.PARAMETER ReconnectTimeoutSec
+    Cuanto esperar la reconexion del USB. Default: 120 segundos.
+
+.PARAMETER NoUpdateCheck
+    No consulta si hay una version mas nueva publicada. El chequeo ya se saltea solo en modo
+    agente (-Quiet / -Json / salida redirigida) y nunca bloquea el diagnostico.
+
+.PARAMETER CheckUpdate
+    Solo consulta la version publicada, informa y termina. No diagnostica nada.
+
 .PARAMETER AllowQueuePurge
     Decide sin preguntar si se limpia la cola de impresion (unica accion irreversible).
     Si no se pasa: en consola interactiva se le pregunta al asesor; en modo no interactivo
@@ -105,6 +120,24 @@ CONTRATO DE SALIDA (v1.1)
     diagnosis.nextActions[] (que hacer / quien lo hace / articulo), engineErrors[], checks[], telemetry.
 
 CHANGELOG
+    1.9  - Multi-impresora: se revisan TODAS las colas reales de Windows (puerto, offline, pausada,
+             trabajos en cola, si el puerto tiene hardware) y se diagnostica la que esta fallando,
+             no la primera que aparece. Antes, en un local con caja y cocina podia elegir la que
+             funcionaba y devolver 'todo ok' con la otra tapada con miles de trabajos.
+             Las colas sanas se listan como 'funcionando -- no se toca'.
+           - Flujo de reconexion guiada: cuando la cola apunta a un puerto muerto, el motor espera
+             a que se desenchufe y se vuelva a enchufar el USB, detecta el puerto nuevo, apunta la
+             cola ahi, prueba un ticket y, si la cola esta rota, la recrea con el MISMO nombre
+             (Fudo encuentra la impresora por nombre). Es la secuencia que resuelve el caso real.
+           - Repair-QueueRecreate: reemplazo seguro de una cola rota. Primero crea una cola
+             temporal y comprueba que imprima; solo entonces borra la vieja y renombra la nueva.
+             Nunca deja al cliente sin cola.
+           - Resumen reorganizado: primero las impresoras instaladas en Windows con su estado y
+             sintomas, despues el hardware conectado. Menos ruido, sin contradicciones entre
+             'conectada' y 'desconectada' (se deduplica por puerto y por nombre del equipo).
+           - Mensaje especifico cuando hay decenas de trabajos acumulados: las comandas llegan
+             desde Fudo, el problema esta en la impresora o su cola.
+    1.8  - Distribucion: chequeo de version publicada (-CheckUpdate / aviso en el resumen).
     1.7  - FIX: una impresora DESENCHUFADA seguia figurando como conectada. El registro
              Enum\USBPRINT es historico (guarda toda impresora que estuvo conectada alguna vez),
              asi que ahora se cruza contra los dispositivos realmente presentes
@@ -206,6 +239,10 @@ param(
     [string]$JsonOut,
     [switch]$Quiet,
     [switch]$Json,
+    [bool]$WaitReconnect,
+    [int]$ReconnectTimeoutSec = 120,
+    [switch]$NoUpdateCheck,
+    [switch]$CheckUpdate,
     [switch]$SelfTest
 )
 
@@ -229,7 +266,11 @@ $script:StartTime    = Get-Date
 $script:Diagnostics  = [ordered]@{}   # datos crudos recolectados
 $script:Errors       = New-Object System.Collections.ArrayList   # fallas internas del motor
 $script:TestPrintersCreated = New-Object System.Collections.ArrayList   # colas temporales creadas por el motor
-$script:SchemaVersion = '1.7'
+$script:SchemaVersion = '1.9'
+# Distribucion: repo publico. VERSION es un archivo de una linea con la version publicada.
+$script:RepoUrl    = 'https://github.com/Gartcia/fudo-print-doctor'
+$script:RawBase    = 'https://raw.githubusercontent.com/Gartcia/fudo-print-doctor/main'
+$script:UpdateNote = ''   # mensaje de "hay version nueva", si corresponde
 $script:JsonBegin    = '<<<FUDO_JSON_BEGIN>>>'
 $script:JsonEnd      = '<<<FUDO_JSON_END>>>'
 $script:AutoJsonPath = ''
@@ -251,11 +292,11 @@ $script:StepIndex   = 0
 $script:StepLabel   = ''
 $script:StepNote    = ''
 $script:LiveWidth   = 76
+$script:ReconnectedPort = ''   # puerto donde reaparecio la impresora tras reconectar el USB
 $script:PresentIds   = $null   # cache de InstanceIds de dispositivos PRESENTES
 $script:PresentIdsOk = $false  # pudimos determinar la presencia?
 
-# Conocido: marcas de impresoras termicas/POS (art. 16419361 + registro real de asesores)
-# Marcas reales de termicas/POS (art. 16419361 + registro de asesores).
+# Marcas reales de termicas/POS mas frecuentes en comercios (art. 16419361).
 # OJO: aca NO van tokens genericos como 'POS', 'Generic' o 'Thermal': matchean
 # 'USB Composite Device' y 'Generic USB Hub'. Esas palabras viven en $script:PrinterWordRx.
 $script:PosBrands = @('Bixolon','Epson','Citizen','Hasar','Sam4s','3nStar','XPrinter','Rongta','Gprinter',
@@ -671,8 +712,8 @@ function Test-Layer0-Environment {
 }
 
 # ---------------------------------------------------------------------------
-# LAYER 0b - App Nativa de Fudo vs Antivirus (CAUSA RAIZ #1 segun registro real)
-# ~46% de los casos: la App Nativa queda bloqueada / en cuarentena por Defender o Avast.
+# LAYER 0b - App Nativa de Fudo vs Antivirus
+# Causa muy frecuente: la App Nativa queda bloqueada / en cuarentena por Defender o Avast.
 # Estrategia: exclusiones quirurgicas (ruta + proceso) en vez de desactivar el antivirus.
 # ---------------------------------------------------------------------------
 function Find-FudoNativeInstall {
@@ -897,7 +938,8 @@ function Get-DeviceIdentity {
     # modelo: lo que quede del nombre / del segmento de USBPRINT.
     # Los nombres que pone Windows cuando no sabe que es ('USB Printing Support', etc.) no son modelo.
     $model = ''
-    if ($name -and ($name -notmatch '(?i)^(usb printing support|soporte de impresi|compatible usb|unknown|desconocid|dispositivo (compuesto|usb)|generic usb)')) { $model = $name }
+    # 'No Printer Attached', 'Printer', 'USB Printing Support'... son etiquetas del driver, no modelos.
+    if ($name -and ($name -notmatch '(?i)^(usb printing support|soporte de impresi|compatible usb|unknown|desconocid|dispositivo (compuesto|usb)|generic usb|no printer attached|sin impresora|printer|impresora)\s*$')) { $model = $name }
     elseif ($inst -match '(?i)^USBPRINT\\([^\\]+)') { $model = ($Matches[1] -replace '_+', ' ').Trim() }
     $brandFirst = ''
     if ($brand) { $brandFirst = ($brand -split ' ')[0] }
@@ -1333,6 +1375,61 @@ function New-FudoTestPrinter {
     return ''
 }
 
+function Get-PrinterQueues {
+    <#
+      Todas las colas REALES de Windows (sin virtuales) con su estado, para poder decidir cual
+      es la que esta fallando. En un local hay caja y cocina: la que anda no se toca.
+      'score' mide que tan mal esta: 0 = sana. Se elige como objetivo la de score mas alto.
+    #>
+    $out = @()
+    $all = @()
+    try { $all = @(Get-Printer -ErrorAction Stop) } catch { return @() }
+
+    foreach ($q in $all) {
+        if ((Test-IsVirtualPrinter $q).isVirtual) { continue }
+        $nombre = [string]$q.Name
+        $puerto = [string]$q.PortName
+
+        $offline = $false; $pausada = $false
+        try {
+            $w = Get-CimInstance Win32_Printer -Filter "Name='$($nombre -replace "'","''")'" -ErrorAction Stop
+            if ($w) {
+                try { $offline = [bool]$w.WorkOffline } catch {}
+                try { $pausada = ((([int]$w.PrinterState) -band 1) -ne 0) } catch {}
+            }
+        } catch {}
+
+        $jobs = @()
+        try { $jobs = @(Get-PrintJob -PrinterName $nombre -ErrorAction Stop) } catch {}
+        $masViejo = ''
+        if (@($jobs).Count -gt 0) {
+            try {
+                $t = @($jobs | Where-Object { $_.SubmittedTime } | Sort-Object SubmittedTime | Select-Object -First 1)
+                if (@($t).Count -gt 0) { $masViejo = ([datetime]@($t)[0].SubmittedTime).ToString('dd/MM HH:mm') }
+            } catch {}
+        }
+
+        $puertoVivo = Test-PortHasLiveDevice -PortName $puerto
+
+        $score = 0
+        $sintomas = @()
+        if (@($jobs).Count -ge 3)  { $score += 40; $sintomas += "$(@($jobs).Count) trabajos encolados" + $(if ($masViejo) { " (el mas viejo del $masViejo)" } else { '' }) }
+        elseif (@($jobs).Count -gt 0) { $score += 10; $sintomas += "$(@($jobs).Count) trabajo(s) en cola" }
+        if (-not $puertoVivo)      { $score += 30; $sintomas += "el puerto $puerto no tiene ningun dispositivo conectado" }
+        if ($offline)              { $score += 25; $sintomas += 'marcada como sin conexion (offline)' }
+        if ($pausada)              { $score += 20; $sintomas += 'pausada' }
+
+        $out += [ordered]@{
+            nombre = $nombre; puerto = $puerto; driver = [string]$q.DriverName
+            offline = $offline; pausada = $pausada; trabajos = @($jobs).Count; trabajoMasViejo = $masViejo
+            puertoVivo = [bool]$puertoVivo; esPos = (Test-IsPosPrinter $q)
+            score = $score; sintomas = @($sintomas)
+            estado = $(if ($score -eq 0) { 'sana' } elseif ($score -ge 40) { 'no imprime' } else { 'con problemas' })
+        }
+    }
+    return @($out | Sort-Object -Property @{ Expression = { [int]$_.score }; Descending = $true })
+}
+
 function Test-PortHasLiveDevice {
     <#
       El puerto USB00x tiene un dispositivo PRESENTE detras?
@@ -1380,6 +1477,7 @@ function Test-Layer1a-HardwareInventory {
             driverNota    = [string]$plan.note
             deteccion     = [string]$d.deteccion
             certeza       = [string]$d.certeza
+            nombreCrudo   = [string]$d.name
         }
     }
     $script:Diagnostics['printersConnected'] = $identified
@@ -1390,9 +1488,39 @@ function Test-Layer1a-HardwareInventory {
     $script:Diagnostics['livePorts']      = $devPorts
     $script:Diagnostics['hwDeviceCount']  = (@($devices).Count + @($problems).Count)
 
-    # 1a.1c Impresoras que Windows conoce pero que NO estan conectadas ahora
+    # 1a.1c Impresoras que Windows conoce pero que NO estan conectadas ahora.
+    # Dedup: una entrada historica cuyo puerto esta vivo, o que coincide con una impresora
+    # presente, es la MISMA impresora. Listarla como desconectada seria contradictorio.
     $desconectadas = @()
-    if ($script:Diagnostics.Contains('impresorasDesconectadas')) { $desconectadas = @($script:Diagnostics['impresorasDesconectadas']) }
+    if ($script:Diagnostics.Contains('impresorasDesconectadas')) {
+        $nombresPresentes = @(@($identified | ForEach-Object { [string]$_.nombre }) + @($identified | ForEach-Object { [string]$_.nombreCrudo }) | Where-Object { $_ })
+        $desconectadas = @($script:Diagnostics['impresorasDesconectadas'] | Where-Object {
+            $mismoPuertoVivo = ($_.puerto -and (@($devPorts) -contains [string]$_.puerto))
+            $mismoNombre     = ([string]$_.nombre -and (@($nombresPresentes) -contains [string]$_.nombre))
+            -not ($mismoPuertoVivo -or $mismoNombre)
+        })
+        # colapsar duplicados por puerto (el registro guarda una entrada por reconexion)
+        $vistos = @{}
+        $unicas = @()
+        foreach ($d in @($desconectadas)) {
+            $k = (([string]$d.nombre) + '|' + ([string]$d.puerto)).ToUpper()
+            if (-not $vistos.ContainsKey($k)) { $vistos[$k] = $true; $unicas += $d }
+        }
+        # Si el puerto coincide con una cola instalada, nombrarla: conecta los puntos para el asesor
+        foreach ($d in @($unicas)) {
+            $colaDeEsePuerto = ''
+            try {
+                $m = @($installed | Where-Object { [string]$_.PortName -eq [string]$d.puerto -and -not (Test-IsVirtualPrinter $_).isVirtual }) | Select-Object -First 1
+                if ($m) { $colaDeEsePuerto = [string]$m.Name }
+            } catch {}
+            $d['colaWindows'] = $colaDeEsePuerto
+            if ($colaDeEsePuerto -and ([string]$d.nombre -match '(?i)^(no printer attached|printer|impresora|sin impresora|impresora sin identificar)\s*$')) {
+                $d['nombre'] = $colaDeEsePuerto
+            }
+        }
+        $desconectadas = @($unicas)
+        $script:Diagnostics['impresorasDesconectadas'] = $desconectadas
+    }
     if (@($desconectadas).Count -gt 0) {
         $detalle = @($desconectadas | ForEach-Object { $_.nombre + $(if ($_.puerto) { " (estaba en $($_.puerto))" } else { '' }) })
         Add-Check -Id 'hw.disconnected' -Layer 1 -Name ('Impresora instalada pero DESCONECTADA: ' + ($detalle -join ' | ')) `
@@ -1400,8 +1528,12 @@ function Test-Layer1a-HardwareInventory {
             -Evidence @{ desconectadas = $desconectadas; conectadasAhora = @($identified).Count } `
             -ArticleRef 'https://soporte.fu.do/es/articles/11730817' `
             -Recommendation ("Windows tiene instalada esta impresora pero el dispositivo no esta presente: esta apagada o desenchufada. " +
-                             "Conectarla al MISMO puerto USB donde estaba" + $(if (@($desconectadas)[0].puerto) { " ($(@($desconectadas)[0].puerto))" } else { '' }) +
-                             ", encenderla y volver a correr el diagnostico. Si se conecta en otro puerto USB, el motor va a reasignar la cola.")
+                             $(if (@($desconectadas).Count -eq 1 -and @($desconectadas)[0].puerto) {
+                                    "Conectarla al MISMO puerto USB donde estaba ($(@($desconectadas)[0].puerto)), encenderla"
+                                } else {
+                                    'Encenderlas y conectarlas, de ser posible en el mismo puerto USB donde estaban'
+                                }) +
+                             " y volver a correr el diagnostico. Si se conecta en otro puerto, el motor reasigna la cola.")
     }
 
     # 1a.1 Hay una impresora fisica conectada?
@@ -1459,6 +1591,10 @@ function Test-Layer1a-HardwareInventory {
                 if ($m) { $cola = [string]$m.Name }
             }
             $pc['colaWindows'] = $cola
+            # 'No Printer Attached' y similares no dicen nada: mostrar el nombre de la cola
+            if ($cola -and ([string]$pc.nombre -match '(?i)^(impresora sin identificar|no printer attached|printer|impresora)')) {
+                $pc['nombre'] = ($cola + $(if ($pc.puerto) { '' } else { '' }))
+            }
         }
     }
     $orphanPorts = @($devPorts | Where-Object { $installedRealPorts -notcontains $_ })
@@ -1573,7 +1709,37 @@ function Resolve-TargetPrinter {
         return $null
     }
 
-    # --- Caso C: hay colas reales -> elegir la mejor candidata (POS > puerto fisico)
+    # --- Caso C: hay colas reales.
+    # Primero miramos el estado de TODAS: si una esta fallando (cola tapada, offline, puerto
+    # muerto) esa es la que hay que diagnosticar. Las que andan bien no se tocan.
+    $colas = @(Get-PrinterQueues)
+    $script:Diagnostics['colas'] = $colas
+    if (@($colas).Count -gt 0) {
+        $enfermas = @($colas | Where-Object { [int]$_.score -gt 0 })
+        $sanas    = @($colas | Where-Object { [int]$_.score -eq 0 })
+
+        if (@($colas).Count -gt 1) {
+            Add-Check -Id 'printer.multiple' -Layer 1 -Name ("Hay $(@($colas).Count) impresoras instaladas en Windows") -Status $(if (@($enfermas).Count -gt 0) { 'warn' } else { 'ok' }) `
+                -Evidence @{ colas = @($colas | ForEach-Object { [ordered]@{ nombre = $_.nombre; puerto = $_.puerto; estado = $_.estado; trabajos = $_.trabajos; sintomas = $_.sintomas } }) } `
+                -Recommendation $(if (@($enfermas).Count -gt 0) {
+                        "Se diagnostica '" + [string]@($enfermas)[0].nombre + "', que es la que presenta problemas. " +
+                        $(if (@($sanas).Count -gt 0) { 'Las que estan funcionando (' + (@($sanas | ForEach-Object { $_.nombre }) -join ', ') + ') no se tocan.' } else { '' })
+                    } else { 'Ninguna presenta problemas evidentes. Si el cliente dice que una no imprime, correr con -PrinterName "<nombre exacto>".' })
+        }
+
+        if (@($enfermas).Count -gt 0) {
+            $elegida = @($enfermas)[0]
+            $target = $real | Where-Object { [string]$_.Name -eq [string]$elegida.nombre } | Select-Object -First 1
+            if ($target) {
+                Add-Check -Id 'printer.exists' -Layer 1 -Name "Impresora '$($target.Name)' presente en Windows (la que falla)" -Status 'ok' `
+                    -Evidence @{ name = [string]$target.Name; driver = [string]$target.DriverName; port = [string]$target.PortName
+                                 sintomas = @($elegida.sintomas); score = $elegida.score } `
+                    -Recommendation ("Sintomas detectados en '$($target.Name)': " + (@($elegida.sintomas) -join '; ') + '.')
+                return $target
+            }
+        }
+    }
+
     $pos = @($real | Where-Object { Test-IsPosPrinter $_ })
     $byPort = @($real | Where-Object { ([string]$_.PortName -match '^USB\d+') -or ([string]$_.PortName -match '9100') -or ([string]$_.PortName -match '^\d{1,3}(\.\d{1,3}){3}') -or ([string]$_.PortName -match '^IP_') })
     $ranked = @(@($pos) + @($byPort) + @($real) | Select-Object -Unique)
@@ -1592,6 +1758,109 @@ function Resolve-TargetPrinter {
     Add-Check -Id 'printer.exists' -Layer 1 -Name "Impresora '$($target.Name)' presente en Windows" -Status 'ok' `
         -Evidence @{ name = [string]$target.Name; driver = [string]$target.DriverName; port = [string]$target.PortName; descartadasVirtuales = $virtualNames }
     return $target
+}
+
+function Wait-ForPrinterReconnect {
+    <#
+      Espera a que alguien desenchufe y vuelva a enchufar el USB de la impresora.
+      Windows re-enumera el dispositivo y le asigna un puerto USB00x: eso es lo que buscamos.
+      Devuelve el puerto nuevo (o '' si no aparecio nada).
+    #>
+    param([int]$TimeoutSec = 120)
+
+    $script:PresentIds = $null
+    $antesDev = @(Get-UsbPrintDevices)
+    $antesIds = @($antesDev | ForEach-Object { ([string]$_.instanceId).ToUpper() })
+    $antesPorts = @($antesDev | Where-Object { $_.portName } | ForEach-Object { [string]$_.portName })
+
+    $t0 = Get-Date
+    while (((Get-Date) - $t0).TotalSeconds -lt $TimeoutSec) {
+        $restante = [int]($TimeoutSec - ((Get-Date) - $t0).TotalSeconds)
+        Write-LiveStatus ("  Esperando que desconectes y vuelvas a conectar el USB de la impresora... ${restante}s")
+        Start-Sleep -Seconds 3
+
+        $script:PresentIds = $null
+        $ahora = @(Get-UsbPrintDevices)
+        $nuevosDev = @($ahora | Where-Object { $antesIds -notcontains ([string]$_.instanceId).ToUpper() })
+        $puertosNuevos = @($ahora | Where-Object { $_.portName -and ($antesPorts -notcontains [string]$_.portName) } | ForEach-Object { [string]$_.portName })
+
+        if (@($puertosNuevos).Count -gt 0) { return [string]@($puertosNuevos)[0] }
+        if (@($nuevosDev).Count -gt 0) {
+            # aparecio el device pero Windows todavia no le mapeo el puerto: darle un momento
+            Start-Sleep -Seconds 4
+            $script:PresentIds = $null
+            $ahora2 = @(Get-UsbPrintDevices)
+            $pp = @($ahora2 | Where-Object { $_.portName } | ForEach-Object { [string]$_.portName })
+            $nuevo = @($pp | Where-Object { $antesPorts -notcontains $_ })
+            if (@($nuevo).Count -gt 0) { return [string]@($nuevo)[0] }
+            if (@($pp).Count -gt 0) { return [string]@($pp)[0] }
+        }
+    }
+    return ''
+}
+
+function Invoke-ReconnectFlow {
+    <#
+      Caso tipico: la cola apunta a un puerto muerto. La solucion real suele ser reconectar el
+      cable USB (Windows re-enumera y crea el puerto) y despues apuntar la cola ahi.
+      Este flujo lo acompana: espera la reconexion, reasigna la cola al puerto nuevo, prueba un
+      ticket y, si la cola esta rota, la recrea con el mismo nombre.
+      Devuelve @{ recovered = $bool; note = '...'; port = '...' }
+    #>
+    param($Printer)
+
+    if (-not $AutoFix -or $DryRun) { return @{ recovered = $false; note = 'sin auto-fix / dry-run'; port = '' } }
+
+    $quiere = $false
+    if ($script:BoundParams -and $script:BoundParams.ContainsKey('WaitReconnect')) { $quiere = [bool]$WaitReconnect }
+    elseif (Test-IsInteractiveConsole) {
+        [Console]::Error.WriteLine('')
+        [Console]::Error.WriteLine('  ------------------------------------------------------------')
+        [Console]::Error.WriteLine("  La cola '$($Printer.Name)' apunta a $($Printer.PortName), donde no hay ningun")
+        [Console]::Error.WriteLine('  dispositivo conectado. Lo que suele resolverlo es desenchufar el')
+        [Console]::Error.WriteLine('  cable USB de la impresora y volver a enchufarlo (con la impresora')
+        [Console]::Error.WriteLine('  encendida): Windows la vuelve a detectar y le asigna un puerto.')
+        [Console]::Error.WriteLine('  ------------------------------------------------------------')
+        $ans = ''
+        try { $ans = Read-Host '  Espero mientras lo haces? (s = si / cualquier otra tecla = no)' } catch {}
+        $quiere = ($ans -match '(?i)^\s*(s|si|sí|y|yes)\s*$')
+    }
+    if (-not $quiere) { return @{ recovered = $false; note = 'no se espero la reconexion'; port = '' } }
+
+    $puerto = Wait-ForPrinterReconnect -TimeoutSec $ReconnectTimeoutSec
+    if (-not $puerto) {
+        return @{ recovered = $false; note = "se esperaron $ReconnectTimeoutSec segundos y Windows no detecto ninguna impresora nueva"; port = '' }
+    }
+
+    Write-StepDetail ("la impresora reaparecio en " + $puerto + ", apuntando la cola ahi")
+    $script:ReconnectedPort = $puerto
+
+    # 1) reasignar la cola al puerto nuevo y probar
+    $notas = @()
+    try {
+        Set-Printer -Name $Printer.Name -PortName $puerto -ErrorAction Stop
+        Add-Action -Type 'printer.setport' -Target ([string]$Printer.Name) -Before ([string]$Printer.PortName) -After $puerto
+        $notas += "cola reasignada a $puerto"
+        Start-Sleep -Milliseconds 800
+        Initialize-RawPrinterHelper
+        $ticket = [System.Text.Encoding]::GetEncoding(437).GetBytes((Get-EscPosTestTicket -Caption 'FUDO RECONEXION'))
+        if ([FudoRawPrinter]::SendBytes([string]$Printer.Name, $ticket)) {
+            Start-Sleep -Milliseconds 1800
+            $pend = @()
+            try { $pend = @(Get-PrintJob -PrinterName ([string]$Printer.Name) -ErrorAction SilentlyContinue | Where-Object { [string]$_.DocumentName -match '(?i)fudo' }) } catch {}
+            if (@($pend).Count -eq 0) {
+                return @{ recovered = $true; note = ($notas -join ' | ') + ' y el ticket de prueba salio'; port = $puerto }
+            }
+            $notas += 'el ticket quedo en la cola'
+        } else { $notas += 'el envio RAW fallo' }
+    } catch { $notas += "no se pudo reasignar el puerto: $($_.Exception.Message)" }
+
+    # 2) la cola esta rota: recrearla con el mismo nombre en el puerto que ya sabemos bueno
+    $rec = Repair-QueueRecreate -Printer $Printer -CandidatePorts @($puerto)
+    if ($rec.applied) {
+        return @{ recovered = $true; note = ($notas -join ' | ') + ' | ' + [string]$rec.note; port = $puerto }
+    }
+    return @{ recovered = $false; note = ($notas -join ' | ') + ' | ' + [string]$rec.note; port = $puerto }
 }
 
 function Test-Layer1-PrinterState {
@@ -1621,6 +1890,20 @@ function Test-Layer1-PrinterState {
     if (-not $portLive) {
         $conocida = @()
         if ($script:Diagnostics.Contains('impresorasDesconectadas')) { $conocida = @($script:Diagnostics['impresorasDesconectadas']) }
+
+        # La solucion real suele ser reconectar el USB: si hay alguien ahi, lo acompanamos.
+        $flow = Invoke-ReconnectFlow -Printer $Printer
+        if ($flow.recovered) {
+            Add-Check -Id 'printer.disconnected' -Layer 1 -Name "Impresora '$($Printer.Name)' recuperada tras reconectar el USB" `
+                -Status 'fixed' -RootCauseCandidate $true -Plane 'hardware' `
+                -Evidence @{ printer = [string]$Printer.Name; puertoAnterior = [string]$Printer.PortName; puertoNuevo = [string]$flow.port } `
+                -ActionTaken ([string]$flow.note) `
+                -ArticleRef 'https://soporte.fu.do/es/articles/11730817' `
+                -Recommendation ("La impresora estaba enumerada en un puerto que ya no existia. Al reconectar el USB, Windows la detecto en $($flow.port) y la cola quedo apuntando ahi. " +
+                                 'Verificar en Fudo que siga asignada a su area/cocina y mandar una comanda de prueba.')
+            return $wmi
+        }
+
         Add-Check -Id 'printer.disconnected' -Layer 1 -Name "La impresora '$($Printer.Name)' esta desconectada (puerto $($Printer.PortName) sin dispositivo)" `
             -Status 'fail' -RootCauseCandidate $true -Plane 'hardware' `
             -Evidence @{ printer = [string]$Printer.Name; port = [string]$Printer.PortName; workOffline = $workOffline
@@ -1628,8 +1911,10 @@ function Test-Layer1-PrinterState {
                          conocidasDesconectadas = $conocida } `
             -ArticleRef 'https://soporte.fu.do/es/articles/11730817' `
             -Recommendation ("La cola '$($Printer.Name)' apunta a $($Printer.PortName), pero ahi no hay ningun dispositivo conectado. " +
-                             'Encender la impresora y conectar el cable USB (probar el mismo puerto de la PC y, si no, otro directo sin hub). ' +
-                             'No tiene sentido tocar el estado de la cola hasta que el hardware aparezca.')
+                             'Con la impresora encendida, DESENCHUFAR el cable USB y volver a ENCHUFARLO: Windows la re-detecta y le asigna un puerto nuevo. ' +
+                             'Correr el script de nuevo y responder que si cuando pregunte si espera la reconexion: apunta la cola al puerto nuevo, prueba un ticket y, si la cola esta rota, la recrea con el mismo nombre. ' +
+                             'Si tras reconectar Windows sigue sin verla, probar otro cable y otro puerto USB directo (sin hub).' +
+                             $(if (@($flow.note)) { ' [' + [string]$flow.note + ']' } else { '' }))
         return $wmi
     }
 
@@ -1708,6 +1993,8 @@ function Test-Layer2-Queue {
             -ActionTaken $rem.note -Reversible $false `
             -Recommendation $(if ($rem.applied) {
                     'Un trabajo trabado bloquea toda la cola: se limpio. Volver a imprimir desde Fudo las comandas que estaban esperando.'
+                } elseif (@($jobs).Count -ge 50) {
+                    "Hay $(@($jobs).Count) trabajos acumulados: la App Nativa siguio mandando comandas que nunca salieron. Eso confirma que el problema NO es Fudo (las comandas llegan), sino la impresora o su cola en Windows. Limpiar la cola descarta esos trabajos (son comandas viejas que ya no sirven). Para hacerlo: correr el script en la consola y responder 's' cuando pregunte, o pasar -AllowQueuePurge `$true, o a mano: Get-PrintJob -PrinterName '$($Printer.Name)' | Remove-PrintJob"
                 } else {
                     "Un trabajo trabado bloquea toda la cola: las comandas nuevas no salen hasta limpiarla. Limpiarla descarta los $(@($jobs).Count) trabajos pendientes (hay que reimprimirlos desde Fudo). Para hacerlo: correr el script en la consola y responder 's' cuando pregunte, o pasar -AllowQueuePurge `$true, o a mano: Get-PrintJob -PrinterName '$($Printer.Name)' | Remove-PrintJob"
                 })
@@ -1729,6 +2016,77 @@ function Get-DetectedInterface {
     if ($port -like 'USB*' -or $port -like 'LPT*' -or $port -like '*USB*') { return 'USB' }
     if ($port -match '^\d{1,3}(\.\d{1,3}){3}' -or $port -like 'IP_*' -or $port -like '*9100*') { return 'Ethernet' }
     return 'USB'
+}
+
+function Repair-QueueRecreate {
+    <#
+      Ultimo recurso para una cola que no imprime en ningun puerto: recrearla.
+      Secuencia segura (nunca deja al cliente sin cola):
+        1) crear una cola TEMPORAL con driver de texto generico en cada puerto candidato y probar
+           un ticket real;
+        2) recien cuando una imprime, borrar la cola vieja y RENOMBRAR la temporal con el nombre
+           original (Fudo apunta a la impresora por nombre: el nombre no puede cambiar);
+        3) si ninguna imprime, no se borra nada.
+      El borrado de la cola vieja es irreversible -> pasa por la confirmacion.
+    #>
+    param($Printer, [string[]]$CandidatePorts)
+
+    $nombre = [string]$Printer.Name
+    $puertoOk = ''
+    $temporal = ''
+
+    Write-StepDetail "probando en que puerto responde '$nombre'"
+    try {
+        Initialize-RawPrinterHelper
+        $ticket = [System.Text.Encoding]::GetEncoding(437).GetBytes((Get-EscPosTestTicket -Caption 'FUDO PORT TEST'))
+        foreach ($cp in @($CandidatePorts)) {
+            $tmp = ''
+            try {
+                Write-StepDetail "probando el puerto $cp"
+                $tmp = New-FudoTestPrinter -PortName $cp
+                if (-not $tmp) { continue }
+                Start-Sleep -Milliseconds 600
+                if ([FudoRawPrinter]::SendBytes($tmp, $ticket)) {
+                    Start-Sleep -Milliseconds 1500
+                    $pend = @()
+                    try { $pend = @(Get-PrintJob -PrinterName $tmp -ErrorAction SilentlyContinue) } catch {}
+                    if (@($pend).Count -eq 0) { $puertoOk = $cp; $temporal = $tmp; break }
+                }
+                try { Remove-Printer -Name $tmp -ErrorAction SilentlyContinue } catch {}
+            } catch {}
+        }
+    } catch {}
+
+    if (-not $puertoOk) {
+        return @{ applied = $false; note = "ninguno de los puertos probados ($(@($CandidatePorts) -join ', ')) imprimio un ticket de prueba" }
+    }
+
+    # Hay un puerto que imprime: ahora si vale reemplazar la cola vieja.
+    $rem = Invoke-Remediation -Description "Reemplazar la cola '$nombre' por una nueva con driver de texto generico en $puertoOk (ya probada: imprimio)" `
+        -Type 'printer.recreate' -Target $nombre -Before "$([string]$Printer.DriverName) en $([string]$Printer.PortName)" -After "Generic / Text Only en $puertoOk" `
+        -Reversible $false -Impact "se elimina la cola '$nombre' con sus trabajos pendientes y sus preferencias; se recrea con el mismo nombre para que Fudo la siga encontrando" -Fix {
+            try { Get-PrintJob -PrinterName $nombre -ErrorAction SilentlyContinue | Remove-PrintJob -ErrorAction SilentlyContinue } catch {}
+            Remove-Printer -Name $nombre -ErrorAction Stop
+            Start-Sleep -Milliseconds 500
+            $renombrada = $false
+            try { Rename-Printer -Name $temporal -NewName $nombre -ErrorAction Stop; $renombrada = $true } catch {}
+            if (-not $renombrada) {
+                $drv = Get-GenericTextDriverName
+                if (-not $drv) { $drv = Install-GenericTextDriver }
+                Add-Printer -Name $nombre -DriverName $drv -PortName $puertoOk -ErrorAction Stop
+                try { Remove-Printer -Name $temporal -ErrorAction SilentlyContinue } catch {}
+            }
+            $i = $script:TestPrintersCreated.IndexOf($temporal)
+            if ($i -ge 0) { $script:TestPrintersCreated.RemoveAt($i) }
+            "cola '$nombre' recreada con driver de texto generico en $puertoOk (ticket de prueba OK)"
+        }
+
+    if (-not $rem.applied) {
+        # No se confirmo el reemplazo: dejamos la temporal como evidencia de donde SI imprime.
+        return @{ applied = $false
+                  note = "el puerto correcto es $puertoOk (la cola de prueba '$temporal' imprimio). " + [string]$rem.note }
+    }
+    return $rem
 }
 
 function Test-Layer3-UsbPort {
@@ -1800,6 +2158,30 @@ function Test-Layer3-UsbPort {
             }
         }
     $fixedOk = $rem.applied -and ($rem.note -match 'reasignado')
+
+    # Si cambiar el puerto no alcanzo, la cola en si puede estar rota: recrearla en el puerto
+    # donde el hardware realmente responde (con el mismo nombre, para no romper Fudo).
+    if (-not $fixedOk -and $InstallGenericDriver) {
+        $rec = Repair-QueueRecreate -Printer $Printer -CandidatePorts $candidatePorts
+        if ($rec.applied) {
+            Add-Check -Id 'conn.usb' -Layer 3 -Name "Cola '$($Printer.Name)' recreada en el puerto correcto" -Status 'fixed' -RootCauseCandidate $true `
+                -Evidence @{ antes = @{ puerto = [string]$Printer.PortName; driver = [string]$Printer.DriverName }; candidatos = $candidatePorts } `
+                -ActionTaken $rec.note -Reversible $false `
+                -ArticleRef 'https://soporte.fu.do/es/articles/11730817' `
+                -Recommendation ("La cola apuntaba a un puerto que no responde y no alcanzo con reasignarla, asi que se recreo con driver de texto generico en el puerto donde el hardware si imprime. " +
+                                 'Verificar en Fudo que la impresora siga asignada a su area/cocina (el nombre se mantuvo).')
+            return
+        }
+        if ($rec.note -match 'el puerto correcto es') {
+            Add-Check -Id 'conn.usb' -Layer 3 -Name 'Puerto USB desmapeado (reemplazo de cola pendiente de confirmacion)' -Status 'warn' -RootCauseCandidate $true `
+                -Evidence @{ currentPort = $currentPort; candidates = $candidatePorts; livePorts = $livePorts; motivo = $reason } `
+                -ActionTaken $rec.note -ArticleRef 'https://soporte.fu.do/es/articles/11730817' `
+                -Recommendation ([string]$rec.note + " Para aplicarlo: correr el script en la consola y confirmar cuando pregunte, o pasar -AllowQueuePurge `$true.")
+            return
+        }
+        $rem = @{ applied = $rem.applied; note = ([string]$rem.note + ' | ' + [string]$rec.note) }
+    }
+
     Add-Check -Id 'conn.usb' -Layer 3 -Name 'Puerto USB desmapeado' -Status $(if($fixedOk){'fixed'}elseif($rem.applied){'warn'}else{'warn'}) -RootCauseCandidate $true `
         -Evidence @{ currentPort = $currentPort; candidates = $candidatePorts; livePorts = $livePorts; motivo = $reason } -ActionTaken $rem.note `
         -ArticleRef 'https://soporte.fu.do/es/articles/11730817' `
@@ -2121,7 +2503,7 @@ function Get-NextActions {
 
 function Get-Category {
     param($Diag)
-    # Categorizacion para telemetria / Contact Rate por causa
+    # Categorizacion para telemetria: permite agrupar los casos por causa
     $rc = [string]$Diag.rootCause
     switch -Regex ($rc) {
         'DESCONECTADA|esta desconectada|sin dispositivo' { return 'hardware.desconectada' }
@@ -2218,31 +2600,57 @@ function Build-HumanSummary {
               "   Interfaz: $DetectedInterface")
     Add-Line $bar
 
-    # --- impresoras fisicas detectadas
+    if ($script:UpdateNote) {
+        Add-Line ''
+        Add-Line ('  * ' + $script:UpdateNote)
+    }
+
+    # --- colas de Windows (lo primero que hay que entender: que impresoras hay configuradas)
+    $colas = @()
+    if ($script:Diagnostics.Contains('colas')) { $colas = @($script:Diagnostics['colas']) }
+    if (@($colas).Count -gt 0) {
+        Add-Line ''
+        Add-Line ("  IMPRESORAS INSTALADAS EN WINDOWS: " + @($colas).Count)
+        foreach ($c in $colas) {
+            $marca = $(if ([int]$c.score -gt 0) { '  >>' } else { '    ' })
+            $etiqueta = switch ([string]$c.estado) {
+                'no imprime'    { 'NO IMPRIME' }
+                'con problemas' { 'con problemas' }
+                default         { 'funcionando -- no se toca' }
+            }
+            Add-Line ($marca + ' ' + [string]$c.nombre + $(if ($c.puerto) { "  [$($c.puerto)]" } else { '' }) + '  ' + $etiqueta)
+            foreach ($sin in @($c.sintomas)) {
+                foreach ($ln in @(Format-Wrap -Text $sin -Width 64 -Indent '           ')) { Add-Line ('         - ' + $ln) }
+            }
+        }
+    }
+
+    # --- hardware fisico detectado
     $conn = @()
     if ($script:Diagnostics.Contains('printersConnected')) { $conn = @($script:Diagnostics['printersConnected']) }
     Add-Line ''
-    Add-Line ("  IMPRESORAS CONECTADAS: " + @($conn).Count)
+    Add-Line ("  HARDWARE DE IMPRESION CONECTADO: " + @($conn).Count)
     $desc = @()
     if ($script:Diagnostics.Contains('descartadosNoImpresora')) { $desc = @($script:Diagnostics['descartadosNoImpresora']) }
     if (@($conn).Count -eq 0) {
         Add-Line '    (ninguna: Windows no ve hardware de impresion conectado)'
     } else {
-        $n = 0
         foreach ($c in $conn) {
-            $n++
             $cola = [string]$c.colaWindows
-            $where = $(if ($cola) { "instalada como '$cola'" } else { 'SIN cola en Windows' })
-            Add-Line ("    $n. " + [string]$c.nombre + $(if ($c.puerto) { "  [$($c.puerto)]" } else { '' }) + "  -> $where")
+            $nombre = $(if ($cola) { $cola } else { [string]$c.nombre })
+            $donde = $(if ($c.puerto) { [string]$c.puerto } else { 'sin puerto asignado' })
+            $nota = $(if ($cola) { '' } else { '  -- sin cola en Windows' })
+            Add-Line ("    - $donde : $nombre$nota")
+            if ($cola -and [string]$c.nombre -and ([string]$c.nombre -ne $cola)) {
+                Add-Line ("        equipo: " + [string]$c.nombre)
+            }
             if ($c.certeza -and $c.certeza -ne 'alta') {
-                Add-Line ("       deteccion: " + [string]$c.deteccion + " (certeza $($c.certeza): confirmar que sea la comandera)")
+                Add-Line ("        deteccion: " + [string]$c.deteccion + " (certeza $($c.certeza))")
             }
             if ($c.driverSugerido -eq 'oem_recomendado') {
-                Add-Line ("       driver: tiene driver propio de $($c.marca) (opcional); el generico de texto alcanza")
+                Add-Line ("        driver: tiene driver propio de $($c.marca); el generico de texto igual alcanza")
             } elseif ($c.driverSugerido -eq 'oem_instalado') {
-                Add-Line ("       driver: usa el de $($c.marca) ya instalado ($($c.driverNombre))")
-            } elseif ($c.driverSugerido -eq 'generico') {
-                Add-Line ('       driver: generico de texto (Generic / Text Only)')
+                Add-Line ("        driver: usa el de $($c.marca) ya instalado ($($c.driverNombre))")
             }
         }
     }
@@ -2256,7 +2664,9 @@ function Build-HumanSummary {
         Add-Line ''
         Add-Line ("  DESCONECTADAS (instaladas en Windows, sin hardware presente): " + @($off).Count)
         foreach ($o in $off) {
-            Add-Line ("    - " + [string]$o.nombre + $(if ($o.puerto) { "  [estaba en $($o.puerto)]" } else { '' }))
+            $ext = ''
+            if ($o.colaWindows -and ([string]$o.colaWindows -ne [string]$o.nombre)) { $ext = "  (es la cola '$($o.colaWindows)')" }
+            Add-Line ("    - " + [string]$o.nombre + $(if ($o.puerto) { "  [estaba en $($o.puerto)]" } else { '' }) + $ext)
         }
         Add-Line '      -> encender la impresora y conectar el USB, preferentemente en el mismo puerto'
     }
@@ -2285,6 +2695,9 @@ function Build-HumanSummary {
     # --- resultado
     $conf = switch ([string]$Diag.confidence) { 'high' { 'alta' } 'medium' { 'media' } default { 'baja' } }
     Add-Line ''
+    $target = ''
+    if ($script:Diagnostics.Contains('printer')) { $target = [string]$script:Diagnostics['printer'].name }
+    if ($target) { Add-Line ("  IMPRESORA DIAGNOSTICADA: $target") }
     if ($Diag.resolved) { Add-Line ("  RESULTADO: RESUELTO   (confianza $conf)") }
     else { Add-Line ("  RESULTADO: NO RESUELTO AUTOMATICAMENTE   (confianza $conf)") }
     foreach ($ln in @(Format-Wrap -Text ("CAUSA: " + [string]$Diag.rootCause) -Indent '         ')) { Add-Line ("  $ln") }
@@ -2360,6 +2773,34 @@ function Write-HumanReport {
 # ---------------------------------------------------------------------------
 # PREFLIGHT - valida como fue invocado y avisa en lenguaje claro (no explota)
 # ---------------------------------------------------------------------------
+function Get-PublishedVersion {
+    <#
+      Version publicada en el repo. Timeout corto y silencioso: en la PC de un cliente puede no
+      haber internet, y el diagnostico no depende de esto.
+    #>
+    param([int]$TimeoutSec = 4)
+    try {
+        try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+        $r = Invoke-WebRequest -Uri ($script:RawBase + '/VERSION') -UseBasicParsing -TimeoutSec $TimeoutSec -ErrorAction Stop
+        $v = ([string]$r.Content).Trim()
+        if ($v -match '^\d+(\.\d+){1,3}$') { return $v }
+    } catch {}
+    return ''
+}
+
+function Test-UpdateAvailable {
+    <# Deja el aviso en $script:UpdateNote si hay una version mas nueva. #>
+    if ($NoUpdateCheck -or $Quiet -or $Json) { return }
+    Write-StepDetail 'verificando si hay una version mas nueva'
+    $pub = Get-PublishedVersion
+    if (-not $pub) { return }
+    try {
+        if ([version]$pub -gt [version]$script:SchemaVersion) {
+            $script:UpdateNote = "Hay una version mas nueva publicada: $pub (esta corriendo la $($script:SchemaVersion)). Actualizar con Actualizar-FudoPrintDoctor.cmd o bajarla de $($script:RepoUrl)"
+        }
+    } catch {}
+}
+
 function Test-Preflight {
     $problems = @()
 
@@ -2397,6 +2838,12 @@ function Invoke-FudoPrintDoctor {
         Write-Host ''
     }
 
+    $null = Invoke-Step -Name 'update.check' -Body { Test-UpdateAvailable }
+    if ($script:UpdateNote) {
+        Add-Check -Id 'engine.updateAvailable' -Layer 0 -Name 'Hay una version mas nueva del motor' -Status 'warn' -Plane 'os' `
+            -Evidence @{ actual = $script:SchemaVersion } -Recommendation $script:UpdateNote
+    }
+
     $badArgs = @(Test-Preflight)
     if (@($badArgs).Count -gt 0) {
         foreach ($b in $badArgs) {
@@ -2414,6 +2861,10 @@ function Invoke-FudoPrintDoctor {
         $null = Invoke-Step -Name 'layer1a.hardwareInventory' -Body { Test-Layer1a-HardwareInventory }
         $printer = Invoke-Step -Name 'layer1.resolvePrinter' -Body { Resolve-TargetPrinter }
         $wmi = Invoke-Step -Name 'layer1.printerState' -Body { Test-Layer1-PrinterState -Printer $printer }
+        if ($script:ReconnectedPort -and $printer) {
+            $refrescada = Invoke-Step -Name 'layer1.refresh' -Body { Get-Printer -Name ([string]$printer.Name) -ErrorAction SilentlyContinue }
+            if ($refrescada) { $printer = $refrescada }
+        }
         $null = Invoke-Step -Name 'layer2.queue' -Body { Test-Layer2-Queue -Printer $printer -Wmi $wmi }
         $detectedInterface = Invoke-Step -Name 'layer3.detectInterface' -Body { Get-DetectedInterface -Printer $printer }
         if (-not $detectedInterface) { $detectedInterface = 'USB' }
@@ -2447,6 +2898,7 @@ function Invoke-FudoPrintDoctor {
 
     $result = [ordered]@{
         schemaVersion = $script:SchemaVersion
+        updateAvailable = [string]$script:UpdateNote
         status        = $(if ($diag.resolved -and -not $diag.needsEscalation) { 'resolved' }
                           elseif (@($script:Errors).Count -gt 0) { 'partial_engine_error' }
                           else { 'needs_escalation' })
@@ -2782,6 +3234,54 @@ function Invoke-SelfTest {
     Test-Layer4-HardwarePrint -Printer ([pscustomobject]@{ Name='FUDO-TEST-USB002'; DriverName='Generic / Text Only'; PortName='USB002' }) -DetectedInterface 'USB'
     Assert-Eq 'S23 no da falso OK de hardware' 'skipped' (Get-CheckById 'hw.testprint').status
 
+    # Escenario 24 (caso real): caja tapada con miles de trabajos + cocina sana.
+    # Antes se elegia la primera cola y se devolvia "todo ok" ignorando la que fallaba.
+    Reset-State
+    $script:PresentIdsOk = $true
+    $script:Diagnostics['livePorts'] = @('USB001')      # solo cocina tiene hardware
+    $script:Diagnostics['hwDeviceCount'] = 1
+    function Get-Printer { @(
+        [pscustomobject]@{ Name='Microsoft Print to PDF'; DriverName='Microsoft Print To PDF'; PortName='PORTPROMPT:' },
+        [pscustomobject]@{ Name='CAJA';   DriverName='Generic / Text Only'; PortName='USB003' },
+        [pscustomobject]@{ Name='COCINA'; DriverName='Generic / Text Only'; PortName='USB001' }
+    ) }
+    function Get-CimInstance {
+        if ("$args" -match 'CAJA') { return [pscustomobject]@{ WorkOffline=$true;  PrinterState=0 } }
+        return [pscustomobject]@{ WorkOffline=$false; PrinterState=0 }
+    }
+    function Get-PrintJob {
+        $n=''; for ($i=0; $i -lt $args.Count; $i++) { if ("$($args[$i])" -eq '-PrinterName') { $n="$($args[$i+1])" } }
+        if ($n -eq 'CAJA') { return @(1..1440 | ForEach-Object { [pscustomobject]@{ Id=$_; JobStatus='Normal'; DocumentName='node print job'; SubmittedTime=(Get-Date) } }) }
+        return @()
+    }
+    $colas = @(Get-PrinterQueues)
+    Assert-Eq 'S24 solo cuenta colas reales' 2 (@($colas).Count)
+    Assert-Eq 'S24 ordena primero la que falla' 'CAJA' ([string]@($colas)[0].nombre)
+    Assert-Eq 'S24 CAJA no imprime' 'no imprime' ([string]@($colas)[0].estado)
+    Assert-Eq 'S24 COCINA sana' 'sana' ([string]@($colas | Where-Object { $_.nombre -eq 'COCINA' })[0].estado)
+    Assert-Eq 'S24 detecta los 1440 trabajos' 1440 ([int]@($colas)[0].trabajos)
+    $t24 = Resolve-TargetPrinter
+    Assert-Eq 'S24 diagnostica la que falla' 'CAJA' $(if ($t24) { [string]$t24.Name } else { '' })
+    Assert-Eq 'S24 avisa que hay varias' $true ([bool]((Get-CheckById 'printer.multiple') -ne $null))
+
+    # Escenario 25: si el puerto esta vivo, esa impresora NO va a la lista de desconectadas
+    Reset-State
+    $script:PresentIdsOk = $true
+    function Get-UsbPrintDevices {
+        $script:Diagnostics['impresorasDesconectadas'] = @(
+            [ordered]@{ nombre='COCINA-HW'; puerto='USB001'; instanceId='USBPRINT\A\1'; motivo='historico' },
+            [ordered]@{ nombre='CAJA-HW';   puerto='USB003'; instanceId='USBPRINT\B\1'; motivo='historico' }
+        )
+        return @([ordered]@{ source='registry.USBPRINT'; name='COCINA-HW'; instanceId='USBPRINT\A\9'; portName='USB001'; status='enumerado'; problem=0; deteccion='interfaz USBPRINT (usbprint.sys)'; certeza='alta' })
+    }
+    function Get-ProblemPrinterDevices { @() }
+    function Get-PrinterPort { @([pscustomobject]@{ Name='USB001'; Description='USB' }, [pscustomobject]@{ Name='USB003'; Description='USB' }) }
+    function Get-Printer { @([pscustomobject]@{ Name='COCINA'; DriverName='Generic / Text Only'; PortName='USB001' }) }
+    Test-Layer1a-HardwareInventory
+    $off = @($script:Diagnostics['impresorasDesconectadas'])
+    Assert-Eq 'S25 dedup por puerto vivo' 1 (@($off).Count)
+    Assert-Eq 'S25 la que queda es la del puerto muerto' 'CAJA-HW' ([string]@($off)[0].nombre)
+
     Write-Host ""
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)
     if ($script:__f -gt 0) { exit 4 }
@@ -2842,6 +3342,23 @@ function Write-DoctorResult {
 
 try {
     if ($SelfTest) { Invoke-SelfTest; return }
+
+    if ($CheckUpdate) {
+        $pub = Get-PublishedVersion -TimeoutSec 8
+        if (-not $pub) {
+            [Console]::Error.WriteLine("  No se pudo consultar la version publicada (sin internet o el repo no responde).")
+            [Console]::Error.WriteLine("  Version local: $($script:SchemaVersion)")
+            exit 3
+        }
+        $nueva = $false
+        try { $nueva = ([version]$pub -gt [version]$script:SchemaVersion) } catch {}
+        if ($nueva) {
+            [Console]::Error.WriteLine("  Version local: $($script:SchemaVersion)  |  publicada: $pub  ->  HAY ACTUALIZACION")
+            exit 2
+        }
+        [Console]::Error.WriteLine("  Version local: $($script:SchemaVersion)  |  publicada: $pub  ->  al dia")
+        exit 0
+    }
 
     $final = Invoke-FudoPrintDoctor
     Write-DoctorResult -Obj $final
