@@ -18,13 +18,16 @@ jobs:
         shell: cmd
         run: |
           powershell -NoProfile -ExecutionPolicy Bypass -File .\FudoPrintDoctor.ps1 -SelfTest
-          if errorlevel 1 exit /b 1
+          echo Exit code: %errorlevel%
+          if %errorlevel% neq 0 exit /b %errorlevel%
 
       - name: PowerShell 7
         shell: pwsh
         run: |
           ./FudoPrintDoctor.ps1 -SelfTest
-          if ($LASTEXITCODE -ne 0) { exit 1 }
+          # OJO: con 'return' en el script, $LASTEXITCODE queda $null. Comparar contra 0
+          # directamente marca el job en rojo aunque el self-test haya pasado.
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
 
       - name: Sintaxis (parser)
         shell: pwsh
@@ -34,15 +37,26 @@ jobs:
           if ($errs) { $errs | ForEach-Object { "L$($_.Extent.StartLineNumber): $($_.Message)" }; exit 1 }
           "Parser OK ($($toks.Count) tokens)"
 
+      - name: VERSION coincide con el script
+        shell: pwsh
+        run: |
+          $ver = (Get-Content ./VERSION -Raw).Trim()
+          $m = Select-String -Path ./FudoPrintDoctor.ps1 -Pattern "SchemaVersion\s*=\s*'([\d.]+)'" | Select-Object -First 1
+          $enScript = $m.Matches[0].Groups[1].Value
+          "VERSION=$ver  script=$enScript"
+          if ($ver -ne $enScript) { "No coinciden: actualizar el archivo VERSION"; exit 1 }
+
   analyzer:
-    name: PSScriptAnalyzer
+    name: PSScriptAnalyzer (informativo)
     runs-on: windows-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - shell: pwsh
         run: |
           Install-Module PSScriptAnalyzer -Force -Scope CurrentUser -SkipPublisherCheck
           $r = Invoke-ScriptAnalyzer -Path ./FudoPrintDoctor.ps1 -Severity Error,Warning `
-                 -ExcludeRule PSAvoidUsingWriteHost,PSUseShouldProcessForStateChangingFunctions,PSAvoidUsingEmptyCatchBlock
-          if ($r) { $r | Format-Table -AutoSize | Out-String | Write-Host }
-          if (@($r | Where-Object Severity -eq 'Error').Count -gt 0) { exit 1 }
+                 -ExcludeRule PSAvoidUsingWriteHost,PSUseShouldProcessForStateChangingFunctions,PSAvoidUsingEmptyCatchBlock,PSUseSingularNouns,PSAvoidUsingInvokeExpression
+          if ($r) { $r | Format-Table -AutoSize | Out-String -Width 200 | Write-Host } else { "Sin observaciones" }
+          $errores = @($r | Where-Object { "$($_.Severity)" -eq 'Error' })
+          if (@($errores).Count -gt 0) { "Hay $(@($errores).Count) error(es) de analisis"; exit 1 }

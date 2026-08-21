@@ -3284,7 +3284,10 @@ function Invoke-SelfTest {
 
     Write-Host ""
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)
+    # Salida explicita en los dos casos: si el script termina con 'return', $LASTEXITCODE
+    # queda sin definir y cualquier automatizacion lo interpreta como fallo.
     if ($script:__f -gt 0) { exit 4 }
+    exit 0
 }
 
 # ---------------------------------------------------------------------------
