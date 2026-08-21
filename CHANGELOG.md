@@ -2,6 +2,27 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [1.4] - 2026-08-21
+
+### Corregido
+- **Falso positivo de detección**: cualquier dispositivo USB podía pasar por impresora. El token
+  `POS` de la lista de marcas matcheaba `USB Com`**`pos`**`ite Device` y `Generic` matcheaba
+  `Generic USB Hub`. Ahora hay un clasificador explícito (`Test-IsPrinterDevice`) con señales
+  ordenadas por certeza: interfaz `USBPRINT` / clase `Printer` / driver `usbprint` /
+  `CompatibleID USB\Class_07` (clase USB 07h del estándar) → alta; VID de fabricante de
+  impresoras → media; nombre que menciona impresora o modelo típico → baja. Mouse, teclados,
+  hubs, composites, audio, cámaras y almacenamiento se descartan.
+- `Test-IsPosPrinter` (heurística sobre colas de Windows) usa límites de palabra.
+- `5890` y `80c` salieron de la lista de marcas: son números de modelo, y generaban etiquetas
+  absurdas como "80c XP" para una `XP-80C`.
+
+### Agregado
+- `hardware.usbDevicesRejected[]`: qué dispositivos USB se descartaron y por qué.
+- `deteccion` y `certeza` por impresora; el resumen las muestra cuando la certeza no es alta.
+- `-SkipIrreversible`: repara todo menos lo que no se puede deshacer (hoy, la purga de la cola).
+- Launcher `2-Diagnosticar-y-reparar.cmd` usa `-SkipIrreversible` y avisa qué va a hacer antes de
+  arrancar; la purga de cola queda en `4-Reparar-todo-incluida-la-cola.cmd`.
+
 ## [1.3] - 2026-08-21
 
 ### Agregado

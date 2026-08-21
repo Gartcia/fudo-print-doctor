@@ -15,9 +15,15 @@ Descargar la carpeta y hacer doble clic:
 
 | Archivo | Qué hace |
 |---|---|
-| `1-Diagnosticar.cmd` | Solo diagnostica. **No toca nada** en la PC. Empezar siempre por acá. |
-| `2-Diagnosticar-y-reparar.cmd` | Diagnostica y aplica las reparaciones seguras. Pide permisos de administrador. |
+| `1-Diagnosticar.cmd` | Solo diagnostica. **No toca nada** en la PC. |
+| `2-Diagnosticar-y-reparar.cmd` | Diagnostica **y** repara, salteando lo irreversible. Se eleva a administrador solo. Es el que hay que usar. |
 | `3-Para-el-agente.cmd` | Igual que el 2 pero además deja `resultado.json` al lado del script. |
+| `4-Reparar-todo-incluida-la-cola.cmd` | Agrega la limpieza de la cola de impresión, que **descarta las comandas pendientes**. Solo si hay una cola trabada. |
+
+No hace falta diagnosticar antes de reparar: el 2 hace las dos cosas en la misma corrida y el
+diagnóstico completo queda igual en el JSON. Cada reparación se registra en `actionsApplied[]`
+con su antes/después y si es reversible. Lo único que no se puede deshacer es la purga de la cola,
+y por eso el launcher 2 la saltea (`-SkipIrreversible`).
 
 Lo que se ve en pantalla:
 
@@ -71,12 +77,27 @@ Lo que se ve en pantalla:
 
 ### Detección de hardware (capa 1a)
 
-Enumera las impresoras físicas con tres fuentes en cascada:
+Primero decide **qué dispositivos USB son realmente impresoras** (`Test-IsPrinterDevice`), con las
+señales ordenadas por certeza:
+
+| Certeza | Señal |
+|---|---|
+| alta | `InstanceId` empieza con `USBPRINT\` (interfaz que crea `usbprint.sys`) |
+| alta | clase de dispositivo `Printer`, o driver `usbprint` |
+| alta | `CompatibleID` contiene `USB\Class_07` — clase USB 07h = Printer, del estándar USB |
+| media | VID de un fabricante de impresoras (Epson `04B8`, Bixolon `1504`, Star `0519`, Citizen `2730`, Zebra `0A5F`…) |
+| baja | el nombre menciona impresora / térmica / POS / comandera / modelos típicos (`XP-80C`, `SRP-350`, `5890`) |
+
+Mouse, teclados, hubs, `USB Composite Device`, audio, cámaras y almacenamiento se descartan y
+quedan auditables en `hardware.usbDevicesRejected` con el motivo. Cuando la certeza no es alta, el
+resumen lo dice para que el asesor confirme que esa es la comandera.
+
+Después enumera las impresoras físicas con tres fuentes en cascada:
 
 1. `HKLM\SYSTEM\CurrentControlSet\Enum\USBPRINT` → `Device Parameters\PortName`.
    Es el único lugar donde vive el mapeo **device → USB00x**.
-2. `Get-PnpDevice` (clase `Printer`).
-3. `Win32_PnPEntity` con `Service='usbprint'`, como fallback.
+2. `Win32_PnPEntity` en una sola query (trae `CompatibleID`, `Service`, clase y estado).
+3. `Get-PnpDevice` como fallback.
 
 Con eso distingue tres cosas que a ojo se confunden: **puertos USB00x huérfanos** (restos de
 instalaciones viejas, sin nada detrás), **device presente sin driver** (código 28 del
@@ -129,12 +150,13 @@ Contrato completo del JSON: [`docs/contrato-json.md`](docs/contrato-json.md).
 | `-DryRun` | off | No modifica nada; registra qué haría |
 | `-TestPrint` | `$true` | Emitir ticket ESC/POS de prueba |
 | `-InstallGenericDriver` | `$true` | Instalar driver y cola de prueba si el hardware está sin instalar |
+| `-SkipIrreversible` | off | Repara todo menos lo que no se puede deshacer (hoy: purgar la cola) |
 | `-KeepTestPrinter` | conserva | `:$false` borra la cola `FUDO-TEST-*` al terminar |
 | `-CaseId` / `-ClientId` | vacío | Solo correlación de telemetría; no afecta el diagnóstico |
 | `-JsonOut` | — | Volcar el JSON a un archivo |
 | `-Json` / `-Quiet` | off | Forzar JSON a stdout / silenciar el resumen |
 | `-Verbose` | off | Lista todos los chequeos en pantalla |
-| `-SelfTest` | off | Corre los 38 asserts de la lógica de decisión. No toca la PC. |
+| `-SelfTest` | off | Corre los 47 asserts de la lógica de decisión. No toca la PC. |
 
 ## Desarrollo
 
@@ -147,8 +169,9 @@ pwsh -File .\FudoPrintDoctor.ps1 -SelfTest
 ```
 
 El self-test corre sin impresora ni Windows real: mockea los cmdlets de `PrintManagement` y
-valida el árbol de decisión, la clasificación de impresoras virtuales, el aislamiento de etapas
-y las regresiones ya corregidas. CI: [`.github/workflows/selftest.yml`](.github/workflows/selftest.yml)
+valida el árbol de decisión, la clasificación de dispositivos USB (que un mouse o un
+`USB Composite Device` no pasen por impresora) y de impresoras virtuales, el aislamiento de
+etapas y todas las regresiones ya corregidas. CI: [`.github/workflows/selftest.yml`](.github/workflows/selftest.yml)
 lo corre en `windows-latest` con 5.1 **y** 7 en cada push.
 
 Ver también [`docs/arquitectura-capas.md`](docs/arquitectura-capas.md) y

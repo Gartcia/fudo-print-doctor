@@ -48,6 +48,8 @@ Pensado para que un agente decida el próximo paso sin leer prosa.
 {
   "devicesConnected": [ { "name": "...", "instanceId": "...", "portName": "USB001", "status": "..." } ],
   "problemDevices":   [ { "name": "...", "problem": 28, "class": "Printer" } ],
+  "printersIdentified": [ ... ],     // ver diagnostics.printersConnected
+  "usbDevicesRejected": [ { "nombre": "USB Composite Device", "motivo": "el nombre corresponde a otro tipo de dispositivo", "instanceId": "..." } ],
   "livePorts":  ["USB001"],          // puertos con device físico detrás
   "usbPorts":   ["USB001","USB002"], // todos los USB00x de Windows (pueden ser huérfanos)
   "printersFound": [ { "name": "...", "driver": "...", "port": "...", "isVirtual": true, "virtualReason": "...", "isPos": false } ],
@@ -67,8 +69,22 @@ El listado identificado de impresoras físicas vive en `diagnostics.printersConn
   "colaWindows": "TM-T20III",        // "" si el device no tiene cola en Windows
   "driverSugerido": "oem_instalado" | "oem_recomendado" | "generico",
   "driverNombre": "EPSON TM-T20III ReceiptE4",
-  "driverNota": "texto explicativo"
+  "driverNota": "texto explicativo",
+  "deteccion": "interfaz USBPRINT (usbprint.sys)",   // por qué se considera impresora
+  "certeza": "alta" | "media" | "baja"
 }
+```
+
+Certeza de la detección:
+
+| Certeza | Señal |
+|---|---|
+| `alta` | interfaz `USBPRINT`, clase de dispositivo `Printer`, driver `usbprint`, o `CompatibleID` con `USB\Class_07` (clase USB 07h = Printer) |
+| `media` | VID de fabricante de impresoras |
+| `baja` | el nombre menciona impresora / POS / modelo típico de térmica |
+
+Con certeza `media` o `baja` conviene confirmar con el asesor que ese device es la comandera antes
+de instalar nada sobre su puerto.
 ```
 
 ## `diagnosis`

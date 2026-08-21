@@ -45,6 +45,10 @@
     Patron de nombre del proceso/servicio de la App Nativa de Fudo (para chequear prerequisito).
     Default cubre variantes conocidas; ajustar segun el binario real.
 
+.PARAMETER SkipIrreversible
+    No aplica las remediaciones marcadas como irreversibles (hoy: limpiar la cola de impresion,
+    que descarta los trabajos pendientes). Todo lo demas se sigue reparando.
+
 .PARAMETER InstallGenericDriver
     Si hay una impresora conectada por USB pero sin cola en Windows, instala el driver inbox
     "Generic / Text Only" (en Windows en espanol: "Generico / Solo texto") y crea una cola
@@ -96,6 +100,19 @@ CONTRATO DE SALIDA (v1.1)
     diagnosis.nextActions[] (que hacer / quien lo hace / articulo), engineErrors[], checks[], telemetry.
 
 CHANGELOG
+    1.4  - FIX importante de deteccion: se tomaba cualquier dispositivo USB por impresora.
+             El token 'POS' de la lista de marcas matcheaba 'USB Com-POS-ite Device' y 'Generic'
+             matcheaba 'Generic USB Hub'. Ahora hay un clasificador explicito
+             (Test-IsPrinterDevice) con senales ordenadas por certeza:
+               alta  = interfaz USBPRINT | clase de dispositivo Printer | driver usbprint |
+                       CompatibleID USB\Class_07 (clase USB 07h = Printer, del estandar USB)
+               media = VID de fabricante de impresoras (Epson, Bixolon, Star, Citizen, Zebra...)
+               baja  = el nombre menciona impresora/POS/comandera
+             Mouse, teclados, hubs, composites, audio, camaras y almacenamiento se descartan y
+             quedan auditables en hardware.usbDevicesRejected con el motivo.
+           - El listado muestra como se detecto cada impresora cuando la certeza no es alta.
+           - Nuevo -SkipIrreversible: repara todo menos lo que no se puede deshacer
+             (hoy, la purga de la cola de impresion).
     1.3  - Consola legible: resumen compacto (impresoras detectadas + semaforo por area +
              causa + hasta 3 acciones), con color cuando la consola es interactiva.
              El detalle completo queda en el JSON; -Verbose lista todos los chequeos.
@@ -153,6 +170,7 @@ param(
     [string]$CaseId = '',
     [string]$ClientId = '',
     [bool]$InstallGenericDriver = $true,
+    [switch]$SkipIrreversible,
     [switch]$KeepTestPrinter,
     [string]$JsonOut,
     [switch]$Quiet,
@@ -176,15 +194,18 @@ $script:StartTime    = Get-Date
 $script:Diagnostics  = [ordered]@{}   # datos crudos recolectados
 $script:Errors       = New-Object System.Collections.ArrayList   # fallas internas del motor
 $script:TestPrintersCreated = New-Object System.Collections.ArrayList   # colas temporales creadas por el motor
-$script:SchemaVersion = '1.3'
+$script:SchemaVersion = '1.4'
 $script:JsonBegin    = '<<<FUDO_JSON_BEGIN>>>'
 $script:JsonEnd      = '<<<FUDO_JSON_END>>>'
 $script:AutoJsonPath = ''
 
 # Conocido: marcas de impresoras termicas/POS (art. 16419361 + registro real de asesores)
-$script:PosBrands = @('Bixolon','Epson','Citizen','Hasar','Sam4s','POS','Thermal','Generic','Generica',
-    '3nStar','3nstar','XPrinter','Xprinter','Rongta','Gprinter','Nictom','Kretz','OCOM','Barpos','Solpos',
-    'Jaltech','Sprt','Sewoo','Giant','5890','80c','TM-T','TM20','RPT','IT 0','Ser force','SerForce')
+# Marcas reales de termicas/POS (art. 16419361 + registro de asesores).
+# OJO: aca NO van tokens genericos como 'POS', 'Generic' o 'Thermal': matchean
+# 'USB Composite Device' y 'Generic USB Hub'. Esas palabras viven en $script:PrinterWordRx.
+$script:PosBrands = @('Bixolon','Epson','Citizen','Hasar','Sam4s','3nStar','XPrinter','Rongta','Gprinter',
+    'Nictom','Kretz','OCOM','Barpos','Solpos','Jaltech','Sprt','Sewoo','TM-T','TM20','RPT008','SerForce',
+    'Ser force','Star Micronics','Zebra','Custom','Posiflex')
 
 function Write-DoctorLog {
     param([string]$Level, [string]$Message)
@@ -335,6 +356,10 @@ function Invoke-Remediation {
     if ($DryRun) {
         Write-DoctorLog -Level 'INFO' -Message "DRY-RUN: aplicaria -> $Description"
         return @{ applied = $false; note = "dry-run: $Description" }
+    }
+    if ($SkipIrreversible -and -not $Reversible) {
+        Write-DoctorLog -Level 'WARN' -Message "OMITIDA (irreversible, -SkipIrreversible): $Description"
+        return @{ applied = $false; note = "omitida por -SkipIrreversible (irreversible): $Description" }
     }
     try {
         $result = & $Fix
@@ -717,8 +742,10 @@ function Get-DeviceIdentity {
     $model = ''
     if ($name -and ($name -notmatch '(?i)^(usb printing support|soporte de impresi|compatible usb|unknown|desconocid|dispositivo (compuesto|usb)|generic usb)')) { $model = $name }
     elseif ($inst -match '(?i)^USBPRINT\\([^\\]+)') { $model = ($Matches[1] -replace '_+', ' ').Trim() }
-    if ($model -and $brand -and $model -match [regex]::Escape(($brand -split ' ')[0])) {
-        $model = ($model -replace [regex]::Escape(($brand -split ' ')[0]), '').Trim(' -_')
+    $brandFirst = ''
+    if ($brand) { $brandFirst = ($brand -split ' ')[0] }
+    if ($model -and $brandFirst -and ($model -match ('(?i)^' + [regex]::Escape($brandFirst)))) {
+        $model = ($model -replace ('(?i)^' + [regex]::Escape($brandFirst)), '').Trim(' -_')
     }
 
     $label = ''
@@ -797,10 +824,22 @@ function Test-IsVirtualPrinter {
 }
 
 function Test-IsPosPrinter {
+    <#
+      Heuristica para COLAS de Windows (no para hardware): el nombre o el driver sugieren
+      una termica/POS. Usa limites de palabra para no matchear 'Generic USB Hub' o
+      'USB Composite Device' (el token 'POS' esta dentro de 'com-POS-ite').
+    #>
     param($P)
     $probe = ''
     try { $probe = "{0} {1}" -f [string]$P.Name, [string]$P.DriverName } catch {}
-    foreach ($b in $script:PosBrands) { if ($probe -match [regex]::Escape($b)) { return $true } }
+    if (-not $probe) { return $false }
+    if ($probe -match '(?i)Generic\s*/\s*Text') { return $true }
+    if ($probe -match $script:PrinterWordRx) { return $true }
+    foreach ($b in $script:PosBrands) {
+        $esc = [regex]::Escape($b)
+        # marcas cortas o ambiguas exigen limite de palabra
+        if ($probe -match ('(?i)(^|[^A-Za-z0-9])' + $esc + '([^A-Za-z0-9]|$)')) { return $true }
+    }
     return $false
 }
 
@@ -808,17 +847,80 @@ function Test-IsPosPrinter {
 # LAYER 1a - INVENTARIO DE HARDWARE (Administrador de dispositivos + puertos)
 # Se corre ANTES de elegir impresora: primero saber si hay fierro conectado.
 # ---------------------------------------------------------------------------
+function Get-CompatibleIdList {
+    <# CompatibleIDs del device. La clase USB 07h ('USB\Class_07') es la senal canonica de impresora. #>
+    param($WmiEntity, [string]$InstanceId)
+    $ids = @()
+    if ($WmiEntity) {
+        try { $ids = @($WmiEntity.CompatibleID | Where-Object { $_ }) } catch {}
+    }
+    if (@($ids).Count -eq 0 -and $InstanceId) {
+        try { $ids = @((Get-PnpDeviceProperty -InstanceId $InstanceId -KeyName 'DEVPKEY_Device_CompatibleIds' -ErrorAction Stop).Data | Where-Object { $_ }) } catch {}
+    }
+    return @($ids)
+}
+
+# Palabras que SI hablan de impresora, y palabras que la descartan de plano.
+$script:PrinterWordRx    = '(?i)\b(printer|impresora|thermal|termica|receipt|ticket|comandera|usbprint|escpos|esc/pos)\b|\bPOS\b|\bPOS-?\d|\b(xp-?\d{2,3}|srp-?\d{2,3}|rpt-?\d{2,3}|tm-?[tu]?\d{2,3}|5890|80c|58mm|80mm)\b'
+$script:NonPrinterWordRx = '(?i)\b(mouse|mice|keyboard|teclado|hub|composite|compuesto|camera|webcam|audio|speaker|headset|micro[fp]ono|mass storage|almacenamiento|disk|disco|flash|bluetooth|wireless receiver|receptor|hid|human interface|joystick|gamepad|scanner|escaner|network|ethernet|wi-?fi|modem|card reader|lector de tarjetas|fingerprint|monitor|display|touch|graphics|serial converter|root hub|controlador de host|host controller)\b'
+# VIDs de fabricantes de impresoras: valen como senal por si solos.
+$script:PrinterVids = @('04B8','1504','0519','2730','0A5F','0DD4','03F0','04A9','04F9','0924','043D','04E8')
+
+function Test-IsPrinterDevice {
+    <#
+      Decide si un dispositivo USB es realmente una impresora, con la razon y el nivel de certeza.
+      Evita el clasico falso positivo de tomar un mouse o un "USB Composite Device" por una POS.
+
+      Senales, de mas fuerte a mas debil:
+        alta   - InstanceId empieza con USBPRINT\ (interfaz de impresora USB creada por usbprint.sys)
+        alta   - PNPClass 'Printer' / Service 'usbprint'
+        alta   - CompatibleID contiene USB\Class_07 (clase USB 07h = Printer, definida por el estandar)
+        media  - VID de un fabricante de impresoras (Epson, Bixolon, Star, Citizen, Zebra, ...)
+        baja   - el nombre habla de impresora (printer / impresora / termica / POS / comandera)
+      Cualquier palabra de no-impresora (mouse, hub, composite, audio, ...) descarta,
+      salvo que exista una senal alta.
+    #>
+    param([string]$Name, [string]$InstanceId, [string]$PnpClass, [string]$Service, [string[]]$CompatibleIds)
+
+    $probe = "$Name $InstanceId"
+    $compat = (@($CompatibleIds) -join ' ')
+
+    if ($InstanceId -match '(?i)^USBPRINT\\') { return @{ isPrinter = $true; confidence = 'alta'; reason = 'interfaz USBPRINT (usbprint.sys)' } }
+    if ($PnpClass -eq 'Printer')              { return @{ isPrinter = $true; confidence = 'alta'; reason = 'clase de dispositivo Printer' } }
+    if ($Service -match '(?i)^usbprint$')     { return @{ isPrinter = $true; confidence = 'alta'; reason = 'driver usbprint' } }
+    if ($compat -match '(?i)USB\\Class_07')   { return @{ isPrinter = $true; confidence = 'alta'; reason = 'clase USB 07h (Printer)' } }
+
+    # Descartes explicitos: sin senal alta, un mouse/hub/composite no es impresora
+    if ($Name -match $script:NonPrinterWordRx -and $Name -notmatch $script:PrinterWordRx) {
+        return @{ isPrinter = $false; confidence = 'alta'; reason = 'el nombre corresponde a otro tipo de dispositivo' }
+    }
+
+    $vid = ''
+    if ($InstanceId -match '(?i)VID_([0-9A-F]{4})') { $vid = $Matches[1].ToUpper() }
+    if ($vid -and ($script:PrinterVids -contains $vid)) {
+        return @{ isPrinter = $true; confidence = 'media'; reason = "VID_$vid es de un fabricante de impresoras" }
+    }
+    if ($probe -match $script:PrinterWordRx) {
+        return @{ isPrinter = $true; confidence = 'baja'; reason = 'el nombre menciona impresora/POS' }
+    }
+    return @{ isPrinter = $false; confidence = 'alta'; reason = 'sin ninguna senal de impresora (ni clase, ni driver, ni VID, ni nombre)' }
+}
+
 function Get-UsbPrintDevices {
     <#
-      Impresoras fisicas enumeradas por Windows (usbprint / clase Printer) con su puerto USB00x.
-      Fuentes, en orden de confiabilidad:
-        1) HKLM\SYSTEM\CurrentControlSet\Enum\USBPRINT -> Device Parameters\PortName (mapea device -> USB00x)
-        2) Get-PnpDevice -Class Printer/USB (Win8+)
-        3) Win32_PnPEntity (Service='usbprint' o PNPClass='Printer')
+      Impresoras fisicas enumeradas por Windows, con su puerto USB00x.
+      Fuentes:
+        1) HKLM\SYSTEM\CurrentControlSet\Enum\USBPRINT -> Device Parameters\PortName
+           (el unico lugar con el mapeo device -> USB00x)
+        2) Win32_PnPEntity en UNA sola query (trae CompatibleID, Service, clase y estado)
+        3) Get-PnpDevice como fallback
+      Todo candidato pasa por Test-IsPrinterDevice; los descartados quedan registrados
+      en $script:Diagnostics['descartadosNoImpresora'] para poder auditar la decision.
     #>
-    $devices = @()
+    $devices  = @()
+    $rejected = @()
 
-    # (1) Registro USBPRINT: es el unico lugar donde vive el mapeo device -> PortName
+    # (1) Registro USBPRINT: mapeo device -> PortName
     try {
         $root = 'HKLM:\SYSTEM\CurrentControlSet\Enum\USBPRINT'
         if (Test-Path $root) {
@@ -839,51 +941,65 @@ function Get-UsbPrintDevices {
                     }
                     if ($desc -match ';') { $desc = ($desc -split ';')[-1] }
                     $devices += [ordered]@{
-                        source     = 'registry.USBPRINT'
-                        name       = $desc
+                        source = 'registry.USBPRINT'; name = $desc
                         instanceId = ('USBPRINT\' + $hw.PSChildName + '\' + $inst.PSChildName)
-                        portName   = $portName
-                        status     = 'enumerado'
-                        problem    = 0
+                        portName = $portName; status = 'enumerado'; problem = 0
+                        deteccion = 'interfaz USBPRINT (usbprint.sys)'; certeza = 'alta'
                     }
                 }
             }
         }
     } catch {}
 
-    # (2) PnP moderno
+    # (2) WMI: una query y clasificamos en memoria
+    $wmiOk = $false
     try {
-        $pnp = @(Get-PnpDevice -PresentOnly -ErrorAction Stop | Where-Object {
-            ($_.Class -eq 'Printer') -or ($_.Class -eq 'USB' -and $_.FriendlyName -match '(?i)printer|impresora|POS|thermal')
-        })
-        foreach ($d in $pnp) {
-            $devices += [ordered]@{
-                source     = 'PnpDevice'
-                name       = [string]$d.FriendlyName
-                instanceId = [string]$d.InstanceId
-                portName   = ''
-                status     = [string]$d.Status
-                problem    = $(try { [int]$d.ProblemCode } catch { 0 })
+        $all = @(Get-CimInstance Win32_PnPEntity -ErrorAction Stop)
+        $wmiOk = $true
+        foreach ($d in $all) {
+            $inst = [string]$d.PNPDeviceID
+            # solo miramos lo que esta colgado de USB (o ya es clase Printer)
+            if ($inst -notmatch '(?i)^(USB|USBPRINT)\\' -and [string]$d.PNPClass -ne 'Printer') { continue }
+            $compat = Get-CompatibleIdList -WmiEntity $d -InstanceId $inst
+            $verdict = Test-IsPrinterDevice -Name ([string]$d.Name) -InstanceId $inst `
+                        -PnpClass ([string]$d.PNPClass) -Service ([string]$d.Service) -CompatibleIds $compat
+            if ($verdict.isPrinter) {
+                $devices += [ordered]@{
+                    source = 'Win32_PnPEntity'; name = [string]$d.Name; instanceId = $inst
+                    portName = ''; status = [string]$d.Status
+                    problem = $(try { [int]$d.ConfigManagerErrorCode } catch { 0 })
+                    deteccion = [string]$verdict.reason; certeza = [string]$verdict.confidence
+                }
+            } else {
+                $rejected += [ordered]@{ nombre = [string]$d.Name; motivo = [string]$verdict.reason; instanceId = $inst }
             }
         }
-    } catch {
-        # (3) Fallback WMI
+    } catch {}
+
+    # (3) Fallback PnP moderno (si WMI no respondio)
+    if (-not $wmiOk) {
         try {
-            $wmiDev = @(Get-CimInstance Win32_PnPEntity -ErrorAction Stop | Where-Object {
-                ($_.Service -eq 'usbprint') -or ($_.PNPClass -eq 'Printer')
-            })
-            foreach ($d in $wmiDev) {
-                $devices += [ordered]@{
-                    source     = 'Win32_PnPEntity'
-                    name       = [string]$d.Name
-                    instanceId = [string]$d.PNPDeviceID
-                    portName   = ''
-                    status     = [string]$d.Status
-                    problem    = $(try { [int]$d.ConfigManagerErrorCode } catch { 0 })
+            foreach ($d in @(Get-PnpDevice -PresentOnly -ErrorAction Stop)) {
+                $inst = [string]$d.InstanceId
+                if ($inst -notmatch '(?i)^(USB|USBPRINT)\\' -and [string]$d.Class -ne 'Printer') { continue }
+                $compat = Get-CompatibleIdList -WmiEntity $null -InstanceId $inst
+                $verdict = Test-IsPrinterDevice -Name ([string]$d.FriendlyName) -InstanceId $inst `
+                            -PnpClass ([string]$d.Class) -Service '' -CompatibleIds $compat
+                if ($verdict.isPrinter) {
+                    $devices += [ordered]@{
+                        source = 'PnpDevice'; name = [string]$d.FriendlyName; instanceId = $inst
+                        portName = ''; status = [string]$d.Status
+                        problem = $(try { [int]$d.ProblemCode } catch { 0 })
+                        deteccion = [string]$verdict.reason; certeza = [string]$verdict.confidence
+                    }
+                } else {
+                    $rejected += [ordered]@{ nombre = [string]$d.FriendlyName; motivo = [string]$verdict.reason; instanceId = $inst }
                 }
             }
         } catch {}
     }
+
+    $script:Diagnostics['descartadosNoImpresora'] = @($rejected)
 
     # Dedup por instanceId, priorizando la entrada que trae portName
     $byId = [ordered]@{}
@@ -896,39 +1012,44 @@ function Get-UsbPrintDevices {
 }
 
 function Get-ProblemPrinterDevices {
-    <# Dispositivos presentes sin driver (codigo 28) o con error: candidatos a instalar driver generico. #>
+    <#
+      Dispositivos de impresion presentes con problema (28 = sin driver instalado).
+      Mismo filtro que arriba: un mouse con driver roto no es asunto de este motor.
+    #>
     $out = @()
     try {
-        # Ojo: no traer TODOS los dispositivos desconocidos de la PC (ruido y falsa causa raiz).
-        # Solo clase Printer, o desconocidos colgados de USB (tipico POS sin driver, codigo 28).
-        $bad = @(Get-PnpDevice -PresentOnly -ErrorAction Stop | Where-Object {
-            $_.Status -ne 'OK' -and (
-                ($_.Class -eq 'Printer') -or
-                ($_.FriendlyName -match '(?i)printer|impresora|POS|thermal|USB Printing') -or
-                (($_.Class -eq 'Unknown' -or $_.Class -eq 'Other' -or -not $_.Class) -and ([string]$_.InstanceId -match '^USB'))
-            )
-        })
-        foreach ($d in $bad) {
+        foreach ($d in @(Get-CimInstance Win32_PnPEntity -ErrorAction Stop | Where-Object { $_.ConfigManagerErrorCode -ne 0 })) {
+            $inst = [string]$d.PNPDeviceID
+            if ($inst -notmatch '(?i)^(USB|USBPRINT)\\' -and [string]$d.PNPClass -ne 'Printer') { continue }
+            $compat = Get-CompatibleIdList -WmiEntity $d -InstanceId $inst
+            $verdict = Test-IsPrinterDevice -Name ([string]$d.Name) -InstanceId $inst `
+                        -PnpClass ([string]$d.PNPClass) -Service ([string]$d.Service) -CompatibleIds $compat
+            if (-not $verdict.isPrinter) { continue }
             $out += [ordered]@{
-                name = [string]$d.FriendlyName; instanceId = [string]$d.InstanceId
-                status = [string]$d.Status; problem = $(try { [int]$d.ProblemCode } catch { 0 }); class = [string]$d.Class
+                name = [string]$d.Name; instanceId = $inst; status = [string]$d.Status
+                problem = [int]$d.ConfigManagerErrorCode; class = [string]$d.PNPClass
+                deteccion = [string]$verdict.reason; certeza = [string]$verdict.confidence
             }
         }
-    } catch {
-        try {
-            $bad = @(Get-CimInstance Win32_PnPEntity -ErrorAction Stop | Where-Object { $_.ConfigManagerErrorCode -ne 0 })
-            foreach ($d in $bad) {
-                if ([string]$d.Name -match '(?i)printer|impresora|POS|thermal|desconocido|unknown') {
-                    $out += [ordered]@{
-                        name = [string]$d.Name; instanceId = [string]$d.PNPDeviceID
-                        status = [string]$d.Status; problem = [int]$d.ConfigManagerErrorCode; class = [string]$d.PNPClass
-                    }
-                }
+        return @($out)
+    } catch {}
+    try {
+        foreach ($d in @(Get-PnpDevice -PresentOnly -ErrorAction Stop | Where-Object { $_.Status -ne 'OK' })) {
+            $inst = [string]$d.InstanceId
+            if ($inst -notmatch '(?i)^(USB|USBPRINT)\\' -and [string]$d.Class -ne 'Printer') { continue }
+            $verdict = Test-IsPrinterDevice -Name ([string]$d.FriendlyName) -InstanceId $inst `
+                        -PnpClass ([string]$d.Class) -Service '' -CompatibleIds @(Get-CompatibleIdList -WmiEntity $null -InstanceId $inst)
+            if (-not $verdict.isPrinter) { continue }
+            $out += [ordered]@{
+                name = [string]$d.FriendlyName; instanceId = $inst; status = [string]$d.Status
+                problem = $(try { [int]$d.ProblemCode } catch { 0 }); class = [string]$d.Class
+                deteccion = [string]$verdict.reason; certeza = [string]$verdict.confidence
             }
-        } catch {}
-    }
+        }
+    } catch {}
     return @($out)
 }
+
 
 function Get-GenericTextDriverName {
     <#
@@ -1030,6 +1151,8 @@ function Test-Layer1a-HardwareInventory {
             driverSugerido = [string]$plan.kind
             driverNombre  = [string]$plan.driverName
             driverNota    = [string]$plan.note
+            deteccion     = [string]$d.deteccion
+            certeza       = [string]$d.certeza
         }
     }
     $script:Diagnostics['printersConnected'] = $identified
@@ -1051,9 +1174,13 @@ function Test-Layer1a-HardwareInventory {
     }
 
     $cant = @($identified).Count
+    $descartados = @()
+    if ($script:Diagnostics.Contains('descartadosNoImpresora')) { $descartados = @($script:Diagnostics['descartadosNoImpresora']) }
     $listado = @($identified | ForEach-Object { $_.nombre + $(if ($_.puerto) { " ($($_.puerto))" } else { '' }) })
     Add-Check -Id 'hw.deviceConnected' -Layer 1 -Name ("Impresoras fisicas detectadas: $cant" + $(if ($cant -gt 0) { ' -> ' + ($listado -join ' | ') } else { '' })) -Status 'ok' -Plane 'hardware' `
-        -Evidence @{ cantidad = $cant; impresoras = $identified; livePorts = $devPorts } `
+        -Evidence @{ cantidad = $cant; impresoras = $identified; livePorts = $devPorts
+                     dispositivosUsbDescartados = @($descartados).Count
+                     descartados = @($descartados | Select-Object -First 15) } `
         -Recommendation $(if ($cant -gt 1) { "Hay $cant impresoras conectadas. Si el diagnostico apunta a la equivocada, correr con -PrinterName '<nombre exacto de la cola en Windows>'." } else { '' })
 
     # 1a.1b Que driver corresponde a cada una
@@ -1788,6 +1915,8 @@ function Build-HumanSummary {
     if ($script:Diagnostics.Contains('printersConnected')) { $conn = @($script:Diagnostics['printersConnected']) }
     Add-Line ''
     Add-Line ("  IMPRESORAS CONECTADAS: " + @($conn).Count)
+    $desc = @()
+    if ($script:Diagnostics.Contains('descartadosNoImpresora')) { $desc = @($script:Diagnostics['descartadosNoImpresora']) }
     if (@($conn).Count -eq 0) {
         Add-Line '    (ninguna: Windows no ve hardware de impresion conectado)'
     } else {
@@ -1797,6 +1926,9 @@ function Build-HumanSummary {
             $cola = [string]$c.colaWindows
             $where = $(if ($cola) { "instalada como '$cola'" } else { 'SIN cola en Windows' })
             Add-Line ("    $n. " + [string]$c.nombre + $(if ($c.puerto) { "  [$($c.puerto)]" } else { '' }) + "  -> $where")
+            if ($c.certeza -and $c.certeza -ne 'alta') {
+                Add-Line ("       deteccion: " + [string]$c.deteccion + " (certeza $($c.certeza): confirmar que sea la comandera)")
+            }
             if ($c.driverSugerido -eq 'oem_recomendado') {
                 Add-Line ("       driver: tiene driver propio de $($c.marca) (opcional); el generico de texto alcanza")
             } elseif ($c.driverSugerido -eq 'oem_instalado') {
@@ -1805,6 +1937,10 @@ function Build-HumanSummary {
                 Add-Line ('       driver: generico de texto (Generic / Text Only)')
             }
         }
+    }
+
+    if (@($desc).Count -gt 0) {
+        Add-Line ("    (se descartaron " + @($desc).Count + " dispositivos USB que no son impresoras: mouse, hubs, etc.)")
     }
 
     # --- semaforo por area
@@ -1999,6 +2135,8 @@ function Invoke-FudoPrintDoctor {
         hardware      = [ordered]@{
             devicesConnected = $(if ($script:Diagnostics.Contains('hwDevices')) { @($script:Diagnostics['hwDevices']) } else { @() })
             problemDevices   = $(if ($script:Diagnostics.Contains('hwProblemDevs')) { @($script:Diagnostics['hwProblemDevs']) } else { @() })
+            printersIdentified = $(if ($script:Diagnostics.Contains('printersConnected')) { @($script:Diagnostics['printersConnected']) } else { @() })
+            usbDevicesRejected = $(if ($script:Diagnostics.Contains('descartadosNoImpresora')) { @($script:Diagnostics['descartadosNoImpresora']) } else { @() })
             livePorts        = $(if ($script:Diagnostics.Contains('livePorts')) { @($script:Diagnostics['livePorts']) } else { @() })
             usbPorts         = $(if ($script:Diagnostics.Contains('usbPorts')) { @($script:Diagnostics['usbPorts']) } else { @() })
             printersFound    = $(if ($script:Diagnostics.Contains('printersFound')) { @($script:Diagnostics['printersFound']) } else { @() })
@@ -2203,6 +2341,58 @@ function Invoke-SelfTest {
     Assert-Eq 'S15 rechaza virtual explicita' $true ($null -eq $r15)
     Assert-Eq 'S15 check dedicado' 'fail' (Get-CheckById 'printer.virtualTarget').status
     $PrinterName = $script:__pn
+
+    # Escenario 16: clasificador de dispositivos USB (el falso positivo del mouse / composite)
+    Reset-State
+    $noImpresoras = @(
+        @{ n = 'USB Composite Device';            i = 'USB\VID_1234&PID_5678\5&1';    c = 'USB';     s = 'usbccgp'; cid = @('USB\Class_00') },
+        @{ n = 'Generic USB Hub';                 i = 'USB\VID_8087&PID_0024\5&2';    c = 'USB';     s = 'usbhub';  cid = @('USB\Class_09') },
+        @{ n = 'Logitech USB Optical Mouse';      i = 'USB\VID_046D&PID_C077\6&3';    c = 'HIDClass';s = 'HidUsb';  cid = @('USB\Class_03') },
+        @{ n = 'Dispositivo compuesto USB';       i = 'USB\VID_0BDA&PID_0129\7&4';    c = 'USB';     s = '';        cid = @() },
+        @{ n = 'Realtek USB Audio';               i = 'USB\VID_0BDA&PID_4014\8&5';    c = 'MEDIA';   s = 'usbaudio';cid = @('USB\Class_01') },
+        @{ n = 'USB Mass Storage Device';         i = 'USB\VID_0781&PID_5581\9&6';    c = 'USB';     s = 'USBSTOR'; cid = @('USB\Class_08') },
+        @{ n = 'Standard PS/2 Keyboard';          i = 'ACPI\PNP0303\4&7';             c = 'Keyboard';s = 'i8042prt';cid = @() },
+        @{ n = 'Generic PnP Monitor';             i = 'DISPLAY\GSM5B10\5&8';          c = 'Monitor'; s = 'monitor'; cid = @() }
+    )
+    $falsosPos = @()
+    foreach ($d in $noImpresoras) {
+        $v = Test-IsPrinterDevice -Name $d.n -InstanceId $d.i -PnpClass $d.c -Service $d.s -CompatibleIds $d.cid
+        if ($v.isPrinter) { $falsosPos += ($d.n + ' [' + $v.reason + ']') }
+    }
+    Assert-Eq 'S16 no toma mouse/hub/composite como impresora' '' ($falsosPos -join ' ; ')
+
+    $siImpresoras = @(
+        @{ n = 'EPSON TM-T20III';        i = 'USBPRINT\EPSONTM-T20III\6&1';  c = 'Printer'; s = 'usbprint'; cid = @();                 esp = 'alta' },
+        @{ n = 'XP-80C';                 i = 'USB\VID_0416&PID_5011\6&2';    c = 'USB';     s = '';         cid = @('USB\Class_07');   esp = 'alta' },
+        @{ n = 'Impresora termica';      i = 'USB\VID_1FC9&PID_2016\6&3';    c = 'USB';     s = '';         cid = @();                 esp = 'baja' },
+        @{ n = 'Dispositivo desconocido';i = 'USB\VID_04B8&PID_0E15\6&4';    c = 'Unknown'; s = '';         cid = @();                 esp = 'media' },
+        @{ n = 'BIXOLON SRP-350III';     i = 'USB\VID_1504&PID_0006\6&5';    c = 'USB';     s = '';         cid = @();                 esp = 'media' }
+    )
+    $falsosNeg = @(); $certezas = @()
+    foreach ($d in $siImpresoras) {
+        $v = Test-IsPrinterDevice -Name $d.n -InstanceId $d.i -PnpClass $d.c -Service $d.s -CompatibleIds $d.cid
+        if (-not $v.isPrinter) { $falsosNeg += $d.n }
+        elseif ($v.confidence -ne $d.esp) { $certezas += ($d.n + ': ' + $v.confidence + ' != ' + $d.esp) }
+    }
+    Assert-Eq 'S16 detecta las impresoras reales' '' ($falsosNeg -join ' ; ')
+    Assert-Eq 'S16 certeza correcta por senal' '' ($certezas -join ' ; ')
+
+    # Escenario 17: colas de Windows con nombres ambiguos (regresion del token 'POS'/'Generic')
+    Reset-State
+    Assert-Eq 'S17 POS-58 es POS' $true (Test-IsPosPrinter ([pscustomobject]@{ Name='POS-58'; DriverName='Generic / Text Only' }))
+    Assert-Eq 'S17 comandera es POS' $true (Test-IsPosPrinter ([pscustomobject]@{ Name='Comandera Cocina'; DriverName='XPrinter XP-80C' }))
+    Assert-Eq 'S17 Composite NO es POS' $false (Test-IsPosPrinter ([pscustomobject]@{ Name='USB Composite Device'; DriverName='' }))
+    Assert-Eq 'S17 Generic USB Hub NO es POS' $false (Test-IsPosPrinter ([pscustomobject]@{ Name='Generic USB Hub'; DriverName='' }))
+
+    # Escenario 18: -SkipIrreversible no aplica la purga de cola pero si el resto
+    Reset-State
+    $script:SkipIrreversibleBackup = $SkipIrreversible
+    $SkipIrreversible = $true
+    $r18a = Invoke-Remediation -Description 'purga' -Type 'queue.purge' -Target 'X' -Reversible $false -Fix { 'purgado' }
+    $r18b = Invoke-Remediation -Description 'reversible' -Type 'service.start' -Target 'X' -Reversible $true -Fix { 'ok' }
+    Assert-Eq 'S18 omite la irreversible' $false $r18a.applied
+    Assert-Eq 'S18 aplica la reversible' $true $r18b.applied
+    $SkipIrreversible = $script:SkipIrreversibleBackup
 
     Write-Host ""
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)

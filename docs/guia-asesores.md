@@ -3,10 +3,13 @@
 ## Cómo se corre
 
 1. Copiar la carpeta a la PC del cliente (Escritorio o Descargas).
-2. Doble clic en **`1-Diagnosticar.cmd`**. No cambia nada, solo mira.
+2. Doble clic en **`2-Diagnosticar-y-reparar.cmd`**: diagnostica y repara en la misma corrida.
+   Pide permisos de administrador y avisa qué va a hacer antes de arrancar. **No** borra los
+   trabajos de la cola.
+   - Si preferís mirar antes de tocar, **`1-Diagnosticar.cmd`** no cambia nada.
+   - Si hay una cola trabada con comandas viejas y hay que limpiarla,
+     **`4-Reparar-todo-incluida-la-cola.cmd`** (ojo: las comandas pendientes se pierden).
 3. Leer el bloque **QUE HACER AHORA**.
-4. Si el diagnóstico apunta a algo que el motor puede arreglar solo, doble clic en
-   **`2-Diagnosticar-y-reparar.cmd`** (pide permisos de administrador).
 5. Si hay que escalar, adjuntar el JSON: la ruta aparece al final del resumen, o usar
    `3-Para-el-agente.cmd` que lo deja como `resultado.json` al lado del script.
 
@@ -18,6 +21,9 @@ de todas formas*. Es porque el archivo viene de internet, no porque tenga algo r
 **IMPRESORAS CONECTADAS** es lo primero que hay que mirar.
 
 - `0` → no es un problema de software. Revisar energía, cable y puerto USB antes de seguir.
+- Si abajo del nombre dice `deteccion: ... (certeza baja)` → Windows no confirma que sea una
+  impresora, solo lo sugiere el nombre. Confirmá que ese sea el equipo antes de instalarle nada.
+- Los mouse, teclados y hubs USB no aparecen: se descartan y quedan en el JSON con el motivo.
 - La térmica aparece con `-> SIN cola en Windows` → está conectada pero no instalada.
 - Aparece `Impresora generica [VID_xxxx]` → Windows la ve pero no sabe qué es. Normal en
   térmicas chinas (XPrinter, 3nStar, Rongta). El driver `Genérico / Solo texto` es el correcto.
@@ -70,7 +76,8 @@ Artículos: [áreas y cocinas](https://soporte.fu.do/es/articles/11730815) ·
 - **Ticket de prueba**: sin `-DryRun` el motor manda un ticket ESC/POS real. Avisarle al cliente
   que va a salir un papel.
 - **Cola trabada**: limpiarla borra los trabajos pendientes. Si hay comandas sin imprimir en la
-  cola, se pierden (hay que volver a mandarlas desde Fudo).
+  cola, se pierden (hay que volver a mandarlas desde Fudo). Es la única reparación irreversible,
+  y por eso vive en un launcher aparte.
 - **Cola `FUDO-TEST-*`**: si el motor la creó, queda instalada. Borrarla cuando se instale la
   definitiva: `Remove-Printer -Name "FUDO-TEST-USB001"`.
 - **Impresora de red**: si la IP cambió por DHCP, el motor escanea la subred buscando el
