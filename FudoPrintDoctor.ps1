@@ -159,6 +159,13 @@ CONTRATO DE SALIDA (v1.1)
     diagnosis.nextActions[] (que hacer / quien lo hace / articulo), engineErrors[], checks[], telemetry.
 
 CHANGELOG
+    2.6  - La URL de telemetria puede viajar en el propio launcher (set FUDO_TELEMETRY_URL en el
+             .cmd interno), asi no hay un archivo extra que el asesor pueda olvidarse de copiar:
+             el .cmd es el archivo que si o si tiene que estar. El repo publico lo trae vacio.
+           - Se busca el archivo de configuracion tambien en las carpetas redirigidas por OneDrive
+             (Escritorio / Desktop), que es donde estaba el caso real.
+           - El updater ya no sobrescribe el launcher si existe: ahi vive la configuracion local.
+           - -TestTelemetry, cuando no encuentra la URL, lista todas las rutas donde busco.
     2.5  - FIX de observabilidad: el JSON se serializaba y se guardaba ANTES de enviar la
              telemetria, asi que el archivo siempre salia con telemetria=null y sin las lineas de
              log del envio: era imposible saber por que no llegaba. Ahora el envio ocurre primero y
@@ -371,7 +378,7 @@ $script:StartTime    = Get-Date
 $script:Diagnostics  = [ordered]@{}   # datos crudos recolectados
 $script:Errors       = New-Object System.Collections.ArrayList   # fallas internas del motor
 $script:TestPrintersCreated = New-Object System.Collections.ArrayList   # colas temporales creadas por el motor
-$script:SchemaVersion = '2.5'
+$script:SchemaVersion = '2.6'
 # Distribucion: repo publico. VERSION es un archivo de una linea con la version publicada.
 $script:RepoUrl    = 'https://github.com/Gartcia/fudo-print-doctor'
 $script:RawBase    = 'https://raw.githubusercontent.com/Gartcia/fudo-print-doctor/main'
@@ -4361,7 +4368,15 @@ function Get-TelemetryUrl {
     $carpetas = @()
     try { if ($PSCommandPath) { $carpetas += (Split-Path -Parent $PSCommandPath) } } catch {}
     try { $carpetas += (Get-Location).Path } catch {}
-    try { if ($env:USERPROFILE) { $carpetas += @((Join-Path $env:USERPROFILE 'Downloads'), (Join-Path $env:USERPROFILE 'Desktop')) } } catch {}
+    try {
+        if ($env:USERPROFILE) {
+            $carpetas += @((Join-Path $env:USERPROFILE 'Downloads'), (Join-Path $env:USERPROFILE 'Desktop'))
+            # OneDrive redirige Escritorio/Documentos: hay que mirar ahi tambien
+            $carpetas += @((Join-Path $env:USERPROFILE 'OneDrive\Escritorio'), (Join-Path $env:USERPROFILE 'OneDrive\Desktop'),
+                           (Join-Path $env:USERPROFILE 'Escritorio'))
+        }
+        if ($env:OneDrive) { $carpetas += @((Join-Path $env:OneDrive 'Escritorio'), (Join-Path $env:OneDrive 'Desktop')) }
+    } catch {}
     $rutas = @()
     foreach ($c in @($carpetas | Where-Object { $_ })) {
         foreach ($n in $nombres) { $rutas += (Join-Path $c $n) }
@@ -4592,7 +4607,10 @@ try {
     if ($TestTelemetry) {
         $u = Get-TelemetryUrl
         if (-not $u) {
-            [Console]::Error.WriteLine('  No hay URL de telemetria configurada (-TelemetryUrl, FUDO_TELEMETRY_URL o telemetria.url).')
+            [Console]::Error.WriteLine('  No hay URL de telemetria configurada.')
+            [Console]::Error.WriteLine('  Opciones: -TelemetryUrl <url>, la variable FUDO_TELEMETRY_URL (la setea el .cmd interno),')
+            [Console]::Error.WriteLine('  o un archivo telemetria.txt junto al script. Se busco en:')
+            foreach ($d in @($script:TelemetryLookup)) { [Console]::Error.WriteLine('    - ' + $d) }
             exit 3
         }
         [Console]::Error.WriteLine("  Probando el endpoint: $u")

@@ -35,11 +35,14 @@ if errorlevel 1 goto sin_red
 findstr /c:"FudoPrintDoctor" motor.tmp >nul
 if errorlevel 1 goto no_publico
 
+REM El launcher puede tener la URL de telemetria: no se pisa si ya existe.
+if exist "FudoPrintDoctor.cmd" goto launcher_ok
 call :descargar FudoPrintDoctor.cmd launcher.tmp
 if errorlevel 1 goto sin_red
+move /y launcher.tmp "FudoPrintDoctor.cmd" >nul
+:launcher_ok
 
 move /y motor.tmp "FudoPrintDoctor.ps1" >nul
-move /y launcher.tmp "FudoPrintDoctor.cmd" >nul
 move /y version.tmp "version-descargada.txt" >nul
 
 echo.
