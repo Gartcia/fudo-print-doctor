@@ -159,6 +159,12 @@ CONTRATO DE SALIDA (v1.1)
     diagnosis.nextActions[] (que hacer / quien lo hace / articulo), engineErrors[], checks[], telemetry.
 
 CHANGELOG
+    2.5  - FIX de observabilidad: el JSON se serializaba y se guardaba ANTES de enviar la
+             telemetria, asi que el archivo siempre salia con telemetria=null y sin las lineas de
+             log del envio: era imposible saber por que no llegaba. Ahora el envio ocurre primero y
+             su resultado (y el log) quedan dentro del JSON.
+           - El campo telemetria incluye 'dondeBusco': la lista de rutas donde se busco el archivo
+             de configuracion, con el motivo por el que cada una no sirvio.
     2.4  - FIX (falso positivo, el mismo patron de siempre en el ultimo camino que faltaba): la
              reasignacion de puerto USB reportaba 'puerto reasignado (test HW OK)' con la impresora
              desenchufada, porque WritePrinter devuelve exito cuando el spooler acepta el trabajo.
@@ -365,7 +371,7 @@ $script:StartTime    = Get-Date
 $script:Diagnostics  = [ordered]@{}   # datos crudos recolectados
 $script:Errors       = New-Object System.Collections.ArrayList   # fallas internas del motor
 $script:TestPrintersCreated = New-Object System.Collections.ArrayList   # colas temporales creadas por el motor
-$script:SchemaVersion = '2.4'
+$script:SchemaVersion = '2.5'
 # Distribucion: repo publico. VERSION es un archivo de una linea con la version publicada.
 $script:RepoUrl    = 'https://github.com/Gartcia/fudo-print-doctor'
 $script:RawBase    = 'https://raw.githubusercontent.com/Gartcia/fudo-print-doctor/main'
@@ -384,6 +390,7 @@ $script:NativeInstallerUrl = ''
 $script:ForceWaitReconnect = $false
 $script:LastResult = $null
 $script:TelemetryStatus = $null
+$script:TelemetryLookup = @()
 # Progreso en vivo: titulo humano de cada etapa. Las etapas sin titulo no se muestran.
 $script:StepPlan = [ordered]@{
     'layer0.environment'        = 'Entorno de Windows'
@@ -4345,8 +4352,9 @@ function Install-FudoNative {
 
 function Get-TelemetryUrl {
     <# Resuelve la URL de telemetria sin necesidad de tenerla en el codigo. #>
-    if ($TelemetryUrl) { return $TelemetryUrl }
-    if ($env:FUDO_TELEMETRY_URL) { return [string]$env:FUDO_TELEMETRY_URL }
+    $script:TelemetryLookup = @()
+    if ($TelemetryUrl) { $script:TelemetryLookup += 'parametro -TelemetryUrl'; return $TelemetryUrl }
+    if ($env:FUDO_TELEMETRY_URL) { $script:TelemetryLookup += 'variable FUDO_TELEMETRY_URL'; return [string]$env:FUDO_TELEMETRY_URL }
     # OJO: en Windows la extension .url esta reservada para accesos directos de Internet,
     # asi que el archivo preferido es telemetria.txt (se acepta .url por compatibilidad).
     $nombres = @('telemetria.txt','telemetria.url','fudo-telemetria.txt')
@@ -4359,12 +4367,19 @@ function Get-TelemetryUrl {
         foreach ($n in $nombres) { $rutas += (Join-Path $c $n) }
     }
     foreach ($r in @($rutas | Where-Object { $_ })) {
+        $existe = $false
+        try { $existe = [bool](Test-Path $r) } catch {}
+        if (-not $existe) { $script:TelemetryLookup += ("no existe: " + $r); continue }
         try {
-            if (Test-Path $r) {
-                $u = ((Get-Content -Path $r -TotalCount 1 -ErrorAction Stop) | Out-String).Trim()
-                if ($u -match '^https://') { return $u }
+            $u = ((Get-Content -Path $r -TotalCount 1 -ErrorAction Stop) | Out-String).Trim()
+            if ($u -match '^https://') {
+                $script:TelemetryLookup += ("leido de: " + $r)
+                return $u
             }
-        } catch {}
+            $script:TelemetryLookup += ("existe pero no tiene una URL https en la primera linea: " + $r)
+        } catch {
+            $script:TelemetryLookup += ("no se pudo leer: " + $r + ' -> ' + $_.Exception.Message)
+        }
     }
     if ($script:TelemetryUrl) { return $script:TelemetryUrl }
     return ''
@@ -4451,7 +4466,12 @@ function Send-Telemetry {
     $url = Get-TelemetryUrl
     if (-not $url) {
         # Antes esto era un return silencioso y nadie se enteraba de que no estaba configurada.
-        $script:TelemetryStatus = [ordered]@{ enviada = $false; detalle = 'no configurada: falta el archivo telemetria.txt junto al script (o -TelemetryUrl / FUDO_TELEMETRY_URL)'; url = '' }
+        $script:TelemetryStatus = [ordered]@{
+            enviada = $false
+            detalle = 'no configurada: falta el archivo telemetria.txt junto al script (o -TelemetryUrl / FUDO_TELEMETRY_URL)'
+            url = ''
+            dondeBusco = @($script:TelemetryLookup)
+        }
         Write-DoctorLog -Level 'WARN' -Message 'Telemetria no configurada: no se encontro telemetria.txt ni -TelemetryUrl'
         return $false
     }
@@ -4485,7 +4505,7 @@ function Send-Telemetry {
         }
         $body = $payload | ConvertTo-Json -Depth 8 -Compress
         $r = Invoke-TelemetryPost -Url $url -Body $body
-        $script:TelemetryStatus = [ordered]@{ enviada = [bool]$r.ok; detalle = [string]$r.note; url = $url }
+        $script:TelemetryStatus = [ordered]@{ enviada = [bool]$r.ok; detalle = [string]$r.note; url = $url; dondeBusco = @($script:TelemetryLookup) }
         if ($r.ok) {
             Write-DoctorLog -Level 'INFO' -Message "Telemetria enviada ($($r.note))"
         } else {
@@ -4493,7 +4513,7 @@ function Send-Telemetry {
         }
         return [bool]$r.ok
     } catch {
-        $script:TelemetryStatus = [ordered]@{ enviada = $false; detalle = [string]$_.Exception.Message; url = $url }
+        $script:TelemetryStatus = [ordered]@{ enviada = $false; detalle = [string]$_.Exception.Message; url = $url; dondeBusco = @($script:TelemetryLookup) }
         Write-DoctorLog -Level 'WARN' -Message "No se pudo enviar la telemetria: $($_.Exception.Message)"
         return $false
     }
@@ -4502,6 +4522,17 @@ function Send-Telemetry {
 function Write-DoctorResult {
     param($Obj)
     $script:LastResult = $Obj
+
+    # La telemetria se manda ANTES de serializar: si no, el JSON se guardaba con
+    # telemetria=null y sin las lineas de log del envio, y no habia forma de depurarlo.
+    $null = Send-Telemetry -Result $Obj
+    try {
+        if ($Obj -is [System.Collections.IDictionary]) {
+            $Obj['telemetria'] = $script:TelemetryStatus
+            $Obj['log'] = @($script:Log)
+        }
+    } catch {}
+
     $json = $null
     try {
         $json = $Obj | ConvertTo-Json -Depth 12
@@ -4528,8 +4559,6 @@ function Write-DoctorResult {
             $script:AutoJsonPath = $auto
         } catch {}
     }
-
-    $null = Send-Telemetry -Result $Obj
 
     if ($emitJson) {
         Write-Output $script:JsonBegin
