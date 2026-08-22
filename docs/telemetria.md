@@ -140,12 +140,27 @@ Eso es exactamente el objetivo "identificar qué solución resuelve el problema"
 
 El estado se guarda en `HKCU\Software\Fudo\PrintDoctor` (contador, último status, última causa).
 
-### ¿Y para identificar al comercio?
+### ¿Y para identificar al comercio? — respondido: no se puede desde la PC
 
-Desde la PC no hay forma confiable hoy. Por eso cada corrida manda `nativaHuella`: un sondeo de
-`%LOCALAPPDATA%\Fudo` que reporta **solo nombres de archivo y nombres de clave** de los `.json`
-—ningún valor, para no transportar tokens— y así averiguar si la App Nativa guarda algo usable (un
-subdominio, un id de cuenta). Con dos o tres casos reales se decide si hay algo aprovechable.
+El sondeo `nativaHuella` ya trajo la respuesta de un caso real. En `%LOCALAPPDATA%\Fudo` hay
+exactamente cuatro archivos:
+
+| Archivo | Qué es |
+|---|---|
+| `do.fu.native_extension_chrome.json` | manifest de *native messaging* de Chrome |
+| `do.fu.native_extension_firefox.json` | ídem para Firefox |
+| `fudo_native_extension.exe` | el ejecutable de la Nativa (~69 MB) |
+| `node_printer.node` | el módulo binario que habla con el spooler |
+
+Y las claves de esos JSON son las del estándar de native messaging: `name`, `description`, `path`,
+`type`, `allowed_origins`, `allowed_extensions`. **No hay ningún identificador de comercio, ni
+subdominio, ni token, ni configuración de cuenta**: la Nativa no persiste nada de la sesión en
+disco, todo pasa por el navegador.
+
+Conclusión: desde la PC no se puede saber a qué comercio pertenece. `pcId` es la mejor unidad de
+análisis disponible, y para cruzar con la cuenta de Fudo hace falta la API o que el asesor cargue el
+`caseId`. El sondeo se deja igual porque es barato y avisaría si una versión futura de la Nativa
+empieza a guardar algo.
 
 ## 6. En qué estado llegan: el campo `llegada`
 

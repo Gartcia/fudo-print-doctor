@@ -16,6 +16,11 @@
  *   5. En FudoPrintDoctor.ps1, poner esa URL en $script:TelemetryUrl
  *      (o pasarla con -TelemetryUrl).
  *
+ * SI SE ACTUALIZA ESTE ARCHIVO
+ *   Cuando cambian las columnas, la hoja existente se renombra a
+ *   "corridas_hasta_<fecha>" y se crea una nueva con la cabecera correcta. Los datos
+ *   viejos no se pierden y las filas nuevas nunca quedan desalineadas.
+ *
  * SEGURIDAD
  *   La URL /exec es publica: cualquiera que la tenga puede escribir. Por eso doPost
  *   valida la forma del payload y doGet exige el TOKEN. Si en algun momento aparece
@@ -107,12 +112,28 @@ function obtenerHoja_() {
   var ss = SpreadsheetApp.getActiveSpreadsheet();
   var hoja = ss.getSheetByName(HOJA);
   if (!hoja) { hoja = ss.insertSheet(HOJA); }
+
   if (hoja.getLastRow() === 0) {
-    hoja.appendRow(COLUMNAS);
-    hoja.setFrozenRows(1);
-    hoja.getRange(1, 1, 1, COLUMNAS.length).setFontWeight('bold');
+    escribirCabecera_(hoja);
+    return hoja;
+  }
+
+  // Si el motor agrego columnas, la cabecera vieja quedaria desalineada con las filas nuevas.
+  // En ese caso la hoja actual se archiva y se arranca una limpia con la cabecera correcta.
+  var actual = hoja.getRange(1, 1, 1, hoja.getLastColumn()).getValues()[0];
+  if (actual.join('|') !== COLUMNAS.join('|')) {
+    var sello = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMdd-HHmm');
+    hoja.setName(HOJA + '_hasta_' + sello);
+    hoja = ss.insertSheet(HOJA);
+    escribirCabecera_(hoja);
   }
   return hoja;
+}
+
+function escribirCabecera_(hoja) {
+  hoja.appendRow(COLUMNAS);
+  hoja.setFrozenRows(1);
+  hoja.getRange(1, 1, 1, COLUMNAS.length).setFontWeight('bold');
 }
 
 function armarFila_(d) {
