@@ -88,6 +88,10 @@
 .PARAMETER TelemetryFull
     Enviar el JSON completo en lugar del payload reducido.
 
+.PARAMETER TestTelemetry
+    Manda una fila de prueba al endpoint de telemetria y termina, informando si llego. Sirve para
+    validar la configuracion sin correr el diagnostico.
+
 .PARAMETER NoUpdateCheck
     No consulta si hay una version mas nueva publicada. El chequeo ya se saltea solo en modo
     agente (-Quiet / -Json / salida redirigida) y nunca bloquea el diagnostico.
@@ -155,6 +159,24 @@ CONTRATO DE SALIDA (v1.1)
     diagnosis.nextActions[] (que hacer / quien lo hace / articulo), engineErrors[], checks[], telemetry.
 
 CHANGELOG
+    2.4  - FIX (falso positivo, el mismo patron de siempre en el ultimo camino que faltaba): la
+             reasignacion de puerto USB reportaba 'puerto reasignado (test HW OK)' con la impresora
+             desenchufada, porque WritePrinter devuelve exito cuando el spooler acepta el trabajo.
+             Ahora verifica que el ticket haya SALIDO de la cola, y si no hay ningun dispositivo
+             conectado no prueba puertos: informa que primero hay que conectar la impresora.
+           - Telemetria: el archivo de configuracion pasa a llamarse telemetria.txt (en Windows la
+             extension .url esta reservada para accesos directos de Internet, y por eso el archivo
+             no se leia); se busca tambien en Descargas y Escritorio, y se acepta .url por
+             compatibilidad. Y ya no falla en silencio: si no esta configurada, queda en el log,
+             en el resumen y en el JSON.
+           - Entorno: campo paisProbable derivado de la zona horaria, porque el pais por cultura
+             devuelve US cuando Windows esta en ingles.
+    2.3  - FIX de telemetria: /exec de Apps Script responde 302 y, al seguir el redirect, el POST
+             se convierte en GET y se pierde el cuerpo (la fila nunca llegaba). Ahora, si el primer
+             intento no devuelve ok, se repite el POST contra el Location.
+           - El resultado del envio se ve: linea en el resumen y campo 'telemetria' en el JSON.
+             Antes un fallo quedaba solo en el log y nadie se enteraba.
+           - Nuevo -TestTelemetry: manda una fila de prueba y dice si llego, sin diagnosticar nada.
     2.2  - La URL de telemetria ya no vive en el codigo: se toma de -TelemetryUrl, de la variable
              de entorno FUDO_TELEMETRY_URL o de un archivo 'telemetria.url' al lado del script.
              El repositorio es publico y una URL de escritura publicada se puede spamear.
@@ -319,6 +341,7 @@ param(
     [switch]$TelemetryFull,
     [switch]$NoUpdateCheck,
     [switch]$CheckUpdate,
+    [switch]$TestTelemetry,
     [switch]$SelfTest
 )
 
@@ -342,7 +365,7 @@ $script:StartTime    = Get-Date
 $script:Diagnostics  = [ordered]@{}   # datos crudos recolectados
 $script:Errors       = New-Object System.Collections.ArrayList   # fallas internas del motor
 $script:TestPrintersCreated = New-Object System.Collections.ArrayList   # colas temporales creadas por el motor
-$script:SchemaVersion = '2.2'
+$script:SchemaVersion = '2.4'
 # Distribucion: repo publico. VERSION es un archivo de una linea con la version publicada.
 $script:RepoUrl    = 'https://github.com/Gartcia/fudo-print-doctor'
 $script:RawBase    = 'https://raw.githubusercontent.com/Gartcia/fudo-print-doctor/main'
@@ -360,6 +383,7 @@ $script:TelemetryUrl = ''
 $script:NativeInstallerUrl = ''
 $script:ForceWaitReconnect = $false
 $script:LastResult = $null
+$script:TelemetryStatus = $null
 # Progreso en vivo: titulo humano de cada etapa. Las etapas sin titulo no se muestran.
 $script:StepPlan = [ordered]@{
     'layer0.environment'        = 'Entorno de Windows'
@@ -1507,6 +1531,19 @@ function Get-EnvironmentInfo {
     }
 
     # Region / pais / zona horaria (local, sin consultar nada por internet)
+    # El pais por cultura miente cuando Windows esta en ingles (da US aunque el local sea de AR),
+    # asi que ademas derivamos un pais probable de la zona horaria.
+    $tzPais = [ordered]@{
+        'Argentina Standard Time' = 'AR'; 'E. South America Standard Time' = 'BR'
+        'Central Brazilian Standard Time' = 'BR'; 'Bahia Standard Time' = 'BR'
+        'Pacific SA Standard Time' = 'CL'; 'Easter Island Standard Time' = 'CL'
+        'SA Pacific Standard Time' = 'CO/PE/EC'; 'SA Western Standard Time' = 'BO/DO/PR'
+        'Central America Standard Time' = 'CR/GT/HN/NI/SV'
+        'Central Standard Time (Mexico)' = 'MX'; 'Mountain Standard Time (Mexico)' = 'MX'
+        'Pacific Standard Time (Mexico)' = 'MX'; 'Montevideo Standard Time' = 'UY'
+        'Paraguay Standard Time' = 'PY'; 'Venezuela Standard Time' = 'VE'
+        'Romance Standard Time' = 'ES'; 'W. Europe Standard Time' = 'EU'
+    }
     $pais = ''; $paisNombre = ''; $cultura = ''; $tz = ''
     try { $cultura = [string](Get-Culture).Name } catch {}
     try {
@@ -1540,6 +1577,9 @@ function Get-EnvironmentInfo {
         }
     } catch {}
 
+    $paisProbable = $pais
+    if ($tz -and $tzPais.Contains($tz)) { $paisProbable = [string]$tzPais[$tz] }
+
     return [ordered]@{
         so             = $os
         powershell     = [string]$PSVersionTable.PSVersion
@@ -1549,6 +1589,7 @@ function Get-EnvironmentInfo {
         cultura        = $cultura
         pais           = $pais
         paisNombre     = $paisNombre
+        paisProbable   = $paisProbable
         zonaHoraria    = $tz
         redes          = @($redes)
         tipoConexionPC = $(if (@($redes | Where-Object { $_.tipo -eq 'cable' }).Count -gt 0) { 'cable' } elseif (@($redes).Count -gt 0) { 'wifi' } else { 'sin red' })
@@ -2327,6 +2368,19 @@ function Test-Layer3-UsbPort {
         $candidatePorts = @(@($livePorts | Where-Object { $_ -ne $currentPort }) + @($candidatePorts) | Select-Object -Unique)
     }
 
+    # Si Windows no ve ningun dispositivo de impresion, no hay puerto a donde apuntar:
+    # probar candidatos solo genera falsos positivos.
+    $hwCount = -1
+    if ($script:Diagnostics.Contains('hwDeviceCount')) { $hwCount = [int]$script:Diagnostics['hwDeviceCount'] }
+    if ($hwCount -eq 0) {
+        Add-Check -Id 'conn.usb' -Layer 3 -Name 'Puerto USB: no hay ningun dispositivo conectado' -Status 'fail' -RootCauseCandidate $true -Plane 'hardware' `
+            -Evidence @{ currentPort = $currentPort; usbPorts = $usbPorts; hwDevices = 0 } `
+            -ArticleRef 'https://soporte.fu.do/es/articles/11730817' `
+            -Recommendation ('No tiene sentido reasignar el puerto: Windows no detecta ninguna impresora conectada. ' +
+                             'Conectar el USB con la impresora encendida (el motor puede esperar la reconexion y seguir solo) y recien despues revisar el puerto.')
+        return
+    }
+
     # Sintoma que dispara el remapeo (art. 11730817: se reconecto a otro puerto USB)
     $needsPortFix = $false
     $reason = ''
@@ -2362,16 +2416,28 @@ function Test-Layer3-UsbPort {
             $chosen = $null
             foreach ($cp in $candidatePorts) {
                 try {
+                    Write-StepDetail ("probando el puerto " + $cp)
                     Set-Printer -Name $Printer.Name -PortName $cp -ErrorAction Stop
                     Start-Sleep -Milliseconds 500
-                    if ([FudoRawPrinter]::SendBytes($Printer.Name, $ticket)) { $chosen = $cp; break }
+                    if (-not ([FudoRawPrinter]::SendBytes($Printer.Name, $ticket))) { continue }
+                    # OJO: SendBytes OK solo dice que el spooler acepto el trabajo. Si el papel no
+                    # sale, el trabajo queda en la cola. Sin esta verificacion se reportaba
+                    # "puerto reasignado (test HW OK)" con la impresora desenchufada.
+                    Start-Sleep -Milliseconds 1800
+                    $pend = @()
+                    try { $pend = @(Get-PrintJob -PrinterName $Printer.Name -ErrorAction SilentlyContinue | Where-Object { [string]$_.DocumentName -match '(?i)fudo' }) } catch {}
+                    if (@($pend).Count -gt 0) {
+                        try { $pend | Remove-PrintJob -ErrorAction SilentlyContinue } catch {}
+                        continue
+                    }
+                    $chosen = $cp; break
                 } catch {}
             }
             if ($null -eq $chosen) {
                 try { Set-Printer -Name $Printer.Name -PortName $currentPort -ErrorAction SilentlyContinue } catch {}
-                "ningun candidato imprimio; puerto revertido a $currentPort"
+                "ningun candidato imprimio un ticket de verdad; puerto revertido a $currentPort"
             } else {
-                "puerto reasignado a $chosen (test HW OK)"
+                "puerto reasignado a $chosen y el ticket salio de la cola"
             }
         }
     $fixedOk = $rem.applied -and ($rem.note -match 'reasignado')
@@ -3333,6 +3399,7 @@ function Invoke-FudoPrintDoctor {
     $result = [ordered]@{
         schemaVersion = $script:SchemaVersion
         updateAvailable = [string]$script:UpdateNote
+        telemetria    = $script:TelemetryStatus
         status        = $(if ($diag.resolved -and -not $diag.needsEscalation) { 'resolved' }
                           elseif (@($script:Errors).Count -gt 0) { 'partial_engine_error' }
                           else { 'needs_escalation' })
@@ -3800,7 +3867,7 @@ public class FudoFakePrinter {
     try { $env30 = Get-EnvironmentInfo } catch { $err30 = $_.Exception.Message }
     Assert-Eq 'S30 entorno no explota' '' $err30
     Assert-Eq 'S30 trae la version de PowerShell' $true ([bool]([string]$env30.powershell -match '^\d'))
-    Assert-Eq 'S30 tiene los campos que pide la telemetria' 'so,powershell,chrome,edge,nativaVersion,cultura,pais,paisNombre,zonaHoraria,redes,tipoConexionPC,esAdmin' (@($env30.Keys) -join ',')
+    Assert-Eq 'S30 tiene los campos que pide la telemetria' 'so,powershell,chrome,edge,nativaVersion,cultura,pais,paisNombre,paisProbable,zonaHoraria,redes,tipoConexionPC,esAdmin' (@($env30.Keys) -join ',')
 
     # Escenario 31: sin log de impresion habilitado no se afirma nada
     Reset-State
@@ -3834,6 +3901,82 @@ public class FudoFakePrinter {
     $c33 = Get-CheckById 'fudo.usoReal'
     Assert-Eq 'S33 marca la sospecha' 'warn' ([string]$c33.status)
     Assert-Eq 'S33 es candidata a causa raiz' $true ([bool]$c33.rootCauseCandidate)
+
+    # Escenario 34: el POST de telemetria contra un servidor de verdad, incluido el 302
+    # que hace Apps Script (que es lo que rompia el envio).
+    Reset-State
+    if (-not ('FudoFakeEndpoint' -as [type])) {
+        Add-Type -Language CSharp -TypeDefinition @'
+using System;
+using System.IO;
+using System.Net;
+using System.Text;
+using System.Threading;
+public class FudoFakeEndpoint {
+    public static string UltimoCuerpo = "";
+    public static int Start(bool redirige) {
+        HttpListener l = new HttpListener();
+        int port = 0;
+        // buscamos un puerto libre
+        for (int p = 18500; p < 18600; p++) {
+            try {
+                l = new HttpListener();
+                l.Prefixes.Add("http://127.0.0.1:" + p + "/exec/");
+                l.Prefixes.Add("http://127.0.0.1:" + p + "/real/");
+                l.Start();
+                port = p;
+                break;
+            } catch { }
+        }
+        if (port == 0) { return 0; }
+        HttpListener lis = l;
+        int puerto = port;
+        Thread t = new Thread(delegate() {
+            try {
+                for (int i = 0; i < 12; i++) {
+                    HttpListenerContext ctx = lis.GetContext();
+                    string path = ctx.Request.Url.AbsolutePath;
+                    string cuerpo = new StreamReader(ctx.Request.InputStream, Encoding.UTF8).ReadToEnd();
+                    byte[] resp;
+                    // /exec: imita Apps Script y redirige a /real
+                    if (redirige && path.StartsWith("/exec")) {
+                        ctx.Response.StatusCode = 302;
+                        ctx.Response.AddHeader("Location", "http://127.0.0.1:" + puerto + "/real/");
+                        resp = Encoding.UTF8.GetBytes("moved");
+                    } else if (ctx.Request.HttpMethod == "POST" && cuerpo.Length > 0) {
+                        UltimoCuerpo = cuerpo;
+                        resp = Encoding.UTF8.GetBytes("{" + (char)34 + "ok" + (char)34 + ":true}");
+                    } else {
+                        // POST convertido en GET por el redirect: cuerpo perdido
+                        resp = Encoding.UTF8.GetBytes("{" + (char)34 + "ok" + (char)34 + ":false}");
+                    }
+                    ctx.Response.ContentType = "application/json";
+                    ctx.Response.OutputStream.Write(resp, 0, resp.Length);
+                    ctx.Response.OutputStream.Close();
+                }
+            } catch { }
+            try { lis.Stop(); } catch { }
+        });
+        t.IsBackground = true;
+        t.Start();
+        return puerto;
+    }
+}
+'@
+    }
+    $pDirecto = [int][FudoFakeEndpoint]::Start($false)
+    if ($pDirecto -gt 0) {
+        $r34 = Invoke-TelemetryPost -Url ("http://127.0.0.1:$pDirecto/exec/") -Body '{"schemaVersion":"2.3","status":"resolved"}'
+        Assert-Eq 'S34 POST directo llega' $true ([bool]$r34.ok)
+        Assert-Eq 'S34 el servidor recibio el cuerpo' $true ([bool]([FudoFakeEndpoint]::UltimoCuerpo -match 'schemaVersion'))
+    }
+    $pRedir = [int][FudoFakeEndpoint]::Start($true)
+    if ($pRedir -gt 0) {
+        [FudoFakeEndpoint]::UltimoCuerpo = ''
+        $r35 = Invoke-TelemetryPost -Url ("http://127.0.0.1:$pRedir/exec/") -Body '{"schemaVersion":"2.3","status":"resolved","caseId":"CONREDIRECT"}'
+        Assert-Eq 'S34 sobrevive al 302 de Apps Script' $true ([bool]$r35.ok)
+        Assert-Eq 'S34 el cuerpo no se pierde en el redirect' $true ([bool]([FudoFakeEndpoint]::UltimoCuerpo -match 'CONREDIRECT'))
+    }
 
     Write-Host ""
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)
@@ -4204,9 +4347,17 @@ function Get-TelemetryUrl {
     <# Resuelve la URL de telemetria sin necesidad de tenerla en el codigo. #>
     if ($TelemetryUrl) { return $TelemetryUrl }
     if ($env:FUDO_TELEMETRY_URL) { return [string]$env:FUDO_TELEMETRY_URL }
+    # OJO: en Windows la extension .url esta reservada para accesos directos de Internet,
+    # asi que el archivo preferido es telemetria.txt (se acepta .url por compatibilidad).
+    $nombres = @('telemetria.txt','telemetria.url','fudo-telemetria.txt')
+    $carpetas = @()
+    try { if ($PSCommandPath) { $carpetas += (Split-Path -Parent $PSCommandPath) } } catch {}
+    try { $carpetas += (Get-Location).Path } catch {}
+    try { if ($env:USERPROFILE) { $carpetas += @((Join-Path $env:USERPROFILE 'Downloads'), (Join-Path $env:USERPROFILE 'Desktop')) } } catch {}
     $rutas = @()
-    try { if ($PSCommandPath) { $rutas += (Join-Path (Split-Path -Parent $PSCommandPath) 'telemetria.url') } } catch {}
-    try { $rutas += (Join-Path (Get-Location).Path 'telemetria.url') } catch {}
+    foreach ($c in @($carpetas | Where-Object { $_ })) {
+        foreach ($n in $nombres) { $rutas += (Join-Path $c $n) }
+    }
     foreach ($r in @($rutas | Where-Object { $_ })) {
         try {
             if (Test-Path $r) {
@@ -4219,6 +4370,78 @@ function Get-TelemetryUrl {
     return ''
 }
 
+function Invoke-TelemetryPost {
+    <#
+      POST robusto para Apps Script. El detalle importante: /exec responde 302 hacia
+      script.googleusercontent.com, y al seguir el redirect el POST se convierte en GET y se pierde
+      el cuerpo. Por eso, si el primer intento no devuelve ok, se repite el POST contra el Location.
+      Devuelve @{ ok = $bool; note = '...' }
+    #>
+    param([string]$Url, [string]$Body)
+
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+    $bytes = [Text.Encoding]::UTF8.GetBytes($Body)
+
+    # --- intento 1: el camino simple
+    try {
+        $r = Invoke-RestMethod -Uri $Url -Method Post -Body $Body -ContentType 'application/json; charset=utf-8' -TimeoutSec 20 -ErrorAction Stop
+        if ($r -and ($r.ok -eq $true)) { return @{ ok = $true; note = 'enviado' } }
+        $txt = ''
+        try { $txt = ([string]($r | ConvertTo-Json -Compress -Depth 4)) } catch { $txt = [string]$r }
+        if ($txt.Length -gt 200) { $txt = $txt.Substring(0, 200) }
+        $primero = "respuesta inesperada: $txt"
+    } catch {
+        $primero = "fallo directo: $($_.Exception.Message)"
+    }
+
+    # --- intento 2: POST -> 302 -> POST al Location (sin auto-redirect)
+    try {
+        $req = [Net.HttpWebRequest]::Create($Url)
+        $req.Method = 'POST'
+        $req.ContentType = 'application/json; charset=utf-8'
+        $req.AllowAutoRedirect = $false
+        $req.Timeout = 20000
+        $req.ContentLength = $bytes.Length
+        $st = $req.GetRequestStream(); $st.Write($bytes, 0, $bytes.Length); $st.Close()
+
+        $res = $null
+        try { $res = $req.GetResponse() } catch [Net.WebException] { $res = $_.Exception.Response }
+        if (-not $res) { return @{ ok = $false; note = $primero } }
+
+        $codigo = [int]$res.StatusCode
+        $destino = [string]$res.Headers['Location']
+        $cuerpo = ''
+        try { $cuerpo = (New-Object IO.StreamReader($res.GetResponseStream())).ReadToEnd() } catch {}
+        try { $res.Close() } catch {}
+
+        if ($codigo -ge 300 -and $codigo -lt 400 -and $destino) {
+            $req2 = [Net.HttpWebRequest]::Create($destino)
+            $req2.Method = 'POST'
+            $req2.ContentType = 'application/json; charset=utf-8'
+            $req2.AllowAutoRedirect = $true
+            $req2.Timeout = 20000
+            $req2.ContentLength = $bytes.Length
+            $st2 = $req2.GetRequestStream(); $st2.Write($bytes, 0, $bytes.Length); $st2.Close()
+            $res2 = $null
+            try { $res2 = $req2.GetResponse() } catch [Net.WebException] { $res2 = $_.Exception.Response }
+            if ($res2) {
+                $cuerpo2 = ''
+                try { $cuerpo2 = (New-Object IO.StreamReader($res2.GetResponseStream())).ReadToEnd() } catch {}
+                try { $res2.Close() } catch {}
+                if ($cuerpo2 -match '"ok"\s*:\s*true') { return @{ ok = $true; note = 'enviado (via redirect)' } }
+                $c2 = $cuerpo2; if ($c2.Length -gt 200) { $c2 = $c2.Substring(0, 200) }
+                return @{ ok = $false; note = "el endpoint respondio: $c2" }
+            }
+        }
+
+        if ($cuerpo -match '"ok"\s*:\s*true') { return @{ ok = $true; note = 'enviado' } }
+        $c1 = $cuerpo; if ($c1.Length -gt 200) { $c1 = $c1.Substring(0, 200) }
+        return @{ ok = $false; note = "HTTP $codigo. $primero. Cuerpo: $c1" }
+    } catch {
+        return @{ ok = $false; note = "$primero | segundo intento: $($_.Exception.Message)" }
+    }
+}
+
 function Send-Telemetry {
     <#
       Manda el resultado a un endpoint para no depender de que el asesor guarde el JSON.
@@ -4226,7 +4449,12 @@ function Send-Telemetry {
     #>
     param($Result)
     $url = Get-TelemetryUrl
-    if (-not $url) { return }
+    if (-not $url) {
+        # Antes esto era un return silencioso y nadie se enteraba de que no estaba configurada.
+        $script:TelemetryStatus = [ordered]@{ enviada = $false; detalle = 'no configurada: falta el archivo telemetria.txt junto al script (o -TelemetryUrl / FUDO_TELEMETRY_URL)'; url = '' }
+        Write-DoctorLog -Level 'WARN' -Message 'Telemetria no configurada: no se encontro telemetria.txt ni -TelemetryUrl'
+        return $false
+    }
 
     try {
         $payload = $Result
@@ -4256,11 +4484,16 @@ function Send-Telemetry {
             }
         }
         $body = $payload | ConvertTo-Json -Depth 8 -Compress
-        try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
-        $null = Invoke-RestMethod -Uri $url -Method Post -Body $body -ContentType 'application/json; charset=utf-8' -TimeoutSec 10 -ErrorAction Stop
-        Write-DoctorLog -Level 'INFO' -Message "Telemetria enviada a $url"
-        return $true
+        $r = Invoke-TelemetryPost -Url $url -Body $body
+        $script:TelemetryStatus = [ordered]@{ enviada = [bool]$r.ok; detalle = [string]$r.note; url = $url }
+        if ($r.ok) {
+            Write-DoctorLog -Level 'INFO' -Message "Telemetria enviada ($($r.note))"
+        } else {
+            Write-DoctorLog -Level 'WARN' -Message "No se pudo enviar la telemetria: $($r.note)"
+        }
+        return [bool]$r.ok
     } catch {
+        $script:TelemetryStatus = [ordered]@{ enviada = $false; detalle = [string]$_.Exception.Message; url = $url }
         Write-DoctorLog -Level 'WARN' -Message "No se pudo enviar la telemetria: $($_.Exception.Message)"
         return $false
     }
@@ -4304,6 +4537,16 @@ function Write-DoctorResult {
         Write-Output $script:JsonEnd
     }
 
+    if ($script:TelemetryStatus -and -not $Quiet) {
+        if ($script:TelemetryStatus.enviada) {
+            Write-HumanReport -Text ("  Reporte enviado al panel de telemetria.`r`n")
+        } elseif ([string]$script:TelemetryStatus.detalle -match '^no configurada') {
+            Write-HumanReport -Text ("  Telemetria no configurada (falta telemetria.txt junto al script).`r`n")
+        } else {
+            Write-HumanReport -Text ("  ATENCION: no se pudo enviar el reporte de telemetria.`r`n  " + [string]$script:TelemetryStatus.detalle + "`r`n")
+        }
+    }
+
     # El resumen humano va al final: es lo ultimo que queda en pantalla.
     if (-not $Quiet) {
         $hs = $null
@@ -4316,6 +4559,28 @@ function Write-DoctorResult {
 
 try {
     if ($SelfTest) { Invoke-SelfTest; return }
+
+    if ($TestTelemetry) {
+        $u = Get-TelemetryUrl
+        if (-not $u) {
+            [Console]::Error.WriteLine('  No hay URL de telemetria configurada (-TelemetryUrl, FUDO_TELEMETRY_URL o telemetria.url).')
+            exit 3
+        }
+        [Console]::Error.WriteLine("  Probando el endpoint: $u")
+        $prueba = [ordered]@{
+            schemaVersion = $script:SchemaVersion; status = 'resolved'
+            caseId = 'PRUEBA-TELEMETRIA'; clientId = ''; host = $env:COMPUTERNAME
+            timestamp = (Get-Date).ToString('o'); interface = 'USB'; dryRun = $true
+            rootCause = 'Prueba de conectividad de telemetria'; resolved = $true; confidence = 'high'
+            telemetry = [ordered]@{ category = 'test'; durationMs = 0; entorno = (Get-EnvironmentInfo) }
+            checks = @()
+        }
+        $r = Invoke-TelemetryPost -Url $u -Body ($prueba | ConvertTo-Json -Depth 8 -Compress)
+        if ($r.ok) { [Console]::Error.WriteLine("  OK: el endpoint recibio la prueba ($($r.note)). Deberia aparecer una fila con caseId PRUEBA-TELEMETRIA."); exit 0 }
+        [Console]::Error.WriteLine("  FALLO: $($r.note)")
+        [Console]::Error.WriteLine('  Revisar en Apps Script: Implementar > Administrar implementaciones > "Quien tiene acceso" = Cualquier persona.')
+        exit 3
+    }
 
     if ($CheckUpdate) {
         $pub = Get-PublishedVersion -TimeoutSec 8

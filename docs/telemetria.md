@@ -20,11 +20,32 @@ spamear. El motor la busca, en este orden:
 
 1. El parámetro `-TelemetryUrl <url>`.
 2. La variable de entorno `FUDO_TELEMETRY_URL`.
-3. Un archivo **`telemetria.url`** al lado del script, con la URL en una sola línea.
+3. Un archivo **`telemetria.txt`** al lado del script (o en Descargas / Escritorio), con la URL en una sola línea.
 
 La opción 3 es la práctica: se genera una vez, se distribuye junto al `.ps1` y el `.cmd` por el
 canal interno (no por el repo — está en el `.gitignore`), y a partir de ahí cada corrida reporta
 sola. Para cambiar de destino, se reemplaza ese archivito.
+
+**Ojo con la extensión**: tiene que ser `.txt`. En Windows, `.url` está reservada para accesos
+directos de Internet y el archivo no se lee (se acepta igual por compatibilidad, pero no conviene).
+
+Para verificar que está bien configurado, sin correr el diagnóstico:
+
+```powershell
+.\FudoPrintDoctor.ps1 -TestTelemetry
+```
+
+Manda una fila de prueba con `caseId = PRUEBA-TELEMETRIA` y dice si llegó. Si falla, el mensaje
+indica qué revisar (lo más común: el Apps Script no está implementado con *Quién tiene acceso:
+Cualquier persona*).
+
+## Detalle técnico: el redirect de Apps Script
+
+`/exec` responde **302** hacia `script.googleusercontent.com`. Al seguir ese redirect, el POST se
+convierte en GET y **se pierde el cuerpo**: la fila nunca llega y el endpoint contesta como si el
+pedido estuviera vacío. Por eso el motor, si el primer intento no devuelve `ok`, repite el POST
+contra la URL del `Location`. Está cubierto por el self-test con un servidor HTTP real que imita ese
+302.
 
 Sobre el riesgo: cualquier URL que llegue a la PC de un cliente es, en la práctica, semi-pública. Lo
 peor que puede pasar es que alguien escriba basura en la planilla; por eso el Apps Script valida la

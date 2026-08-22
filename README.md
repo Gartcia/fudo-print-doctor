@@ -252,7 +252,9 @@ Para no depender de que el asesor guarde el JSON: con `-TelemetryUrl` (o fijando
 POST con un resumen del resultado. Es silencioso: si falla, no molesta ni corta el diagnóstico.
 
 Receptor listo para usar en [`tools/telemetria-appscript.gs`](tools/telemetria-appscript.gs) (Google
-Sheets + Apps Script), con los pasos en [`docs/telemetria.md`](docs/telemetria.md).
+Sheets + Apps Script), con los pasos en [`docs/telemetria.md`](docs/telemetria.md). La URL no va en
+el código: se pone en un archivo `telemetria.txt` al lado del script. `-TestTelemetry` manda una fila
+de prueba para verificar la configuración.
 
 Además del resultado del diagnóstico viaja el **contexto de la PC**, que el motor recolecta sin
 preguntarle nada al cliente:
@@ -347,7 +349,7 @@ Contrato completo del JSON: [`docs/contrato-json.md`](docs/contrato-json.md).
 | `-JsonOut` | — | Volcar el JSON a un archivo |
 | `-Json` / `-Quiet` | off | Forzar JSON a stdout / silenciar el resumen |
 | `-Verbose` | off | Lista todos los chequeos en pantalla |
-| `-SelfTest` | off | Corre los 95 asserts de la lógica de decisión. No toca la PC. |
+| `-SelfTest` | off | Corre los 99 asserts de la lógica de decisión. No toca la PC. |
 
 ## Desarrollo
 
