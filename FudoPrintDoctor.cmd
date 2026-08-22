@@ -57,7 +57,10 @@ echo  ================================================================
 pause >nul
 echo.
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0FudoPrintDoctor.ps1" -JsonOut "%~dp0resultado.json"
+set "FPD_CASO="
+set /p FPD_CASO=  ID del caso (Intercom/ClickUp), o Enter para omitir: 
+echo.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0FudoPrintDoctor.ps1" -JsonOut "%~dp0resultado.json" -CaseId "%FPD_CASO%"
 set FPD_EXIT=%errorlevel%
 
 echo.

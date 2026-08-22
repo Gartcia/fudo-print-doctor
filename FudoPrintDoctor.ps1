@@ -93,7 +93,12 @@
     validar la configuracion sin correr el diagnostico.
 
 .PARAMETER NoUpdateCheck
-    No consulta si hay una version mas nueva publicada. El chequeo ya se saltea solo en modo
+    No consulta si hay una version mas nueva publicada.
+    NOTA DE DISENO: el motor avisa cuando hay una version nueva, pero NUNCA se actualiza solo.
+    Corre en la PC de un cliente y no esta firmado digitalmente: una actualizacion automatica
+    propagaria cualquier bug (o cualquier cambio malicioso en el repo) a todos los locales sin que
+    nadie lo revise. La actualizacion es una accion explicita: la opcion A del menu, o el
+    Actualizar-FudoPrintDoctor.cmd del asesor. El chequeo ya se saltea solo en modo
     agente (-Quiet / -Json / salida redirigida) y nunca bloquea el diagnostico.
 
 .PARAMETER CheckUpdate
@@ -159,6 +164,16 @@ CONTRATO DE SALIDA (v1.1)
     diagnosis.nextActions[] (que hacer / quien lo hace / articulo), engineErrors[], checks[], telemetry.
 
 CHANGELOG
+    2.9b - Opcion A del menu: actualizar el motor a la ultima version publicada. Aparece solo si
+             hay una version nueva, valida lo descargado (tamano, firma y version legible) y deja
+             una copia .bak antes de reemplazar. Sigue siendo explicita: el motor no se
+             autoactualiza (ver NOTA DE DISENO en -NoUpdateCheck).
+    2.9  - FIX del payload de telemetria: impresoras, cantidadColas, cantidadHardware e
+             historialFudo viajaban en la raiz, pero el receptor los lee dentro de 'telemetry', asi
+             que esas columnas quedaban vacias (los datos igual estaban en la columna json). Ahora
+             van anidados: el Apps Script ya desplegado los toma sin cambios.
+           - El launcher pregunta el ID del caso (Enter para omitir) y lo pasa como -CaseId, para
+             poder cruzar cada corrida con su conversacion.
     2.8  - La URL de telemetria, una vez conocida, queda guardada en la variable de entorno de
              USUARIO de esa PC (y se lee de ahi en las corridas siguientes). Asi deja de depender
              de un archivo que una actualizacion pueda reemplazar: alcanza con que UNA corrida la
@@ -387,7 +402,7 @@ $script:StartTime    = Get-Date
 $script:Diagnostics  = [ordered]@{}   # datos crudos recolectados
 $script:Errors       = New-Object System.Collections.ArrayList   # fallas internas del motor
 $script:TestPrintersCreated = New-Object System.Collections.ArrayList   # colas temporales creadas por el motor
-$script:SchemaVersion = '2.8'
+$script:SchemaVersion = '2.9'
 # Distribucion: repo publico. VERSION es un archivo de una linea con la version publicada.
 $script:RepoUrl    = 'https://github.com/Gartcia/fudo-print-doctor'
 $script:RawBase    = 'https://raw.githubusercontent.com/Gartcia/fudo-print-doctor/main'
@@ -4001,6 +4016,14 @@ public class FudoFakeEndpoint {
         Assert-Eq 'S34 el cuerpo no se pierde en el redirect' $true ([bool]([FudoFakeEndpoint]::UltimoCuerpo -match 'CONREDIRECT'))
     }
 
+    # Escenario 35: la opcion de actualizar aparece solo si hay version nueva
+    Reset-State
+    $script:UpdateNote = ''
+    Assert-Eq 'S35 sin novedad no ofrece actualizar' $false (@(Get-MenuOptions | ForEach-Object { [string]$_.k }) -contains 'A')
+    $script:UpdateNote = 'Hay una version mas nueva publicada: 9.9'
+    Assert-Eq 'S35 con novedad ofrece actualizar' $true (@(Get-MenuOptions | ForEach-Object { [string]$_.k }) -contains 'A')
+    $script:UpdateNote = ''
+
     Write-Host ""
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)
     # Salida explicita en los dos casos: si el script termina con 'return', $LASTEXITCODE
@@ -4058,6 +4081,9 @@ function Get-MenuOptions {
     $nativaMal = @($script:Checks | Where-Object { $_.id -like 'nativa.*' -and $_.status -in @('fail','warn') }).Count -gt 0
     if ($nativaMal) { $ops += [ordered]@{ k = 'F'; t = 'Instalar / reparar la App Nativa de Fudo' } }
 
+    if ($script:UpdateNote) {
+        $ops += [ordered]@{ k = 'A'; t = 'Actualizar el motor a la ultima version publicada' }
+    }
     $ops += [ordered]@{ k = 'T'; t = 'Imprimir un ticket de prueba' }
     $ops += [ordered]@{ k = 'D'; t = 'Ver el detalle completo de los chequeos' }
     $ops += [ordered]@{ k = 'J'; t = 'Guardar el JSON en un archivo' }
@@ -4208,6 +4234,45 @@ function Invoke-MenuAction {
         }
 
         'F' { $null = Install-FudoNative; return $true }
+
+        'A' {
+            # Actualizacion explicita, pedida por la persona que esta mirando la consola.
+            # A proposito NO es automatica: ver la nota en la cabecera del script.
+            $destino = ''
+            try { $destino = [string]$PSCommandPath } catch {}
+            if (-not $destino) { Write-Host '  No se pudo determinar la ruta del script.' -ForegroundColor Red; return $false }
+            $tmp = Join-Path $env:TEMP ('FudoPrintDoctor-nuevo-' + (Get-Date).ToString('HHmmss') + '.ps1')
+            try {
+                Write-Host ''
+                Write-Host '  Descargando la ultima version...' -ForegroundColor Cyan
+                try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+                Invoke-WebRequest -Uri ($script:RawBase + '/FudoPrintDoctor.ps1') -UseBasicParsing -TimeoutSec 90 -OutFile $tmp -ErrorAction Stop
+
+                # Validaciones antes de reemplazar nada
+                $contenido = Get-Content -Path $tmp -Raw -ErrorAction Stop
+                if ($contenido.Length -lt 50000 -or ($contenido -notmatch 'FudoPrintDoctor')) {
+                    throw 'lo que se descargo no parece el motor (archivo corto o sin la firma esperada)'
+                }
+                $verNueva = ''
+                $m = [regex]::Match($contenido, "SchemaVersion\s*=\s*'([\d.]+)'")
+                if ($m.Success) { $verNueva = $m.Groups[1].Value }
+                if (-not $verNueva) { throw 'no se pudo leer la version del archivo descargado' }
+
+                # Copia de seguridad del actual, por si hay que volver atras
+                $backup = "$destino.bak"
+                try { Copy-Item -Path $destino -Destination $backup -Force -ErrorAction Stop } catch {}
+
+                Move-Item -Path $tmp -Destination $destino -Force -ErrorAction Stop
+                Write-Host ("  Actualizado a la version " + $verNueva + '.') -ForegroundColor Green
+                Write-Host ("  Copia de la anterior: " + $backup) -ForegroundColor DarkGray
+                Write-Host '  Cerra esta ventana y volve a abrir el Print Doctor para usar la version nueva.' -ForegroundColor Yellow
+            } catch {
+                Write-Host ("  No se pudo actualizar: " + $_.Exception.Message) -ForegroundColor Red
+                Write-Host ('  Alternativa: bajar el ZIP de ' + $script:RepoUrl) -ForegroundColor DarkGray
+                try { if (Test-Path $tmp) { Remove-Item $tmp -Force -ErrorAction SilentlyContinue } } catch {}
+            }
+            return $false
+        }
 
         'T' {
             $nombre = ''
@@ -4564,13 +4629,18 @@ function Send-Telemetry {
                 confidence    = [string]$Result.diagnosis.confidence
                 needsEscalation = [bool]$Result.diagnosis.needsEscalation
                 autoFixesApplied = @($Result.diagnosis.autoFixesApplied)
-                telemetry     = $Result.telemetry
-                checks        = @($Result.checks | ForEach-Object { [ordered]@{ id = [string]$_.id; status = [string]$_.status; layer = $_.layer } })
-                impresoras    = @($(if ($script:Diagnostics.Contains('colas')) { $script:Diagnostics['colas'] | ForEach-Object { [ordered]@{ nombre = $_.nombre; puerto = $_.puerto; estado = $_.estado; trabajos = $_.trabajos } } } else { @() }))
-                cantidadColas = @($(if ($script:Diagnostics.Contains('colas')) { $script:Diagnostics['colas'] } else { @() })).Count
-                cantidadHardware = @($(if ($script:Diagnostics.Contains('printersConnected')) { $script:Diagnostics['printersConnected'] } else { @() })).Count
+                telemetry     = $(
+                    $t = [ordered]@{}
+                    try { foreach ($k in @($Result.telemetry.Keys)) { $t[$k] = $Result.telemetry[$k] } } catch {}
+                    $t['impresoras'] = @($(if ($script:Diagnostics.Contains('colas')) { $script:Diagnostics['colas'] | ForEach-Object { [ordered]@{ nombre = $_.nombre; puerto = $_.puerto; estado = $_.estado; trabajos = $_.trabajos } } } else { @() }))
+                    $t['cantidadColas'] = @($(if ($script:Diagnostics.Contains('colas')) { $script:Diagnostics['colas'] } else { @() })).Count
+                    $t['cantidadHardware'] = @($(if ($script:Diagnostics.Contains('printersConnected')) { $script:Diagnostics['printersConnected'] } else { @() })).Count
+                    $t['historialFudo'] = @($(if ($script:Diagnostics.Contains('historialImpresion')) { $script:Diagnostics['historialImpresion'].porImpresora } else { @() }))
+                    $t['entorno'] = $Result.entorno
+                    $t
+                )
                 entorno       = $Result.entorno
-                historialFudo = @($(if ($script:Diagnostics.Contains('historialImpresion')) { $script:Diagnostics['historialImpresion'].porImpresora } else { @() }))
+                checks        = @($Result.checks | ForEach-Object { [ordered]@{ id = [string]$_.id; status = [string]$_.status; layer = $_.layer } })
             }
         }
         $body = $payload | ConvertTo-Json -Depth 8 -Compress

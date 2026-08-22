@@ -17,8 +17,15 @@ Sin instalar nada, sin cuenta de GitHub:
 - **Mantenerlo al día**: guardá `Actualizar-FudoPrintDoctor.cmd` en una carpeta y hacé doble clic
   cuando quieras la versión nueva. Baja el motor y el launcher, y te dice qué versión quedó.
 
-El script avisa solo si está corriendo una versión vieja. `-CheckUpdate` compara contra la
-publicada y termina; `-NoUpdateCheck` desactiva el chequeo.
+El script **avisa** solo si está corriendo una versión vieja, y ofrece la opción `A` del menú para
+actualizarse en el momento. `-CheckUpdate` compara contra la publicada y termina; `-NoUpdateCheck`
+desactiva el chequeo.
+
+**Por qué no se actualiza solo**: corre en la PC de un cliente y no está firmado digitalmente. Una
+actualización automática propagaría cualquier bug —o cualquier cambio malicioso en el repo— a todos
+los locales sin que nadie lo revise. Avisar y dejar la decisión a una persona cuesta un clic y evita
+convertir el repo en un canal de ejecución remota. La opción `A` valida lo que descarga (tamaño,
+firma y versión legible) y guarda un `.bak` antes de reemplazar.
 
 Para trabajar en la PC de un cliente, copiale **dos archivos**: `FudoPrintDoctor.cmd` y
 `FudoPrintDoctor.ps1`. Si solo copiaste el `.cmd` y esa PC tiene internet, él baja el `.ps1` solo.
@@ -349,7 +356,7 @@ Contrato completo del JSON: [`docs/contrato-json.md`](docs/contrato-json.md).
 | `-JsonOut` | — | Volcar el JSON a un archivo |
 | `-Json` / `-Quiet` | off | Forzar JSON a stdout / silenciar el resumen |
 | `-Verbose` | off | Lista todos los chequeos en pantalla |
-| `-SelfTest` | off | Corre los 99 asserts de la lógica de decisión. No toca la PC. |
+| `-SelfTest` | off | Corre los 101 asserts de la lógica de decisión. No toca la PC. |
 
 ## Desarrollo
 
