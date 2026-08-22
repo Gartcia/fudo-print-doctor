@@ -33,7 +33,8 @@ var TOKEN = 'CAMBIAR-POR-UNA-CLAVE';
 var HOJA  = 'corridas';
 
 var COLUMNAS = [
-  'recibido', 'timestamp', 'caseId', 'clientId', 'host',
+  'recibido', 'timestamp', 'pcId', 'corridaNro', 'transicion', 'causaAnterior',
+  'caseId', 'clientId', 'host',
   'pais', 'zonaHoraria', 'so', 'soBuild', 'arquitectura', 'powershell',
   'chrome', 'edge', 'nativaVersion', 'conexionPC',
   'interfaz', 'cantidadColas', 'cantidadHardware', 'impresoras',
@@ -52,6 +53,7 @@ function doPost(e) {
     }
     var hoja = obtenerHoja_();
     hoja.appendRow(armarFila_(d));
+    try { actualizarResumen_(); } catch (e2) { /* el resumen no debe romper la recepcion */ }
     return json_({ ok: true });
   } catch (err) {
     return json_({ ok: false, error: String(err) });
@@ -125,8 +127,12 @@ function armarFila_(d) {
   var usanFudo = (tel.historialFudo || []).filter(function (h) { return h.deFudo > 0; })
     .map(function (h) { return h.impresora + ' (' + h.deFudo + ')'; }).join(' | ');
 
+  var cor = d.corrida || {};
+
   return [
-    new Date(), d.timestamp || '', d.caseId || '', d.clientId || '', d.host || '',
+    new Date(), d.timestamp || '',
+    d.pcId || '', cor.numero || 0, cor.transicion || '', cor.causaAnterior || '',
+    d.caseId || '', d.clientId || '', d.host || '',
     env.pais || '', env.zonaHoraria || '', so.nombre || '', so.build || '', so.arquitectura || '', env.powershell || '',
     env.chrome || '', env.edge || '', env.nativaVersion || '', env.tipoConexionPC || '',
     d.interface || '', tel.cantidadColas || 0, tel.cantidadHardware || 0, impresoras,
@@ -135,6 +141,91 @@ function armarFila_(d) {
     (d.autoFixesApplied || []).join(' | '), d.schemaVersion || '',
     JSON.stringify(d)
   ];
+}
+
+/**
+ * Hoja "resumen": se recalcula en cada corrida recibida. Es el dashboard.
+ */
+function actualizarResumen_() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var datos = obtenerHoja_();
+  var total = datos.getLastRow();
+  if (total < 2) { return; }
+
+  var filas = datos.getRange(2, 1, total - 1, COLUMNAS.length).getValues();
+  var idx = {};
+  for (var i = 0; i < COLUMNAS.length; i++) { idx[COLUMNAS[i]] = i; }
+
+  var pcs = {}, categorias = {}, chromes = {}, sos = {}, conexiones = {}, paises = {};
+  var resueltas = 0, transiciones = {}, queResolvio = {};
+
+  for (var f = 0; f < filas.length; f++) {
+    var r = filas[f];
+    var cat = r[idx['categoria']] || 'sin dato';
+    categorias[cat] = (categorias[cat] || 0) + 1;
+    chromes[r[idx['chrome']] || 'sin dato'] = (chromes[r[idx['chrome']] || 'sin dato'] || 0) + 1;
+    sos[r[idx['so']] || 'sin dato'] = (sos[r[idx['so']] || 'sin dato'] || 0) + 1;
+    conexiones[r[idx['conexionPC']] || 'sin dato'] = (conexiones[r[idx['conexionPC']] || 'sin dato'] || 0) + 1;
+    paises[r[idx['pais']] || 'sin dato'] = (paises[r[idx['pais']] || 'sin dato'] || 0) + 1;
+    if (r[idx['pcId']]) { pcs[r[idx['pcId']]] = true; }
+    if (r[idx['resuelto']] === true || r[idx['resuelto']] === 'TRUE') { resueltas++; }
+
+    var tr = r[idx['transicion']] || 'sin dato';
+    transiciones[tr] = (transiciones[tr] || 0) + 1;
+
+    // Que estaba fallando cuando algo paso a resuelto, y con que reparacion
+    if (tr === 'se_resolvio') {
+      var clave = (r[idx['causaAnterior']] || 'sin dato') + '  ==>  ' +
+                  (r[idx['reparaciones']] || 'sin reparacion automatica (accion manual)');
+      queResolvio[clave] = (queResolvio[clave] || 0) + 1;
+    }
+  }
+
+  var hoja = ss.getSheetByName('resumen');
+  if (!hoja) { hoja = ss.insertSheet('resumen'); }
+  hoja.clear();
+
+  var out = [];
+  out.push(['FUDO PRINT DOCTOR - resumen', '']);
+  out.push(['actualizado', new Date()]);
+  out.push(['corridas', filas.length]);
+  out.push(['PCs distintas', Object.keys(pcs).length]);
+  out.push(['corridas resueltas', resueltas]);
+  out.push(['% resueltas', filas.length ? Math.round(resueltas * 100 / filas.length) + '%' : '']);
+  out.push(['', '']);
+  out.push(bloque_('CAUSA (categoria)', categorias));
+  var secciones = [
+    ['TRANSICIONES', transiciones],
+    ['QUE RESOLVIO (causa anterior ==> reparacion)', queResolvio],
+    ['SISTEMA OPERATIVO', sos],
+    ['VERSION DE CHROME', chromes],
+    ['CONEXION DE LA PC', conexiones],
+    ['PAIS', paises]
+  ];
+  volcar_(hoja, out, categorias, secciones);
+}
+
+function bloque_(titulo, mapa) { return [titulo, 'cantidad']; }
+
+function volcar_(hoja, cabecera, categorias, secciones) {
+  var filas = cabecera.slice(0);
+  filas = filas.concat(ordenar_(categorias));
+  for (var s = 0; s < secciones.length; s++) {
+    filas.push(['', '']);
+    filas.push([secciones[s][0], 'cantidad']);
+    filas = filas.concat(ordenar_(secciones[s][1]));
+  }
+  hoja.getRange(1, 1, filas.length, 2).setValues(filas);
+  hoja.getRange('A1').setFontWeight('bold').setFontSize(12);
+  hoja.setColumnWidth(1, 520);
+  hoja.setColumnWidth(2, 90);
+}
+
+function ordenar_(mapa) {
+  var arr = [];
+  for (var k in mapa) { arr.push([k, mapa[k]]); }
+  arr.sort(function (a, b) { return b[1] - a[1]; });
+  return arr;
 }
 
 function json_(obj) {

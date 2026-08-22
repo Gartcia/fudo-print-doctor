@@ -164,6 +164,17 @@ CONTRATO DE SALIDA (v1.1)
     diagnosis.nextActions[] (que hacer / quien lo hace / articulo), engineErrors[], checks[], telemetry.
 
 CHANGELOG
+    3.0  - Telemetria analizable sin pedirle datos a nadie:
+             * pcId: hash SHA256 truncado del MachineGuid de Windows. Estable y anonimo: agrupa las
+               corridas de una misma PC sin identificar al comercio ni permitir volver al original.
+             * corrida: numero de corrida en esa PC, status y causa de la corrida ANTERIOR, y la
+               transicion (primera | se_resolvio | volvio_a_fallar | sigue_ok | sigue_fallando).
+               Con esto una sola fila cuenta que se hizo y si funciono, sin cruzar tablas.
+             * nativaHuella: sondeo de %LOCALAPPDATA%\Fudo que reporta SOLO nombres de archivo y
+               NOMBRES de clave de los json (ningun valor), para averiguar si la App Nativa guarda
+               algun identificador de comercio aprovechable. Si aparece algo util, se evalua aparte.
+           - El CaseId sigue existiendo pero pasa a ser opcional: para el analisis agregado no hace
+             falta, y el pcId cubre el seguimiento de un mismo equipo.
     2.9b - Opcion A del menu: actualizar el motor a la ultima version publicada. Aparece solo si
              hay una version nueva, valida lo descargado (tamano, firma y version legible) y deja
              una copia .bak antes de reemplazar. Sigue siendo explicita: el motor no se
@@ -402,7 +413,7 @@ $script:StartTime    = Get-Date
 $script:Diagnostics  = [ordered]@{}   # datos crudos recolectados
 $script:Errors       = New-Object System.Collections.ArrayList   # fallas internas del motor
 $script:TestPrintersCreated = New-Object System.Collections.ArrayList   # colas temporales creadas por el motor
-$script:SchemaVersion = '2.9'
+$script:SchemaVersion = '3.0'
 # Distribucion: repo publico. VERSION es un archivo de una linea con la version publicada.
 $script:RepoUrl    = 'https://github.com/Gartcia/fudo-print-doctor'
 $script:RawBase    = 'https://raw.githubusercontent.com/Gartcia/fudo-print-doctor/main'
@@ -1521,6 +1532,86 @@ function New-FudoTestPrinter {
         return $name
     }
     return ''
+}
+
+function Get-PcId {
+    <#
+      Identificador ESTABLE y ANONIMO de la PC, para poder agrupar las corridas de una misma
+      maquina y ver la secuencia "fallaba -> se hizo X -> quedo resuelto".
+      Es un hash (SHA256 truncado) del MachineGuid de Windows: no permite volver al dato original
+      ni identificar al comercio, solo saber que dos corridas vienen del mismo lugar.
+    #>
+    $base = ''
+    try { $base = [string](Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Cryptography' -Name 'MachineGuid' -ErrorAction Stop).MachineGuid } catch {}
+    if (-not $base) { try { $base = [string](Get-CimInstance Win32_ComputerSystemProduct -ErrorAction Stop).UUID } catch {} }
+    if (-not $base) { $base = "$env:COMPUTERNAME|$env:USERNAME" }
+    try {
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+        $bytes = $sha.ComputeHash([System.Text.Encoding]::UTF8.GetBytes('fudo-print-doctor|' + $base))
+        return ((([BitConverter]::ToString($bytes)) -replace '-', '').Substring(0, 16).ToLower())
+    } catch { return '' }
+}
+
+function Get-LocalRunHistory {
+    <# Que paso en las corridas anteriores de ESTA PC (guardado en HKCU, sin datos del cliente). #>
+    $r = [ordered]@{ corridas = 0; ultimoStatus = ''; ultimaCausa = ''; ultimaFecha = '' }
+    try {
+        $k = 'HKCU:\Software\Fudo\PrintDoctor'
+        if (Test-Path $k) {
+            $v = Get-ItemProperty -Path $k -ErrorAction Stop
+            try { $r.corridas    = [int]$v.Corridas } catch {}
+            try { $r.ultimoStatus = [string]$v.UltimoStatus } catch {}
+            try { $r.ultimaCausa  = [string]$v.UltimaCausa } catch {}
+            try { $r.ultimaFecha  = [string]$v.UltimaFecha } catch {}
+        }
+    } catch {}
+    return $r
+}
+
+function Save-LocalRunHistory {
+    <# Deja el resultado de esta corrida para que la proxima pueda contar la transicion. #>
+    param([string]$Status, [string]$Causa, [int]$Corridas)
+    try {
+        $k = 'HKCU:\Software\Fudo\PrintDoctor'
+        if (-not (Test-Path $k)) { New-Item -Path $k -Force -ErrorAction Stop | Out-Null }
+        New-ItemProperty -Path $k -Name 'Corridas'     -Value $Corridas -PropertyType DWord  -Force -ErrorAction SilentlyContinue | Out-Null
+        New-ItemProperty -Path $k -Name 'UltimoStatus' -Value $Status   -PropertyType String -Force -ErrorAction SilentlyContinue | Out-Null
+        New-ItemProperty -Path $k -Name 'UltimaCausa'  -Value $Causa    -PropertyType String -Force -ErrorAction SilentlyContinue | Out-Null
+        New-ItemProperty -Path $k -Name 'UltimaFecha'  -Value ((Get-Date).ToString('o')) -PropertyType String -Force -ErrorAction SilentlyContinue | Out-Null
+    } catch {}
+}
+
+function Get-FudoNativeFingerprint {
+    <#
+      Sondeo para averiguar SI la App Nativa guarda algun identificador de comercio que se pueda
+      usar como identificador (y asi no tener que pedirle nada al asesor).
+      A proposito manda solo NOMBRES de archivo y NOMBRES de clave: ningun valor, para no
+      transportar tokens ni credenciales. Con esto decidimos si hay algo aprovechable.
+    #>
+    $out = [ordered]@{ carpeta = ''; archivos = @(); clavesJson = @() }
+    $carpetas = @()
+    try { if ($env:LOCALAPPDATA) { $carpetas += (Join-Path $env:LOCALAPPDATA 'Fudo') } } catch {}
+    try { if ($env:APPDATA) { $carpetas += (Join-Path $env:APPDATA 'Fudo') } } catch {}
+    foreach ($c in @($carpetas | Where-Object { $_ })) {
+        try { if (-not (Test-Path $c)) { continue } } catch { continue }
+        $out.carpeta = $c
+        try {
+            $archivos = @(Get-ChildItem -Path $c -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 40)
+            $out.archivos = @($archivos | ForEach-Object { [ordered]@{ nombre = $_.Name; kb = [int]($_.Length / 1KB) } })
+            foreach ($f in @($archivos | Where-Object { $_.Extension -match '(?i)^\.(json|cfg|ini|conf)$' -and $_.Length -lt 200KB })) {
+                try {
+                    $txt = Get-Content -Path $f.FullName -Raw -ErrorAction Stop
+                    foreach ($m in @([regex]::Matches($txt, '"([A-Za-z0-9_\-]{2,40})"\s*:'))) {
+                        $clave = $m.Groups[1].Value
+                        if (@($out.clavesJson) -notcontains $clave) { $out.clavesJson += $clave }
+                    }
+                } catch {}
+            }
+            $out.clavesJson = @(@($out.clavesJson) | Select-Object -First 40)
+        } catch {}
+        break
+    }
+    return $out
 }
 
 function Get-EnvironmentInfo {
@@ -3449,7 +3540,30 @@ function Invoke-FudoPrintDoctor {
         dryRun        = [bool]$DryRun
         autoFix       = [bool]$AutoFix
         printer       = $(if ($script:Diagnostics.Contains('printer')) { $script:Diagnostics['printer'] } else { $null })
+        pcId          = $(Invoke-Step -Name 'env.pcid' -Body { Get-PcId })
+        corrida       = $(
+            $h = Invoke-Step -Name 'env.history' -Body { Get-LocalRunHistory }
+            if (-not $h) { $h = [ordered]@{ corridas = 0; ultimoStatus = ''; ultimaCausa = ''; ultimaFecha = '' } }
+            $nro = ([int]$h.corridas + 1)
+            $st = $(if ($diag.resolved -and -not $diag.needsEscalation) { 'resolved' } elseif (@($script:Errors).Count -gt 0) { 'partial_engine_error' } else { 'needs_escalation' })
+            $trans = 'primera'
+            if ([int]$h.corridas -gt 0) {
+                if ($st -eq 'resolved' -and [string]$h.ultimoStatus -ne 'resolved') { $trans = 'se_resolvio' }
+                elseif ($st -ne 'resolved' -and [string]$h.ultimoStatus -eq 'resolved') { $trans = 'volvio_a_fallar' }
+                elseif ($st -eq 'resolved') { $trans = 'sigue_ok' }
+                else { $trans = 'sigue_fallando' }
+            }
+            $null = Invoke-Step -Name 'env.saveHistory' -Body { Save-LocalRunHistory -Status $st -Causa ([string]$diag.rootCause) -Corridas $nro }
+            [ordered]@{
+                numero = $nro
+                statusAnterior = [string]$h.ultimoStatus
+                causaAnterior  = [string]$h.ultimaCausa
+                fechaAnterior  = [string]$h.ultimaFecha
+                transicion     = $trans
+            }
+        )
         entorno       = $(Invoke-Step -Name 'env.info' -Body { Get-EnvironmentInfo })
+        nativaHuella  = $(Invoke-Step -Name 'env.nativeFingerprint' -Body { Get-FudoNativeFingerprint })
         hardware      = [ordered]@{
             devicesConnected = $(if ($script:Diagnostics.Contains('hwDevices')) { @($script:Diagnostics['hwDevices']) } else { @() })
             problemDevices   = $(if ($script:Diagnostics.Contains('hwProblemDevs')) { @($script:Diagnostics['hwProblemDevs']) } else { @() })
@@ -4618,6 +4732,9 @@ function Send-Telemetry {
                 schemaVersion = [string]$Result.schemaVersion
                 status        = [string]$Result.status
                 caseId        = [string]$Result.caseId
+                pcId          = [string]$Result.pcId
+                corrida       = $Result.corrida
+                nativaHuella  = $Result.nativaHuella
                 clientId      = [string]$Result.clientId
                 host          = [string]$Result.host
                 timestamp     = [string]$Result.timestamp

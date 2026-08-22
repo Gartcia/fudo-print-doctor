@@ -107,7 +107,61 @@ GET <URL>/exec?key=TOKEN&formato=csv
 
 La columna `json` no se devuelve por la API (solo queda en la planilla).
 
-## 5. Qué mirar cuando haya datos
+## 5. Identificadores: qué hace falta y qué no
+
+El `caseId` es opcional a propósito. Para lo que se quiere responder con esta telemetría, casi no
+sirve:
+
+| Pregunta | ¿Necesita identificar al cliente? |
+|---|---|
+| ¿En qué estado llegan los clientes a Fudo? | No — es agregado sobre atributos |
+| ¿Qué tienen en común los que tienen problemas? | No — es agregado |
+| ¿Qué solución resolvió el problema? | Sí, pero hace falta unir corridas de la **misma PC**, no del mismo caso |
+
+Para lo tercero se usa **`pcId`**: un hash SHA-256 truncado del `MachineGuid` de Windows. Es estable
+(la misma PC siempre da el mismo valor), anónimo (no se puede volver al dato original ni saber de
+qué comercio es) y **no requiere que nadie escriba nada**.
+
+Y para no tener que cruzar filas a mano, cada corrida trae el contexto de la anterior **de esa misma
+PC**:
+
+```jsonc
+"corrida": {
+  "numero": 3,
+  "statusAnterior": "needs_escalation",
+  "causaAnterior": "La impresora 'CAJA' esta desconectada (puerto USB003 sin dispositivo)",
+  "transicion": "se_resolvio"
+}
+```
+
+`transicion` vale `primera`, `se_resolvio`, `volvio_a_fallar`, `sigue_ok` o `sigue_fallando`. Con eso,
+**una sola fila ya cuenta la historia**: qué estaba fallando, qué reparación se aplicó y si funcionó.
+Eso es exactamente el objetivo "identificar qué solución resuelve el problema", sin joins.
+
+El estado se guarda en `HKCU\Software\Fudo\PrintDoctor` (contador, último status, última causa).
+
+### ¿Y para identificar al comercio?
+
+Desde la PC no hay forma confiable hoy. Por eso cada corrida manda `nativaHuella`: un sondeo de
+`%LOCALAPPDATA%\Fudo` que reporta **solo nombres de archivo y nombres de clave** de los `.json`
+—ningún valor, para no transportar tokens— y así averiguar si la App Nativa guarda algo usable (un
+subdominio, un id de cuenta). Con dos o tres casos reales se decide si hay algo aprovechable.
+
+## 6. El dashboard
+
+La hoja **`resumen`** se recalcula sola con cada corrida que llega (la genera el Apps Script). Trae:
+
+- corridas totales, **PCs distintas**, resueltas y % de resolución;
+- ranking de **causas** (`categoria`);
+- **transiciones** (cuántas pasaron a resuelto, cuántas volvieron a fallar);
+- **qué resolvió**: `causa anterior ==> reparación aplicada`, ordenado por frecuencia;
+- distribución por sistema operativo, versión de Chrome, conexión (cable/wifi) y país.
+
+Es el dashboard con cero infraestructura: vive en la misma planilla y se actualiza al recibir datos.
+Si más adelante se quiere algo más lindo, esa hoja ya tiene todo lo necesario para alimentar un
+Looker Studio.
+
+## 7. Qué mirar cuando haya datos
 
 - **`categoria`**: cuál es la causa más frecuente. Define dónde conviene invertir.
 - **`chrome` y `nativaVersion`**: si los casos se concentran en una versión vieja.
