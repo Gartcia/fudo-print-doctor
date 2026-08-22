@@ -53,6 +53,30 @@
 .PARAMETER ReconnectTimeoutSec
     Cuanto esperar la reconexion del USB. Default: 120 segundos.
 
+.PARAMETER NativeInstallerUrl
+    URL del instalador de la App Nativa de Fudo. Si se indica (o si se fija
+    $script:NativeInstallerUrl en el script), el motor puede descargarla e instalarla cuando falta,
+    agregando antes las exclusiones de antivirus. Sin URL solo guia los pasos manuales.
+
+.PARAMETER InstallNetworkPrinter
+    Instalar la impresora de red indicada con -PrinterIp como cola de Windows con driver de texto
+    generico. El nombre se toma de -NewPrinterName (default: FUDO-<ip>).
+
+.PARAMETER NewPrinterName
+    Nombre para la cola que se cree (red o USB).
+
+.PARAMETER NoMenu
+    No mostrar el menu de acciones al terminar. El menu solo aparece en consola interactiva.
+
+.PARAMETER TelemetryUrl
+    Si se indica (o si se fija $script:TelemetryUrl en el script), al terminar se envia por POST
+    un resumen del resultado a esa URL. Silencioso: si falla, no molesta ni corta el run.
+    Por defecto viaja un payload REDUCIDO (sin rutas, sin log): version, caso, cliente, host,
+    causa raiz, categoria, confianza, duracion y el id+estado de cada chequeo.
+
+.PARAMETER TelemetryFull
+    Enviar el JSON completo en lugar del payload reducido.
+
 .PARAMETER NoUpdateCheck
     No consulta si hay una version mas nueva publicada. El chequeo ya se saltea solo en modo
     agente (-Quiet / -Json / salida redirigida) y nunca bloquea el diagnostico.
@@ -120,6 +144,20 @@ CONTRATO DE SALIDA (v1.1)
     diagnosis.nextActions[] (que hacer / quien lo hace / articulo), engineErrors[], checks[], telemetry.
 
 CHANGELOG
+    2.0  - El JSON ya no se imprime en pantalla salvo que se pida con -Json: la deteccion de
+             redireccion no es confiable en Windows PowerShell dentro de un .cmd y el asesor
+             terminaba viendo el JSON entero. El resumen humano quedo al final de la salida.
+           - Menu de acciones al terminar (solo consola interactiva): volver a revisar, esperar la
+             reconexion del USB, instalar la impresora conectada, limpiar la cola, buscar impresoras
+             por IP, instalar una de red, instalar la Nativa, imprimir un ticket, ver el detalle o
+             guardar el JSON. Ya no hay que cerrar y reabrir la app para reintentar. -NoMenu lo saltea.
+           - Ethernet: barrido de la subred con identificacion real (DLE EOT: una termica responde),
+             reporte de cuantas y cuales, deteccion de las que ya tienen cola en Windows, e
+             instalacion por IP con driver de texto generico (-InstallNetworkPrinter / menu).
+           - Telemetria opcional: -TelemetryUrl (o $script:TelemetryUrl) envia por POST un resumen
+             del resultado para no depender de que el asesor guarde el JSON. -TelemetryFull manda todo.
+           - App Nativa: -NativeInstallerUrl permite descargarla e instalarla agregando primero las
+             exclusiones de antivirus. Sin URL, guia los pasos manuales.
     1.9  - Multi-impresora: se revisan TODAS las colas reales de Windows (puerto, offline, pausada,
              trabajos en cola, si el puerto tiene hardware) y se diagnostica la que esta fallando,
              no la primera que aparece. Antes, en un local con caja y cocina podia elegir la que
@@ -241,6 +279,12 @@ param(
     [switch]$Json,
     [bool]$WaitReconnect,
     [int]$ReconnectTimeoutSec = 120,
+    [string]$NativeInstallerUrl = '',
+    [switch]$InstallNetworkPrinter,
+    [string]$NewPrinterName = '',
+    [switch]$NoMenu,
+    [string]$TelemetryUrl = '',
+    [switch]$TelemetryFull,
     [switch]$NoUpdateCheck,
     [switch]$CheckUpdate,
     [switch]$SelfTest
@@ -266,7 +310,7 @@ $script:StartTime    = Get-Date
 $script:Diagnostics  = [ordered]@{}   # datos crudos recolectados
 $script:Errors       = New-Object System.Collections.ArrayList   # fallas internas del motor
 $script:TestPrintersCreated = New-Object System.Collections.ArrayList   # colas temporales creadas por el motor
-$script:SchemaVersion = '1.9'
+$script:SchemaVersion = '2.0'
 # Distribucion: repo publico. VERSION es un archivo de una linea con la version publicada.
 $script:RepoUrl    = 'https://github.com/Gartcia/fudo-print-doctor'
 $script:RawBase    = 'https://raw.githubusercontent.com/Gartcia/fudo-print-doctor/main'
@@ -274,6 +318,13 @@ $script:UpdateNote = ''   # mensaje de "hay version nueva", si corresponde
 $script:JsonBegin    = '<<<FUDO_JSON_BEGIN>>>'
 $script:JsonEnd      = '<<<FUDO_JSON_END>>>'
 $script:AutoJsonPath = ''
+# Telemetria: dejar la URL aca para que todos los asesores la manden al mismo lugar
+# sin tener que pasar parametros. Vacio = no se envia nada.
+$script:TelemetryUrl = ''
+# URL del instalador de la App Nativa (completar cuando este definida).
+$script:NativeInstallerUrl = ''
+$script:ForceWaitReconnect = $false
+$script:LastResult = $null
 # Progreso en vivo: titulo humano de cada etapa. Las etapas sin titulo no se muestran.
 $script:StepPlan = [ordered]@{
     'layer0.environment'        = 'Entorno de Windows'
@@ -1812,7 +1863,8 @@ function Invoke-ReconnectFlow {
     if (-not $AutoFix -or $DryRun) { return @{ recovered = $false; note = 'sin auto-fix / dry-run'; port = '' } }
 
     $quiere = $false
-    if ($script:BoundParams -and $script:BoundParams.ContainsKey('WaitReconnect')) { $quiere = [bool]$WaitReconnect }
+    if ($script:ForceWaitReconnect) { $quiere = $true }
+    elseif ($script:BoundParams -and $script:BoundParams.ContainsKey('WaitReconnect')) { $quiere = [bool]$WaitReconnect }
     elseif (Test-IsInteractiveConsole) {
         [Console]::Error.WriteLine('')
         [Console]::Error.WriteLine('  ------------------------------------------------------------')
@@ -2188,6 +2240,136 @@ function Test-Layer3-UsbPort {
         -Recommendation 'Caso clasico: la impresora se reconecto a otro puerto USB y la cola apunta al viejo.'
 }
 
+function Get-LocalSubnetPrefixes {
+    <# Prefijos /24 de las placas de red locales, para saber donde buscar. #>
+    $out = @()
+    try {
+        foreach ($ip in @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop | Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' })) {
+            $p = (([string]$ip.IPAddress) -split '\.')[0..2] -join '.'
+            if ($p -and ($out -notcontains $p)) { $out += $p }
+        }
+    } catch {
+        try {
+            foreach ($c in @(Get-CimInstance Win32_NetworkAdapterConfiguration -ErrorAction Stop | Where-Object { $_.IPEnabled })) {
+                foreach ($a in @($c.IPAddress)) {
+                    if ($a -match '^\d{1,3}(\.\d{1,3}){3}$' -and $a -notmatch '^(127\.|169\.254\.)') {
+                        $p = ($a -split '\.')[0..2] -join '.'
+                        if ($out -notcontains $p) { $out += $p }
+                    }
+                }
+            }
+        } catch {}
+    }
+    return @($out)
+}
+
+function Test-IsEscPosDevice {
+    <#
+      Confirma que lo que escucha en ese puerto sea una impresora ESC/POS y no otra cosa.
+      Se manda DLE EOT 1 (pedido de estado en tiempo real): una termica responde 1 byte.
+    #>
+    param([string]$Ip, [int]$TcpPort, [int]$TimeoutMs = 1200)
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $iar = $client.BeginConnect($Ip, $TcpPort, $null, $null)
+        if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs)) { return $false }
+        $client.EndConnect($iar)
+        $stream = $client.GetStream()
+        $stream.WriteTimeout = $TimeoutMs
+        $stream.ReadTimeout  = $TimeoutMs
+        $stream.Write([byte[]]@(0x10, 0x04, 0x01), 0, 3)
+        $stream.Flush()
+        Start-Sleep -Milliseconds 250
+        $buf = New-Object byte[] 4
+        try { return (($stream.Read($buf, 0, 4)) -gt 0) } catch { return $false }
+    } catch { return $false }
+    finally { try { $client.Close() } catch {} }
+}
+
+function Find-NetworkPrinters {
+    <#
+      Barre la subred buscando el puerto de impresion (9100 por defecto) y, en cada hallazgo,
+      chequea si responde como ESC/POS. Devuelve la lista de candidatas.
+    #>
+    param([string]$Prefix, [int]$TcpPort = 9100, [int]$WaitMs = 900)
+    $found = @()
+    if (-not $Prefix) { return @() }
+    Write-StepDetail ("buscando impresoras en " + $Prefix + ".1-254 (puerto " + $TcpPort + ")")
+    $pend = @()
+    try {
+        foreach ($h in 1..254) {
+            $cand = "$Prefix.$h"
+            $cli = New-Object System.Net.Sockets.TcpClient
+            $ar  = $cli.BeginConnect($cand, $TcpPort, $null, $null)
+            $pend += [pscustomobject]@{ ip = $cand; client = $cli; ar = $ar }
+        }
+        Start-Sleep -Milliseconds $WaitMs
+        foreach ($j in $pend) {
+            try {
+                if ($j.ar.AsyncWaitHandle.WaitOne(0)) {
+                    $j.client.EndConnect($j.ar)
+                    $found += [string]$j.ip
+                }
+            } catch {}
+            finally { try { $j.client.Close() } catch {} }
+        }
+    } catch {}
+
+    $res = @()
+    foreach ($ip in @($found)) {
+        Write-StepDetail ("verificando si " + $ip + " es una impresora")
+        $esc = Test-IsEscPosDevice -Ip $ip -TcpPort $TcpPort
+        $res += [ordered]@{ ip = $ip; puerto = $TcpPort; respondeEscPos = [bool]$esc
+                            tipo = $(if ($esc) { 'impresora termica (responde ESC/POS)' } else { 'dispositivo con el puerto abierto (no confirmado como impresora)' }) }
+    }
+    return @($res)
+}
+
+function Get-InstalledNetworkPrinters {
+    <# Colas de Windows que apuntan a una IP: para no instalar dos veces la misma impresora. #>
+    $out = @()
+    $ports = @()
+    try { $ports = @(Get-PrinterPort -ErrorAction Stop | Where-Object { $_.PrinterHostAddress }) } catch {}
+    $printers = @()
+    try { $printers = @(Get-Printer -ErrorAction SilentlyContinue) } catch {}
+    foreach ($pt in $ports) {
+        $colas = @($printers | Where-Object { [string]$_.PortName -eq [string]$pt.Name } | ForEach-Object { [string]$_.Name })
+        $out += [ordered]@{
+            ip = [string]$pt.PrinterHostAddress
+            puertoTcp = $(try { [int]$pt.PortNumber } catch { 0 })
+            puertoWindows = [string]$pt.Name
+            colas = @($colas)
+        }
+    }
+    return @($out)
+}
+
+function New-NetworkPrinter {
+    <#
+      Instala una impresora de red con el driver de texto generico apuntando a IP:puerto.
+      Devuelve el nombre creado o ''.
+    #>
+    param([string]$Ip, [int]$TcpPort = 9100, [string]$Name = '')
+    if (-not $Name) { $Name = ('FUDO-' + ($Ip -replace '\.', '-')) }
+    $drv = Get-GenericTextDriverName
+    if (-not $drv) { $drv = Install-GenericTextDriver }
+    if (-not $drv) { throw 'no se pudo instalar el driver de texto generico' }
+
+    $portName = "IP_$Ip"
+    $existePuerto = $false
+    try { $existePuerto = [bool](Get-PrinterPort -Name $portName -ErrorAction SilentlyContinue) } catch {}
+    if (-not $existePuerto) {
+        try { Add-PrinterPort -Name $portName -PrinterHostAddress $Ip -PortNumber $TcpPort -ErrorAction Stop }
+        catch { throw "no se pudo crear el puerto TCP/IP ${portName}: $($_.Exception.Message)" }
+    }
+    $existe = $false
+    try { $existe = [bool](Get-Printer -Name $Name -ErrorAction SilentlyContinue) } catch {}
+    if (-not $existe) {
+        Add-Printer -Name $Name -DriverName $drv -PortName $portName -ErrorAction Stop
+    }
+    return $Name
+}
+
 function Test-Layer3-Network {
     param($Printer)
     $ip = $PrinterIp
@@ -2196,9 +2378,33 @@ function Test-Layer3-Network {
         if ($pn -match '(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})') { $ip = $Matches[1] }
     }
     if (-not $ip) {
-        Add-Check -Id 'conn.net' -Layer 3 -Name 'Conectividad de red a la impresora' -Status 'skipped' `
-            -Evidence @{ note = 'sin IP conocida (pasar -PrinterIp o interfaz Ethernet en Fudo)' } `
-            -ArticleRef 'https://soporte.fu.do/es/articles/11730816'
+        # Sin IP conocida: barremos la red para ver si hay alguna impresora esperando.
+        $prefijos = @(Get-LocalSubnetPrefixes)
+        $enc = @()
+        foreach ($pref in @($prefijos | Select-Object -First 2)) { $enc += @(Find-NetworkPrinters -Prefix $pref -TcpPort $Port) }
+        $script:Diagnostics['impresorasEnRed'] = @($enc)
+        $yaInstaladas = @(Get-InstalledNetworkPrinters)
+        $script:Diagnostics['impresorasRedInstaladas'] = @($yaInstaladas)
+
+        if (@($enc).Count -eq 0) {
+            Add-Check -Id 'conn.net' -Layer 3 -Name ('No se encontraron impresoras por IP en la red' + $(if (@($prefijos).Count -gt 0) { ' (' + (@($prefijos | ForEach-Object { $_ + '.0/24' }) -join ', ') + ')' } else { '' })) `
+                -Status 'fail' -RootCauseCandidate $true -Plane 'fudo_config' `
+                -Evidence @{ subredes = $prefijos; puerto = $Port; encontradas = 0; yaInstaladas = $yaInstaladas } `
+                -ArticleRef 'https://soporte.fu.do/es/articles/11730816' `
+                -Recommendation ("Ningun equipo de la red responde en el puerto $Port. Si la comandera es Ethernet: revisar que este encendida y con el cable de red puesto (luces del puerto verde/naranja), " +
+                                 'y hacer el self-test de la impresora (apagar, mantener FEED, encender) para leer su IP. Si la IP que imprime el self-test es de otra subred, hay que corregirla o poner la PC en la misma red.')
+            return
+        }
+
+        $lista = @($enc | ForEach-Object { $_.ip + ' (' + $_.tipo + ')' })
+        Add-Check -Id 'conn.net' -Layer 3 -Name ("Se encontraron $(@($enc).Count) impresora(s) por IP en la red") -Status 'warn' -Plane 'fudo_config' `
+            -Evidence @{ encontradas = $enc; yaInstaladas = $yaInstaladas; puerto = $Port } `
+            -ArticleRef 'https://soporte.fu.do/es/articles/11730816' `
+            -Recommendation ('Detectadas en: ' + ($lista -join ' | ') + '. ' +
+                             $(if (@($yaInstaladas).Count -gt 0) {
+                                    'Ya hay colas de Windows apuntando a: ' + (@($yaInstaladas | ForEach-Object { $_.ip + $(if (@($_.colas).Count -gt 0) { ' -> ' + (@($_.colas) -join ', ') } else { ' (puerto sin cola)' }) }) -join ' | ') + '. '
+                                } else { 'Ninguna esta instalada todavia en Windows. ' }) +
+                             'Para instalar una: correr el script en la consola y elegir la opcion de instalar impresora de red, o pasar -PrinterIp <ip> -InstallNetworkPrinter.')
         return
     }
     $script:Diagnostics['printerIp'] = $ip
@@ -2223,8 +2429,16 @@ function Test-Layer3-Network {
     }
 
     if ($portOk) {
+        $esc = Test-IsEscPosDevice -Ip $ip -TcpPort $Port
+        $yaInstaladas = @(Get-InstalledNetworkPrinters | Where-Object { [string]$_.ip -eq [string]$ip })
+        $script:Diagnostics['impresorasRedInstaladas'] = @(Get-InstalledNetworkPrinters)
         Add-Check -Id 'conn.net' -Layer 3 -Name "Conectividad a impresora de red ${ip}:${Port}" -Status 'ok' `
-            -Evidence @{ ip = $ip; ping = $pingOk; port9100 = $true }
+            -Evidence @{ ip = $ip; ping = $pingOk; port9100 = $true; respondeEscPos = $esc; colasQueLaUsan = @($yaInstaladas | ForEach-Object { @($_.colas) } | Where-Object { $_ }) } `
+            -Recommendation $(if (@($yaInstaladas).Count -eq 0) {
+                    "La impresora responde en ${ip}:${Port} pero NO hay ninguna cola de Windows apuntando ahi. Instalarla con la opcion de impresora de red del menu, o con -PrinterIp $ip -InstallNetworkPrinter."
+                } elseif (-not $esc) {
+                    "Hay algo escuchando en ${ip}:${Port} pero no respondio como impresora ESC/POS: confirmar que la IP sea la de la comandera y no de otro equipo."
+                } else { '' })
         return
     }
 
@@ -3282,6 +3496,83 @@ function Invoke-SelfTest {
     Assert-Eq 'S25 dedup por puerto vivo' 1 (@($off).Count)
     Assert-Eq 'S25 la que queda es la del puerto muerto' 'CAJA-HW' ([string]@($off)[0].nombre)
 
+    # Escenario 26: el menu ofrece lo que corresponde segun lo encontrado
+    Reset-State
+    $base = @(Get-MenuOptions | ForEach-Object { [string]$_.k })
+    Assert-Eq 'S26 siempre ofrece revisar' $true ($base -contains 'R')
+    Assert-Eq 'S26 siempre ofrece buscar en red' $true ($base -contains 'N')
+    Assert-Eq 'S26 siempre ofrece salir' $true ($base -contains 'S')
+    Assert-Eq 'S26 sin desconexion no ofrece esperar USB' $false ($base -contains 'U')
+    Assert-Eq 'S26 sin cola no ofrece limpiar' $false ($base -contains 'L')
+    Add-Check -Id 'printer.disconnected' -Layer 1 -Name 'desconectada' -Status 'fail' -Plane 'hardware'
+    $script:Diagnostics['colas'] = @([ordered]@{ nombre='CAJA'; puerto='USB003'; trabajos=1440; estado='no imprime' })
+    $script:Diagnostics['impresorasEnRed'] = @([ordered]@{ ip='192.168.0.50'; puerto=9100; respondeEscPos=$true; tipo='impresora termica' })
+    $conEstado = @(Get-MenuOptions | ForEach-Object { [string]$_.k })
+    Assert-Eq 'S26 ofrece esperar el USB' $true ($conEstado -contains 'U')
+    Assert-Eq 'S26 ofrece limpiar la cola' $true ($conEstado -contains 'L')
+    Assert-Eq 'S26 ofrece instalar la de red' $true ($conEstado -contains 'P')
+
+    # Escenario 27: Reset-RunState limpia el run pero conserva las colas ya creadas
+    Reset-State
+    [void]$script:TestPrintersCreated.Add('FUDO-TEST-USB001')
+    Add-Check -Id 'x' -Layer 0 -Name 'x' -Status 'ok'
+    $script:Diagnostics['algo'] = 'valor'
+    Reset-RunState
+    Assert-Eq 'S27 limpia los checks' 0 (@($script:Checks).Count)
+    Assert-Eq 'S27 limpia diagnostics' $false ($script:Diagnostics.Contains('algo'))
+    Assert-Eq 'S27 conserva las colas creadas' $true (@($script:TestPrintersCreated) -contains 'FUDO-TEST-USB001')
+    $script:TestPrintersCreated = New-Object System.Collections.ArrayList
+
+    # Escenario 28: identificacion ESC/POS contra sockets de verdad.
+    # El servidor de prueba va en C#: un scriptblock casteado a Action no corre en su runspace.
+    Reset-State
+    if (-not ('FudoFakePrinter' -as [type])) {
+        Add-Type -Language CSharp -TypeDefinition @'
+using System.Net;
+using System.Net.Sockets;
+using System.Threading;
+public class FudoFakePrinter {
+    // Levanta un listener que imita una termica: contesta 1 byte de estado a DLE EOT.
+    public static int Start(bool responde) {
+        TcpListener l = new TcpListener(IPAddress.Loopback, 0);
+        l.Start();
+        int port = ((IPEndPoint)l.LocalEndpoint).Port;
+        Thread t = new Thread(delegate() {
+            try {
+                TcpClient c = l.AcceptTcpClient();
+                NetworkStream s = c.GetStream();
+                byte[] b = new byte[8];
+                s.Read(b, 0, 8);
+                if (responde) { s.Write(new byte[] { 0x16 }, 0, 1); s.Flush(); }
+                Thread.Sleep(600);
+                c.Close();
+            } catch { }
+            try { l.Stop(); } catch { }
+        });
+        t.IsBackground = true;
+        t.Start();
+        return port;
+    }
+}
+'@
+    }
+    $puertoEsc = [FudoFakePrinter]::Start($true)
+    Assert-Eq 'S28 detecta el que responde como ESC/POS' $true (Test-IsEscPosDevice -Ip '127.0.0.1' -TcpPort $puertoEsc)
+    $puertoMudo = [FudoFakePrinter]::Start($false)
+    Assert-Eq 'S28 el que no contesta no es impresora' $false (Test-IsEscPosDevice -Ip '127.0.0.1' -TcpPort $puertoMudo -TimeoutMs 900)
+
+    # Escenario 29: colas de red ya instaladas (para no instalar dos veces)
+    Reset-State
+    function Get-PrinterPort { @(
+        [pscustomobject]@{ Name='IP_192.168.0.50'; PrinterHostAddress='192.168.0.50'; PortNumber=9100 },
+        [pscustomobject]@{ Name='USB001'; Description='USB' }
+    ) }
+    function Get-Printer { @([pscustomobject]@{ Name='COMANDERA'; DriverName='Generic / Text Only'; PortName='IP_192.168.0.50' }) }
+    $red = @(Get-InstalledNetworkPrinters)
+    Assert-Eq 'S29 detecta 1 puerto de red' 1 (@($red).Count)
+    Assert-Eq 'S29 con su IP' '192.168.0.50' ([string]@($red)[0].ip)
+    Assert-Eq 'S29 y la cola que la usa' 'COMANDERA' ((@($red)[0].colas) -join ',')
+
     Write-Host ""
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)
     # Salida explicita en los dos casos: si el script termina con 'return', $LASTEXITCODE
@@ -3291,13 +3582,349 @@ function Invoke-SelfTest {
 }
 
 # ---------------------------------------------------------------------------
+# MENU DE ACCIONES (solo consola interactiva)
+# Permite volver a revisar o aplicar una accion sin cerrar y reabrir la app.
+# ---------------------------------------------------------------------------
+function Reset-RunState {
+    <# Deja todo listo para una corrida nueva dentro de la misma sesion. #>
+    $script:Checks      = New-Object System.Collections.ArrayList
+    $script:Actions     = New-Object System.Collections.ArrayList
+    $script:Errors      = New-Object System.Collections.ArrayList
+    $script:Log         = New-Object System.Collections.ArrayList
+    $script:Diagnostics = [ordered]@{}
+    $script:StartTime   = Get-Date
+    $script:StepIndex   = 0
+    $script:StepLabel   = ''
+    $script:StepNote    = ''
+    $script:PresentIds  = $null
+    $script:PresentIdsOk = $false
+    $script:ReconnectedPort = ''
+    $script:UpdateNote  = ''
+    # $script:TestPrintersCreated NO se limpia: son colas reales ya creadas en la PC.
+}
+
+function Get-MenuOptions {
+    <# Opciones disponibles segun lo que se encontro. Las letras son estables. #>
+    $ops = @()
+    $ops += [ordered]@{ k = 'R'; t = 'Volver a revisar todo' }
+
+    $hayDesconectada = @($script:Checks | Where-Object { $_.id -in @('printer.disconnected','hw.disconnected') -and $_.status -eq 'fail' }).Count -gt 0
+    if ($hayDesconectada) { $ops += [ordered]@{ k = 'U'; t = 'Esperar a que conectes/desconectes el USB y revisar de nuevo' } }
+
+    $huerfanos = @()
+    if ($script:Diagnostics.Contains('orphanLivePorts')) { $huerfanos = @($script:Diagnostics['orphanLivePorts'] | Where-Object { $_ }) }
+    if (@($huerfanos).Count -gt 0) { $ops += [ordered]@{ k = 'I'; t = ("Instalar la impresora conectada en " + (@($huerfanos) -join ', ') + ' (driver de texto generico)') } }
+
+    $conCola = @()
+    if ($script:Diagnostics.Contains('colas')) { $conCola = @($script:Diagnostics['colas'] | Where-Object { [int]$_.trabajos -gt 0 }) }
+    if (@($conCola).Count -gt 0) {
+        $c0 = @($conCola)[0]
+        $ops += [ordered]@{ k = 'L'; t = ("Limpiar la cola de '" + [string]$c0.nombre + "' (" + [string]$c0.trabajos + ' trabajos)'); target = [string]$c0.nombre }
+    }
+
+    $ops += [ordered]@{ k = 'N'; t = 'Buscar impresoras en la red (por IP)' }
+    $enRed = @()
+    if ($script:Diagnostics.Contains('impresorasEnRed')) { $enRed = @($script:Diagnostics['impresorasEnRed']) }
+    if (@($enRed).Count -gt 0) { $ops += [ordered]@{ k = 'P'; t = 'Instalar una de las impresoras de red encontradas' } }
+
+    $nativaMal = @($script:Checks | Where-Object { $_.id -like 'nativa.*' -and $_.status -in @('fail','warn') }).Count -gt 0
+    if ($nativaMal) { $ops += [ordered]@{ k = 'F'; t = 'Instalar / reparar la App Nativa de Fudo' } }
+
+    $ops += [ordered]@{ k = 'T'; t = 'Imprimir un ticket de prueba' }
+    $ops += [ordered]@{ k = 'D'; t = 'Ver el detalle completo de los chequeos' }
+    $ops += [ordered]@{ k = 'J'; t = 'Guardar el JSON en un archivo' }
+    $ops += [ordered]@{ k = 'S'; t = 'Salir' }
+    return @($ops)
+}
+
+function Show-DoctorMenu {
+    $ops = @(Get-MenuOptions)
+    Write-Host ''
+    Write-Host '  ==============================================================' -ForegroundColor DarkGray
+    Write-Host '   QUE QUERES HACER AHORA' -ForegroundColor Cyan
+    Write-Host '  ==============================================================' -ForegroundColor DarkGray
+    foreach ($o in $ops) {
+        $color = $(if ($o.k -eq 'S') { 'DarkGray' } else { 'Gray' })
+        Write-Host ("   [" + $o.k + "]  " + $o.t) -ForegroundColor $color
+    }
+    Write-Host ''
+    $r = ''
+    try { $r = Read-Host '   Opcion' } catch { return 'S' }
+    $r = ([string]$r).Trim().ToUpper()
+    if (-not $r) { return 'S' }
+    if (@($ops | ForEach-Object { [string]$_.k }) -contains $r) { return $r }
+    Write-Host '   Opcion invalida.' -ForegroundColor Yellow
+    return '?'
+}
+
+function Invoke-MenuAction {
+    <# Ejecuta la opcion elegida. Devuelve $true si hay que volver a diagnosticar. #>
+    param([string]$Op)
+
+    switch ($Op) {
+        'R' { return $true }
+
+        'U' {
+            $script:ForceWaitReconnect = $true
+            $nombre = ''
+            if ($script:Diagnostics.Contains('printer')) { $nombre = [string]$script:Diagnostics['printer'].name }
+            $pr = $null
+            if ($nombre) { try { $pr = Get-Printer -Name $nombre -ErrorAction SilentlyContinue } catch {} }
+            if ($pr) {
+                $f = Invoke-ReconnectFlow -Printer $pr
+                Write-Host ''
+                Write-Host ('  ' + $(if ($f.recovered) { 'Recuperada: ' } else { 'Sin exito: ' }) + [string]$f.note) -ForegroundColor $(if ($f.recovered) { 'Green' } else { 'Yellow' })
+            } else {
+                Write-Host ''
+                Write-Host '  Desenchufa y volve a enchufar el USB de la impresora (encendida)...' -ForegroundColor Cyan
+                $puerto = Wait-ForPrinterReconnect -TimeoutSec $ReconnectTimeoutSec
+                Write-Host ''
+                if ($puerto) { Write-Host ("  Apareció una impresora en " + $puerto) -ForegroundColor Green }
+                else { Write-Host '  No se detecto ninguna impresora nueva.' -ForegroundColor Yellow }
+            }
+            $script:ForceWaitReconnect = $false
+            return $true
+        }
+
+        'I' {
+            $huerfanos = @()
+            if ($script:Diagnostics.Contains('orphanLivePorts')) { $huerfanos = @($script:Diagnostics['orphanLivePorts'] | Where-Object { $_ }) }
+            if (@($huerfanos).Count -eq 0) { Write-Host '  Ya no hay puertos con impresora sin instalar.' -ForegroundColor Yellow; return $true }
+            $puerto = @($huerfanos)[0]
+            $nombre = ''
+            try { $nombre = Read-Host ("   Nombre para la impresora en $puerto (Enter = FUDO-TEST-$puerto)") } catch {}
+            try {
+                $creada = New-FudoTestPrinter -PortName $puerto
+                if ($creada -and $nombre) {
+                    try { Rename-Printer -Name $creada -NewName $nombre -ErrorAction Stop; $creada = $nombre
+                          $i = $script:TestPrintersCreated.IndexOf($creada); if ($i -ge 0) { $script:TestPrintersCreated.RemoveAt($i) } } catch {}
+                }
+                Write-Host ("  Cola '" + $creada + "' creada en " + $puerto) -ForegroundColor Green
+                Write-Host '  Acordate de registrarla en Fudo (Administracion > Impresoras) con su cocina/area.' -ForegroundColor Yellow
+            } catch { Write-Host ("  No se pudo crear: " + $_.Exception.Message) -ForegroundColor Red }
+            return $true
+        }
+
+        'L' {
+            $conCola = @()
+            if ($script:Diagnostics.Contains('colas')) { $conCola = @($script:Diagnostics['colas'] | Where-Object { [int]$_.trabajos -gt 0 }) }
+            if (@($conCola).Count -eq 0) { Write-Host '  No hay colas con trabajos pendientes.' -ForegroundColor Yellow; return $true }
+            $nombre = [string]@($conCola)[0].nombre
+            $cant = [string]@($conCola)[0].trabajos
+            if (Confirm-Irreversible -Description "Limpiar la cola de '$nombre' ($cant trabajos)" -Impact 'se descartan las comandas que estan esperando; hay que volver a imprimirlas desde Fudo') {
+                try {
+                    Get-PrintJob -PrinterName $nombre -ErrorAction SilentlyContinue | Remove-PrintJob -ErrorAction SilentlyContinue
+                    Add-Action -Type 'queue.purge' -Target $nombre -Before "$cant jobs" -After '0 jobs' -Reversible $false
+                    Write-Host ("  Cola de '" + $nombre + "' limpiada.") -ForegroundColor Green
+                } catch { Write-Host ("  No se pudo limpiar: " + $_.Exception.Message) -ForegroundColor Red }
+            }
+            return $true
+        }
+
+        'N' {
+            $prefijos = @(Get-LocalSubnetPrefixes)
+            if (@($prefijos).Count -eq 0) { Write-Host '  No se pudo determinar la red local.' -ForegroundColor Yellow; return $false }
+            Write-Host ''
+            Write-Host ("  Buscando impresoras en " + (@($prefijos | ForEach-Object { $_ + '.0/24' }) -join ', ') + " ... (puede tardar unos segundos)") -ForegroundColor Cyan
+            $enc = @()
+            foreach ($pref in @($prefijos | Select-Object -First 2)) { $enc += @(Find-NetworkPrinters -Prefix $pref -TcpPort $Port) }
+            $script:Diagnostics['impresorasEnRed'] = @($enc)
+            $inst = @(Get-InstalledNetworkPrinters)
+            $script:Diagnostics['impresorasRedInstaladas'] = @($inst)
+            Write-Host ''
+            if (@($enc).Count -eq 0) {
+                Write-Host '  No se encontraron impresoras por IP en la red.' -ForegroundColor Yellow
+                Write-Host '  Revisar que la comandera este encendida, con cable de red, y hacer su' -ForegroundColor DarkGray
+                Write-Host '  self-test (apagar, mantener FEED, encender) para leer la IP que tiene.' -ForegroundColor DarkGray
+            } else {
+                Write-Host ("  Encontradas: " + @($enc).Count) -ForegroundColor Green
+                foreach ($e in $enc) {
+                    $ya = @($inst | Where-Object { [string]$_.ip -eq [string]$e.ip })
+                    $extra = $(if (@($ya).Count -gt 0) { '  -> ya instalada como: ' + ((@($ya | ForEach-Object { @($_.colas) }) | Where-Object { $_ }) -join ', ') } else { '  -> sin instalar en Windows' })
+                    Write-Host ("    - " + [string]$e.ip + ':' + [string]$e.puerto + '  ' + [string]$e.tipo + $extra)
+                }
+            }
+            return $false
+        }
+
+        'P' {
+            $enRed = @()
+            if ($script:Diagnostics.Contains('impresorasEnRed')) { $enRed = @($script:Diagnostics['impresorasEnRed']) }
+            if (@($enRed).Count -eq 0) { Write-Host '  Primero buscar impresoras en la red (opcion N).' -ForegroundColor Yellow; return $false }
+            Write-Host ''
+            $i = 0
+            foreach ($e in $enRed) { $i++; Write-Host ("   [$i] " + [string]$e.ip + ':' + [string]$e.puerto + '  ' + [string]$e.tipo) }
+            $sel = ''
+            try { $sel = Read-Host '   Cual instalar? (numero, Enter para cancelar)' } catch {}
+            if (-not $sel) { return $false }
+            $idx = 0
+            try { $idx = [int]$sel } catch { return $false }
+            if ($idx -lt 1 -or $idx -gt @($enRed).Count) { Write-Host '  Numero invalido.' -ForegroundColor Yellow; return $false }
+            $elegida = @($enRed)[$idx - 1]
+            $nombre = ''
+            try { $nombre = Read-Host ("   Nombre para la impresora (Enter = FUDO-" + (([string]$elegida.ip) -replace '\.', '-') + ')') } catch {}
+            try {
+                $creada = New-NetworkPrinter -Ip ([string]$elegida.ip) -TcpPort ([int]$elegida.puerto) -Name $nombre
+                Write-Host ("  Cola '" + $creada + "' creada apuntando a " + [string]$elegida.ip + ':' + [string]$elegida.puerto) -ForegroundColor Green
+                Write-Host '  Mandando un ticket de prueba...' -ForegroundColor Cyan
+                $ok = $false
+                try { $ok = Send-EscPosOverTcp -Ip ([string]$elegida.ip) -TcpPort ([int]$elegida.puerto) } catch {}
+                Write-Host ('  ' + $(if ($ok) { 'Ticket enviado: si salio el papel, la impresora esta lista.' } else { 'No se pudo enviar el ticket.' })) -ForegroundColor $(if ($ok) { 'Green' } else { 'Yellow' })
+                Write-Host '  Falta registrarla en Fudo (Administracion > Impresoras) como Directo Ethernet con su cocina/area.' -ForegroundColor Yellow
+            } catch { Write-Host ("  No se pudo instalar: " + $_.Exception.Message) -ForegroundColor Red }
+            return $true
+        }
+
+        'F' { $null = Install-FudoNative; return $true }
+
+        'T' {
+            $nombre = ''
+            if ($script:Diagnostics.Contains('printer')) { $nombre = [string]$script:Diagnostics['printer'].name }
+            if (-not $nombre) { Write-Host '  No hay impresora objetivo para probar.' -ForegroundColor Yellow; return $false }
+            try {
+                Initialize-RawPrinterHelper
+                $bytes = [System.Text.Encoding]::GetEncoding(437).GetBytes((Get-EscPosTestTicket -Caption 'FUDO PRUEBA MANUAL'))
+                $ok = [FudoRawPrinter]::SendBytes($nombre, $bytes)
+                Start-Sleep -Milliseconds 1500
+                $pend = @()
+                try { $pend = @(Get-PrintJob -PrinterName $nombre -ErrorAction SilentlyContinue | Where-Object { [string]$_.DocumentName -match '(?i)fudo' }) } catch {}
+                if ($ok -and @($pend).Count -eq 0) { Write-Host ("  Ticket enviado a '" + $nombre + "'. Si salio el papel, el hardware imprime.") -ForegroundColor Green }
+                elseif ($ok) { Write-Host '  El ticket quedo en la cola: la impresora no esta respondiendo.' -ForegroundColor Yellow }
+                else { Write-Host '  No se pudo enviar el ticket.' -ForegroundColor Red }
+            } catch { Write-Host ("  Error: " + $_.Exception.Message) -ForegroundColor Red }
+            return $false
+        }
+
+        'D' {
+            Write-Host ''
+            foreach ($c in @($script:Checks)) {
+                $col = switch ([string]$c.status) { 'fail' { 'Red' } 'warn' { 'Yellow' } 'fixed' { 'Green' } 'ok' { 'DarkGreen' } default { 'DarkGray' } }
+                Write-Host ("   [{0,-8}] L{1} {2}" -f [string]$c.status, $c.layer, [string]$c.name) -ForegroundColor $col
+                if ($c.recommendation) { foreach ($ln in @(Format-Wrap -Text ([string]$c.recommendation) -Width 66 -Indent '            ')) { Write-Host ('          ' + $ln) -ForegroundColor DarkGray } }
+            }
+            return $false
+        }
+
+        'J' {
+            $ruta = ''
+            try { $ruta = Read-Host '   Ruta del archivo (Enter = resultado.json aca al lado)' } catch {}
+            if (-not $ruta) { $ruta = Join-Path (Get-Location) 'resultado.json' }
+            try {
+                ($script:LastResult | ConvertTo-Json -Depth 12) | Out-File -FilePath $ruta -Encoding UTF8
+                Write-Host ("  Guardado en " + $ruta) -ForegroundColor Green
+            } catch { Write-Host ("  No se pudo guardar: " + $_.Exception.Message) -ForegroundColor Red }
+            return $false
+        }
+    }
+    return $false
+}
+
+# ---------------------------------------------------------------------------
 # CONTRATO DE SALIDA (para el agente que corre el script)
 #   stdout : SOLO el JSON, delimitado por <<<FUDO_JSON_BEGIN>>> / <<<FUDO_JSON_END>>>
 #   stderr : resumen humano (es-AR) y avisos. Usar -Quiet para silenciarlo.
 #   exit   : 0 = resuelto | 2 = requiere escalamiento | 3 = falla del motor | 4 = self-test fallido
 # ---------------------------------------------------------------------------
+function Install-FudoNative {
+    <#
+      Instala la App Nativa de Fudo. Antes agrega las exclusiones de antivirus, porque el bloqueo
+      del AV es la causa mas frecuente de que la Nativa no quede funcionando.
+      Sin URL de instalador configurada, guia los pasos manuales.
+    #>
+    $url = $NativeInstallerUrl
+    if (-not $url) { $url = $script:NativeInstallerUrl }
+
+    if (-not $url) {
+        Write-Host ''
+        Write-Host '  No hay URL de instalador configurada, asi que hay que instalarla a mano:' -ForegroundColor Yellow
+        Write-Host '    1. Entrar a la web app de Fudo desde esta PC.'
+        Write-Host '    2. Descargar la App Nativa desde el asistente de instalacion de impresoras.'
+        Write-Host '    3. Si el antivirus la bloquea o la manda a cuarentena, primero correr este'
+        Write-Host '       script (agrega las exclusiones de Defender) y despues reinstalar.'
+        Write-Host '    Guia: https://soporte.fu.do/es/articles/16419361'
+        Write-Host ''
+        Write-Host '  Para automatizarlo, pasar -NativeInstallerUrl <url del instalador>.' -ForegroundColor DarkGray
+        return @{ applied = $false; note = 'sin URL de instalador configurada' }
+    }
+
+    return (Invoke-Remediation -Description 'Descargar e instalar la App Nativa de Fudo' -Type 'nativa.install' -Target 'FudoNativa' `
+        -Before 'no instalada' -After 'instalada' -Reversible $true -Fix {
+            $notas = @()
+            # 1) exclusiones ANTES de bajar el instalador: si no, el AV lo borra en la descarga
+            if ($UseDefenderExclusions) {
+                foreach ($ruta in @($env:TEMP, (Join-Path $env:LOCALAPPDATA 'Fudo'), (Join-Path $env:LOCALAPPDATA 'Programs'))) {
+                    try { Add-MpPreference -ExclusionPath $ruta -ErrorAction SilentlyContinue; $notas += "excl $ruta" } catch {}
+                }
+                try { Add-MpPreference -ExclusionProcess "$FudoAppProcess*.exe" -ErrorAction SilentlyContinue } catch {}
+            }
+            # 2) descargar
+            $destino = Join-Path $env:TEMP ('FudoNativa-' + (Get-Date).ToString('yyyyMMddHHmmss') + '.exe')
+            Write-StepDetail 'descargando el instalador de la App Nativa'
+            try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+            Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 180 -OutFile $destino -ErrorAction Stop
+            $tam = 0
+            try { $tam = [int]((Get-Item $destino).Length / 1024) } catch {}
+            if ($tam -lt 100) { throw "el archivo descargado pesa ${tam}KB: no parece un instalador (revisar la URL)" }
+            $notas += "instalador descargado (${tam}KB)"
+            # 3) ejecutar
+            Write-StepDetail 'ejecutando el instalador (puede pedir confirmacion en pantalla)'
+            $pr = Start-Process -FilePath $destino -PassThru -Wait -ErrorAction Stop
+            $notas += "instalador finalizo con codigo $($pr.ExitCode)"
+            Start-Sleep -Seconds 3
+            $corriendo = $false
+            try { $corriendo = (@(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*$FudoAppProcess*" }).Count -gt 0) } catch {}
+            $notas += $(if ($corriendo) { 'la Nativa esta corriendo' } else { 'la Nativa todavia no aparece corriendo: puede requerir iniciar sesion en la web app' })
+            ($notas -join ' | ')
+        })
+}
+
+function Send-Telemetry {
+    <#
+      Manda el resultado a un endpoint para no depender de que el asesor guarde el JSON.
+      Nunca corta el diagnostico: timeout corto y errores silenciados.
+    #>
+    param($Result)
+    $url = $TelemetryUrl
+    if (-not $url) { $url = $script:TelemetryUrl }
+    if (-not $url) { return }
+
+    try {
+        $payload = $Result
+        if (-not $TelemetryFull) {
+            $payload = [ordered]@{
+                schemaVersion = [string]$Result.schemaVersion
+                status        = [string]$Result.status
+                caseId        = [string]$Result.caseId
+                clientId      = [string]$Result.clientId
+                host          = [string]$Result.host
+                timestamp     = [string]$Result.timestamp
+                interface     = [string]$Result.interface
+                dryRun        = [bool]$Result.dryRun
+                rootCause     = [string]$Result.diagnosis.rootCause
+                rootCauseCheckId = [string]$Result.diagnosis.rootCauseCheckId
+                resolved      = [bool]$Result.diagnosis.resolved
+                confidence    = [string]$Result.diagnosis.confidence
+                needsEscalation = [bool]$Result.diagnosis.needsEscalation
+                autoFixesApplied = @($Result.diagnosis.autoFixesApplied)
+                telemetry     = $Result.telemetry
+                checks        = @($Result.checks | ForEach-Object { [ordered]@{ id = [string]$_.id; status = [string]$_.status; layer = $_.layer } })
+                impresoras    = @($(if ($script:Diagnostics.Contains('colas')) { $script:Diagnostics['colas'] | ForEach-Object { [ordered]@{ nombre = $_.nombre; puerto = $_.puerto; estado = $_.estado; trabajos = $_.trabajos } } } else { @() }))
+            }
+        }
+        $body = $payload | ConvertTo-Json -Depth 8 -Compress
+        try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+        $null = Invoke-RestMethod -Uri $url -Method Post -Body $body -ContentType 'application/json; charset=utf-8' -TimeoutSec 10 -ErrorAction Stop
+        Write-DoctorLog -Level 'INFO' -Message "Telemetria enviada a $url"
+        return $true
+    } catch {
+        Write-DoctorLog -Level 'WARN' -Message "No se pudo enviar la telemetria: $($_.Exception.Message)"
+        return $false
+    }
+}
+
 function Write-DoctorResult {
     param($Obj)
+    $script:LastResult = $Obj
     $json = $null
     try {
         $json = $Obj | ConvertTo-Json -Depth 12
@@ -3312,11 +3939,10 @@ function Write-DoctorResult {
             [Console]::Error.WriteLine("No se pudo escribir '$JsonOut': $($_.Exception.Message)")
         }
     }
-    # Consola interactiva: mostramos SOLO el resumen y dejamos el JSON en un archivo.
-    # Salida redirigida (agente) o -Json: JSON delimitado por stdout.
-    $redirected = $true
-    try { $redirected = [Console]::IsOutputRedirected } catch {}
-    $emitJson = ($Json -or $redirected)
+    # El JSON va a pantalla SOLO si se pide con -Json. Nunca por deteccion automatica:
+    # en Windows PowerShell dentro de un .cmd la deteccion de redireccion no es confiable,
+    # y el asesor terminaba viendo el JSON entero arriba del resumen.
+    $emitJson = [bool]$Json
 
     if (-not $emitJson -and -not $JsonOut) {
         try {
@@ -3326,20 +3952,21 @@ function Write-DoctorResult {
         } catch {}
     }
 
-    if (-not $Quiet) {
-        $hs = $null
-        try { $hs = [string]$Obj.humanSummary } catch {}
-        if ($hs) { Write-HumanReport -Text $hs }
-        if (-not $emitJson) {
-            $where = $(if ($JsonOut) { $JsonOut } elseif ($script:AutoJsonPath) { $script:AutoJsonPath } else { '' })
-            if ($where) { Write-HumanReport -Text ("  JSON completo: $where`r`n  (para el agente: agregar -Json o redirigir la salida)`r`n") }
-        }
-    }
+    $null = Send-Telemetry -Result $Obj
 
     if ($emitJson) {
         Write-Output $script:JsonBegin
         Write-Output $json
         Write-Output $script:JsonEnd
+    }
+
+    # El resumen humano va al final: es lo ultimo que queda en pantalla.
+    if (-not $Quiet) {
+        $hs = $null
+        try { $hs = [string]$Obj.humanSummary } catch {}
+        if ($hs) { Write-HumanReport -Text $hs }
+        $where = $(if ($JsonOut) { $JsonOut } elseif ($script:AutoJsonPath) { $script:AutoJsonPath } else { '' })
+        if ($where) { Write-HumanReport -Text ("  Detalle completo (JSON): $where`r`n") }
     }
 }
 
@@ -3365,6 +3992,21 @@ try {
 
     $final = Invoke-FudoPrintDoctor
     Write-DoctorResult -Obj $final
+
+    # Menu de acciones: permite volver a revisar o corregir sin cerrar y reabrir la app.
+    if (-not $NoMenu -and (Test-IsInteractiveConsole)) {
+        while ($true) {
+            $op = Show-DoctorMenu
+            if ($op -eq 'S') { break }
+            if ($op -eq '?') { continue }
+            $volverACorrer = Invoke-MenuAction -Op $op
+            if ($volverACorrer) {
+                Reset-RunState
+                $final = Invoke-FudoPrintDoctor
+                Write-DoctorResult -Obj $final
+            }
+        }
+    }
 
     if (@($script:Errors).Count -gt 0)                                   { exit 3 }
     elseif ($final.diagnosis.resolved -and -not $final.diagnosis.needsEscalation) { exit 0 }

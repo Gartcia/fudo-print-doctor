@@ -198,6 +198,60 @@ comando exacto para hacerla. Se puede decidir de antemano con `-AllowQueuePurge 
 No se automatiza nunca: desactivar el antivirus (solo exclusiones de ruta y proceso), tocar
 antivirus de terceros como McAfee o Avast, ni cambiar la configuración de Fudo.
 
+## Menú de acciones
+
+Al terminar el diagnóstico, en consola interactiva aparece un menú para seguir trabajando sin
+cerrar y reabrir la app. Las letras son estables (siempre la misma tecla para lo mismo):
+
+```
+   [R]  Volver a revisar todo
+   [U]  Esperar a que conectes/desconectes el USB y revisar de nuevo
+   [I]  Instalar la impresora conectada en USB002 (driver de texto generico)
+   [L]  Limpiar la cola de 'CAJA' (1440 trabajos)
+   [N]  Buscar impresoras en la red (por IP)
+   [P]  Instalar una de las impresoras de red encontradas
+   [F]  Instalar / reparar la App Nativa de Fudo
+   [T]  Imprimir un ticket de prueba
+   [D]  Ver el detalle completo de los chequeos
+   [J]  Guardar el JSON en un archivo
+   [S]  Salir
+```
+
+Las opciones aparecen según lo que se encontró: `U` solo si hay una impresora desconectada, `L`
+solo si hay una cola con trabajos, `P` solo después de encontrar impresoras por IP. Después de cada
+acción que cambia algo, el diagnóstico se vuelve a correr solo. `-NoMenu` lo desactiva.
+
+## Impresoras de red (Ethernet)
+
+Cuando no hay IP conocida, el motor barre la subred local buscando el puerto de impresión y, en cada
+hallazgo, confirma si **responde como impresora**: le manda `DLE EOT 1` (pedido de estado en tiempo
+real) y una térmica contesta un byte. Así distingue una comandera de cualquier otro equipo que tenga
+el 9100 abierto.
+
+Reporta cuántas encontró, en qué IPs, cuáles **ya tienen** una cola de Windows apuntando ahí, y si
+no encuentra nada lo dice explícitamente con los pasos para leer la IP real de la impresora
+(self-test: apagar, mantener FEED, encender).
+
+Para instalarla: opción `P` del menú, o `-PrinterIp <ip> -InstallNetworkPrinter`. Crea el puerto
+TCP/IP y la cola con driver de texto genérico, con el nombre que elijas (`-NewPrinterName`), y manda
+un ticket de prueba. Después hay que registrarla en Fudo como *Directo Ethernet* con su cocina/área.
+
+## Telemetría (opcional)
+
+Para no depender de que el asesor guarde el JSON: con `-TelemetryUrl` (o fijando
+`$script:TelemetryUrl` en el script, que es lo práctico para todo el equipo) cada corrida hace un
+POST con un resumen del resultado. Es silencioso: si falla, no molesta ni corta el diagnóstico.
+
+El payload por defecto es **reducido** —versión, caso, cliente, host, causa raíz, categoría,
+confianza, duración, el id y estado de cada chequeo, y el estado de cada cola— sin rutas de archivos
+ni el log. `-TelemetryFull` manda el JSON completo.
+
+## App Nativa de Fudo
+
+Con `-NativeInstallerUrl` el motor puede descargar e instalar la App Nativa, agregando **antes** las
+exclusiones de antivirus (si no, el AV suele borrar el instalador durante la descarga). Sin URL
+configurada, la opción `F` del menú guía los pasos manuales.
+
 ## Uso desde un agente
 
 ```powershell
@@ -207,12 +261,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\FudoPrintDoctor.ps1 -Json 
 Variantes útiles: `-DryRun` (no toca nada), `-AllowQueuePurge $true` (limpiar la cola sin
 preguntar), `-PrinterName "<cola>"` para forzar el objetivo.
 
-- **stdout**: solo el JSON, entre `<<<FUDO_JSON_BEGIN>>>` y `<<<FUDO_JSON_END>>>`.
+- **stdout**: el JSON entre `<<<FUDO_JSON_BEGIN>>>` y `<<<FUDO_JSON_END>>>`, **solo si se pasa
+  `-Json`**. Sin ese switch nunca se imprime en pantalla (el asesor no tiene que ver el JSON).
 - **stderr**: resumen humano y logs. `-Quiet` lo silencia.
 - **exit code**: `0` resuelto · `2` requiere escalamiento · `3` falla del motor · `4` self-test fallido.
 
-Si la salida **no** está redirigida y no se pasa `-Json`, el JSON no se vuelca a pantalla: queda
-en `%TEMP%\FudoPrintDoctor-<fecha>.json` y el script informa la ruta.
+Sin `-Json`, el JSON queda en el archivo de `-JsonOut` o en `%TEMP%\FudoPrintDoctor-<fecha>.json`, y
+el script informa la ruta al final. El resumen humano siempre va último, así queda a la vista.
 
 Contrato completo del JSON: [`docs/contrato-json.md`](docs/contrato-json.md).
 
@@ -231,13 +286,18 @@ Contrato completo del JSON: [`docs/contrato-json.md`](docs/contrato-json.md).
 | `-WaitReconnect` | pregunta | Esperar la reconexión del USB sin preguntar (`$true`) o nunca (`$false`) |
 | `-ReconnectTimeoutSec` | `120` | Cuánto esperar la reconexión |
 | `-CheckUpdate` / `-NoUpdateCheck` | off | Comparar con la versión publicada / no chequear |
+| `-InstallNetworkPrinter` | off | Instalar la impresora de `-PrinterIp` como cola de Windows |
+| `-NewPrinterName` | auto | Nombre de la cola que se cree |
+| `-TelemetryUrl` / `-TelemetryFull` | vacío | Enviar el resultado por POST / mandar el JSON completo |
+| `-NativeInstallerUrl` | vacío | URL del instalador de la App Nativa |
+| `-NoMenu` | off | No mostrar el menú de acciones al terminar |
 | `-SkipIrreversible` | off | No aplica nada irreversible, sin preguntar |
 | `-KeepTestPrinter` | conserva | `:$false` borra la cola `FUDO-TEST-*` al terminar |
 | `-CaseId` / `-ClientId` | vacío | Solo correlación de telemetría; no afecta el diagnóstico |
 | `-JsonOut` | — | Volcar el JSON a un archivo |
 | `-Json` / `-Quiet` | off | Forzar JSON a stdout / silenciar el resumen |
 | `-Verbose` | off | Lista todos los chequeos en pantalla |
-| `-SelfTest` | off | Corre los 69 asserts de la lógica de decisión. No toca la PC. |
+| `-SelfTest` | off | Corre los 85 asserts de la lógica de decisión. No toca la PC. |
 
 ## Desarrollo
 

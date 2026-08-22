@@ -120,6 +120,24 @@ Artículos: [áreas y cocinas](https://soporte.fu.do/es/articles/11730815) ·
 - **Sin permisos de administrador** algunas reparaciones fallan (spooler, drivers). El launcher
   `2-*` los pide solo.
 
+## El menú del final
+
+Cuando termina, el script no se cierra: te ofrece un menú. Eso sirve para el ida y vuelta típico
+con el cliente sin volver a arrancar todo:
+
+- **R** — revisar de nuevo, después de que el cliente hizo algo.
+- **U** — le pedís al cliente que desenchufe y vuelva a enchufar el USB, y el script detecta el
+  puerto nuevo solo.
+- **I** — instalar la impresora que está conectada pero no tiene cola en Windows.
+- **L** — limpiar una cola trabada (te avisa cuántas comandas se descartan).
+- **N** — buscar impresoras por IP en la red del local.
+- **P** — instalar una de las que encontró por IP.
+- **T** — tirar un ticket de prueba cuando quieras.
+- **D** — ver el detalle completo de los chequeos.
+- **J** — guardar el JSON donde vos quieras.
+
+Después de cada acción que cambia algo, vuelve a diagnosticar solo, así siempre ves el estado real.
+
 ## Cuándo escalar
 
 - El resumen dice `FALLA` en `Hardware conectado` y ya se probó otro cable y otro puerto.

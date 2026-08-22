@@ -2,6 +2,26 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [2.0] - 2026-08-22
+
+### Corregido
+- El JSON se imprimía en pantalla arriba del resumen. La detección de redirección
+  (`[Console]::IsOutputRedirected`) no es confiable en Windows PowerShell dentro de un `.cmd`, así
+  que ahora el JSON va a stdout **solo con `-Json`**. El resumen humano quedó al final de la salida.
+
+### Agregado
+- **Menú de acciones** al terminar (consola interactiva): volver a revisar, esperar la reconexión del
+  USB, instalar la impresora conectada, limpiar la cola, buscar impresoras por IP, instalar una de
+  red, instalar la Nativa, imprimir un ticket de prueba, ver el detalle o guardar el JSON. Ya no hay
+  que cerrar y reabrir la app para reintentar. `-NoMenu` lo desactiva.
+- **Ethernet**: barrido de la subred con identificación real (`DLE EOT`, que una térmica responde),
+  reporte de cuántas y cuáles se encontraron, detección de las que ya tienen cola en Windows, e
+  instalación por IP con driver de texto genérico (`-InstallNetworkPrinter` o menú).
+- **Telemetría opcional**: `-TelemetryUrl` / `$script:TelemetryUrl` envía por POST un resumen del
+  resultado, para no depender de que el asesor guarde el JSON. `-TelemetryFull` manda todo.
+- **App Nativa**: `-NativeInstallerUrl` permite descargarla e instalarla agregando primero las
+  exclusiones de antivirus. Sin URL, se guían los pasos manuales.
+
 ## [1.9] - 2026-08-21
 
 ### Corregido
