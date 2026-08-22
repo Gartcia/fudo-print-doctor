@@ -58,6 +58,14 @@
     $script:NativeInstallerUrl en el script), el motor puede descargarla e instalarla cuando falta,
     agregando antes las exclusiones de antivirus. Sin URL solo guia los pasos manuales.
 
+.PARAMETER NativeInstallerPath
+    Ruta a un instalador de la App Nativa que ya esta en la PC (por ejemplo, copiado por el asesor
+    junto al script). Se usa antes que -NativeInstallerUrl: no hace falta que el cliente descargue
+    nada. Si no se indica, se busca un archivo tipo Fudo*.exe al lado del script.
+
+.PARAMETER NativeInstallerArgs
+    Argumentos para el instalador (por ejemplo /S o /SILENT segun el empaquetador).
+
 .PARAMETER InstallNetworkPrinter
     Instalar la impresora de red indicada con -PrinterIp como cola de Windows con driver de texto
     generico. El nombre se toma de -NewPrinterName (default: FUDO-<ip>).
@@ -144,6 +152,22 @@ CONTRATO DE SALIDA (v1.1)
     diagnosis.nextActions[] (que hacer / quien lo hace / articulo), engineErrors[], checks[], telemetry.
 
 CHANGELOG
+    2.1  - Nuevo: se identifica A QUE COLA le manda Fudo, leyendo el log del spooler
+             (Microsoft-Windows-PrintService/Operational, evento 307) y reconociendo los trabajos
+             de la App Nativa ('node print job'). Si el log esta deshabilitado (viene asi de
+             fabrica) se habilita para la proxima corrida. No reemplaza a la API de Fudo: dice a
+             donde llegan los trabajos, no que cocina/area tiene asignada cada impresora.
+           - Contexto de la PC en el JSON y en la telemetria: SO con build y arquitectura,
+             PowerShell, Chrome, Edge, version de la Nativa, pais, cultura, zona horaria, conexion
+             de la PC (cable o wifi) y cantidad de colas e impresoras fisicas.
+           - App Nativa desde un instalador que ya esta en la PC (-NativeInstallerPath, o
+             autodeteccion de Fudo*.exe al lado del script / Descargas / Escritorio), asi el
+             cliente no tiene que descargar nada. -NativeInstallerArgs para instalacion silenciosa.
+           - FIX: Join-Path con base $null explotaba en Windows de 32 bits al buscar Chrome, Edge
+             o el instalador de la Nativa.
+           - Los textos de impresoras de red distinguen los dos caminos de Fudo (Directo Ethernet,
+             que no usa colas de Windows, vs impresora del sistema operativo) y ya no sugieren que
+             una cola de Windows implique que Fudo la tenga configurada.
     2.0  - El JSON ya no se imprime en pantalla salvo que se pida con -Json: la deteccion de
              redireccion no es confiable en Windows PowerShell dentro de un .cmd y el asesor
              terminaba viendo el JSON entero. El resumen humano quedo al final de la salida.
@@ -280,6 +304,8 @@ param(
     [bool]$WaitReconnect,
     [int]$ReconnectTimeoutSec = 120,
     [string]$NativeInstallerUrl = '',
+    [string]$NativeInstallerPath = '',
+    [string]$NativeInstallerArgs = '',
     [switch]$InstallNetworkPrinter,
     [string]$NewPrinterName = '',
     [switch]$NoMenu,
@@ -310,7 +336,7 @@ $script:StartTime    = Get-Date
 $script:Diagnostics  = [ordered]@{}   # datos crudos recolectados
 $script:Errors       = New-Object System.Collections.ArrayList   # fallas internas del motor
 $script:TestPrintersCreated = New-Object System.Collections.ArrayList   # colas temporales creadas por el motor
-$script:SchemaVersion = '2.0'
+$script:SchemaVersion = '2.1'
 # Distribucion: repo publico. VERSION es un archivo de una linea con la version publicada.
 $script:RepoUrl    = 'https://github.com/Gartcia/fudo-print-doctor'
 $script:RawBase    = 'https://raw.githubusercontent.com/Gartcia/fudo-print-doctor/main'
@@ -1426,6 +1452,136 @@ function New-FudoTestPrinter {
     return ''
 }
 
+function Get-EnvironmentInfo {
+    <#
+      Contexto de la PC: sistema operativo, navegador, region, tipo de red.
+      Sirve para telemetria y para entender el caso sin pedirle datos al cliente.
+    #>
+    $os = [ordered]@{}
+    try {
+        $w = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+        $os = [ordered]@{
+            nombre = [string]$w.Caption; version = [string]$w.Version
+            build = [string]$w.BuildNumber; arquitectura = [string]$w.OSArchitecture
+        }
+    } catch {
+        try { $os = [ordered]@{ nombre = 'Windows'; version = [string][Environment]::OSVersion.Version } } catch {}
+    }
+
+    # Chrome: la extension de Fudo corre ahi, asi que la version importa.
+    # OJO: Join-Path explota si la base es $null (pasa con ProgramFiles(x86) en 32 bits).
+    $chrome = ''
+    $rutasChrome = @()
+    foreach ($base in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:LOCALAPPDATA)) {
+        if ($base) { $rutasChrome += (Join-Path $base 'Google\Chrome\Application\chrome.exe') }
+    }
+    foreach ($r in $rutasChrome) {
+        try { if (Test-Path $r) { $chrome = [string](Get-Item $r).VersionInfo.ProductVersion; break } } catch {}
+    }
+    if (-not $chrome) {
+        foreach ($k in @('HKLM:\SOFTWARE\Wow6432Node\Google\Update\Clients\*','HKLM:\SOFTWARE\Google\Update\Clients\*')) {
+            try {
+                $hit = @(Get-ItemProperty -Path $k -ErrorAction SilentlyContinue | Where-Object { $_.name -match '(?i)^Google Chrome$' }) | Select-Object -First 1
+                if ($hit -and $hit.pv) { $chrome = [string]$hit.pv; break }
+            } catch {}
+        }
+    }
+
+    # Otros navegadores (por si el local usa Edge)
+    $edge = ''
+    foreach ($base in @(${env:ProgramFiles(x86)}, $env:ProgramFiles)) {
+        if (-not $base) { continue }
+        try {
+            $r = Join-Path $base 'Microsoft\Edge\Application\msedge.exe'
+            if (Test-Path $r) { $edge = [string](Get-Item $r).VersionInfo.ProductVersion; break }
+        } catch {}
+    }
+
+    # Region / pais / zona horaria (local, sin consultar nada por internet)
+    $pais = ''; $paisNombre = ''; $cultura = ''; $tz = ''
+    try { $cultura = [string](Get-Culture).Name } catch {}
+    try {
+        $ri = [System.Globalization.RegionInfo]::CurrentRegion
+        $pais = [string]$ri.TwoLetterISORegionName; $paisNombre = [string]$ri.EnglishName
+    } catch {}
+    try { $tz = [string](Get-TimeZone -ErrorAction Stop).Id } catch { try { $tz = [string][TimeZoneInfo]::Local.Id } catch {} }
+
+    # Como esta conectada la PC: cable o wifi (importa para impresoras de red)
+    $redes = @()
+    try {
+        foreach ($a in @(Get-NetAdapter -Physical -ErrorAction Stop | Where-Object { $_.Status -eq 'Up' })) {
+            $tipo = 'cable'
+            if (([string]$a.InterfaceDescription -match '(?i)wi-?fi|wireless|802\.11') -or ([string]$a.Name -match '(?i)wi-?fi|inalambr')) { $tipo = 'wifi' }
+            $redes += [ordered]@{ nombre = [string]$a.Name; descripcion = [string]$a.InterfaceDescription; tipo = $tipo; velocidad = [string]$a.LinkSpeed }
+        }
+    } catch {
+        try {
+            foreach ($a in @(Get-CimInstance Win32_NetworkAdapter -ErrorAction Stop | Where-Object { $_.NetEnabled -eq $true -and $_.PhysicalAdapter })) {
+                $tipo = $(if ([string]$a.Name -match '(?i)wi-?fi|wireless|802\.11') { 'wifi' } else { 'cable' })
+                $redes += [ordered]@{ nombre = [string]$a.NetConnectionID; descripcion = [string]$a.Name; tipo = $tipo; velocidad = '' }
+            }
+        } catch {}
+    }
+
+    $nativaVer = ''
+    try {
+        if ($script:Diagnostics.Contains('nativeInstall')) {
+            $reg = @($script:Diagnostics['nativeInstall'].regInfo)
+            if (@($reg).Count -gt 0) { $nativaVer = [string]@($reg)[0].version }
+        }
+    } catch {}
+
+    return [ordered]@{
+        so             = $os
+        powershell     = [string]$PSVersionTable.PSVersion
+        chrome         = $chrome
+        edge           = $edge
+        nativaVersion  = $nativaVer
+        cultura        = $cultura
+        pais           = $pais
+        paisNombre     = $paisNombre
+        zonaHoraria    = $tz
+        redes          = @($redes)
+        tipoConexionPC = $(if (@($redes | Where-Object { $_.tipo -eq 'cable' }).Count -gt 0) { 'cable' } elseif (@($redes).Count -gt 0) { 'wifi' } else { 'sin red' })
+        esAdmin        = $(if ($script:Diagnostics.Contains('isAdmin')) { [bool]$script:Diagnostics['isAdmin'] } else { $false })
+    }
+}
+
+function Get-PrintHistory {
+    <#
+      Historial real de impresion desde el log del spooler (evento 307 = trabajo impreso).
+      Es la unica forma, desde la PC, de saber a que cola le esta mandando Fudo: los trabajos de
+      la App Nativa se llaman 'node print job'.
+      El log viene DESHABILITADO de fabrica en Windows; si esta apagado lo decimos.
+    #>
+    param([int]$MaxEventos = 300)
+    $log = 'Microsoft-Windows-PrintService/Operational'
+    $habilitado = $false
+    try { $habilitado = [bool](Get-WinEvent -ListLog $log -ErrorAction Stop).IsEnabled } catch {}
+    if (-not $habilitado) { return [ordered]@{ habilitado = $false; porImpresora = @() } }
+
+    $porImp = @{}
+    try {
+        foreach ($e in @(Get-WinEvent -LogName $log -MaxEvents $MaxEventos -ErrorAction Stop | Where-Object { $_.Id -eq 307 })) {
+            $doc = ''; $imp = ''
+            try { $doc = [string]$e.Properties[1].Value } catch {}
+            try { $imp = [string]$e.Properties[4].Value } catch {}
+            if (-not $imp) { continue }
+            if (-not $porImp.ContainsKey($imp)) {
+                $porImp[$imp] = [ordered]@{ impresora = $imp; total = 0; deFudo = 0; ultimo = ''; ultimoDeFudo = ''; ejemploDoc = $doc }
+            }
+            $porImp[$imp].total++
+            if (-not $porImp[$imp].ultimo) { $porImp[$imp].ultimo = $e.TimeCreated.ToString('dd/MM HH:mm') }
+            # La Nativa manda los trabajos con este nombre
+            if ($doc -match '(?i)node print job|fudo') {
+                $porImp[$imp].deFudo++
+                if (-not $porImp[$imp].ultimoDeFudo) { $porImp[$imp].ultimoDeFudo = $e.TimeCreated.ToString('dd/MM HH:mm') }
+            }
+        }
+    } catch {}
+    return [ordered]@{ habilitado = $true; porImpresora = @($porImp.Values) }
+}
+
 function Get-PrinterQueues {
     <#
       Todas las colas REALES de Windows (sin virtuales) con su estado, para poder decidir cual
@@ -2402,9 +2558,12 @@ function Test-Layer3-Network {
             -ArticleRef 'https://soporte.fu.do/es/articles/11730816' `
             -Recommendation ('Detectadas en: ' + ($lista -join ' | ') + '. ' +
                              $(if (@($yaInstaladas).Count -gt 0) {
-                                    'Ya hay colas de Windows apuntando a: ' + (@($yaInstaladas | ForEach-Object { $_.ip + $(if (@($_.colas).Count -gt 0) { ' -> ' + (@($_.colas) -join ', ') } else { ' (puerto sin cola)' }) }) -join ' | ') + '. '
-                                } else { 'Ninguna esta instalada todavia en Windows. ' }) +
-                             'Para instalar una: correr el script en la consola y elegir la opcion de instalar impresora de red, o pasar -PrinterIp <ip> -InstallNetworkPrinter.')
+                                    'Hay colas de Windows apuntando a: ' + (@($yaInstaladas | ForEach-Object { $_.ip + $(if (@($_.colas).Count -gt 0) { ' -> ' + (@($_.colas) -join ', ') } else { ' (puerto sin cola)' }) }) -join ' | ') + ' (que exista la cola no significa que Fudo la tenga configurada). '
+                                } else { 'Ninguna tiene cola de Windows todavia. ' }) +
+                             'DOS CAMINOS EN FUDO, segun como se quiera configurar: ' +
+                             '(A) Directo Ethernet -> NO hace falta instalar nada en Windows, alcanza con cargar la IP en Fudo (Administracion > Impresoras > Directo Ethernet, puerto 9100). ' +
+                             '(B) Impresora del sistema operativo -> hay que instalar la cola en Windows (opcion del menu o -PrinterIp <ip> -InstallNetworkPrinter) y despues elegirla por nombre en Fudo. ' +
+                             'Si en Fudo solo aparece el campo de IP, es la opcion A.')
         return
     }
     $script:Diagnostics['printerIp'] = $ip
@@ -2435,7 +2594,7 @@ function Test-Layer3-Network {
         Add-Check -Id 'conn.net' -Layer 3 -Name "Conectividad a impresora de red ${ip}:${Port}" -Status 'ok' `
             -Evidence @{ ip = $ip; ping = $pingOk; port9100 = $true; respondeEscPos = $esc; colasQueLaUsan = @($yaInstaladas | ForEach-Object { @($_.colas) } | Where-Object { $_ }) } `
             -Recommendation $(if (@($yaInstaladas).Count -eq 0) {
-                    "La impresora responde en ${ip}:${Port} pero NO hay ninguna cola de Windows apuntando ahi. Instalarla con la opcion de impresora de red del menu, o con -PrinterIp $ip -InstallNetworkPrinter."
+                    "La impresora responde en ${ip}:${Port}, asi que el hardware y la red estan bien. En Fudo se puede usar de dos formas: (A) Directo Ethernet, cargando solo esta IP y el puerto $Port, sin instalar nada en Windows; o (B) como impresora del sistema operativo, instalando la cola en Windows (opcion del menu o -PrinterIp $ip -InstallNetworkPrinter) y eligiendola por nombre en Fudo. Hoy no hay ninguna cola de Windows apuntando a esta IP."
                 } elseif (-not $esc) {
                     "Hay algo escuchando en ${ip}:${Port} pero no respondio como impresora ESC/POS: confirmar que la IP sea la de la comandera y no de otro equipo."
                 } else { '' })
@@ -2577,6 +2736,43 @@ function Test-Layer4-HardwarePrint {
 # ---------------------------------------------------------------------------
 function Test-Layer5-FudoConfig {
     param($DetectedInterface)
+
+    # 5.0 A que cola le esta mandando Fudo REALMENTE (evidencia local, no hace falta la API)
+    Write-StepDetail 'revisando el historial de impresion del spooler'
+    $hist = Get-PrintHistory
+    $script:Diagnostics['historialImpresion'] = $hist
+
+    if (-not $hist.habilitado) {
+        $rem = Invoke-Remediation -Description 'Habilitar el log de impresion de Windows (para saber que cola usa Fudo)' `
+            -Type 'log.enable' -Target 'Microsoft-Windows-PrintService/Operational' -Before 'deshabilitado' -After 'habilitado' -Reversible $true -Fix {
+                & wevtutil sl 'Microsoft-Windows-PrintService/Operational' /e:true 2>&1 | Out-Null
+                'log de PrintService habilitado'
+            }
+        Add-Check -Id 'fudo.usoReal' -Layer 5 -Name 'Historial de impresion no disponible' -Status $(if ($rem.applied) { 'fixed' } else { 'skipped' }) -Plane 'os' `
+            -Evidence @{ log = 'Microsoft-Windows-PrintService/Operational'; habilitado = $false } -ActionTaken $rem.note `
+            -Recommendation $(if ($rem.applied) {
+                    'Windows no registraba los trabajos de impresion. Se activo el registro: a partir de ahora, cada corrida va a poder decir a que cola le manda Fudo y cuando fue la ultima comanda. Volver a correr el diagnostico despues de intentar imprimir una comanda.'
+                } else {
+                    'El log de impresion de Windows esta deshabilitado (viene asi de fabrica), por eso no se puede ver el historial. Habilitarlo con: wevtutil sl "Microsoft-Windows-PrintService/Operational" /e:true'
+                })
+    } else {
+        $conFudo = @($hist.porImpresora | Where-Object { [int]$_.deFudo -gt 0 } | Sort-Object -Property @{ Expression = { [int]$_.deFudo }; Descending = $true })
+        if (@($conFudo).Count -gt 0) {
+            $detalle = @($conFudo | ForEach-Object { "$($_.impresora): $($_.deFudo) comanda(s), ultima el $($_.ultimoDeFudo)" })
+            Add-Check -Id 'fudo.usoReal' -Layer 5 -Name ('Fudo le manda comandas a: ' + (@($conFudo | ForEach-Object { $_.impresora }) -join ', ')) -Status 'ok' -Plane 'fudo_config' `
+                -Evidence @{ porImpresora = @($hist.porImpresora) } `
+                -Recommendation ('Historial del spooler: ' + ($detalle -join ' | ') + '. Esto confirma que en Fudo esa impresora esta configurada y recibiendo comandas; si el papel no sale, el problema esta en la impresora o su cola, no en la configuracion de Fudo.')
+        } else {
+            $otras = @($hist.porImpresora | Where-Object { [int]$_.total -gt 0 })
+            Add-Check -Id 'fudo.usoReal' -Layer 5 -Name 'Ninguna cola recibio comandas de Fudo en el historial' -Status 'warn' -RootCauseCandidate $true -Plane 'fudo_config' `
+                -Evidence @{ porImpresora = @($hist.porImpresora) } `
+                -ArticleRef 'https://soporte.fu.do/es/articles/11730815' `
+                -Recommendation ('En el historial de impresion de Windows no hay ningun trabajo de la App Nativa de Fudo' +
+                                 $(if (@($otras).Count -gt 0) { ' (si hay de otros programas: ' + (@($otras | ForEach-Object { $_.impresora }) -join ', ') + ')' } else { '' }) +
+                                 '. Eso apunta a que Fudo no esta llegando a mandar la comanda: revisar que la impresora este registrada en Fudo con su cocina/area y que las categorias tengan cocina asignada. Tambien puede ser que el historial sea corto: probar imprimir una comanda y volver a correr.')
+        }
+    }
+
     # Estos chequeos viven en el backend de Fudo (no en el OS). El motor los deja
     # como 'requires_fudo_config' con la guia puntual; la capa orquestadora (API Fudo o asesor) resuelve.
     $items = @(
@@ -2690,6 +2886,21 @@ function Get-NextActions {
             articleRef = [string]$c.articleRef
         }
     }
+    $enRed = @()
+    if ($script:Diagnostics.Contains('impresorasEnRed')) { $enRed = @($script:Diagnostics['impresorasEnRed'] | Where-Object { $_.respondeEscPos }) }
+    if (@($enRed).Count -gt 0) {
+        $out += [ordered]@{
+            priority   = (@($out).Count + 1)
+            checkId    = 'conn.net.ip'
+            layer      = 3
+            status     = 'info'
+            what       = ('Impresora(s) de red detectada(s): ' + (@($enRed | ForEach-Object { $_.ip + ':' + $_.puerto }) -join ', '))
+            do         = ('Cargar esta IP en Fudo (Administracion > Impresoras > Directo Ethernet, puerto ' + [string]@($enRed)[0].puerto + '): ' + [string]@($enRed)[0].ip + '. Si en cambio se quiere usar como impresora del sistema operativo, instalar primero la cola en Windows.')
+            owner      = 'asesor'
+            articleRef = 'https://soporte.fu.do/es/articles/11730816'
+        }
+    }
+
     if (@($script:Errors).Count -gt 0) {
         foreach ($e in @($script:Errors)) {
             $out += [ordered]@{
@@ -3124,6 +3335,7 @@ function Invoke-FudoPrintDoctor {
         dryRun        = [bool]$DryRun
         autoFix       = [bool]$AutoFix
         printer       = $(if ($script:Diagnostics.Contains('printer')) { $script:Diagnostics['printer'] } else { $null })
+        entorno       = $(Invoke-Step -Name 'env.info' -Body { Get-EnvironmentInfo })
         hardware      = [ordered]@{
             devicesConnected = $(if ($script:Diagnostics.Contains('hwDevices')) { @($script:Diagnostics['hwDevices']) } else { @() })
             problemDevices   = $(if ($script:Diagnostics.Contains('hwProblemDevs')) { @($script:Diagnostics['hwProblemDevs']) } else { @() })
@@ -3573,6 +3785,47 @@ public class FudoFakePrinter {
     Assert-Eq 'S29 con su IP' '192.168.0.50' ([string]@($red)[0].ip)
     Assert-Eq 'S29 y la cola que la usa' 'COMANDERA' ((@($red)[0].colas) -join ',')
 
+    # Escenario 30: info de entorno (no debe explotar aunque no haya nada de Windows)
+    Reset-State
+    $env30 = $null; $err30 = ''
+    try { $env30 = Get-EnvironmentInfo } catch { $err30 = $_.Exception.Message }
+    Assert-Eq 'S30 entorno no explota' '' $err30
+    Assert-Eq 'S30 trae la version de PowerShell' $true ([bool]([string]$env30.powershell -match '^\d'))
+    Assert-Eq 'S30 tiene los campos que pide la telemetria' 'so,powershell,chrome,edge,nativaVersion,cultura,pais,paisNombre,zonaHoraria,redes,tipoConexionPC,esAdmin' (@($env30.Keys) -join ',')
+
+    # Escenario 31: sin log de impresion habilitado no se afirma nada
+    Reset-State
+    function Get-WinEvent { throw 'log deshabilitado' }
+    $h31 = Get-PrintHistory
+    Assert-Eq 'S31 detecta el log deshabilitado' $false ([bool]$h31.habilitado)
+    Assert-Eq 'S31 no inventa historial' 0 (@($h31.porImpresora).Count)
+
+    # Escenario 32: con historial, se identifica a que cola le manda Fudo
+    Reset-State
+    function Get-PrintHistory {
+        [ordered]@{ habilitado = $true; porImpresora = @(
+            [ordered]@{ impresora='COCINA'; total=120; deFudo=118; ultimo='21/08 20:10'; ultimoDeFudo='21/08 20:10'; ejemploDoc='node print job' },
+            [ordered]@{ impresora='HP LaserJet'; total=3; deFudo=0; ultimo='19/08 11:00'; ultimoDeFudo=''; ejemploDoc='Documento1.docx' }
+        ) }
+    }
+    Test-Layer5-FudoConfig -DetectedInterface 'USB'
+    $c32 = Get-CheckById 'fudo.usoReal'
+    Assert-Eq 'S32 detecta la cola que usa Fudo' 'ok' ([string]$c32.status)
+    Assert-Eq 'S32 la nombra' $true ([bool]($c32.name -match 'COCINA'))
+    Assert-Eq 'S32 no confunde otras impresoras' $false ([bool]($c32.name -match 'LaserJet'))
+
+    # Escenario 33: historial habilitado pero sin trabajos de Fudo => sospecha de config
+    Reset-State
+    function Get-PrintHistory {
+        [ordered]@{ habilitado = $true; porImpresora = @(
+            [ordered]@{ impresora='CAJA'; total=2; deFudo=0; ultimo='20/08 10:00'; ultimoDeFudo=''; ejemploDoc='Test Page' }
+        ) }
+    }
+    Test-Layer5-FudoConfig -DetectedInterface 'USB'
+    $c33 = Get-CheckById 'fudo.usoReal'
+    Assert-Eq 'S33 marca la sospecha' 'warn' ([string]$c33.status)
+    Assert-Eq 'S33 es candidata a causa raiz' $true ([bool]$c33.rootCauseCandidate)
+
     Write-Host ""
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)
     # Salida explicita en los dos casos: si el script termina con 'return', $LASTEXITCODE
@@ -3740,7 +3993,7 @@ function Invoke-MenuAction {
                 Write-Host ("  Encontradas: " + @($enc).Count) -ForegroundColor Green
                 foreach ($e in $enc) {
                     $ya = @($inst | Where-Object { [string]$_.ip -eq [string]$e.ip })
-                    $extra = $(if (@($ya).Count -gt 0) { '  -> ya instalada como: ' + ((@($ya | ForEach-Object { @($_.colas) }) | Where-Object { $_ }) -join ', ') } else { '  -> sin instalar en Windows' })
+                    $extra = $(if (@($ya).Count -gt 0) { '  -> hay cola de Windows: ' + ((@($ya | ForEach-Object { @($_.colas) }) | Where-Object { $_ }) -join ', ') } else { '  -> sin cola en Windows' })
                     Write-Host ("    - " + [string]$e.ip + ':' + [string]$e.puerto + '  ' + [string]$e.tipo + $extra)
                 }
             }
@@ -3770,7 +4023,11 @@ function Invoke-MenuAction {
                 $ok = $false
                 try { $ok = Send-EscPosOverTcp -Ip ([string]$elegida.ip) -TcpPort ([int]$elegida.puerto) } catch {}
                 Write-Host ('  ' + $(if ($ok) { 'Ticket enviado: si salio el papel, la impresora esta lista.' } else { 'No se pudo enviar el ticket.' })) -ForegroundColor $(if ($ok) { 'Green' } else { 'Yellow' })
-                Write-Host '  Falta registrarla en Fudo (Administracion > Impresoras) como Directo Ethernet con su cocina/area.' -ForegroundColor Yellow
+                Write-Host ''
+                Write-Host '  Ahora, en Fudo (Administracion > Impresoras):' -ForegroundColor Yellow
+                Write-Host ("    - Si la vas a usar como IMPRESORA DEL SISTEMA: elegila por su nombre '" + $creada + "'.") -ForegroundColor Yellow
+                Write-Host ("    - Si vas a usar DIRECTO ETHERNET: no hace falta esta cola, alcanza con cargar la IP " + [string]$elegida.ip + " y el puerto " + [string]$elegida.puerto + '.') -ForegroundColor Yellow
+                Write-Host '    En los dos casos hay que asignarle la cocina/area.' -ForegroundColor Yellow
             } catch { Write-Host ("  No se pudo instalar: " + $_.Exception.Message) -ForegroundColor Red }
             return $true
         }
@@ -3825,6 +4082,28 @@ function Invoke-MenuAction {
 #   stderr : resumen humano (es-AR) y avisos. Usar -Quiet para silenciarlo.
 #   exit   : 0 = resuelto | 2 = requiere escalamiento | 3 = falla del motor | 4 = self-test fallido
 # ---------------------------------------------------------------------------
+function Find-LocalNativeInstaller {
+    <# Busca un instalador de la Nativa ya presente: al lado del script, en Descargas o en el Escritorio. #>
+    if ($NativeInstallerPath) {
+        if (Test-Path $NativeInstallerPath) { return (Resolve-Path $NativeInstallerPath).Path }
+        return ''
+    }
+    $donde = @()
+    try { $donde += (Split-Path -Parent $PSCommandPath) } catch {}
+    try { $donde += (Get-Location).Path } catch {}
+    if ($env:USERPROFILE) { $donde += @((Join-Path $env:USERPROFILE 'Downloads'), (Join-Path $env:USERPROFILE 'Desktop')) }
+    foreach ($d in @($donde | Where-Object { $_ })) {
+        foreach ($pat in @('Fudo*.exe','*fudo*.exe','*Nativa*.exe')) {
+            try {
+                $hit = @(Get-ChildItem -Path $d -Filter $pat -File -ErrorAction SilentlyContinue |
+                         Where-Object { $_.Length -gt 200KB } | Sort-Object LastWriteTime -Descending) | Select-Object -First 1
+                if ($hit) { return [string]$hit.FullName }
+            } catch {}
+        }
+    }
+    return ''
+}
+
 function Install-FudoNative {
     <#
       Instala la App Nativa de Fudo. Antes agrega las exclusiones de antivirus, porque el bloqueo
@@ -3833,6 +4112,37 @@ function Install-FudoNative {
     #>
     $url = $NativeInstallerUrl
     if (-not $url) { $url = $script:NativeInstallerUrl }
+
+    # Preferimos un instalador que ya este en la PC: evita que el cliente tenga que descargar
+    # (y que el antivirus borre la descarga a mitad de camino).
+    $local = Find-LocalNativeInstaller
+    if ($local) {
+        Write-Host ''
+        Write-Host ("  Instalador encontrado en la PC: " + $local) -ForegroundColor Cyan
+        return (Invoke-Remediation -Description ('Instalar la App Nativa desde ' + $local) -Type 'nativa.install_local' -Target 'FudoNativa' `
+            -Before 'no instalada' -After 'instalada' -Reversible $true -Fix {
+                $notas = @()
+                if ($UseDefenderExclusions) {
+                    $rutasExcl = @((Split-Path -Parent $local))
+                    if ($env:LOCALAPPDATA) { $rutasExcl += @((Join-Path $env:LOCALAPPDATA 'Fudo'), (Join-Path $env:LOCALAPPDATA 'Programs')) }
+                    foreach ($ruta in @($rutasExcl | Where-Object { $_ })) {
+                        try { Add-MpPreference -ExclusionPath $ruta -ErrorAction SilentlyContinue; $notas += "excl $ruta" } catch {}
+                    }
+                    try { Add-MpPreference -ExclusionProcess "$FudoAppProcess*.exe" -ErrorAction SilentlyContinue } catch {}
+                    try { Add-MpPreference -ExclusionPath $local -ErrorAction SilentlyContinue } catch {}
+                }
+                Write-StepDetail 'ejecutando el instalador local'
+                $pr = $null
+                if ($NativeInstallerArgs) { $pr = Start-Process -FilePath $local -ArgumentList $NativeInstallerArgs -PassThru -Wait -ErrorAction Stop }
+                else { $pr = Start-Process -FilePath $local -PassThru -Wait -ErrorAction Stop }
+                $notas += "instalador finalizo con codigo $($pr.ExitCode)"
+                Start-Sleep -Seconds 3
+                $corriendo = $false
+                try { $corriendo = (@(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*$FudoAppProcess*" }).Count -gt 0) } catch {}
+                $notas += $(if ($corriendo) { 'la Nativa esta corriendo' } else { 'la Nativa todavia no aparece corriendo: puede requerir iniciar sesion en la web app de Fudo' })
+                ($notas -join ' | ')
+            })
+    }
 
     if (-not $url) {
         Write-Host ''
@@ -3843,7 +4153,8 @@ function Install-FudoNative {
         Write-Host '       script (agrega las exclusiones de Defender) y despues reinstalar.'
         Write-Host '    Guia: https://soporte.fu.do/es/articles/16419361'
         Write-Host ''
-        Write-Host '  Para automatizarlo, pasar -NativeInstallerUrl <url del instalador>.' -ForegroundColor DarkGray
+        Write-Host '  Si ya tenes el instalador, copialo al lado de este script (o pasar' -ForegroundColor DarkGray
+        Write-Host '  -NativeInstallerPath <ruta>) y el motor lo ejecuta sin descargar nada.' -ForegroundColor DarkGray
         return @{ applied = $false; note = 'sin URL de instalador configurada' }
     }
 
@@ -3852,7 +4163,9 @@ function Install-FudoNative {
             $notas = @()
             # 1) exclusiones ANTES de bajar el instalador: si no, el AV lo borra en la descarga
             if ($UseDefenderExclusions) {
-                foreach ($ruta in @($env:TEMP, (Join-Path $env:LOCALAPPDATA 'Fudo'), (Join-Path $env:LOCALAPPDATA 'Programs'))) {
+                $rutasExcl = @($env:TEMP)
+                if ($env:LOCALAPPDATA) { $rutasExcl += @((Join-Path $env:LOCALAPPDATA 'Fudo'), (Join-Path $env:LOCALAPPDATA 'Programs')) }
+                foreach ($ruta in @($rutasExcl | Where-Object { $_ })) {
                     try { Add-MpPreference -ExclusionPath $ruta -ErrorAction SilentlyContinue; $notas += "excl $ruta" } catch {}
                 }
                 try { Add-MpPreference -ExclusionProcess "$FudoAppProcess*.exe" -ErrorAction SilentlyContinue } catch {}
@@ -3909,6 +4222,10 @@ function Send-Telemetry {
                 telemetry     = $Result.telemetry
                 checks        = @($Result.checks | ForEach-Object { [ordered]@{ id = [string]$_.id; status = [string]$_.status; layer = $_.layer } })
                 impresoras    = @($(if ($script:Diagnostics.Contains('colas')) { $script:Diagnostics['colas'] | ForEach-Object { [ordered]@{ nombre = $_.nombre; puerto = $_.puerto; estado = $_.estado; trabajos = $_.trabajos } } } else { @() }))
+                cantidadColas = @($(if ($script:Diagnostics.Contains('colas')) { $script:Diagnostics['colas'] } else { @() })).Count
+                cantidadHardware = @($(if ($script:Diagnostics.Contains('printersConnected')) { $script:Diagnostics['printersConnected'] } else { @() })).Count
+                entorno       = $Result.entorno
+                historialFudo = @($(if ($script:Diagnostics.Contains('historialImpresion')) { $script:Diagnostics['historialImpresion'].porImpresora } else { @() }))
             }
         }
         $body = $payload | ConvertTo-Json -Depth 8 -Compress

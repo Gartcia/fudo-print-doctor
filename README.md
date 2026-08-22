@@ -232,9 +232,18 @@ Reporta cuántas encontró, en qué IPs, cuáles **ya tienen** una cola de Windo
 no encuentra nada lo dice explícitamente con los pasos para leer la IP real de la impresora
 (self-test: apagar, mantener FEED, encender).
 
-Para instalarla: opción `P` del menú, o `-PrinterIp <ip> -InstallNetworkPrinter`. Crea el puerto
-TCP/IP y la cola con driver de texto genérico, con el nombre que elijas (`-NewPrinterName`), y manda
-un ticket de prueba. Después hay que registrarla en Fudo como *Directo Ethernet* con su cocina/área.
+**Dos caminos en Fudo, y conviene saber cuál se va a usar antes de instalar nada:**
+
+- **Directo Ethernet**: Fudo imprime por socket a la IP y **no usa ninguna cola de Windows**. Si en
+  Fudo solo aparece el campo de IP, es este camino: no hay que instalar nada, alcanza con cargar la
+  IP y el puerto 9100.
+- **Impresora del sistema operativo**: Fudo imprime a través de una cola de Windows, elegida por
+  nombre. Acá sí hay que instalarla, y para eso está la opción `P` del menú o
+  `-PrinterIp <ip> -InstallNetworkPrinter`: crea el puerto TCP/IP y la cola con driver de texto
+  genérico, con el nombre que elijas (`-NewPrinterName`), y manda un ticket de prueba.
+
+El motor reporta si hay una **cola de Windows apuntando a esa IP**, que es un dato distinto de "está
+configurada en Fudo": eso último no se puede saber desde la PC.
 
 ## Telemetría (opcional)
 
@@ -242,15 +251,54 @@ Para no depender de que el asesor guarde el JSON: con `-TelemetryUrl` (o fijando
 `$script:TelemetryUrl` en el script, que es lo práctico para todo el equipo) cada corrida hace un
 POST con un resumen del resultado. Es silencioso: si falla, no molesta ni corta el diagnóstico.
 
-El payload por defecto es **reducido** —versión, caso, cliente, host, causa raíz, categoría,
-confianza, duración, el id y estado de cada chequeo, y el estado de cada cola— sin rutas de archivos
-ni el log. `-TelemetryFull` manda el JSON completo.
+Receptor listo para usar en [`tools/telemetria-appscript.gs`](tools/telemetria-appscript.gs) (Google
+Sheets + Apps Script), con los pasos en [`docs/telemetria.md`](docs/telemetria.md).
+
+Además del resultado del diagnóstico viaja el **contexto de la PC**, que el motor recolecta sin
+preguntarle nada al cliente:
+
+| Dato | De dónde sale |
+|---|---|
+| Sistema operativo, build, arquitectura | `Win32_OperatingSystem` |
+| Versión de PowerShell | `$PSVersionTable` |
+| Versión de Chrome y de Edge | `VersionInfo` del ejecutable, o el registro de Google Update |
+| Versión de la App Nativa de Fudo | registro de desinstalación |
+| País, cultura, zona horaria | `RegionInfo` / `Get-TimeZone` (local, sin geolocalizar por IP) |
+| Conexión de la PC: cable o wifi | `Get-NetAdapter` |
+| Cantidad de colas y de impresoras físicas | inventario de las capas 1 y 1a |
+| A qué cola le manda Fudo | historial del spooler (ver abajo) |
+
+`-TelemetryFull` manda el JSON completo (que incluye rutas): solo para depurar un caso puntual.
+
+## ¿A qué impresora le manda Fudo?
+
+Desde la PC no hay acceso a la configuración de Fudo, pero sí a una evidencia muy buena: el log del
+spooler de Windows (`Microsoft-Windows-PrintService/Operational`, evento 307) registra cada trabajo
+impreso con su cola y el nombre del documento. Los trabajos de la App Nativa se llaman
+`node print job`, así que se puede decir **qué cola recibió comandas de Fudo y cuándo fue la
+última**.
+
+Ese log viene **deshabilitado** de fábrica en Windows. Si está apagado, el motor lo habilita
+(reparación reversible) y avisa que a partir de la próxima corrida va a poder responder esa
+pregunta. Si está habilitado y ninguna cola recibió trabajos de la Nativa, eso apunta a que el
+problema está en la configuración de Fudo y no en Windows.
+
+Esto **no** reemplaza consultar la API de Fudo: dice a dónde llegan los trabajos, no qué cocina o
+área tiene asignada cada impresora.
 
 ## App Nativa de Fudo
 
-Con `-NativeInstallerUrl` el motor puede descargar e instalar la App Nativa, agregando **antes** las
-exclusiones de antivirus (si no, el AV suele borrar el instalador durante la descarga). Sin URL
-configurada, la opción `F` del menú guía los pasos manuales.
+Dos formas, y la primera es la recomendada porque evita que el cliente descargue nada (y que el
+antivirus borre la descarga a mitad de camino):
+
+1. **Instalador que ya está en la PC**: si el asesor copió el `.exe` junto al script, el motor lo
+   encuentra solo (también busca en Descargas y Escritorio). O se indica con `-NativeInstallerPath`.
+   `-NativeInstallerArgs` permite pasarle flags de instalación silenciosa.
+2. **Descarga**: con `-NativeInstallerUrl`.
+
+En los dos casos agrega **primero** las exclusiones de antivirus (carpeta del instalador, `%TEMP%`,
+`%LOCALAPPDATA%\Fudo`, `%LOCALAPPDATA%\Programs` y el proceso), después ejecuta y verifica que la
+Nativa quede corriendo.
 
 ## Uso desde un agente
 
@@ -290,6 +338,8 @@ Contrato completo del JSON: [`docs/contrato-json.md`](docs/contrato-json.md).
 | `-NewPrinterName` | auto | Nombre de la cola que se cree |
 | `-TelemetryUrl` / `-TelemetryFull` | vacío | Enviar el resultado por POST / mandar el JSON completo |
 | `-NativeInstallerUrl` | vacío | URL del instalador de la App Nativa |
+| `-NativeInstallerPath` | autodetecta | Instalador de la Nativa que ya está en la PC |
+| `-NativeInstallerArgs` | vacío | Flags para el instalador (ej. `/S`) |
 | `-NoMenu` | off | No mostrar el menú de acciones al terminar |
 | `-SkipIrreversible` | off | No aplica nada irreversible, sin preguntar |
 | `-KeepTestPrinter` | conserva | `:$false` borra la cola `FUDO-TEST-*` al terminar |
@@ -297,7 +347,7 @@ Contrato completo del JSON: [`docs/contrato-json.md`](docs/contrato-json.md).
 | `-JsonOut` | — | Volcar el JSON a un archivo |
 | `-Json` / `-Quiet` | off | Forzar JSON a stdout / silenciar el resumen |
 | `-Verbose` | off | Lista todos los chequeos en pantalla |
-| `-SelfTest` | off | Corre los 85 asserts de la lógica de decisión. No toca la PC. |
+| `-SelfTest` | off | Corre los 95 asserts de la lógica de decisión. No toca la PC. |
 
 ## Desarrollo
 

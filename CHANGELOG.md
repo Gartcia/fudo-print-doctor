@@ -2,6 +2,31 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [2.1] - 2026-08-22
+
+### Agregado
+- **A qué cola le manda Fudo**: se lee el log del spooler
+  (`Microsoft-Windows-PrintService/Operational`, evento 307) y se identifican los trabajos de la App
+  Nativa (`node print job`). Dice qué cola recibió comandas y cuándo fue la última. Si el log está
+  deshabilitado —viene así de fábrica— se habilita (reversible) para la próxima corrida.
+- **Contexto de la PC** en el JSON y en la telemetría: sistema operativo con build y arquitectura,
+  versión de PowerShell, Chrome, Edge, versión de la App Nativa, país, cultura, zona horaria,
+  conexión de la PC (cable o wifi) y cantidad de colas e impresoras físicas.
+- **Instalador local de la Nativa**: `-NativeInstallerPath` (y autodetección de `Fudo*.exe` al lado
+  del script, en Descargas o en el Escritorio) para instalarla sin que el cliente descargue nada.
+  `-NativeInstallerArgs` para flags de instalación silenciosa.
+- Receptor de telemetría listo para usar: `tools/telemetria-appscript.gs` (Google Sheets + Apps
+  Script) y `docs/telemetria.md`.
+- La IP de una impresora de red detectada aparece en `nextActions`, con el paso concreto para
+  cargarla en Fudo.
+
+### Corregido
+- `Join-Path` con base `$null` explotaba en Windows de 32 bits (donde no existe
+  `ProgramFiles(x86)`) al buscar Chrome, Edge o el instalador de la Nativa.
+- Los textos de impresoras de red distinguen los dos caminos de Fudo (Directo Ethernet, que no usa
+  colas de Windows, vs impresora del sistema operativo) y ya no dan a entender que una cola de
+  Windows implique que Fudo la tenga configurada.
+
 ## [2.0] - 2026-08-22
 
 ### Corregido
