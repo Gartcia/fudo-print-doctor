@@ -159,6 +159,11 @@ CONTRATO DE SALIDA (v1.1)
     diagnosis.nextActions[] (que hacer / quien lo hace / articulo), engineErrors[], checks[], telemetry.
 
 CHANGELOG
+    2.8  - La URL de telemetria, una vez conocida, queda guardada en la variable de entorno de
+             USUARIO de esa PC (y se lee de ahi en las corridas siguientes). Asi deja de depender
+             de un archivo que una actualizacion pueda reemplazar: alcanza con que UNA corrida la
+             haya recibido. Queda registrado en actionsApplied y se borra con
+             setx FUDO_TELEMETRY_URL "".
     2.7  - El error de telemetria se traduce a una instruccion concreta. Un 403 con HTML de Google
              significa que el Apps Script no esta publicado con acceso abierto, y ahora el mensaje
              dice exactamente que cambiar (Implementar > Administrar implementaciones >
@@ -382,7 +387,7 @@ $script:StartTime    = Get-Date
 $script:Diagnostics  = [ordered]@{}   # datos crudos recolectados
 $script:Errors       = New-Object System.Collections.ArrayList   # fallas internas del motor
 $script:TestPrintersCreated = New-Object System.Collections.ArrayList   # colas temporales creadas por el motor
-$script:SchemaVersion = '2.7'
+$script:SchemaVersion = '2.8'
 # Distribucion: repo publico. VERSION es un archivo de una linea con la version publicada.
 $script:RepoUrl    = 'https://github.com/Gartcia/fudo-print-doctor'
 $script:RawBase    = 'https://raw.githubusercontent.com/Gartcia/fudo-print-doctor/main'
@@ -4365,7 +4370,14 @@ function Get-TelemetryUrl {
     <# Resuelve la URL de telemetria sin necesidad de tenerla en el codigo. #>
     $script:TelemetryLookup = @()
     if ($TelemetryUrl) { $script:TelemetryLookup += 'parametro -TelemetryUrl'; return $TelemetryUrl }
-    if ($env:FUDO_TELEMETRY_URL) { $script:TelemetryLookup += 'variable FUDO_TELEMETRY_URL'; return [string]$env:FUDO_TELEMETRY_URL }
+    if ($env:FUDO_TELEMETRY_URL) { $script:TelemetryLookup += 'variable FUDO_TELEMETRY_URL (del proceso / launcher)'; return [string]$env:FUDO_TELEMETRY_URL }
+    try {
+        $guardada = [Environment]::GetEnvironmentVariable('FUDO_TELEMETRY_URL', 'User')
+        if ($guardada -and ([string]$guardada -match '^https://')) {
+            $script:TelemetryLookup += 'variable FUDO_TELEMETRY_URL (guardada en esta PC)'
+            return [string]$guardada
+        }
+    } catch {}
     # OJO: en Windows la extension .url esta reservada para accesos directos de Internet,
     # asi que el archivo preferido es telemetria.txt (se acepta .url por compatibilidad).
     $nombres = @('telemetria.txt','telemetria.url','fudo-telemetria.txt')
@@ -4494,6 +4506,26 @@ function Invoke-TelemetryPost {
     }
 }
 
+function Save-TelemetryUrl {
+    <#
+      Una vez que la URL se conocio (por el launcher o por parametro), la dejamos guardada en una
+      variable de entorno de USUARIO de esa PC. Asi sobrevive a cualquier actualizacion de archivos:
+      si mas adelante el launcher se reemplaza por uno sin URL, la telemetria sigue funcionando.
+      Es un cambio chico y reversible: setx FUDO_TELEMETRY_URL "" lo borra.
+    #>
+    param([string]$Url)
+    if (-not $Url) { return }
+    try {
+        $actual = [Environment]::GetEnvironmentVariable('FUDO_TELEMETRY_URL', 'User')
+        if ([string]$actual -eq $Url) { return }
+        [Environment]::SetEnvironmentVariable('FUDO_TELEMETRY_URL', $Url, 'User')
+        Add-Action -Type 'telemetry.persist' -Target 'FUDO_TELEMETRY_URL (usuario)' -Before ([string]$actual) -After $Url -Reversible $true
+        Write-DoctorLog -Level 'INFO' -Message 'URL de telemetria guardada en la variable de usuario FUDO_TELEMETRY_URL'
+    } catch {
+        Write-DoctorLog -Level 'WARN' -Message "No se pudo guardar la URL de telemetria: $($_.Exception.Message)"
+    }
+}
+
 function Send-Telemetry {
     <#
       Manda el resultado a un endpoint para no depender de que el asesor guarde el JSON.
@@ -4501,6 +4533,7 @@ function Send-Telemetry {
     #>
     param($Result)
     $url = Get-TelemetryUrl
+    if ($url) { Save-TelemetryUrl -Url $url }
     if (-not $url) {
         # Antes esto era un return silencioso y nadie se enteraba de que no estaba configurada.
         $script:TelemetryStatus = [ordered]@{
