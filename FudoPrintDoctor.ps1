@@ -164,6 +164,15 @@ CONTRATO DE SALIDA (v1.1)
     diagnosis.nextActions[] (que hacer / quien lo hace / articulo), engineErrors[], checks[], telemetry.
 
 CHANGELOG
+    3.1  - Campo 'llegada': clasifica en que estado nos encontramos la PC, cruzando tres evidencias
+             independientes (colas instaladas y su estado, entradas historicas del registro USBPRINT
+             y puertos huerfanos, e historial de impresion del spooler):
+               nunca_hubo_impresora_en_esta_pc | primera_instalacion |
+               estaba_instalada_y_dejo_de_funcionar | instalada_pero_nunca_imprimio |
+               una_funciona_y_otra_no | todas_funcionan | hardware_conectado_sin_instalar
+             Incluye usoPrevio (si_imprimio_comandas_de_fudo / imprimio_pero_no_comandas_de_fudo /
+             no_hay_registro_de_impresion / desconocido cuando el log del spooler esta apagado) y
+             el alcance ('esta_pc'): desde la PC no se puede afirmar nada del resto del local.
     3.0  - Telemetria analizable sin pedirle datos a nadie:
              * pcId: hash SHA256 truncado del MachineGuid de Windows. Estable y anonimo: agrupa las
                corridas de una misma PC sin identificar al comercio ni permitir volver al original.
@@ -413,7 +422,7 @@ $script:StartTime    = Get-Date
 $script:Diagnostics  = [ordered]@{}   # datos crudos recolectados
 $script:Errors       = New-Object System.Collections.ArrayList   # fallas internas del motor
 $script:TestPrintersCreated = New-Object System.Collections.ArrayList   # colas temporales creadas por el motor
-$script:SchemaVersion = '3.0'
+$script:SchemaVersion = '3.1'
 # Distribucion: repo publico. VERSION es un archivo de una linea con la version publicada.
 $script:RepoUrl    = 'https://github.com/Gartcia/fudo-print-doctor'
 $script:RawBase    = 'https://raw.githubusercontent.com/Gartcia/fudo-print-doctor/main'
@@ -1532,6 +1541,86 @@ function New-FudoTestPrinter {
         return $name
     }
     return ''
+}
+
+function Get-ArrivalScenario {
+    <#
+      En que estado nos encontramos la PC. Es la pregunta "en que estado llegan los clientes":
+      nunca tuvieron impresora, la tenian y dejo de andar, tienen una andando y otra no, etc.
+
+      Se apoya en tres evidencias independientes:
+        - colas reales instaladas y su estado (capa 1)
+        - entradas historicas del registro USBPRINT y puertos USB00x huerfanos (impresoras que
+          ALGUNA VEZ estuvieron en esta PC)
+        - historial de impresion del spooler (si esa cola imprimio de verdad alguna vez)
+      Cuando el log del spooler esta apagado, el uso previo queda como 'desconocido' en lugar de
+      afirmar que nunca imprimio.
+    #>
+    $colas = @()
+    if ($script:Diagnostics.Contains('colas')) { $colas = @($script:Diagnostics['colas']) }
+    $sanas   = @($colas | Where-Object { [int]$_.score -eq 0 })
+    $malas   = @($colas | Where-Object { [int]$_.score -gt 0 })
+
+    $historicas = @()
+    if ($script:Diagnostics.Contains('impresorasDesconectadas')) { $historicas = @($script:Diagnostics['impresorasDesconectadas']) }
+    $puertosUsb = @()
+    if ($script:Diagnostics.Contains('usbPorts')) { $puertosUsb = @($script:Diagnostics['usbPorts'] | Where-Object { $_ }) }
+    $hwPresente = 0
+    if ($script:Diagnostics.Contains('hwDeviceCount')) { $hwPresente = [int]$script:Diagnostics['hwDeviceCount'] }
+
+    # el motor instalo una cola en esta corrida?
+    $instaloAhora = (@($script:Actions | Where-Object { [string]$_.type -in @('printer.install_generic','printer.recreate') }).Count -gt 0)
+
+    # uso previo real, segun el log del spooler
+    $usoPrevio = 'desconocido'
+    if ($script:Diagnostics.Contains('historialImpresion')) {
+        $h = $script:Diagnostics['historialImpresion']
+        if ($h.habilitado) {
+            $conFudo = @($h.porImpresora | Where-Object { [int]$_.deFudo -gt 0 })
+            $conAlgo = @($h.porImpresora | Where-Object { [int]$_.total -gt 0 })
+            if (@($conFudo).Count -gt 0)      { $usoPrevio = 'si_imprimio_comandas_de_fudo' }
+            elseif (@($conAlgo).Count -gt 0)  { $usoPrevio = 'imprimio_pero_no_comandas_de_fudo' }
+            else                              { $usoPrevio = 'no_hay_registro_de_impresion' }
+        }
+    }
+
+    # Huellas de que en esta PC ALGUNA VEZ hubo una impresora instalada
+    $huboAntes = ((@($historicas).Count -gt 0) -or (@($puertosUsb).Count -gt 0) -or (@($colas).Count -gt 0))
+
+    $esc = 'indeterminado'
+    if (@($colas).Count -eq 0 -and -not $huboAntes -and $hwPresente -eq 0) {
+        $esc = 'nunca_hubo_impresora_en_esta_pc'
+    } elseif ($instaloAhora -and -not (@($historicas).Count -gt 0)) {
+        $esc = 'primera_instalacion'
+    } elseif (@($sanas).Count -gt 0 -and @($malas).Count -gt 0) {
+        $esc = 'una_funciona_y_otra_no'
+    } elseif (@($colas).Count -gt 0 -and @($malas).Count -eq 0) {
+        $esc = 'todas_funcionan'
+    } elseif (@($malas).Count -gt 0) {
+        if ($usoPrevio -eq 'si_imprimio_comandas_de_fudo' -or @($historicas).Count -gt 0) {
+            $esc = 'estaba_instalada_y_dejo_de_funcionar'
+        } elseif ($usoPrevio -eq 'no_hay_registro_de_impresion') {
+            $esc = 'instalada_pero_nunca_imprimio'
+        } else {
+            $esc = 'instalada_y_no_funciona_sin_historial'
+        }
+    } elseif (@($colas).Count -eq 0 -and $hwPresente -gt 0) {
+        $esc = 'hardware_conectado_sin_instalar'
+    }
+
+    return [ordered]@{
+        escenario          = $esc
+        usoPrevio          = $usoPrevio
+        colasTotales       = @($colas).Count
+        colasSanas         = @($sanas).Count
+        colasConProblema   = @($malas).Count
+        impresorasHistoricas = @($historicas).Count
+        hardwarePresente   = $hwPresente
+        instaloEnEstaCorrida = [bool]$instaloAhora
+        # 'primera vez' se puede afirmar de esta PC, no del comercio: desde la PC no hay
+        # forma de saber si en otra maquina del local ya hay impresoras funcionando.
+        alcance            = 'esta_pc'
+    }
 }
 
 function Get-PcId {
@@ -3562,6 +3651,7 @@ function Invoke-FudoPrintDoctor {
                 transicion     = $trans
             }
         )
+        llegada       = $(Invoke-Step -Name 'env.scenario' -Body { Get-ArrivalScenario })
         entorno       = $(Invoke-Step -Name 'env.info' -Body { Get-EnvironmentInfo })
         nativaHuella  = $(Invoke-Step -Name 'env.nativeFingerprint' -Body { Get-FudoNativeFingerprint })
         hardware      = [ordered]@{
@@ -4137,6 +4227,41 @@ public class FudoFakeEndpoint {
     $script:UpdateNote = 'Hay una version mas nueva publicada: 9.9'
     Assert-Eq 'S35 con novedad ofrece actualizar' $true (@(Get-MenuOptions | ForEach-Object { [string]$_.k }) -contains 'A')
     $script:UpdateNote = ''
+
+    # Escenario 36: clasificacion del estado en que se encuentra la PC
+    Reset-State
+    Assert-Eq 'S36 PC sin nada' 'nunca_hubo_impresora_en_esta_pc' ([string](Get-ArrivalScenario).escenario)
+
+    Reset-State
+    $script:Diagnostics['colas'] = @(
+        [ordered]@{ nombre='COCINA'; puerto='USB001'; score=0;  estado='sana' },
+        [ordered]@{ nombre='CAJA';   puerto='USB003'; score=95; estado='no imprime' })
+    Assert-Eq 'S36 una anda y otra no' 'una_funciona_y_otra_no' ([string](Get-ArrivalScenario).escenario)
+    Assert-Eq 'S36 cuenta las sanas' 1 ([int](Get-ArrivalScenario).colasSanas)
+
+    Reset-State
+    $script:Diagnostics['colas'] = @([ordered]@{ nombre='CAJA'; puerto='USB003'; score=95; estado='no imprime' })
+    $script:Diagnostics['impresorasDesconectadas'] = @([ordered]@{ nombre='Xprinter'; puerto='USB003' })
+    Assert-Eq 'S36 estaba instalada y dejo de andar' 'estaba_instalada_y_dejo_de_funcionar' ([string](Get-ArrivalScenario).escenario)
+
+    Reset-State
+    $script:Diagnostics['colas'] = @([ordered]@{ nombre='CAJA'; puerto='USB002'; score=40; estado='no imprime' })
+    $script:Diagnostics['historialImpresion'] = [ordered]@{ habilitado = $true; porImpresora = @() }
+    Assert-Eq 'S36 instalada pero nunca imprimio' 'instalada_pero_nunca_imprimio' ([string](Get-ArrivalScenario).escenario)
+    Assert-Eq 'S36 uso previo sin registro' 'no_hay_registro_de_impresion' ([string](Get-ArrivalScenario).usoPrevio)
+
+    Reset-State
+    $script:Diagnostics['colas'] = @([ordered]@{ nombre='CAJA'; puerto='USB002'; score=40; estado='no imprime' })
+    $script:Diagnostics['historialImpresion'] = [ordered]@{ habilitado = $false; porImpresora = @() }
+    Assert-Eq 'S36 log apagado no afirma nada' 'desconocido' ([string](Get-ArrivalScenario).usoPrevio)
+
+    Reset-State
+    $script:Diagnostics['colas'] = @([ordered]@{ nombre='COCINA'; puerto='USB001'; score=0; estado='sana' })
+    Assert-Eq 'S36 todo funciona' 'todas_funcionan' ([string](Get-ArrivalScenario).escenario)
+
+    Reset-State
+    $script:Diagnostics['hwDeviceCount'] = 1
+    Assert-Eq 'S36 hardware sin instalar' 'hardware_conectado_sin_instalar' ([string](Get-ArrivalScenario).escenario)
 
     Write-Host ""
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)
@@ -4734,6 +4859,7 @@ function Send-Telemetry {
                 caseId        = [string]$Result.caseId
                 pcId          = [string]$Result.pcId
                 corrida       = $Result.corrida
+                llegada       = $Result.llegada
                 nativaHuella  = $Result.nativaHuella
                 clientId      = [string]$Result.clientId
                 host          = [string]$Result.host

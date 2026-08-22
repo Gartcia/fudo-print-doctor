@@ -34,6 +34,7 @@ var HOJA  = 'corridas';
 
 var COLUMNAS = [
   'recibido', 'timestamp', 'pcId', 'corridaNro', 'transicion', 'causaAnterior',
+  'escenarioLlegada', 'usoPrevio', 'colasSanas', 'colasConProblema', 'impresorasHistoricas',
   'caseId', 'clientId', 'host',
   'pais', 'zonaHoraria', 'so', 'soBuild', 'arquitectura', 'powershell',
   'chrome', 'edge', 'nativaVersion', 'conexionPC',
@@ -128,10 +129,13 @@ function armarFila_(d) {
     .map(function (h) { return h.impresora + ' (' + h.deFudo + ')'; }).join(' | ');
 
   var cor = d.corrida || {};
+  var lle = d.llegada || {};
 
   return [
     new Date(), d.timestamp || '',
     d.pcId || '', cor.numero || 0, cor.transicion || '', cor.causaAnterior || '',
+    lle.escenario || '', lle.usoPrevio || '', lle.colasSanas || 0, lle.colasConProblema || 0,
+    lle.impresorasHistoricas || 0,
     d.caseId || '', d.clientId || '', d.host || '',
     env.pais || '', env.zonaHoraria || '', so.nombre || '', so.build || '', so.arquitectura || '', env.powershell || '',
     env.chrome || '', env.edge || '', env.nativaVersion || '', env.tipoConexionPC || '',
@@ -157,7 +161,7 @@ function actualizarResumen_() {
   for (var i = 0; i < COLUMNAS.length; i++) { idx[COLUMNAS[i]] = i; }
 
   var pcs = {}, categorias = {}, chromes = {}, sos = {}, conexiones = {}, paises = {};
-  var resueltas = 0, transiciones = {}, queResolvio = {};
+  var resueltas = 0, transiciones = {}, queResolvio = {}, escenarios = {}, usos = {};
 
   for (var f = 0; f < filas.length; f++) {
     var r = filas[f];
@@ -172,6 +176,11 @@ function actualizarResumen_() {
 
     var tr = r[idx['transicion']] || 'sin dato';
     transiciones[tr] = (transiciones[tr] || 0) + 1;
+
+    var esc = r[idx['escenarioLlegada']] || 'sin dato';
+    escenarios[esc] = (escenarios[esc] || 0) + 1;
+    var uso = r[idx['usoPrevio']] || 'sin dato';
+    usos[uso] = (usos[uso] || 0) + 1;
 
     // Que estaba fallando cuando algo paso a resuelto, y con que reparacion
     if (tr === 'se_resolvio') {
@@ -195,6 +204,8 @@ function actualizarResumen_() {
   out.push(['', '']);
   out.push(bloque_('CAUSA (categoria)', categorias));
   var secciones = [
+    ['EN QUE ESTADO LLEGAN (escenario)', escenarios],
+    ['USO PREVIO DE LA IMPRESORA', usos],
     ['TRANSICIONES', transiciones],
     ['QUE RESOLVIO (causa anterior ==> reparacion)', queResolvio],
     ['SISTEMA OPERATIVO', sos],

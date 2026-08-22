@@ -147,11 +147,38 @@ Desde la PC no hay forma confiable hoy. Por eso cada corrida manda `nativaHuella
 —ningún valor, para no transportar tokens— y así averiguar si la App Nativa guarda algo usable (un
 subdominio, un id de cuenta). Con dos o tres casos reales se decide si hay algo aprovechable.
 
-## 6. El dashboard
+## 6. En qué estado llegan: el campo `llegada`
+
+Cada corrida clasifica sola la situación que encontró, cruzando tres evidencias independientes:
+las colas instaladas y su estado, las entradas históricas del registro `USBPRINT` (impresoras que
+*alguna vez* estuvieron en esa PC) y el historial de impresión del spooler.
+
+| `escenario` | Qué significa |
+|---|---|
+| `nunca_hubo_impresora_en_esta_pc` | Ni colas, ni históricos, ni hardware. Instalación desde cero. |
+| `primera_instalacion` | El motor instaló la primera cola de esa PC en esta corrida. |
+| `estaba_instalada_y_dejo_de_funcionar` | Hay cola o rastro histórico, y evidencia de uso previo. |
+| `instalada_pero_nunca_imprimio` | Hay cola, el log está habilitado y no registró ningún trabajo. |
+| `una_funciona_y_otra_no` | Al menos una cola sana y otra fallando (caja/cocina). |
+| `todas_funcionan` | Ninguna cola con problemas. |
+| `hardware_conectado_sin_instalar` | Impresora enchufada, sin cola en Windows. |
+
+Y `usoPrevio` responde "¿esto imprimió alguna vez?": `si_imprimio_comandas_de_fudo`,
+`imprimio_pero_no_comandas_de_fudo`, `no_hay_registro_de_impresion`, o **`desconocido`** cuando el
+log del spooler está apagado. Ese último valor es importante: es más honesto que afirmar que nunca
+imprimió cuando en realidad no hay registro.
+
+**Límite a tener en cuenta**: el campo `alcance` vale siempre `esta_pc`. Desde la PC no hay forma de
+saber si en otra máquina del local ya hay impresoras funcionando, así que "es la primera impresora
+del comercio" no se puede afirmar — solo "es la primera de esta PC". Para lo otro haría falta un
+identificador de comercio (ver `nativaHuella`) o la API de Fudo.
+
+## 7. El dashboard
 
 La hoja **`resumen`** se recalcula sola con cada corrida que llega (la genera el Apps Script). Trae:
 
 - corridas totales, **PCs distintas**, resueltas y % de resolución;
+- **en qué estado llegan** (ranking de `escenario`) y **uso previo**;
 - ranking de **causas** (`categoria`);
 - **transiciones** (cuántas pasaron a resuelto, cuántas volvieron a fallar);
 - **qué resolvió**: `causa anterior ==> reparación aplicada`, ordenado por frecuencia;
