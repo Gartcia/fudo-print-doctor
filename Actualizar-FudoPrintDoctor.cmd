@@ -54,6 +54,16 @@ echo     FudoPrintDoctor.cmd
 echo     FudoPrintDoctor.ps1
 echo   y que haga doble clic en el .cmd
 echo  ================================================================
+
+REM Aviso si el launcher quedo sin la URL de telemetria (por ejemplo, si se
+REM bajo el del repositorio publico, que la trae vacia a proposito).
+findstr /c:"FUDO_TELEMETRY_URL=https" "FudoPrintDoctor.cmd" >nul 2>&1
+if errorlevel 1 (
+  echo.
+  echo  ATENCION: FudoPrintDoctor.cmd no tiene configurada la URL de
+  echo  telemetria, asi que las corridas no se van a reportar al panel.
+  echo  Pedi el FudoPrintDoctor.cmd interno y reemplaza este archivo.
+)
 echo.
 pause
 exit /b 0
