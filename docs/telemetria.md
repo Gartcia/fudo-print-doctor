@@ -9,8 +9,21 @@ con un resumen, y queda una fila en una planilla de Google.
 2. **Extensiones → Apps Script**, borrar todo y pegar [`tools/telemetria-appscript.gs`](../tools/telemetria-appscript.gs).
 3. Cambiar `TOKEN` por una clave inventada.
 4. **Implementar → Nueva implementación → Aplicación web**:
-   - *Ejecutar como*: Yo
-   - *Quién tiene acceso*: Cualquier persona
+   - *Ejecutar como*: **Yo**
+   - *Quién tiene acceso*: **Cualquier persona**
+
+   Este paso es el que más falla. Ojo con dos trampas:
+
+   - **"Cualquier persona"**, no *"Cualquier persona con una cuenta de Google"*. El script no se
+     autentica con Google, así que la segunda opción devuelve **HTTP 403** y una página de login en
+     lugar de ejecutar el código.
+   - Si ya estaba implementado y cambiás el acceso, hay que hacer **Administrar implementaciones →
+     editar (lápiz) → cambiar → Implementar**. Editando la implementación existente la URL se
+     mantiene; creando una nueva, la URL cambia y hay que actualizarla en el launcher.
+
+   Si la cuenta es de Google Workspace, la organización puede tener bloqueada la opción "Cualquier
+   persona". En ese caso no hay vuelta con Apps Script en esa cuenta: se usa una cuenta personal de
+   Gmail, o otro receptor (un webhook de Slack es el reemplazo más rápido).
 5. Copiar la URL que termina en `/exec`.
 
 ## 2. Conectarlo al motor

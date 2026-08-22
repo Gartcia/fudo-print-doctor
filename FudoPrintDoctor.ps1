@@ -159,6 +159,10 @@ CONTRATO DE SALIDA (v1.1)
     diagnosis.nextActions[] (que hacer / quien lo hace / articulo), engineErrors[], checks[], telemetry.
 
 CHANGELOG
+    2.7  - El error de telemetria se traduce a una instruccion concreta. Un 403 con HTML de Google
+             significa que el Apps Script no esta publicado con acceso abierto, y ahora el mensaje
+             dice exactamente que cambiar (Implementar > Administrar implementaciones >
+             'Quien tiene acceso' = Cualquier persona).
     2.6  - La URL de telemetria puede viajar en el propio launcher (set FUDO_TELEMETRY_URL en el
              .cmd interno), asi no hay un archivo extra que el asesor pueda olvidarse de copiar:
              el .cmd es el archivo que si o si tiene que estar. El repo publico lo trae vacio.
@@ -378,7 +382,7 @@ $script:StartTime    = Get-Date
 $script:Diagnostics  = [ordered]@{}   # datos crudos recolectados
 $script:Errors       = New-Object System.Collections.ArrayList   # fallas internas del motor
 $script:TestPrintersCreated = New-Object System.Collections.ArrayList   # colas temporales creadas por el motor
-$script:SchemaVersion = '2.6'
+$script:SchemaVersion = '2.7'
 # Distribucion: repo publico. VERSION es un archivo de una linea con la version publicada.
 $script:RepoUrl    = 'https://github.com/Gartcia/fudo-print-doctor'
 $script:RawBase    = 'https://raw.githubusercontent.com/Gartcia/fudo-print-doctor/main'
@@ -4400,6 +4404,22 @@ function Get-TelemetryUrl {
     return ''
 }
 
+function Get-TelemetryHint {
+    <# Traduce las fallas tipicas del endpoint a una instruccion concreta. #>
+    param([int]$Codigo, [string]$Cuerpo)
+    $esHtmlDeGoogle = ($Cuerpo -match '(?i)<!DOCTYPE html' -and $Cuerpo -match '(?i)google|accounts\.google|script\.google')
+    if ($Codigo -in @(401, 403) -or $esHtmlDeGoogle) {
+        return ('El Apps Script no esta publicado con acceso abierto: Google devolvio su pagina de login en lugar de ejecutarlo. ' +
+                'En el editor de Apps Script: Implementar > Administrar implementaciones > editar (lapiz) > ' +
+                '"Quien tiene acceso" = Cualquier persona (NO "Cualquier persona con una cuenta de Google"), ' +
+                '"Ejecutar como" = Yo, y Implementar. Si la cuenta es de Workspace y la organizacion bloquea esa opcion, ' +
+                'hay que usar otro receptor (por ejemplo un webhook de Slack) o una cuenta personal de Gmail.')
+    }
+    if ($Codigo -eq 404) { return 'La URL no existe o la implementacion fue borrada: volver a implementar y actualizar la URL en el launcher.' }
+    if ($Codigo -ge 500) { return 'El endpoint devolvio un error del servidor: revisar el codigo del Apps Script (los errores de doPost quedan en Ejecuciones).' }
+    return 'El endpoint no acepto el reporte.'
+}
+
 function Invoke-TelemetryPost {
     <#
       POST robusto para Apps Script. El detalle importante: /exec responde 302 hacia
@@ -4466,9 +4486,11 @@ function Invoke-TelemetryPost {
 
         if ($cuerpo -match '"ok"\s*:\s*true') { return @{ ok = $true; note = 'enviado' } }
         $c1 = $cuerpo; if ($c1.Length -gt 200) { $c1 = $c1.Substring(0, 200) }
-        return @{ ok = $false; note = "HTTP $codigo. $primero. Cuerpo: $c1" }
+        return @{ ok = $false; note = ((Get-TelemetryHint -Codigo $codigo -Cuerpo $cuerpo) + " [HTTP $codigo. $primero. Cuerpo: $c1]") }
     } catch {
-        return @{ ok = $false; note = "$primero | segundo intento: $($_.Exception.Message)" }
+        $extra = ''
+        if ($primero -match '40[13]') { $extra = ' ' + (Get-TelemetryHint -Codigo 403 -Cuerpo '') }
+        return @{ ok = $false; note = "$primero | segundo intento: $($_.Exception.Message).$extra" }
     }
 }
 
