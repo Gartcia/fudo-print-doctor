@@ -190,7 +190,32 @@ identificador de comercio (ver `nativaHuella`) o la API de Fudo.
 
 ## 7. El dashboard
 
-La hoja **`resumen`** se recalcula sola con cada corrida que llega (la genera el Apps Script). Trae:
+Hay dos, y sirven para cosas distintas.
+
+### a) Como página web: `?view=dash`
+
+```
+https://script.google.com/macros/s/<ID>/exec?key=TOKEN&view=dash
+```
+
+El propio Apps Script sirve la página, leyendo la planilla en cada carga. Ventajas: es una URL que
+se puede compartir, **se actualiza sola** (además se refresca cada 5 minutos), no necesita
+infraestructura ni permisos extra, y no depende de que la planilla sea pública.
+
+Contiene: una fila de KPIs (corridas, PCs distintas, % resueltas, escalados), y rankings de *en qué
+estado llegan*, *causa raíz*, *qué resolvió el problema*, *transiciones*, uso previo, conexión,
+sistema operativo, versión de Chrome, versión de la Nativa y país. Abajo, las últimas 15 corridas.
+
+Sobre el diseño: una serie por gráfico (magnitud), así que todas las barras usan el mismo azul
+—nunca colores por categoría, que sugerirían identidades distintas donde solo hay cantidades—, con
+el número como etiqueta directa al lado de cada barra. Se evitó a propósito el par verde/rojo: son
+indistinguibles en deuteranopia (ΔE 4.1 medido), y el único color de estado que se usa va siempre
+acompañado de su etiqueta. Tiene modo claro y oscuro según el sistema del que la abre.
+
+### b) Como hoja de la planilla: `resumen`
+
+Se recalcula sola con cada corrida que llega (la genera el Apps Script). Sirve para mirar los
+números dentro de la planilla y como fuente si más adelante se quiere un Looker Studio. Trae:
 
 - corridas totales, **PCs distintas**, resueltas y % de resolución;
 - **en qué estado llegan** (ranking de `escenario`) y **uso previo**;
