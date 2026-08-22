@@ -1,3 +1,6 @@
+# Telemetria: la URL no se publica (repo publico)
+telemetria.url
+
 # Salidas y archivos temporales
 resultado.json
 FudoPrintDoctor-*.json

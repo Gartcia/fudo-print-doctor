@@ -16,6 +16,13 @@
  *   5. En FudoPrintDoctor.ps1, poner esa URL en $script:TelemetryUrl
  *      (o pasarla con -TelemetryUrl).
  *
+ * SEGURIDAD
+ *   La URL /exec es publica: cualquiera que la tenga puede escribir. Por eso doPost
+ *   valida la forma del payload y doGet exige el TOKEN. Si en algun momento aparece
+ *   basura en la planilla, alcanza con volver a implementar (Nueva version) para
+ *   obtener una URL nueva y actualizar el archivo telemetria.url de los asesores.
+ *   NO subir este archivo con el TOKEN real a un repositorio publico.
+ *
  * COMO LEER LOS DATOS
  *   GET <URL>/exec?key=TOKEN            -> ultimas 100 corridas en JSON
  *   GET <URL>/exec?key=TOKEN&limit=500  -> mas filas
@@ -37,12 +44,27 @@ var COLUMNAS = [
 function doPost(e) {
   try {
     var d = JSON.parse(e.postData.contents);
+
+    // Este endpoint es publico (cualquiera con la URL puede escribir), asi que
+    // descartamos lo que no tenga la forma de un resultado del motor.
+    if (!esPayloadValido_(d)) {
+      return json_({ ok: false, error: 'payload no reconocido' });
+    }
     var hoja = obtenerHoja_();
     hoja.appendRow(armarFila_(d));
     return json_({ ok: true });
   } catch (err) {
     return json_({ ok: false, error: String(err) });
   }
+}
+
+function esPayloadValido_(d) {
+  if (!d || typeof d !== 'object') { return false; }
+  if (typeof d.schemaVersion !== 'string' || !/^\d+\.\d+$/.test(d.schemaVersion)) { return false; }
+  var estados = ['resolved', 'needs_escalation', 'partial_engine_error', 'engine_error'];
+  if (estados.indexOf(d.status) === -1) { return false; }
+  if (!d.telemetry && !d.checks) { return false; }
+  return true;
 }
 
 function doGet(e) {

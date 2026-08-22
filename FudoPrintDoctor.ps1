@@ -77,7 +77,10 @@
     No mostrar el menu de acciones al terminar. El menu solo aparece en consola interactiva.
 
 .PARAMETER TelemetryUrl
-    Si se indica (o si se fija $script:TelemetryUrl en el script), al terminar se envia por POST
+    URL donde reportar el resultado. Tambien se puede dejar en la variable de entorno
+    FUDO_TELEMETRY_URL o en un archivo 'telemetria.url' al lado del script (una linea con la URL).
+    A proposito NO va hardcodeada en el codigo: el repositorio es publico.
+    Si se indica, al terminar se envia por POST
     un resumen del resultado a esa URL. Silencioso: si falla, no molesta ni corta el run.
     Por defecto viaja un payload REDUCIDO (sin rutas, sin log): version, caso, cliente, host,
     causa raiz, categoria, confianza, duracion y el id+estado de cada chequeo.
@@ -152,6 +155,9 @@ CONTRATO DE SALIDA (v1.1)
     diagnosis.nextActions[] (que hacer / quien lo hace / articulo), engineErrors[], checks[], telemetry.
 
 CHANGELOG
+    2.2  - La URL de telemetria ya no vive en el codigo: se toma de -TelemetryUrl, de la variable
+             de entorno FUDO_TELEMETRY_URL o de un archivo 'telemetria.url' al lado del script.
+             El repositorio es publico y una URL de escritura publicada se puede spamear.
     2.1  - Nuevo: se identifica A QUE COLA le manda Fudo, leyendo el log del spooler
              (Microsoft-Windows-PrintService/Operational, evento 307) y reconociendo los trabajos
              de la App Nativa ('node print job'). Si el log esta deshabilitado (viene asi de
@@ -336,7 +342,7 @@ $script:StartTime    = Get-Date
 $script:Diagnostics  = [ordered]@{}   # datos crudos recolectados
 $script:Errors       = New-Object System.Collections.ArrayList   # fallas internas del motor
 $script:TestPrintersCreated = New-Object System.Collections.ArrayList   # colas temporales creadas por el motor
-$script:SchemaVersion = '2.1'
+$script:SchemaVersion = '2.2'
 # Distribucion: repo publico. VERSION es un archivo de una linea con la version publicada.
 $script:RepoUrl    = 'https://github.com/Gartcia/fudo-print-doctor'
 $script:RawBase    = 'https://raw.githubusercontent.com/Gartcia/fudo-print-doctor/main'
@@ -344,8 +350,11 @@ $script:UpdateNote = ''   # mensaje de "hay version nueva", si corresponde
 $script:JsonBegin    = '<<<FUDO_JSON_BEGIN>>>'
 $script:JsonEnd      = '<<<FUDO_JSON_END>>>'
 $script:AutoJsonPath = ''
-# Telemetria: dejar la URL aca para que todos los asesores la manden al mismo lugar
-# sin tener que pasar parametros. Vacio = no se envia nada.
+# Telemetria: la URL NO va hardcodeada aca. El repo es publico, y una URL de escritura
+# en un repo publico se puede spamear. Se resuelve por fuera del repo, en este orden:
+#   1) -TelemetryUrl <url>
+#   2) variable de entorno FUDO_TELEMETRY_URL
+#   3) archivo 'telemetria.url' al lado del script (una linea con la URL)
 $script:TelemetryUrl = ''
 # URL del instalador de la App Nativa (completar cuando este definida).
 $script:NativeInstallerUrl = ''
@@ -4191,14 +4200,32 @@ function Install-FudoNative {
         })
 }
 
+function Get-TelemetryUrl {
+    <# Resuelve la URL de telemetria sin necesidad de tenerla en el codigo. #>
+    if ($TelemetryUrl) { return $TelemetryUrl }
+    if ($env:FUDO_TELEMETRY_URL) { return [string]$env:FUDO_TELEMETRY_URL }
+    $rutas = @()
+    try { if ($PSCommandPath) { $rutas += (Join-Path (Split-Path -Parent $PSCommandPath) 'telemetria.url') } } catch {}
+    try { $rutas += (Join-Path (Get-Location).Path 'telemetria.url') } catch {}
+    foreach ($r in @($rutas | Where-Object { $_ })) {
+        try {
+            if (Test-Path $r) {
+                $u = ((Get-Content -Path $r -TotalCount 1 -ErrorAction Stop) | Out-String).Trim()
+                if ($u -match '^https://') { return $u }
+            }
+        } catch {}
+    }
+    if ($script:TelemetryUrl) { return $script:TelemetryUrl }
+    return ''
+}
+
 function Send-Telemetry {
     <#
       Manda el resultado a un endpoint para no depender de que el asesor guarde el JSON.
       Nunca corta el diagnostico: timeout corto y errores silenciados.
     #>
     param($Result)
-    $url = $TelemetryUrl
-    if (-not $url) { $url = $script:TelemetryUrl }
+    $url = Get-TelemetryUrl
     if (-not $url) { return }
 
     try {

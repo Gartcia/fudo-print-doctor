@@ -15,14 +15,21 @@ con un resumen, y queda una fila en una planilla de Google.
 
 ## 2. Conectarlo al motor
 
-En `FudoPrintDoctor.ps1`, cerca del principio:
+**La URL no va en el código.** El repositorio es público, y una URL de escritura publicada se puede
+spamear. El motor la busca, en este orden:
 
-```powershell
-$script:TelemetryUrl = 'https://script.google.com/macros/s/AKfy.../exec'
-```
+1. El parámetro `-TelemetryUrl <url>`.
+2. La variable de entorno `FUDO_TELEMETRY_URL`.
+3. Un archivo **`telemetria.url`** al lado del script, con la URL en una sola línea.
 
-Así todos los asesores mandan al mismo lugar sin pasar parámetros. También se puede pasar por
-corrida con `-TelemetryUrl <url>`.
+La opción 3 es la práctica: se genera una vez, se distribuye junto al `.ps1` y el `.cmd` por el
+canal interno (no por el repo — está en el `.gitignore`), y a partir de ahí cada corrida reporta
+sola. Para cambiar de destino, se reemplaza ese archivito.
+
+Sobre el riesgo: cualquier URL que llegue a la PC de un cliente es, en la práctica, semi-pública. Lo
+peor que puede pasar es que alguien escriba basura en la planilla; por eso el Apps Script valida la
+forma del payload y descarta lo que no sea un resultado del motor. Si algún día pasa, se vuelve a
+implementar el Apps Script (URL nueva) y se actualiza el `telemetria.url`.
 
 Es silencioso: si no hay internet o la URL falla, el diagnóstico sigue igual y solo queda un `WARN`
 en el log.
