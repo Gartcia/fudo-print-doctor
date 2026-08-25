@@ -422,7 +422,8 @@ $script:StartTime    = Get-Date
 $script:Diagnostics  = [ordered]@{}   # datos crudos recolectados
 $script:Errors       = New-Object System.Collections.ArrayList   # fallas internas del motor
 $script:TestPrintersCreated = New-Object System.Collections.ArrayList   # colas temporales creadas por el motor
-$script:SchemaVersion = '3.2'
+$script:SchemaVersion = '3.3'
+$script:MenuVacios = 0
 # Distribucion: repo publico. VERSION es un archivo de una linea con la version publicada.
 $script:RepoUrl    = 'https://github.com/Gartcia/fudo-print-doctor'
 $script:RawBase    = 'https://raw.githubusercontent.com/Gartcia/fudo-print-doctor/main'
@@ -663,6 +664,77 @@ function Invoke-Step {
     }
 }
 
+function Initialize-ConsoleInputHelper {
+    <#
+      Lee del dispositivo de consola (CONIN$) en vez de stdin. Hace falta porque cuando
+      la ventana se abre desde otro proceso (herramienta de acceso remoto, tarea
+      programada, un wrapper) stdin puede llegar cerrado: cmd sigue funcionando porque
+      'pause' lee la consola, pero Read-Host de PowerShell devuelve vacio al instante y
+      el menu se cerraba solo.
+    #>
+    if ('FudoConsoleIn' -as [type]) { return }
+    Add-Type -Language CSharp -TypeDefinition @'
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+public static class FudoConsoleIn {
+    [DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+    private static extern IntPtr CreateFileW(string name, uint access, uint share,
+        IntPtr sec, uint disposition, uint flags, IntPtr template);
+    public static string ReadLine() {
+        IntPtr h = CreateFileW("CONIN$", 0xC0000000u, 0x3u, IntPtr.Zero, 3u, 0u, IntPtr.Zero);
+        if (h == IntPtr.Zero || h == new IntPtr(-1)) { return null; }
+        using (FileStream fs = new FileStream(new SafeFileHandle(h, true), FileAccess.Read))
+        using (StreamReader sr = new StreamReader(fs)) { return sr.ReadLine(); }
+    }
+}
+'@
+}
+
+function Read-DoctorLine {
+    <#
+      Una linea escrita por el asesor, probando las tres vias en orden:
+        1) stdin normal (Read-Host / Console.In)
+        2) la consola directo (CONIN$)
+      Devuelve $null solo si NO hay teclado de ninguna forma: eso es distinto de
+      "apreto Enter sin escribir nada" (que devuelve cadena vacia) y quien llama tiene
+      que tratarlos distinto.
+    #>
+    param([string]$Prompt = '')
+    if ($Prompt) { Write-Host ($Prompt + ': ') -NoNewline }
+    try {
+        $l = [Console]::In.ReadLine()
+        if ($null -ne $l) { return [string]$l }
+    } catch {}
+    try {
+        Initialize-ConsoleInputHelper
+        $l2 = [FudoConsoleIn]::ReadLine()
+        if ($null -ne $l2) { return [string]$l2 }
+    } catch {}
+    return $null
+}
+
+function Read-DoctorKey {
+    <#
+      Una sola tecla, sin Enter, para el menu. Si no se puede (entrada redirigida),
+      cae a leer una linea completa.
+    #>
+    param([string]$Prompt = '')
+    if ($Prompt) { Write-Host ($Prompt + ': ') -NoNewline }
+    try {
+        if (-not [Console]::IsInputRedirected) {
+            $k = [Console]::ReadKey($true)
+            if ($k.Key -eq [ConsoleKey]::Enter) { Write-Host ''; return '' }
+            Write-Host ([string]$k.KeyChar)
+            return ([string]$k.KeyChar)
+        }
+    } catch {}
+    $l = Read-DoctorLine
+    if ($null -eq $l) { return $null }
+    return [string]$l
+}
+
 function Test-IsInteractiveConsole {
     <# Hay un humano mirando esta consola? (no redirigida, no -Quiet, no -Json) #>
     if ($Quiet -or $Json -or $SelfTest) { return $false }
@@ -721,7 +793,8 @@ function Confirm-PaperCameOut {
     Write-Host ''
     Write-Host ("  Mira la impresora: salio el ticket de prueba de '" + $Printer + "'?") -ForegroundColor Cyan
     $ans = ''
-    try { $ans = Read-Host '  (s = salio / n = no salio / Enter = no puedo verla ahora)' } catch { return $null }
+    $ans = Read-DoctorLine -Prompt '  (s = salio / n = no salio / Enter = no puedo verla ahora)'
+    if ($null -eq $ans) { return $null }
     if ($ans -match '(?i)^\s*(s|si|y|yes|1)\s*$') { return $true }
     if ($ans -match '(?i)^\s*(n|no|0)\s*$')       { return $false }
     return $null
@@ -779,7 +852,8 @@ function Confirm-Irreversible {
     if ($Impact) { [Console]::Error.WriteLine("    Consecuencia: $Impact") }
     [Console]::Error.WriteLine('  ------------------------------------------------------------')
     $ans = ''
-    try { $ans = Read-Host '  Aplicar? (s = si / cualquier otra tecla = no)' } catch { return $false }
+    $ans = Read-DoctorLine -Prompt '  Aplicar? (s = si / cualquier otra tecla = no)'
+    if ($null -eq $ans) { return $false }
     return ($ans -match '(?i)^\s*(s|si|sí|y|yes)\s*$')
 }
 
@@ -2422,7 +2496,7 @@ function Invoke-ReconnectFlow {
         [Console]::Error.WriteLine('  encendida): Windows la vuelve a detectar y le asigna un puerto.')
         [Console]::Error.WriteLine('  ------------------------------------------------------------')
         $ans = ''
-        try { $ans = Read-Host '  Espero mientras lo haces? (s = si / cualquier otra tecla = no)' } catch {}
+        $ans = [string](Read-DoctorLine -Prompt '  Espero mientras lo haces? (s = si / cualquier otra tecla = no)')
         $quiere = ($ans -match '(?i)^\s*(s|si|sí|y|yes)\s*$')
     }
     if (-not $quiere) { return @{ recovered = $false; note = 'no se espero la reconexion'; port = '' } }
@@ -4491,6 +4565,17 @@ public class FudoFakeEndpoint {
     Assert-Eq 'S38 es causa raiz' $true (Get-CheckById 'hw.noPortBound').rootCauseCandidate
     Assert-Eq 'S38 explica los puertos huerfanos' $true ([bool]((Get-CheckById 'hw.noPortBound').recommendation -match 'huerfanos'))
 
+    # Escenario 40: el menu no se cierra solo. Enter pelado vuelve a preguntar (antes salia),
+    # y "no hay teclado" es un caso distinto de "no escribio nada".
+    Reset-State
+    $mk = @('R','T','D','S')
+    Assert-Eq 'S40 Enter no cierra el menu' '?' (Resolve-MenuChoice -Raw '' -Keys $mk)
+    Assert-Eq 'S40 espacios tampoco' '?' (Resolve-MenuChoice -Raw '   ' -Keys $mk)
+    Assert-Eq 'S40 opcion valida' 'T' (Resolve-MenuChoice -Raw 't' -Keys $mk)
+    Assert-Eq 'S40 opcion invalida' '?' (Resolve-MenuChoice -Raw 'z' -Keys $mk)
+    Assert-Eq 'S40 sin teclado se distingue' 'NOKEY' (Resolve-MenuChoice -Raw $null -Keys $mk)
+    Assert-Eq 'S40 salir sigue saliendo' 'S' (Resolve-MenuChoice -Raw 's' -Keys $mk)
+
     # Escenario 39: descarta impresoras de red (WSD/IPP) del inventario de hardware USB
     Reset-State
     $verdictWsd = Test-IsPrinterDevice -Name 'Microsoft IPP Class Driver' -InstanceId 'SWD\PRINTENUM\WSD-442FB327' -PnpClass 'Printer' -Service '' -CompatibleIds @()
@@ -4563,6 +4648,20 @@ function Get-MenuOptions {
     return @($ops)
 }
 
+function Resolve-MenuChoice {
+    <#
+      Decide que hacer con lo que escribio el asesor. Separado de la lectura para poder
+      testearlo: 'NOKEY' = no hay teclado (avisar y salir), '?' = volver a preguntar
+      (incluye Enter pelado, que antes cerraba la app en silencio).
+    #>
+    param($Raw, [string[]]$Keys)
+    if ($null -eq $Raw) { return 'NOKEY' }
+    $r = ([string]$Raw).Trim().ToUpper()
+    if (-not $r) { return '?' }
+    if (@($Keys) -contains $r) { return $r }
+    return '?'
+}
+
 function Show-DoctorMenu {
     $ops = @(Get-MenuOptions)
     Write-Host ''
@@ -4574,13 +4673,19 @@ function Show-DoctorMenu {
         Write-Host ("   [" + $o.k + "]  " + $o.t) -ForegroundColor $color
     }
     Write-Host ''
-    $r = ''
-    try { $r = Read-Host '   Opcion' } catch { return 'S' }
-    $r = ([string]$r).Trim().ToUpper()
-    if (-not $r) { return 'S' }
-    if (@($ops | ForEach-Object { [string]$_.k }) -contains $r) { return $r }
-    Write-Host '   Opcion invalida.' -ForegroundColor Yellow
-    return '?'
+    $r = Resolve-MenuChoice -Raw (Read-DoctorKey -Prompt '   Opcion') -Keys @($ops | ForEach-Object { [string]$_.k })
+    if ($r -eq 'NOKEY') {
+        # No hay teclado: antes esto se interpretaba como "salir" y el menu se cerraba
+        # solo, dando la sensacion de que las opciones no se podian elegir.
+        Write-Host ''
+        Write-Host '   No puedo leer el teclado desde esta ventana.' -ForegroundColor Red
+        Write-Host '   Cerra esta ventana y abri FudoPrintDoctor.cmd con doble clic' -ForegroundColor Yellow
+        Write-Host '   (si se abrio desde una herramienta de acceso remoto o un acceso' -ForegroundColor Yellow
+        Write-Host '   directo, la ventana puede quedar sin teclado).' -ForegroundColor Yellow
+        return 'S'
+    }
+    if ($r -eq '?') { Write-Host '   Escribi la letra de la opcion (por ejemplo T) o S para salir.' -ForegroundColor DarkGray }
+    return $r
 }
 
 function Invoke-MenuAction {
@@ -4618,7 +4723,7 @@ function Invoke-MenuAction {
             if (@($huerfanos).Count -eq 0) { Write-Host '  Ya no hay puertos con impresora sin instalar.' -ForegroundColor Yellow; return $true }
             $puerto = @($huerfanos)[0]
             $nombre = ''
-            try { $nombre = Read-Host ("   Nombre para la impresora en $puerto (Enter = FUDO-TEST-$puerto)") } catch {}
+            try { $nombre = Read-DoctorLine -Prompt ("   Nombre para la impresora en $puerto (Enter = FUDO-TEST-$puerto)") } catch {}
             try {
                 $creada = New-FudoTestPrinter -PortName $puerto
                 if ($creada -and $nombre) {
@@ -4681,14 +4786,14 @@ function Invoke-MenuAction {
             $i = 0
             foreach ($e in $enRed) { $i++; Write-Host ("   [$i] " + [string]$e.ip + ':' + [string]$e.puerto + '  ' + [string]$e.tipo) }
             $sel = ''
-            try { $sel = Read-Host '   Cual instalar? (numero, Enter para cancelar)' } catch {}
+            try { $sel = Read-DoctorLine -Prompt '   Cual instalar? (numero, Enter para cancelar)' } catch {}
             if (-not $sel) { return $false }
             $idx = 0
             try { $idx = [int]$sel } catch { return $false }
             if ($idx -lt 1 -or $idx -gt @($enRed).Count) { Write-Host '  Numero invalido.' -ForegroundColor Yellow; return $false }
             $elegida = @($enRed)[$idx - 1]
             $nombre = ''
-            try { $nombre = Read-Host ("   Nombre para la impresora (Enter = FUDO-" + (([string]$elegida.ip) -replace '\.', '-') + ')') } catch {}
+            try { $nombre = Read-DoctorLine -Prompt ("   Nombre para la impresora (Enter = FUDO-" + (([string]$elegida.ip) -replace '\.', '-') + ')') } catch {}
             try {
                 $creada = New-NetworkPrinter -Ip ([string]$elegida.ip) -TcpPort ([int]$elegida.puerto) -Name $nombre
                 Write-Host ("  Cola '" + $creada + "' creada apuntando a " + [string]$elegida.ip + ':' + [string]$elegida.puerto) -ForegroundColor Green
@@ -4792,7 +4897,7 @@ function Invoke-MenuAction {
 
         'J' {
             $ruta = ''
-            try { $ruta = Read-Host '   Ruta del archivo (Enter = resultado.json aca al lado)' } catch {}
+            try { $ruta = Read-DoctorLine -Prompt '   Ruta del archivo (Enter = resultado.json aca al lado)' } catch {}
             if (-not $ruta) { $ruta = Join-Path (Get-Location) 'resultado.json' }
             try {
                 ($script:LastResult | ConvertTo-Json -Depth 12) | Out-File -FilePath $ruta -Encoding UTF8
@@ -5271,7 +5376,19 @@ try {
         while ($true) {
             $op = Show-DoctorMenu
             if ($op -eq 'S') { break }
-            if ($op -eq '?') { continue }
+            if ($op -eq '?') {
+                # Freno: si nunca llega una opcion valida es que la ventana no tiene
+                # teclado usable. Sin esto el menu podria repetirse para siempre.
+                $script:MenuVacios = [int]$script:MenuVacios + 1
+                if ($script:MenuVacios -ge 5) {
+                    Write-Host ''
+                    Write-Host '  No estoy recibiendo ninguna tecla. Cerra esta ventana y abri' -ForegroundColor Red
+                    Write-Host '  FudoPrintDoctor.cmd con doble clic desde la carpeta.' -ForegroundColor Yellow
+                    break
+                }
+                continue
+            }
+            $script:MenuVacios = 0
             $volverACorrer = Invoke-MenuAction -Op $op
             if ($volverACorrer) {
                 Reset-RunState

@@ -2,6 +2,28 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.3] - 2026-08-25
+
+### Corregido
+- **El menú de acciones no dejaba elegir nada.** Dos causas, las dos arregladas:
+  - Apretar Enter sin escribir una letra caía en `if (-not $r) { return 'S' }`, o sea
+    **cerraba la app en silencio**. Ahora vuelve a preguntar y avisa qué escribir; solo `S`
+    sale.
+  - Si la ventana se abre desde otro proceso (herramienta de acceso remoto, tarea
+    programada, un acceso directo), `stdin` puede llegar cerrado: `pause` de cmd sigue
+    funcionando porque lee la consola, pero `Read-Host` de PowerShell devuelve vacío al
+    instante y el menú se cerraba solo. Ahora la lectura intenta `stdin` y, si no hay,
+    abre **`CONIN$`** (el dispositivo de consola) directo. Si tampoco hay teclado, lo
+    **dice** en vez de salir sin explicación.
+- El menú ahora acepta **una sola tecla, sin Enter**.
+- Los sub-prompts (nombre de la impresora, IP a instalar, ruta del JSON, confirmación de
+  acciones irreversibles, "¿salió el papel?") usan la misma lectura, así que tampoco se
+  saltean solos cuando `stdin` no sirve.
+
+### Agregado
+- `Resolve-MenuChoice`, la decisión del menú separada de la lectura del teclado para poder
+  testearla. Self-test: 123 asserts (S40).
+
 ## [3.2] - 2026-08-25
 
 Dos casos reales de asesores: uno dio "impresión OK" con la impresora sin imprimir, el otro
