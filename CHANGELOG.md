@@ -2,6 +2,40 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.5] - 2026-08-25
+
+Caso real de un asesor en Chile: Epson L5590 conectada por USB, el motor no le ofreció
+asignarle puerto y hubo que instalarla a mano.
+
+### Agregado
+- **Replug por software.** Cuando `hw.noPortBound` detecta que Windows ve la impresora pero
+  no le asignó puerto USB, el motor ya no se limita a pedirle al asesor que desenchufe el
+  cable: hace lo mismo por software con `Restart-PnpDevice` + `pnputil /scan-devices`, espera
+  a que aparezca el puerto y, si aparece, **crea la cola** (`Repair-BindUsbPort`).
+- **La cola se levanta siempre, con el mejor driver disponible** (`New-FudoPrinterQueue`).
+  Antes, si la impresora tenía driver de fabricante ya instalado (`oem_instalado`), el motor
+  se abstenía y no creaba nada. Ahora usa ese driver si está en Windows —una Epson con su
+  driver imprime mejor que con texto genérico— y si no está cae a `Generic / Text Only`. Si
+  las dos cosas fallan, devuelve el error para que el asesor lo vea.
+- **La opción `[I]` del menú aparece también cuando no hay ningún puerto USB**, que era
+  exactamente este caso: antes se ofrecía solo si existía un puerto huérfano, así que en la
+  PC del cliente no aparecía ninguna opción para levantar la impresora.
+- **Nueva capa 3 para colas WSD** (`Test-Layer3-WsdPort`) y chequeo `conn.portMismatch`.
+
+### Corregido
+- **Un puerto WSD se tomaba como USB.** `Get-DetectedInterface` no reconocía `WSD-<guid>`, así
+  que caía en el `return 'USB'` por defecto y la capa 3 informaba **"Puerto USB ... OK"** sobre
+  una cola de red. En el caso real la única cola era la WSD (`Microsoft IPP Class Driver`)
+  mientras el hardware estaba en USB: el ticket entraba a la cola y no salía nunca. Ahora se
+  detecta como `WSD` y, si además hay hardware USB presente, se avisa el desajuste con la
+  indicación de crear la cola sobre el puerto USB y apuntar Fudo ahí.
+
+### Pendiente conocido
+- `Test-IsPosPrinter` es demasiado laxo: marca `esPos = true` para una Epson L5590 (multifunción
+  de tinta) y hasta para "OneNote for Windows 10". Por eso la prueba física le manda ESC/POS
+  RAW a una impresora que no es térmica y el resultado ("la impresora no está respondiendo")
+  es engañoso. Falta decidir qué prueba corresponde a una impresora con driver propio.
+
 ## [3.4] - 2026-08-25
 
 Salió de la primera corrida de la revisión diaria de telemetría: tres corridas de una misma

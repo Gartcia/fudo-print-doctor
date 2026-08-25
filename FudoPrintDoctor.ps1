@@ -425,7 +425,7 @@ $script:TestPrintersCreated = New-Object System.Collections.ArrayList   # colas 
 # Las colas que crea el motor no son del cliente: no pueden contarse como evidencia.
 $script:TestPrinterRx = '(?i)^FUDO-TEST-'
 $script:TestDocRx    = '(?i)fudo print doctor'
-$script:SchemaVersion = '3.4'
+$script:SchemaVersion = '3.5'
 $script:MenuVacios = 0
 # Distribucion: repo publico. VERSION es un archivo de una linea con la version publicada.
 $script:RepoUrl    = 'https://github.com/Gartcia/fudo-print-doctor'
@@ -2262,8 +2262,46 @@ function Test-Layer1a-HardwareInventory {
     # imprimio", cuando lo que falta es que Windows le asigne puerto.
     if ($cant -gt 0 -and @($devPorts).Count -eq 0) {
         $sinPuerto = @($identified | ForEach-Object { [string]$_.nombre })
+        $idsSinPuerto = @($identified | Where-Object { -not $_.puerto } | ForEach-Object { [string]$_.instanceId } | Where-Object { $_ })
+
+        # Antes de mandarle al asesor a desenchufar el cable, hacer el replug por software.
+        $bind = @{ puertos = @(); nota = '' }
+        if (@($idsSinPuerto).Count -gt 0) {
+            $rem = Invoke-Remediation -Description 'Reiniciar el dispositivo para que Windows le asigne un puerto USB (replug por software)' `
+                -Type 'device.rebind' -Target ($sinPuerto -join ', ') -Before 'sin puerto USB' -After 'puerto asignado' -Reversible $true -Fix {
+                    $r = Repair-BindUsbPort -InstanceIds $idsSinPuerto
+                    $script:Diagnostics['rebindPorts'] = @($r.puertos)
+                    if (@($r.puertos).Count -gt 0) { 'Windows asigno ' + (@($r.puertos) -join ', ') + ' (' + [string]$r.nota + ')' }
+                    else { 'no se pudo: ' + [string]$r.nota }
+                }
+            if ($rem.applied -and $script:Diagnostics.Contains('rebindPorts')) { $bind.puertos = @($script:Diagnostics['rebindPorts']) }
+            $bind.nota = [string]$rem.note
+        }
+
+        if (@($bind.puertos).Count -gt 0) {
+            # Aparecio el puerto: ahora si se puede levantar la cola.
+            $devPorts = @($bind.puertos)
+            $script:Diagnostics['livePorts'] = @($devPorts)
+            $script:Diagnostics['usbPorts']  = @($devPorts)
+            $oem = ''
+            try { $oem = [string](@($identified | Where-Object { $_.driverNombre })[0].driverNombre) } catch {}
+            $cola = New-FudoPrinterQueue -PortName (@($devPorts)[0]) -PreferDriver $oem
+            Add-Check -Id 'hw.noPortBound' -Layer 1 `
+                -Name $(if ($cola.ok) { 'Puerto USB asignado y cola creada' } else { 'Puerto USB asignado (falta crear la cola)' }) `
+                -Status $(if ($cola.ok) { 'fixed' } else { 'warn' }) -RootCauseCandidate $true -Plane 'os' `
+                -Evidence @{ impresoras = $sinPuerto; puertoNuevo = @($devPorts); driverUsado = [string]$cola.driver } `
+                -ActionTaken ([string]$bind.nota + ' | ' + [string]$cola.nota) -Reversible $true `
+                -ArticleRef 'https://soporte.fu.do/es/articles/16419361' `
+                -Recommendation $(if ($cola.ok) {
+                        "Windows no le habia asignado puerto USB a la impresora: se reinicio el dispositivo y quedo en $(@($devPorts)[0]), con la cola '$($cola.name)' usando el driver '$($cola.driver)'. Falta registrarla en Fudo (Administracion > Impresoras) con su cocina/area."
+                    } else {
+                        "El puerto $(@($devPorts)[0]) ya existe, pero no se pudo crear la cola automaticamente: $($cola.nota). Crearla a mano: Agregar impresora > la que busco no esta en la lista > agregar local con ese puerto."
+                    })
+            return
+        }
+
         Add-Check -Id 'hw.noPortBound' -Layer 1 -Name 'Impresora conectada pero sin puerto USB asignado' -Status 'fail' -RootCauseCandidate $true -Plane 'os' `
-            -Evidence @{ impresoras = $sinPuerto; puertosUsbExistentes = $usbPorts; livePorts = @() } `
+            -Evidence @{ impresoras = $sinPuerto; puertosUsbExistentes = $usbPorts; livePorts = @(); rebind = [string]$bind.nota } `
             -ArticleRef 'https://soporte.fu.do/es/articles/11730817' `
             -Recommendation ('Windows ve la impresora conectada pero no le asigno ningun puerto USB (no hay nodo USBPRINT con PortName), ' +
                              'asi que ninguna cola puede imprimirle y cambiar el puerto de la cola no sirve de nada. ' +
@@ -2721,6 +2759,74 @@ function Test-Layer2-Queue {
 # ---------------------------------------------------------------------------
 # LAYER 3 - Conectividad / puerto
 # ---------------------------------------------------------------------------
+function Repair-BindUsbPort {
+    <#
+      Windows ve la impresora USB pero no le asigno puerto (no hay nodo USBPRINT con
+      PortName). Sin puerto, ninguna cola puede imprimirle y cambiar el puerto de una cola
+      existente no sirve de nada.
+      La receta manual es desenchufar y volver a enchufar el USB. Esto es lo mismo por
+      software: Restart-PnpDevice reinicia el device (equivale al replug) y pnputil
+      /scan-devices fuerza una redeteccion. Despues se vuelven a leer los puertos.
+      Devuelve @{ puertos = @(...); nota = '...' }
+    #>
+    param([string[]]$InstanceIds)
+    $notas = @()
+    foreach ($id in @($InstanceIds | Where-Object { $_ })) {
+        try {
+            Write-StepDetail 'reiniciando el dispositivo (equivale a desenchufar y enchufar)'
+            Restart-PnpDevice -InstanceId $id -Confirm:$false -ErrorAction Stop
+            $notas += 'device reiniciado'
+        } catch {
+            $notas += ('no se pudo reiniciar el device: ' + $_.Exception.Message)
+        }
+    }
+    try {
+        Write-StepDetail 'pidiendole a Windows que vuelva a detectar dispositivos'
+        $exe = Join-Path $env:WINDIR 'System32\pnputil.exe'
+        if (Test-Path $exe) { & $exe /scan-devices 2>&1 | Out-Null; $notas += 'redeteccion de PnP' }
+    } catch {}
+
+    # Windows tarda en crear el nodo USBPRINT y el puerto: se espera con reintentos.
+    $puertos = @()
+    for ($i = 0; $i -lt 8; $i++) {
+        Start-Sleep -Milliseconds 1200
+        try {
+            $puertos = @(Get-PrinterPort -ErrorAction Stop | Where-Object { $_.Name -like 'USB*' } | ForEach-Object { [string]$_.Name })
+        } catch {}
+        if (@($puertos).Count -gt 0) { break }
+    }
+    return @{ puertos = @($puertos); nota = ($notas -join ' | ') }
+}
+
+function New-FudoPrinterQueue {
+    <#
+      Crea la cola de Windows para una impresora fisica.
+      Decision del equipo (25/08): levantarla SIEMPRE. Si el driver del fabricante ya esta
+      en Windows se usa ese (una Epson con su driver imprime mejor que con texto generico);
+      si no esta, se usa 'Generico / Solo texto', que alcanza para comandas ESC/POS.
+      Si las dos cosas fallan, se devuelve el error para que el asesor lo vea.
+    #>
+    param([string]$PortName, [string]$PreferDriver = '', [string]$Name = '')
+    if (-not $Name) { $Name = 'FUDO-' + ($PortName -replace '[^A-Za-z0-9]', '') }
+    $intentos = @()
+    $drivers = @()
+    if ($PreferDriver) { $drivers += $PreferDriver }
+    $gen = ''
+    try { $gen = Get-GenericTextDriverName } catch {}
+    if (-not $gen) { try { $gen = Install-GenericTextDriver } catch {} }
+    if ($gen -and ($drivers -notcontains $gen)) { $drivers += $gen }
+
+    foreach ($d in @($drivers | Where-Object { $_ })) {
+        try {
+            Add-Printer -Name $Name -DriverName $d -PortName $PortName -ErrorAction Stop
+            return @{ ok = $true; name = $Name; driver = $d; nota = ("cola '" + $Name + "' creada en " + $PortName + " con el driver '" + $d + "'") }
+        } catch {
+            $intentos += ("'" + $d + "': " + $_.Exception.Message)
+        }
+    }
+    return @{ ok = $false; name = ''; driver = ''; nota = ('no se pudo crear la cola en ' + $PortName + ' -> ' + ($intentos -join ' | ')) }
+}
+
 function Get-DetectedInterface {
     param($Printer)
     if ($Interface -ne 'auto') { return $Interface }
@@ -2729,6 +2835,9 @@ function Get-DetectedInterface {
     if ($Printer) { try { $port = [string]$Printer.PortName } catch {} }
     if ($port -like 'USB*' -or $port -like 'LPT*' -or $port -like '*USB*') { return 'USB' }
     if ($port -match '^\d{1,3}(\.\d{1,3}){3}' -or $port -like 'IP_*' -or $port -like '*9100*') { return 'Ethernet' }
+    # WSD: la cola es de red aunque no tenga IP en el nombre del puerto (Windows la descubrio
+    # sola por la red). Tratarla como USB hacia que la capa 3 dijera 'Puerto USB OK'.
+    if ($port -match '(?i)^WSD-' -or $port -match '(?i)^\{?[0-9a-f]{8}-[0-9a-f]{4}-') { return 'WSD' }
     return 'USB'
 }
 
@@ -2804,6 +2913,39 @@ function Repair-QueueRecreate {
                   note = "el puerto correcto es $puertoOk (la cola de prueba '$temporal' imprimio). " + [string]$rem.note }
     }
     return $rem
+}
+
+function Test-Layer3-WsdPort {
+    <#
+      La cola apunta a un puerto WSD (Web Services on Devices): Windows descubrio la
+      impresora POR LA RED y creo la cola sola, con el driver 'Microsoft IPP Class Driver'.
+      Caso real (Epson L5590, CL): la impresora estaba conectada por USB, la unica cola de
+      Windows era la WSD, y el ticket quedaba en la cola para siempre. Mientras Fudo le mande
+      a esa cola, depende de que la impresora este accesible por la red.
+    #>
+    param($Printer)
+    if ($null -eq $Printer) { return }
+    $puerto = [string]$Printer.PortName
+    $hwUsb = 0
+    if ($script:Diagnostics.Contains('hwDeviceCount')) { $hwUsb = [int]$script:Diagnostics['hwDeviceCount'] }
+    $usbPorts = @()
+    if ($script:Diagnostics.Contains('usbPorts')) { $usbPorts = @($script:Diagnostics['usbPorts'] | Where-Object { $_ }) }
+
+    if ($hwUsb -gt 0) {
+        Add-Check -Id 'conn.portMismatch' -Layer 3 -Name 'La cola es de red (WSD) pero la impresora esta conectada por USB' -Status 'warn' -RootCauseCandidate $true -Plane 'os' `
+            -Evidence @{ puerto = $puerto; driver = [string]$Printer.DriverName; hardwareUsb = $hwUsb; puertosUsb = $usbPorts } `
+            -ArticleRef 'https://soporte.fu.do/es/articles/16419361' `
+            -Recommendation ("La cola '$($Printer.Name)' usa el puerto $puerto, que es un puerto de RED (WSD): Windows encontro la impresora por wifi/cable y creo la cola sola. " +
+                             'Pero el hardware esta conectado por USB, asi que si la impresora no esta accesible por la red, todo lo que Fudo manda a esa cola se queda esperando. ' +
+                             'Lo correcto para comandas es una cola sobre el puerto USB: el motor la crea con la opcion [I] del menu, o a mano con Agregar impresora > agregar local > puerto USB00x. ' +
+                             'Despues hay que apuntar Fudo a esa cola nueva (Administracion > Impresoras).')
+        return
+    }
+    Add-Check -Id 'conn.wsd' -Layer 3 -Name 'Cola de red (WSD)' -Status 'warn' -Plane 'os' `
+        -Evidence @{ puerto = $puerto; driver = [string]$Printer.DriverName; hardwareUsb = 0 } `
+        -Recommendation ("La cola '$($Printer.Name)' apunta a un puerto WSD (la impresora se descubrio por la red). " +
+                         'Para comandas conviene una cola directa: por USB, o por IP fija con el puerto 9100 (Directo Ethernet en Fudo). ' +
+                         'Con WSD, si la impresora cambia de IP o se va de la red, las comandas se acumulan en la cola sin aviso.')
 }
 
 function Test-Layer3-UsbPort {
@@ -3897,7 +4039,9 @@ function Invoke-FudoPrintDoctor {
         $null = Invoke-Step -Name 'layer2.queue' -Body { Test-Layer2-Queue -Printer $printer -Wmi $wmi }
         $detectedInterface = Invoke-Step -Name 'layer3.detectInterface' -Body { Get-DetectedInterface -Printer $printer }
         if (-not $detectedInterface) { $detectedInterface = 'USB' }
-        if ($detectedInterface -eq 'USB') {
+        if ($detectedInterface -eq 'WSD') {
+            $null = Invoke-Step -Name 'layer3.wsdPort' -Body { Test-Layer3-WsdPort -Printer $printer }
+        } elseif ($detectedInterface -eq 'USB') {
             $null = Invoke-Step -Name 'layer3.usbPort' -Body { Test-Layer3-UsbPort -Printer $printer -Wmi $wmi }
         } else {
             $null = Invoke-Step -Name 'layer3.network' -Body { Test-Layer3-Network -Printer $printer }
@@ -4612,14 +4756,16 @@ public class FudoFakeEndpoint {
     # a ciegas: se pide replug / instalacion del driver que crea el puerto.
     Reset-State
     function Get-UsbPrintDevices {
-        @([ordered]@{ source='Win32_PnPEntity'; name='Compatibilidad con impresoras USB'
-                      instanceId='USB\VID_6868&PID_0200\6&2798821A&0&3'; portName=''; status='OK'; problem=0
+        @([ordered]@{ source='Win32_PnPEntity'; name='Epson Compatibilidad con impresoras USB'
+                      instanceId='USB\VID_04B8&PID_0E28\583741540123650000'; portName=''; status='OK'; problem=0
                       deteccion='driver usbprint'; certeza='alta' })
     }
     function Get-ProblemPrinterDevices { @() }
     function Get-PrinterPort { @([pscustomobject]@{ Name='USB001'; Description='Puerto de impresora virtual para USB' },
                                  [pscustomobject]@{ Name='USB002'; Description='Puerto de impresora virtual para USB' }) }
     function Get-Printer { @([pscustomobject]@{ Name='POS-80'; DriverName='Generic / Text Only'; PortName='USB002' }) }
+    # el replug por software no consigue puerto: queda como fail con la guia manual
+    function Repair-BindUsbPort { param([string[]]$InstanceIds) @{ puertos = @(); nota = 'no se pudo reiniciar el device' } }
     $err38 = ''
     try { Test-Layer1a-HardwareInventory } catch { $err38 = $_.Exception.Message }
     Assert-Eq 'S38 inventario no explota' '' $err38
@@ -4627,6 +4773,33 @@ public class FudoFakeEndpoint {
     Assert-Eq 'S38 avisa que no hay puerto' 'fail' (Get-CheckById 'hw.noPortBound').status
     Assert-Eq 'S38 es causa raiz' $true (Get-CheckById 'hw.noPortBound').rootCauseCandidate
     Assert-Eq 'S38 explica los puertos huerfanos' $true ([bool]((Get-CheckById 'hw.noPortBound').recommendation -match 'huerfanos'))
+
+    # Escenario 43: el replug por software SI consigue puerto => se levanta la cola sola,
+    # con el driver del fabricante si ya esta en Windows (decision del 25/08).
+    Reset-State
+    function Repair-BindUsbPort { param([string[]]$InstanceIds) @{ puertos = @('USB005'); nota = 'device reiniciado' } }
+    # el driver de Epson ya esta en Windows: es el que hay que preferir
+    function Get-DriverPlan { param($Identity) @{ kind='oem_instalado'; driverName='Epson ESC/P-R V4 Class Driver'; note='ya esta instalado' } }
+    $script:__colaCreada = ''
+    function New-FudoPrinterQueue {
+        param([string]$PortName, [string]$PreferDriver = '', [string]$Name = '')
+        $script:__colaCreada = $PreferDriver
+        @{ ok = $true; name = 'FUDO-USB005'; driver = $PreferDriver; nota = 'cola creada' }
+    }
+    $null = Test-Layer1a-HardwareInventory
+    Assert-Eq 'S43 el puerto aparece y se crea la cola' 'fixed' (Get-CheckById 'hw.noPortBound').status
+    Assert-Eq 'S43 usa el driver de fabricante ya instalado' 'Epson ESC/P-R V4 Class Driver' $script:__colaCreada
+    Assert-Eq 'S43 no manda a desenchufar nada' $false ([bool]((Get-CheckById 'hw.noPortBound').recommendation -match 'desenchufar'))
+
+    # Escenario 44: un puerto WSD no es USB (antes la capa 3 decia 'Puerto USB OK')
+    Reset-State
+    Assert-Eq 'S44 detecta WSD' 'WSD' (Get-DetectedInterface -Printer ([pscustomobject]@{ PortName = 'WSD-fedd4304-37e2-467d-91c1-bdce0e2ec1e9' }))
+    Assert-Eq 'S44 USB sigue siendo USB' 'USB' (Get-DetectedInterface -Printer ([pscustomobject]@{ PortName = 'USB001' }))
+    Assert-Eq 'S44 IP sigue siendo Ethernet' 'Ethernet' (Get-DetectedInterface -Printer ([pscustomobject]@{ PortName = '192.168.1.50' }))
+    $script:Diagnostics['hwDeviceCount'] = 1
+    Test-Layer3-WsdPort -Printer ([pscustomobject]@{ Name = 'EPSON L5590 Series'; PortName = 'WSD-fedd4304'; DriverName = 'Microsoft IPP Class Driver' })
+    Assert-Eq 'S44 avisa el desajuste cola de red / hardware USB' 'warn' (Get-CheckById 'conn.portMismatch').status
+    Assert-Eq 'S44 es candidata a causa raiz' $true (Get-CheckById 'conn.portMismatch').rootCauseCandidate
 
     # Escenario 41: el motor no se diagnostica a si mismo.
     Reset-State
@@ -4702,7 +4875,19 @@ function Get-MenuOptions {
 
     $huerfanos = @()
     if ($script:Diagnostics.Contains('orphanLivePorts')) { $huerfanos = @($script:Diagnostics['orphanLivePorts'] | Where-Object { $_ }) }
-    if (@($huerfanos).Count -gt 0) { $ops += [ordered]@{ k = 'I'; t = ("Instalar la impresora conectada en " + (@($huerfanos) -join ', ') + ' (driver de texto generico)') } }
+    if (@($huerfanos).Count -gt 0) {
+        $ops += [ordered]@{ k = 'I'; t = ("Instalar la impresora conectada en " + (@($huerfanos) -join ', ')) }
+    } else {
+        # Tambien cuando la impresora esta conectada pero Windows no le dio puerto: ahi la
+        # opcion es reiniciar el device para que aparezca el puerto y despues crear la cola.
+        $sinPuerto = @()
+        if ($script:Diagnostics.Contains('printersConnected')) {
+            $sinPuerto = @($script:Diagnostics['printersConnected'] | Where-Object { -not $_.puerto -and -not $_.colaWindows })
+        }
+        if (@($sinPuerto).Count -gt 0) {
+            $ops += [ordered]@{ k = 'I'; t = ("Levantar la impresora conectada (" + [string](@($sinPuerto)[0].nombre) + "): reiniciar el dispositivo y crear la cola") }
+        }
+    }
 
     $conCola = @()
     if ($script:Diagnostics.Contains('colas')) { $conCola = @($script:Diagnostics['colas'] | Where-Object { [int]$_.trabajos -gt 0 }) }
@@ -4801,7 +4986,33 @@ function Invoke-MenuAction {
         'I' {
             $huerfanos = @()
             if ($script:Diagnostics.Contains('orphanLivePorts')) { $huerfanos = @($script:Diagnostics['orphanLivePorts'] | Where-Object { $_ }) }
-            if (@($huerfanos).Count -eq 0) { Write-Host '  Ya no hay puertos con impresora sin instalar.' -ForegroundColor Yellow; return $true }
+            $oemDriver = ''
+            if (@($huerfanos).Count -eq 0) {
+                # No hay puerto todavia: primero el replug por software.
+                $sinPuerto = @()
+                if ($script:Diagnostics.Contains('printersConnected')) {
+                    $sinPuerto = @($script:Diagnostics['printersConnected'] | Where-Object { -not $_.puerto })
+                }
+                if (@($sinPuerto).Count -eq 0) { Write-Host '  Ya no hay impresoras conectadas sin instalar.' -ForegroundColor Yellow; return $true }
+                try { $oemDriver = [string](@($sinPuerto | Where-Object { $_.driverNombre })[0].driverNombre) } catch {}
+                Write-Host ''
+                Write-Host '  Reiniciando el dispositivo para que Windows le asigne un puerto USB...' -ForegroundColor Cyan
+                $r = Repair-BindUsbPort -InstanceIds @($sinPuerto | ForEach-Object { [string]$_.instanceId })
+                if (@($r.puertos).Count -eq 0) {
+                    Write-Host ('  No se pudo: ' + [string]$r.nota) -ForegroundColor Yellow
+                    Write-Host '  Probar a mano: con la impresora encendida, desenchufar el USB, esperar 5 segundos y enchufarlo en un puerto directo (sin hub).' -ForegroundColor Yellow
+                    return $true
+                }
+                Write-Host ('  Windows asigno ' + (@($r.puertos) -join ', ')) -ForegroundColor Green
+                $cola = New-FudoPrinterQueue -PortName (@($r.puertos)[0]) -PreferDriver $oemDriver
+                if ($cola.ok) {
+                    Write-Host ('  ' + [string]$cola.nota) -ForegroundColor Green
+                    Write-Host '  Acordate de registrarla en Fudo (Administracion > Impresoras) con su cocina/area.' -ForegroundColor Yellow
+                } else {
+                    Write-Host ('  ' + [string]$cola.nota) -ForegroundColor Red
+                }
+                return $true
+            }
             $puerto = @($huerfanos)[0]
             $nombre = ''
             try { $nombre = Read-DoctorLine -Prompt ("   Nombre para la impresora en $puerto (Enter = FUDO-TEST-$puerto)") } catch {}
