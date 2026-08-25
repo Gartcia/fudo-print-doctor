@@ -422,7 +422,10 @@ $script:StartTime    = Get-Date
 $script:Diagnostics  = [ordered]@{}   # datos crudos recolectados
 $script:Errors       = New-Object System.Collections.ArrayList   # fallas internas del motor
 $script:TestPrintersCreated = New-Object System.Collections.ArrayList   # colas temporales creadas por el motor
-$script:SchemaVersion = '3.3'
+# Las colas que crea el motor no son del cliente: no pueden contarse como evidencia.
+$script:TestPrinterRx = '(?i)^FUDO-TEST-'
+$script:TestDocRx    = '(?i)fudo print doctor'
+$script:SchemaVersion = '3.4'
 $script:MenuVacios = 0
 # Distribucion: repo publico. VERSION es un archivo de una linea con la version publicada.
 $script:RepoUrl    = 'https://github.com/Gartcia/fudo-print-doctor'
@@ -1127,11 +1130,16 @@ function Test-Layer0b-NativeApp {
 
     # 0b.1 Nativa instalada?
     if (-not $installed) {
-        Add-Check -Id 'nativa.installed' -Layer 0 -Name 'App Nativa de Fudo instalada' -Status 'fail' -RootCauseCandidate $true -Plane 'fudo_config' `
-            -Evidence @{ found = $false } -ArticleRef 'https://soporte.fu.do/es/articles/16419361' `
-            -Recommendation 'La App Nativa no aparece instalada. Instalar Nativa + extension del navegador (accion asistida; frecuentemente bloqueada por antivirus).'
+        # OJO: el nombre del check es el texto que sale como CAUSA en la consola y en la
+        # telemetria. Si dice 'App Nativa instalada' cuando el status es fail, el asesor lee
+        # exactamente lo contrario de lo que pasa.
+        Add-Check -Id 'nativa.installed' -Layer 0 -Name 'App Nativa de Fudo NO instalada' -Status 'fail' -RootCauseCandidate $true -Plane 'fudo_config' `
+            -Evidence @{ found = $false; huella = $(if ($script:Diagnostics.Contains('nativaHuella')) { $script:Diagnostics['nativaHuella'] } else { $null }) } `
+            -ArticleRef 'https://soporte.fu.do/es/articles/16419361' `
+            -Recommendation 'La App Nativa no aparece instalada (no hay archivos ni entradas de registro). Sin la Nativa, Fudo no puede mandar ninguna comanda a la impresora: instalar Nativa + extension del navegador (frecuentemente bloqueada por antivirus).'
     } else {
-        Add-Check -Id 'nativa.installed' -Layer 0 -Name 'App Nativa de Fudo instalada' -Status $(if($procRunning){'ok'}else{'warn'}) `
+        Add-Check -Id 'nativa.installed' -Layer 0 -Name $(if($procRunning){'App Nativa de Fudo instalada y corriendo'}else{'App Nativa de Fudo instalada pero NO esta corriendo'}) `
+            -Status $(if($procRunning){'ok'}else{'warn'}) `
             -RootCauseCandidate (-not $procRunning) `
             -Evidence @{ paths = $install.paths; reg = $install.regInfo; running = $procRunning } `
             -Recommendation $(if($procRunning){''}else{'La Nativa esta instalada pero no en ejecucion: posible bloqueo por antivirus.'})
@@ -1162,9 +1170,34 @@ function Test-Layer0b-NativeApp {
                 }
                 ($notes -join ' | ')
             }
-        Add-Check -Id 'nativa.defenderQuarantine' -Layer 0 -Name 'Nativa en cuarentena de Windows Defender' -Status $(if($rem.applied){'fixed'}else{'fail'}) -RootCauseCandidate $true `
-            -Evidence @{ threats = $av.fudoThreats } -ActionTaken $rem.note `
-            -Recommendation 'Preferir exclusiones (ruta+proceso) a desactivar el antivirus. Reinstalar/reiniciar la Nativa tras excluir.'
+        # Restaurar de cuarentena no garantiza que la Nativa vuelva: si el ejecutable sigue sin
+        # estar, marcarlo 'fixed' es un falso positivo (se vio 'fixed' con nativa.installed en
+        # fail y la transicion en sigue_fallando dos corridas seguidas).
+        $volvio = $false
+        if ($rem.applied) {
+            Start-Sleep -Milliseconds 800
+            try {
+                $reCheck = Find-FudoNativeInstall
+                $volvio = ((@($reCheck.paths).Count -gt 0) -or (@($reCheck.regInfo).Count -gt 0))
+            } catch {}
+        }
+        Add-Check -Id 'nativa.defenderQuarantine' -Layer 0 `
+            -Name $(if (-not $rem.applied) { 'Nativa en cuarentena de Windows Defender' }
+                    elseif ($volvio)       { 'Nativa restaurada de la cuarentena de Defender' }
+                    else                   { 'Nativa en cuarentena: se restauro pero sigue sin aparecer' }) `
+            -Status $(if (-not $rem.applied) { 'fail' } elseif ($volvio) { 'fixed' } else { 'warn' }) -RootCauseCandidate $true `
+            -Evidence @{ threats = $av.fudoThreats; presenteDespues = $volvio } -ActionTaken $rem.note `
+            -Recommendation $(if ($volvio) {
+                    'Se restauro de la cuarentena y se agregaron exclusiones (ruta + proceso). Reiniciar la Nativa y probar una comanda.'
+                } else {
+                    'Se restauro de la cuarentena y se excluyo en Defender, pero la Nativa sigue sin aparecer instalada: el antivirus ya la habia borrado. Hay que REINSTALAR la App Nativa y despues verificar que el antivirus no la vuelva a tocar.' +
+                    $(try {
+                        $hPrev = Get-LocalRunHistory
+                        if ([string]$hPrev.ultimaCausa -match '(?i)cuarentena') {
+                            ' OJO: esto ya se intento en la corrida anterior de esta PC y no alcanzo, asi que no tiene sentido volver a correr el diagnostico esperando otro resultado: hay que reinstalar la Nativa.'
+                        } else { '' }
+                      } catch { '' })
+                })
     } elseif ($installed -and -not $procRunning -and $UseDefenderExclusions -and $av.defender) {
         # Nativa instalada pero no corre y Defender activo: exclusion preventiva quirurgica
         $rem = Invoke-Remediation -Description 'Agregar exclusiones preventivas de Defender para la Nativa' -Type 'defender.exclude' -Target 'FudoNativa' `
@@ -1738,6 +1771,9 @@ function Get-ArrivalScenario {
     #>
     $colas = @()
     if ($script:Diagnostics.Contains('colas')) { $colas = @($script:Diagnostics['colas']) }
+    # Las colas FUDO-TEST-* las creo el motor: si cuentan como colas del cliente, la corrida
+    # N+1 diagnostica la basura de la corrida N (el escenario saltaba a 'todas_funcionan').
+    $colas   = @($colas | Where-Object { -not $_.esDePrueba })
     $sanas   = @($colas | Where-Object { [int]$_.score -eq 0 })
     $malas   = @($colas | Where-Object { [int]$_.score -gt 0 })
 
@@ -2018,6 +2054,9 @@ function Get-PrintHistory {
             if (-not $porImp.ContainsKey($imp)) {
                 $porImp[$imp] = [ordered]@{ impresora = $imp; total = 0; deFudo = 0; ultimo = ''; ultimoDeFudo = ''; ejemploDoc = $doc }
             }
+            # Los tickets de prueba del motor no son historial del local: contarlos hacia que
+            # la corrida siguiente creyera que esa cola imprimio (o peor: que imprimio comandas).
+            if ($doc -match $script:TestDocRx) { continue }
             $porImp[$imp].total++
             if (-not $porImp[$imp].ultimo) { $porImp[$imp].ultimo = $e.TimeCreated.ToString('dd/MM HH:mm') }
             # La Nativa manda los trabajos con este nombre
@@ -2076,6 +2115,7 @@ function Get-PrinterQueues {
 
         $out += [ordered]@{
             nombre = $nombre; puerto = $puerto; driver = [string]$q.DriverName
+            esDePrueba = [bool]($nombre -match $script:TestPrinterRx)
             offline = $offline; pausada = $pausada; trabajos = @($jobs).Count; trabajoMasViejo = $masViejo
             puertoVivo = [bool]$puertoVivo; esPos = (Test-IsPosPrinter $q)
             score = $score; sintomas = @($sintomas)
@@ -3309,7 +3349,10 @@ function Test-Layer5-FudoConfig {
                 & wevtutil sl 'Microsoft-Windows-PrintService/Operational' /e:true 2>&1 | Out-Null
                 'log de PrintService habilitado'
             }
-        Add-Check -Id 'fudo.usoReal' -Layer 5 -Name 'Historial de impresion no disponible' -Status $(if ($rem.applied) { 'fixed' } else { 'skipped' }) -Plane 'os' `
+        # No es una reparacion: es un dato que falta. Marcarlo 'fixed' inflaba autoFixCount,
+        # ensuciaba la columna 'reparaciones' y podia dar por 'resuelta' una corrida que solo
+        # habia encendido un log.
+        Add-Check -Id 'fudo.usoReal' -Layer 5 -Name 'Historial de impresion no disponible' -Status $(if ($rem.applied) { 'warn' } else { 'skipped' }) -Plane 'os' `
             -Evidence @{ log = 'Microsoft-Windows-PrintService/Operational'; habilitado = $false } -ActionTaken $rem.note `
             -Recommendation $(if ($rem.applied) {
                     'Windows no registraba los trabajos de impresion. Se activo el registro: a partir de ahora, cada corrida va a poder decir a que cola le manda Fudo y cuando fue la ultima comanda. Volver a correr el diagnostico despues de intentar imprimir una comanda.'
@@ -3875,9 +3918,29 @@ function Invoke-FudoPrintDoctor {
             if ($tp) { $sirvio = $true }
         } catch {}
         if (-not ($pidioConservar -or $sirvio)) {
-            foreach ($n in $names) { try { Remove-Printer -Name $n -ErrorAction SilentlyContinue } catch {} }
-            Add-Check -Id 'printer.testCleanup' -Layer 1 -Name 'Cola de prueba eliminada' -Status 'ok' `
-                -Evidence @{ removed = $names; motivo = 'no imprimio, no deja rastro en el panel del cliente' }
+            $sobrevivieron = @()
+            foreach ($n in $names) {
+                for ($i = 0; $i -lt 3; $i++) {
+                    try { Remove-Printer -Name $n -ErrorAction SilentlyContinue } catch {}
+                    Start-Sleep -Milliseconds 400
+                    $sigue = $false
+                    try { $sigue = [bool](Get-Printer -Name $n -ErrorAction SilentlyContinue) } catch {}
+                    if (-not $sigue) { break }
+                    # Un trabajo pendiente puede impedir el borrado: se limpia y se reintenta.
+                    try { Get-PrintJob -PrinterName $n -ErrorAction SilentlyContinue | Remove-PrintJob -ErrorAction SilentlyContinue } catch {}
+                }
+                $quedo = $false
+                try { $quedo = [bool](Get-Printer -Name $n -ErrorAction SilentlyContinue) } catch {}
+                if ($quedo) { $sobrevivieron += $n }
+            }
+            if (@($sobrevivieron).Count -gt 0) {
+                Add-Check -Id 'printer.testCleanup' -Layer 1 -Name 'La cola de prueba no se pudo borrar' -Status 'fail' -Plane 'os' `
+                    -Evidence @{ sobrevivieron = $sobrevivieron; intentos = 3 } `
+                    -Recommendation ("No se pudo borrar " + ($sobrevivieron -join ', ') + ". Hay que borrarla a mano, porque si queda instalada la proxima corrida la va a contar como una impresora del cliente: Remove-Printer -Name '" + (@($sobrevivieron)[0]) + "'")
+            } else {
+                Add-Check -Id 'printer.testCleanup' -Layer 1 -Name 'Cola de prueba eliminada' -Status 'ok' `
+                    -Evidence @{ removed = $names; motivo = 'no imprimio, no deja rastro en el panel del cliente' }
+            }
         } else {
             Add-Check -Id 'printer.testCleanup' -Layer 1 -Name 'Cola de prueba conservada' -Status 'warn' -Plane 'os' `
                 -Evidence @{ kept = $names } `
@@ -4565,6 +4628,24 @@ public class FudoFakeEndpoint {
     Assert-Eq 'S38 es causa raiz' $true (Get-CheckById 'hw.noPortBound').rootCauseCandidate
     Assert-Eq 'S38 explica los puertos huerfanos' $true ([bool]((Get-CheckById 'hw.noPortBound').recommendation -match 'huerfanos'))
 
+    # Escenario 41: el motor no se diagnostica a si mismo.
+    Reset-State
+    $script:Diagnostics['colas'] = @(
+        [ordered]@{ nombre='FUDO-TEST-USB001'; puerto='USB001'; score=0; estado='sana'; esDePrueba=$true },
+        [ordered]@{ nombre='CAJA';             puerto='USB002'; score=95; estado='no imprime'; esDePrueba=$false }
+    )
+    $script:Diagnostics['historialImpresion'] = [ordered]@{ habilitado = $true; porImpresora = @() }
+    $esc41 = Get-ArrivalScenario
+    Assert-Eq 'S41 la cola del motor no cuenta como sana' $false ([bool]([string]$esc41.escenario -eq 'una_funciona_y_otra_no'))
+    Assert-Eq 'S41 solo cuenta las colas del cliente' 1 ([int]$esc41.colasTotales)
+
+    # Escenario 42: los tickets del propio motor no son historial del local
+    Reset-State
+    Assert-Eq 'S42 reconoce su propio ticket' $true ([bool]('Fudo Print Doctor Test' -match $script:TestDocRx))
+    Assert-Eq 'S42 no confunde una comanda' $false ([bool]('node print job' -match $script:TestDocRx))
+    Assert-Eq 'S42 reconoce sus colas' $true ([bool]('FUDO-TEST-USB001' -match $script:TestPrinterRx))
+    Assert-Eq 'S42 no confunde una cola del cliente' $false ([bool]('CAJA' -match $script:TestPrinterRx))
+
     # Escenario 40: el menu no se cierra solo. Enter pelado vuelve a preguntar (antes salia),
     # y "no hay teclado" es un caso distinto de "no escribio nada".
     Reset-State
@@ -5229,8 +5310,9 @@ function Send-Telemetry {
                 telemetry     = $(
                     $t = [ordered]@{}
                     try { foreach ($k in @($Result.telemetry.Keys)) { $t[$k] = $Result.telemetry[$k] } } catch {}
-                    $t['impresoras'] = @($(if ($script:Diagnostics.Contains('colas')) { $script:Diagnostics['colas'] | ForEach-Object { [ordered]@{ nombre = $_.nombre; puerto = $_.puerto; estado = $_.estado; trabajos = $_.trabajos } } } else { @() }))
-                    $t['cantidadColas'] = @($(if ($script:Diagnostics.Contains('colas')) { $script:Diagnostics['colas'] } else { @() })).Count
+                    $colasCliente = @($(if ($script:Diagnostics.Contains('colas')) { $script:Diagnostics['colas'] | Where-Object { -not $_.esDePrueba } } else { @() }))
+                    $t['impresoras'] = @($colasCliente | ForEach-Object { [ordered]@{ nombre = $_.nombre; puerto = $_.puerto; estado = $_.estado; trabajos = $_.trabajos } })
+                    $t['cantidadColas'] = @($colasCliente).Count
                     $t['cantidadHardware'] = @($(if ($script:Diagnostics.Contains('printersConnected')) { $script:Diagnostics['printersConnected'] } else { @() })).Count
                     $t['historialFudo'] = @($(if ($script:Diagnostics.Contains('historialImpresion')) { $script:Diagnostics['historialImpresion'].porImpresora } else { @() }))
                     $t['entorno'] = $Result.entorno

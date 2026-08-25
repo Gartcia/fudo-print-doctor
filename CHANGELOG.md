@@ -2,6 +2,42 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.4] - 2026-08-25
+
+Salió de la primera corrida de la revisión diaria de telemetría: tres corridas de una misma
+PC de prueba mostraron que el motor se estaba diagnosticando a sí mismo.
+
+### Corregido
+- **El motor se contaminaba con su propia cola de prueba.** `FUDO-TEST-*` contaba como cola
+  del cliente: en la corrida 2 el `escenarioLlegada` saltaba de `primera_instalacion` a
+  `todas_funcionan` y `cantidadColas` subía, o sea que la corrida N+1 diagnosticaba la basura
+  de la corrida N (y la telemetría de escenarios quedaba inflada). Ahora cada cola lleva
+  `esDePrueba` y las propias quedan fuera de `llegada`, de `cantidadColas` y de `impresoras`.
+- **Los tickets de prueba del motor entraban al historial del spooler.** El filtro
+  `(?i)node print job|fudo` también matcheaba `Fudo Print Doctor Test`, así que el motor
+  podía concluir `si_imprimio_comandas_de_fudo` por sus propios tickets. Se descartan por
+  nombre de documento antes de contar.
+- **La cola de prueba se borra de verdad.** Tres intentos, limpiando los trabajos pendientes
+  entre uno y otro (un trabajo colgado impide el borrado), y si sobrevive el chequeo pasa a
+  `fail` con el `Remove-Printer` exacto — antes quedaba en `warn` y la cola se acumulaba.
+- **`nativa.installed` decía lo contrario de lo que encontraba.** El nombre del chequeo es el
+  texto que sale como CAUSA en consola y telemetría, y decía "App Nativa de Fudo instalada"
+  con el status en `fail`. Ahora dice "NO instalada" (con la huella vacía como evidencia), o
+  "instalada pero NO está corriendo" según el caso.
+- **Restaurar de cuarentena se marcaba `fixed` sin verificar.** Se vio `fixed` en
+  `nativa.defenderQuarantine` con `nativa.installed` en `fail` y la transición en
+  `sigue_fallando` dos corridas seguidas. Ahora se vuelve a buscar la instalación después de
+  restaurar: si la Nativa no aparece, queda en `warn` con la indicación de **reinstalar** —
+  y si la corrida anterior de esa PC ya había intentado lo mismo, lo dice.
+- **Habilitar el log de impresión ya no es una "reparación".** `fudo.usoReal` con historial no
+  disponible pasa de `fixed` a `warn`: es un dato que falta, no un arreglo. Inflaba
+  `autoFixCount`, ensuciaba la columna `reparaciones` y podía dar por resuelta una corrida que
+  solo había encendido un log.
+
+### Agregado
+- Self-test: 129 asserts (S41 la cola del motor no cuenta como cola del cliente; S42 los
+  patrones de auto-reconocimiento no confunden comandas ni colas reales).
+
 ## [3.3] - 2026-08-25
 
 ### Corregido
