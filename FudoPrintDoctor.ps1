@@ -5263,6 +5263,23 @@ function Save-TelemetryUrl {
     } catch {
         Write-DoctorLog -Level 'WARN' -Message "No se pudo guardar la URL de telemetria: $($_.Exception.Message)"
     }
+    # Segunda copia, al lado del motor: la variable de entorno es por usuario de Windows,
+    # asi que si el .cmd se reemplaza por el publico (sin URL) y despues corre otro usuario,
+    # se perderia. telemetria.txt viaja con la carpeta y esta en .gitignore, nunca se publica.
+    try {
+        $dir = ''
+        if ($PSCommandPath) { $dir = Split-Path -Parent $PSCommandPath }
+        if ($dir) {
+            $archivo = Join-Path $dir 'telemetria.txt'
+            if (-not (Test-Path $archivo)) {
+                Set-Content -Path $archivo -Value $Url -Encoding ASCII -ErrorAction Stop
+                Add-Action -Type 'telemetry.persist_file' -Target $archivo -Before 'no existia' -After 'URL guardada' -Reversible $true
+                Write-DoctorLog -Level 'INFO' -Message ('URL de telemetria respaldada en ' + $archivo)
+            }
+        }
+    } catch {
+        Write-DoctorLog -Level 'WARN' -Message "No se pudo respaldar la URL en telemetria.txt: $($_.Exception.Message)"
+    }
 }
 
 function Send-Telemetry {

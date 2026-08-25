@@ -35,6 +35,11 @@ PC de prueba mostraron que el motor se estaba diagnosticando a sí mismo.
   solo había encendido un log.
 
 ### Agregado
+- **La URL de telemetría sobrevive a un launcher reemplazado.** Ya se guardaba en la variable
+  de usuario `FUDO_TELEMETRY_URL`, pero eso es por usuario de Windows: si el `.cmd` se
+  reemplazaba por el público (sin URL) y después corría otro usuario, se perdía. Ahora también
+  se deja una copia en `telemetria.txt` al lado del motor, que viaja con la carpeta y está en
+  `.gitignore` (nunca llega al repo público).
 - Self-test: 129 asserts (S41 la cola del motor no cuenta como cola del cliente; S42 los
   patrones de auto-reconocimiento no confunden comandas ni colas reales).
 
