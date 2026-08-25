@@ -422,7 +422,7 @@ $script:StartTime    = Get-Date
 $script:Diagnostics  = [ordered]@{}   # datos crudos recolectados
 $script:Errors       = New-Object System.Collections.ArrayList   # fallas internas del motor
 $script:TestPrintersCreated = New-Object System.Collections.ArrayList   # colas temporales creadas por el motor
-$script:SchemaVersion = '3.1'
+$script:SchemaVersion = '3.2'
 # Distribucion: repo publico. VERSION es un archivo de una linea con la version publicada.
 $script:RepoUrl    = 'https://github.com/Gartcia/fudo-print-doctor'
 $script:RawBase    = 'https://raw.githubusercontent.com/Gartcia/fudo-print-doctor/main'
@@ -670,6 +670,92 @@ function Test-IsInteractiveConsole {
         if ([Console]::IsOutputRedirected -or [Console]::IsInputRedirected) { return $false }
     } catch { return $false }
     return $true
+}
+
+function Wait-QueueDrain {
+    <#
+      Espera a que el ticket de prueba SALGA de la cola en vez de mirar una sola vez.
+      Un muestreo unico a 1.5s daba las dos clases de error: el spooler todavia no
+      habia marcado el trabajo (falso "no imprimio") o el trabajo ya se habia
+      descartado por error de puerto (falso "imprimio").
+      Devuelve:
+        quedoEnCola  -> el ticket sigue en la cola al vencer el timeout
+        bloqueadoPor -> cuantos trabajos AJENOS (comandas viejas) hay delante
+        esperaMs     -> cuanto se espero de verdad
+    #>
+    param([string]$Printer, [string]$DocMatch = 'fudo print doctor', [int]$TimeoutMs = 8000)
+    $ajenos = 0
+    try {
+        $otros = @(Get-PrintJob -PrinterName $Printer -ErrorAction SilentlyContinue |
+                   Where-Object { [string]$_.DocumentName -notmatch "(?i)$DocMatch" })
+        $ajenos = @($otros).Count
+    } catch {}
+    $inicio = Get-Date
+    $fin    = $inicio.AddMilliseconds($TimeoutMs)
+    $quedo  = $true
+    while ((Get-Date) -lt $fin) {
+        Start-Sleep -Milliseconds 500
+        $pend = @()
+        try {
+            $pend = @(Get-PrintJob -PrinterName $Printer -ErrorAction SilentlyContinue |
+                      Where-Object { [string]$_.DocumentName -match "(?i)$DocMatch" })
+        } catch {}
+        if (@($pend).Count -eq 0) { $quedo = $false; break }
+    }
+    return @{ quedoEnCola = $quedo; bloqueadoPor = [int]$ajenos
+              esperaMs = [int]((Get-Date) - $inicio).TotalMilliseconds }
+}
+
+function Confirm-PaperCameOut {
+    <#
+      El unico juez de si el ticket salio es el humano que esta al lado de la impresora.
+      Ningun chequeo de software alcanza:
+        - WritePrinter devuelve OK cuando el SPOOLER acepta los bytes;
+        - el spooler marca el trabajo como impreso cuando el DEVICE los acepta,
+          aunque no haya papel (rollo terminado, tapa abierta, adaptador
+          USB-paralelo sin impresora del otro lado, papel al reves).
+      Por eso, si hay consola, se pregunta. Devuelve $true / $false / $null (no se pudo).
+    #>
+    param([string]$Printer)
+    if (-not (Test-IsInteractiveConsole)) { return $null }
+    Write-Host ''
+    Write-Host ("  Mira la impresora: salio el ticket de prueba de '" + $Printer + "'?") -ForegroundColor Cyan
+    $ans = ''
+    try { $ans = Read-Host '  (s = salio / n = no salio / Enter = no puedo verla ahora)' } catch { return $null }
+    if ($ans -match '(?i)^\s*(s|si|y|yes|1)\s*$') { return $true }
+    if ($ans -match '(?i)^\s*(n|no|0)\s*$')       { return $false }
+    return $null
+}
+
+function Unblock-QueueForTest {
+    <#
+      Antes de probar puertos hay que dejar la cola en condiciones de imprimir.
+      Caso real: la cola estaba offline y con 11 comandas viejas trabadas, asi que
+      TODOS los puertos candidatos "fallaban" y el motor revertia el cambio.
+      Devuelve la lista de cosas que destrabo (para poder contarlas en el JSON).
+    #>
+    param($Printer)
+    $hechos = @()
+    if ($null -eq $Printer) { return $hechos }
+    $nombre = [string]$Printer.Name
+
+    # 1) marca offline: mientras este puesta, ningun trabajo se manda al puerto
+    $offline = $false
+    try { $offline = [bool](Get-Printer -Name $nombre -ErrorAction SilentlyContinue).WorkOffline } catch {}
+    if (-not $offline) {
+        try { $offline = [bool](Get-CimInstance Win32_Printer -Filter ("Name='" + ($nombre -replace "'","''") + "'") -ErrorAction SilentlyContinue).WorkOffline } catch {}
+    }
+    if ($offline) {
+        try { Set-Printer -Name $nombre -WorkOffline $false -ErrorAction Stop; $hechos += 'se quito la marca offline' } catch {}
+    }
+    # 2) cola pausada
+    try { if ([bool](Get-Printer -Name $nombre -ErrorAction SilentlyContinue).Paused) { Resume-PrintQueue -Name $nombre -ErrorAction Stop; $hechos += 'se reanudo la cola' } } catch {}
+    # 3) tickets de prueba nuestros que hayan quedado colgados (no son comandas del cliente)
+    try {
+        $mios = @(Get-PrintJob -PrinterName $nombre -ErrorAction SilentlyContinue | Where-Object { [string]$_.DocumentName -match '(?i)fudo print doctor' })
+        if (@($mios).Count -gt 0) { $mios | Remove-PrintJob -ErrorAction SilentlyContinue; $hechos += ("se descartaron " + @($mios).Count + " tickets de prueba viejos") }
+    } catch {}
+    return $hechos
 }
 
 function Confirm-Irreversible {
@@ -1346,6 +1432,19 @@ function Get-UsbPrintDevices {
                     $estaPresente = $true
                     if ($script:PresentIdsOk) { $estaPresente = [bool]$presentes.ContainsKey($instId.ToUpper()) }
 
+                    # Algunos adaptadores USB-paralelo y clones POS publican el descriptor
+                    # "No Printer Attached": el nodo existe y esta presente, pero del otro
+                    # lado NO hay impresora. Tomarlo como puerto vivo hacia que el motor
+                    # reasignara colas a un puerto que nunca iba a imprimir.
+                    if ($desc -match '(?i)no printer attached') {
+                        $desconectadas += [ordered]@{
+                            nombre = 'Adaptador de impresora sin impresora conectada'
+                            puerto = $portName
+                            instanceId = $instId
+                            motivo = 'el dispositivo se identifica como "No Printer Attached": el puerto existe pero del otro lado no hay impresora'
+                        }
+                        continue
+                    }
                     if ($estaPresente) {
                         $devices += [ordered]@{
                             source = 'registry.USBPRINT'; name = $desc
@@ -1375,6 +1474,13 @@ function Get-UsbPrintDevices {
             $inst = [string]$d.PNPDeviceID
             # solo miramos lo que esta colgado de USB (o ya es clase Printer)
             if ($inst -notmatch '(?i)^(USB|USBPRINT)\\' -and [string]$d.PNPClass -ne 'Printer') { continue }
+            # Impresoras de RED enumeradas como device (WSD / IPP): existen, pero no son
+            # hardware USB ni tienen puerto USB. Contarlas inflaba "hardware conectado"
+            # y generaba puertos candidatos fantasma.
+            if ($inst -match '(?i)^SWD\\PRINTENUM' -or [string]$d.Name -match '(?i)IPP Class Driver|WSD ') {
+                $rejected += [ordered]@{ nombre = [string]$d.Name; motivo = 'impresora de red (WSD/IPP), no es hardware USB'; instanceId = $inst }
+                continue
+            }
             $compat = Get-CompatibleIdList -WmiEntity $d -InstanceId $inst
             $verdict = Test-IsPrinterDevice -Name ([string]$d.Name) -InstanceId $inst `
                         -PnpClass ([string]$d.PNPClass) -Service ([string]$d.Service) -CompatibleIds $compat
@@ -2035,6 +2141,24 @@ function Test-Layer1a-HardwareInventory {
                      descartados = @($descartados | Select-Object -First 15) } `
         -Recommendation $(if ($cant -gt 1) { "Hay $cant impresoras conectadas. Si el diagnostico apunta a la equivocada, correr con -PrinterName '<nombre exacto de la cola en Windows>'." } else { '' })
 
+    # 1a.1b-pre Impresora presente pero SIN puerto USB asignado por Windows.
+    # Caso real: el device USB (clase 07h) esta enumerado y OK, pero no existe ningun nodo
+    # USBPRINT con PortName, asi que NINGUNA cola puede imprimirle. El motor probaba puertos
+    # sueltos (USB002, USB003) que no corresponden a este device y concluia "ningun puerto
+    # imprimio", cuando lo que falta es que Windows le asigne puerto.
+    if ($cant -gt 0 -and @($devPorts).Count -eq 0) {
+        $sinPuerto = @($identified | ForEach-Object { [string]$_.nombre })
+        Add-Check -Id 'hw.noPortBound' -Layer 1 -Name 'Impresora conectada pero sin puerto USB asignado' -Status 'fail' -RootCauseCandidate $true -Plane 'os' `
+            -Evidence @{ impresoras = $sinPuerto; puertosUsbExistentes = $usbPorts; livePorts = @() } `
+            -ArticleRef 'https://soporte.fu.do/es/articles/11730817' `
+            -Recommendation ('Windows ve la impresora conectada pero no le asigno ningun puerto USB (no hay nodo USBPRINT con PortName), ' +
+                             'asi que ninguna cola puede imprimirle y cambiar el puerto de la cola no sirve de nada. ' +
+                             'Con la impresora ENCENDIDA: desenchufar el USB, esperar 5 segundos y volver a enchufarlo en un puerto directo de la PC (sin hub); ' +
+                             'Windows la re-detecta y crea el puerto. Si sigue sin aparecer, instalar el driver "Generico / Solo texto" ' +
+                             '(Agregar impresora > la que busco no esta en la lista > agregar local), que es lo que crea el puerto USB.' +
+                             $(if (@($usbPorts).Count -gt 0) { " Los puertos $($usbPorts -join ', ') que figuran en Windows son huerfanos: quedaron de instalaciones previas y no apuntan a esta impresora." } else { '' }))
+    }
+
     # 1a.1b Que driver corresponde a cada una
     if ($cant -gt 0) {
         $oemPend = @($identified | Where-Object { $_.driverSugerido -eq 'oem_recomendado' })
@@ -2523,10 +2647,13 @@ function Repair-QueueRecreate {
                 if (-not $tmp) { continue }
                 Start-Sleep -Milliseconds 600
                 if ([FudoRawPrinter]::SendBytes($tmp, $ticket)) {
-                    Start-Sleep -Milliseconds 1500
-                    $pend = @()
-                    try { $pend = @(Get-PrintJob -PrinterName $tmp -ErrorAction SilentlyContinue) } catch {}
-                    if (@($pend).Count -eq 0) { $puertoOk = $cp; $temporal = $tmp; break }
+                    $d = Wait-QueueDrain -Printer $tmp -TimeoutMs 6000
+                    if (-not $d.quedoEnCola) {
+                        # La cola temporal esta limpia y sin offline, asi que si el trabajo salio,
+                        # el puerto responde. El papel lo confirma el humano.
+                        $conf = Confirm-PaperCameOut -Printer $tmp
+                        if ($conf -ne $false) { $puertoOk = $cp; $temporal = $tmp; break }
+                    }
                 }
                 try { Remove-Printer -Name $tmp -ErrorAction SilentlyContinue } catch {}
             } catch {}
@@ -2626,6 +2753,34 @@ function Test-Layer3-UsbPort {
         return
     }
 
+    # Antes de probar puertos hay que dejar la cola en condiciones de imprimir. Caso real:
+    # cola offline + 11 comandas viejas trabadas => todos los candidatos "fallaban" y el
+    # motor revertia el puerto, dejando el problema intacto.
+    $destrabado = Unblock-QueueForTest -Printer $Printer
+    if (@($destrabado).Count -gt 0) { Write-StepDetail ('destrabando la cola: ' + ($destrabado -join '; ')) }
+    $trabajosDelante = 0
+    try { $trabajosDelante = @(Get-PrintJob -PrinterName $Printer.Name -ErrorAction SilentlyContinue).Count } catch {}
+    if ($trabajosDelante -gt 0) {
+        $purga = Invoke-Remediation -Description "Limpiar $trabajosDelante trabajo(s) atascado(s) en '$($Printer.Name)' para poder probar los puertos" `
+            -Type 'queue.purge_for_test' -Target $Printer.Name -Before "$trabajosDelante trabajos" -After 'cola vacia' -Reversible $false `
+            -Impact 'se descartan comandas viejas que nunca salieron (hay que reimprimirlas desde Fudo)' -Fix {
+                Get-PrintJob -PrinterName $Printer.Name -ErrorAction SilentlyContinue | Remove-PrintJob -ErrorAction SilentlyContinue
+                Start-Sleep -Milliseconds 400
+                "cola vaciada para poder probar los puertos"
+            }
+        if (-not $purga.applied) {
+            # Sin vaciar la cola, cualquier prueba de puerto da un falso negativo.
+            Add-Check -Id 'conn.usb' -Layer 3 -Name 'Puerto USB: prueba bloqueada por la cola' -Status 'warn' -RootCauseCandidate $true `
+                -Evidence @{ currentPort = $currentPort; candidates = $candidatePorts; livePorts = $livePorts
+                             trabajosDelante = $trabajosDelante; destrabado = $destrabado } `
+                -ArticleRef 'https://soporte.fu.do/es/articles/11730817' `
+                -Recommendation ("No se puede saber en que puerto responde la impresora: hay $trabajosDelante trabajo(s) atascado(s) delante en '$($Printer.Name)' y cualquier ticket de prueba queda detras. " +
+                                 "Limpiar la cola primero (Get-PrintJob -PrinterName '$($Printer.Name)' | Remove-PrintJob, o correr el script y responder 's' cuando pregunte) y volver a correr el diagnostico.")
+            return
+        }
+        try { $trabajosDelante = @(Get-PrintJob -PrinterName $Printer.Name -ErrorAction SilentlyContinue).Count } catch { $trabajosDelante = 0 }
+    }
+
     # Auto-fix conservador: probar candidatos con test raw y quedarse con el que imprime; si ninguno, revertir.
     $rem = Invoke-Remediation -Description "Reasignar puerto USB probando candidatos: $($candidatePorts -join ', ')" -Type 'printer.setport' -Target $Printer.Name `
         -Before $currentPort -After '(a determinar)' -Fix {
@@ -2641,21 +2796,25 @@ function Test-Layer3-UsbPort {
                     # OJO: SendBytes OK solo dice que el spooler acepto el trabajo. Si el papel no
                     # sale, el trabajo queda en la cola. Sin esta verificacion se reportaba
                     # "puerto reasignado (test HW OK)" con la impresora desenchufada.
-                    Start-Sleep -Milliseconds 1800
-                    $pend = @()
-                    try { $pend = @(Get-PrintJob -PrinterName $Printer.Name -ErrorAction SilentlyContinue | Where-Object { [string]$_.DocumentName -match '(?i)fudo' }) } catch {}
-                    if (@($pend).Count -gt 0) {
-                        try { $pend | Remove-PrintJob -ErrorAction SilentlyContinue } catch {}
+                    $d = Wait-QueueDrain -Printer $Printer.Name -TimeoutMs 6000
+                    if ($d.quedoEnCola) {
+                        try { Get-PrintJob -PrinterName $Printer.Name -ErrorAction SilentlyContinue | Where-Object { [string]$_.DocumentName -match '(?i)fudo print doctor' } | Remove-PrintJob -ErrorAction SilentlyContinue } catch {}
                         continue
                     }
+                    # El puerto acepto los bytes. Que salga papel solo lo puede confirmar el humano.
+                    $conf = Confirm-PaperCameOut -Printer $Printer.Name
+                    if ($conf -eq $false) { continue }
+                    $script:Diagnostics['puertoConfirmado'] = $conf
                     $chosen = $cp; break
                 } catch {}
             }
             if ($null -eq $chosen) {
                 try { Set-Printer -Name $Printer.Name -PortName $currentPort -ErrorAction SilentlyContinue } catch {}
                 "ningun candidato imprimio un ticket de verdad; puerto revertido a $currentPort"
+            } elseif ($script:Diagnostics.Contains('puertoConfirmado') -and $script:Diagnostics['puertoConfirmado'] -eq $true) {
+                "puerto reasignado a $chosen (confirmado: salio el ticket)"
             } else {
-                "puerto reasignado a $chosen y el ticket salio de la cola"
+                "puerto reasignado a $chosen y el ticket salio de la cola (sin confirmar que salio papel)"
             }
         }
     $fixedOk = $rem.applied -and ($rem.note -match 'reasignado')
@@ -2994,29 +3153,64 @@ function Test-Layer4-HardwarePrint {
             # WritePrinter OK solo significa "el spooler lo acepto". Si el trabajo sigue en la
             # cola despues de un momento, el papel NO salio.
             $quedoEnCola = $false
+            $bloqueadoPor = 0
             if ($ok) {
                 Write-StepDetail 'verificando que el ticket haya salido'
-                Start-Sleep -Milliseconds 1800
-                try {
-                    $pend = @(Get-PrintJob -PrinterName $Printer.Name -ErrorAction SilentlyContinue |
-                              Where-Object { [string]$_.DocumentName -match '(?i)fudo print doctor' })
-                    $quedoEnCola = (@($pend).Count -gt 0)
-                } catch {}
+                $drain = Wait-QueueDrain -Printer $Printer.Name
+                $quedoEnCola  = [bool]$drain.quedoEnCola
+                $bloqueadoPor = [int]$drain.bloqueadoPor
             }
             if ($quedoEnCola) {
                 Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica ESC/POS por USB (RAW)' -Status 'fail' -RootCauseCandidate $true `
-                    -Plane 'hardware' -Evidence @{ printer = $Printer.Name; sent = $true; quedoEnCola = $true } `
+                    -Plane 'hardware' -Evidence @{ printer = $Printer.Name; sent = $true; quedoEnCola = $true; trabajosDelante = $bloqueadoPor } `
                     -ArticleRef 'https://soporte.fu.do/es/articles/11730817' `
-                    -Recommendation ('El ticket entro a la cola pero no se imprimio: la impresora no esta respondiendo. ' +
-                                     'Revisar que este encendida, con papel, la tapa cerrada y el cable USB firme. ' +
-                                     'Si la luz esta en rojo o titilando, es falla de hardware o falta de papel.')
+                    -Recommendation $(if ($bloqueadoPor -gt 0) {
+                            "El ticket de prueba entro a la cola pero no salio, y hay $bloqueadoPor comanda(s) vieja(s) delante bloqueandola. Primero limpiar la cola (opcion del script o Get-PrintJob -PrinterName '$($Printer.Name)' | Remove-PrintJob) y recien despues volver a probar: hasta que la cola no este vacia, la prueba de impresion no dice nada sobre la impresora."
+                        } else {
+                            'El ticket entro a la cola pero no se imprimio: la impresora no esta respondiendo. ' +
+                            'Revisar que este encendida, con papel, la tapa cerrada y el cable USB firme. ' +
+                            'Si la luz esta en rojo o titilando, es falla de hardware o falta de papel.'
+                        })
                 return
             }
 
-            Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica ESC/POS por USB (RAW)' -Status $(if($ok){'ok'}else{'fail'}) -RootCauseCandidate (-not $ok) `
-                -Plane 'hardware' -Evidence @{ printer = $Printer.Name; sent = $ok; quedoEnCola = $false } `
+            if (-not $ok) {
+                Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica ESC/POS por USB (RAW)' -Status 'fail' -RootCauseCandidate $true `
+                    -Plane 'hardware' -Evidence @{ printer = $Printer.Name; sent = $false } `
+                    -ArticleRef 'https://soporte.fu.do/es/articles/12044021' `
+                    -Recommendation 'El envio RAW fallo: revisar puerto/driver/cable.'
+                return
+            }
+
+            # El trabajo salio de la cola, pero eso NO prueba que haya salido papel: el
+            # spooler lo da por impreso en cuanto el device acepta los bytes. Sin rollo,
+            # con la tapa abierta o con un adaptador USB-paralelo sin impresora del otro
+            # lado, la cola queda limpia y no se imprimio nada. Preguntamos.
+            $salio = Confirm-PaperCameOut -Printer $Printer.Name
+            $script:Diagnostics['ticketConfirmado'] = $salio
+            if ($salio -eq $false) {
+                Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica ESC/POS por USB (RAW)' -Status 'fail' -RootCauseCandidate $true `
+                    -Plane 'hardware' -Evidence @{ printer = $Printer.Name; sent = $true; quedoEnCola = $false; confirmadoPorHumano = $false } `
+                    -ArticleRef 'https://soporte.fu.do/es/articles/11730817' `
+                    -Recommendation ('El spooler dice que el ticket se imprimio pero no salio papel. Eso descarta Windows y la cola: ' +
+                                     'revisar rollo (que quede papel y que este del lado correcto), tapa bien cerrada, ' +
+                                     'y si la impresora entra por un adaptador USB-paralelo, que el cable llegue a la impresora. ' +
+                                     'Si la luz esta en rojo o titilando, es hardware.')
+                return
+            }
+            if ($null -eq $salio) {
+                Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica ESC/POS por USB (RAW): enviado, sin confirmar' -Status 'warn' `
+                    -Plane 'hardware' -Evidence @{ printer = $Printer.Name; sent = $true; quedoEnCola = $false; confirmadoPorHumano = $null } `
+                    -ArticleRef 'https://soporte.fu.do/es/articles/12044021' `
+                    -Recommendation ('El ticket salio de la cola de Windows, que es todo lo que se puede verificar por software. ' +
+                                     'Hay que mirar la impresora: si salio el papel, el hardware esta bien y el problema es config de Fudo (area/cocina/sala); ' +
+                                     'si no salio, es rollo, tapa o cable.')
+                return
+            }
+            Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica ESC/POS por USB (RAW)' -Status 'ok' `
+                -Plane 'hardware' -Evidence @{ printer = $Printer.Name; sent = $true; quedoEnCola = $false; confirmadoPorHumano = $true } `
                 -ArticleRef 'https://soporte.fu.do/es/articles/12044021' `
-                -Recommendation $(if($ok){'El hardware imprime OK: si la comanda no sale, revisar config de Fudo (area/cocina/sala). Si imprime en blanco, revisar rollo/papel al reves.'}else{'El envio RAW fallo: revisar puerto/driver/cable.'})
+                -Recommendation 'El hardware imprime OK (confirmado: salio el papel). Si la comanda no sale, el problema es la config de Fudo (area/cocina/sala/categorias).'
         } catch {
             Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica ESC/POS por USB (RAW)' -Status 'fail' -RootCauseCandidate $true `
                 -Plane 'hardware' -Evidence @{ error = $_.Exception.Message }
@@ -3595,16 +3789,25 @@ function Invoke-FudoPrintDoctor {
         $null = Invoke-Step -Name 'layer5.fudoConfig' -Body { Test-Layer5-FudoConfig -DetectedInterface $detectedInterface }
     }
 
-    # Colas temporales: se conservan por defecto (sirven para reprobar); -KeepTestPrinter:$false las borra.
+    # Colas temporales: SE BORRAN salvo que hayan servido para algo (una cola de prueba que
+    # no imprimio solo ensucia el panel del cliente: se llegaron a ver 10 impresoras con
+    # POS-80 (copy 1), (copy 2) y FUDO-TEST-* acumuladas).
     if (@($script:TestPrintersCreated).Count -gt 0) {
         $names = @($script:TestPrintersCreated)
-        if ($script:BoundParams -and $script:BoundParams.ContainsKey('KeepTestPrinter') -and -not $KeepTestPrinter) {
+        $pidioConservar = ($script:BoundParams -and $script:BoundParams.ContainsKey('KeepTestPrinter') -and $KeepTestPrinter)
+        $sirvio = $false
+        try {
+            $tp = $script:Checks | Where-Object { $_.id -eq 'hw.testprint' -and $_.status -eq 'ok' } | Select-Object -First 1
+            if ($tp) { $sirvio = $true }
+        } catch {}
+        if (-not ($pidioConservar -or $sirvio)) {
             foreach ($n in $names) { try { Remove-Printer -Name $n -ErrorAction SilentlyContinue } catch {} }
-            Add-Check -Id 'printer.testCleanup' -Layer 1 -Name 'Cola de prueba eliminada' -Status 'ok' -Evidence @{ removed = $names }
+            Add-Check -Id 'printer.testCleanup' -Layer 1 -Name 'Cola de prueba eliminada' -Status 'ok' `
+                -Evidence @{ removed = $names; motivo = 'no imprimio, no deja rastro en el panel del cliente' }
         } else {
             Add-Check -Id 'printer.testCleanup' -Layer 1 -Name 'Cola de prueba conservada' -Status 'warn' -Plane 'os' `
                 -Evidence @{ kept = $names } `
-                -Recommendation ("Queda instalada la cola de prueba " + ($names -join ', ') + ". Borrarla cuando se instale la definitiva: Remove-Printer -Name '" + (@($names)[0]) + "'")
+                -Recommendation ("Queda instalada la cola de prueba " + ($names -join ', ') + " porque SI imprimio: sirve como cola definitiva o como referencia del puerto correcto. Borrarla cuando se instale la definitiva: Remove-Printer -Name '" + (@($names)[0]) + "'")
         }
     }
 
@@ -4263,6 +4466,36 @@ public class FudoFakeEndpoint {
     $script:Diagnostics['hwDeviceCount'] = 1
     Assert-Eq 'S36 hardware sin instalar' 'hardware_conectado_sin_instalar' ([string](Get-ArrivalScenario).escenario)
 
+    # Escenario 37: sin humano al lado, la prueba de impresion NO puede afirmar que salio papel
+    Reset-State
+    Assert-Eq 'S37 sin consola no confirma' $true ($null -eq (Confirm-PaperCameOut -Printer 'CAJA'))
+
+    # Escenario 38: impresora presente pero sin puerto USB asignado por Windows.
+    # (device enumerado OK, ningun nodo USBPRINT con PortName) => no se reasignan puertos
+    # a ciegas: se pide replug / instalacion del driver que crea el puerto.
+    Reset-State
+    function Get-UsbPrintDevices {
+        @([ordered]@{ source='Win32_PnPEntity'; name='Compatibilidad con impresoras USB'
+                      instanceId='USB\VID_6868&PID_0200\6&2798821A&0&3'; portName=''; status='OK'; problem=0
+                      deteccion='driver usbprint'; certeza='alta' })
+    }
+    function Get-ProblemPrinterDevices { @() }
+    function Get-PrinterPort { @([pscustomobject]@{ Name='USB001'; Description='Puerto de impresora virtual para USB' },
+                                 [pscustomobject]@{ Name='USB002'; Description='Puerto de impresora virtual para USB' }) }
+    function Get-Printer { @([pscustomobject]@{ Name='POS-80'; DriverName='Generic / Text Only'; PortName='USB002' }) }
+    $err38 = ''
+    try { Test-Layer1a-HardwareInventory } catch { $err38 = $_.Exception.Message }
+    Assert-Eq 'S38 inventario no explota' '' $err38
+    Assert-Eq 'S38 hardware detectado' 'ok' (Get-CheckById 'hw.deviceConnected').status
+    Assert-Eq 'S38 avisa que no hay puerto' 'fail' (Get-CheckById 'hw.noPortBound').status
+    Assert-Eq 'S38 es causa raiz' $true (Get-CheckById 'hw.noPortBound').rootCauseCandidate
+    Assert-Eq 'S38 explica los puertos huerfanos' $true ([bool]((Get-CheckById 'hw.noPortBound').recommendation -match 'huerfanos'))
+
+    # Escenario 39: descarta impresoras de red (WSD/IPP) del inventario de hardware USB
+    Reset-State
+    $verdictWsd = Test-IsPrinterDevice -Name 'Microsoft IPP Class Driver' -InstanceId 'SWD\PRINTENUM\WSD-442FB327' -PnpClass 'Printer' -Service '' -CompatibleIds @()
+    Assert-Eq 'S39 la clase Printer sola la daba por USB' $true ([bool]$verdictWsd.isPrinter)
+
     Write-Host ""
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)
     # Salida explicita en los dos casos: si el script termina con 'return', $LASTEXITCODE
@@ -4521,12 +4754,28 @@ function Invoke-MenuAction {
                 Initialize-RawPrinterHelper
                 $bytes = [System.Text.Encoding]::GetEncoding(437).GetBytes((Get-EscPosTestTicket -Caption 'FUDO PRUEBA MANUAL'))
                 $ok = [FudoRawPrinter]::SendBytes($nombre, $bytes)
-                Start-Sleep -Milliseconds 1500
-                $pend = @()
-                try { $pend = @(Get-PrintJob -PrinterName $nombre -ErrorAction SilentlyContinue | Where-Object { [string]$_.DocumentName -match '(?i)fudo' }) } catch {}
-                if ($ok -and @($pend).Count -eq 0) { Write-Host ("  Ticket enviado a '" + $nombre + "'. Si salio el papel, el hardware imprime.") -ForegroundColor Green }
-                elseif ($ok) { Write-Host '  El ticket quedo en la cola: la impresora no esta respondiendo.' -ForegroundColor Yellow }
-                else { Write-Host '  No se pudo enviar el ticket.' -ForegroundColor Red }
+                if (-not $ok) { Write-Host '  No se pudo enviar el ticket (el spooler lo rechazo).' -ForegroundColor Red; return $false }
+                Write-Host '  Enviado. Esperando que salga de la cola...' -ForegroundColor DarkGray
+                $drain = Wait-QueueDrain -Printer $nombre
+                if ($drain.quedoEnCola) {
+                    Write-Host '  El ticket quedo en la cola: la impresora no esta respondiendo.' -ForegroundColor Yellow
+                    if ([int]$drain.bloqueadoPor -gt 0) {
+                        Write-Host ("  Ojo: hay " + [int]$drain.bloqueadoPor + " trabajo(s) viejo(s) delante bloqueando la cola. Limpiala y volve a probar.") -ForegroundColor Yellow
+                    }
+                    return $false
+                }
+                # Salio de la cola != salio papel. Preguntamos siempre: es la unica verificacion real.
+                $salio = Confirm-PaperCameOut -Printer $nombre
+                if ($salio -eq $true) {
+                    Write-Host '  Confirmado: el hardware imprime. Si la comanda no sale, el problema es la config de Fudo (area/cocina/sala/categorias).' -ForegroundColor Green
+                } elseif ($salio -eq $false) {
+                    Write-Host '  El spooler lo dio por impreso pero no salio papel: no es Windows ni la cola.' -ForegroundColor Red
+                    Write-Host '  Revisar rollo (que haya papel y este del lado correcto), tapa cerrada, y el cable hasta la impresora.' -ForegroundColor Yellow
+                    Write-Host '  Si la impresora entra por un adaptador USB-paralelo, verificar que del otro lado haya impresora.' -ForegroundColor DarkGray
+                } else {
+                    Write-Host '  El ticket salio de la cola de Windows (es todo lo que se puede verificar por software).' -ForegroundColor Yellow
+                    Write-Host '  Hay que mirar la impresora para saber si salio el papel.' -ForegroundColor DarkGray
+                }
             } catch { Write-Host ("  Error: " + $_.Exception.Message) -ForegroundColor Red }
             return $false
         }

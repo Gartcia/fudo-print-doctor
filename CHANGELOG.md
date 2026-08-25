@@ -2,6 +2,49 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.2] - 2026-08-25
+
+Dos casos reales de asesores: uno dio "impresión OK" con la impresora sin imprimir, el otro
+reconoció bien la cola rota pero no le cambió el puerto.
+
+### Corregido
+- **Falso positivo de "el hardware imprime"**. `WritePrinter` devuelve OK cuando el *spooler*
+  acepta los bytes, y el spooler da el trabajo por impreso cuando el *dispositivo* los acepta:
+  sin rollo, con la tapa abierta o con un adaptador USB-paralelo sin impresora del otro lado, la
+  cola queda limpia y no salió nada. Ahora, cuando el ticket sale de la cola, se le **pregunta al
+  humano** si salió el papel (`Confirm-PaperCameOut`). `hw.testprint` queda en `ok` solo si alguien
+  lo confirmó; sin confirmar queda en `warn` ("enviado, sin confirmar") y nunca en `ok`. Aplica
+  también a la opción `[T]` del menú, que era la que afirmaba "si salió el papel, el hardware
+  imprime" sin verificar nada.
+- **La verificación miraba una sola vez a los 1,5 s**. Reemplazada por `Wait-QueueDrain`, que
+  espera hasta 8 s haciendo poll y además cuenta los **trabajos ajenos** que están delante.
+- **El puerto no se cambiaba nunca cuando la cola estaba trabada**. Caso real: cola marcada
+  offline con 11 comandas de julio atascadas; el motor probaba USB002 y USB003, el ticket de prueba
+  quedaba detrás de las 11, todos los candidatos "fallaban" y revertía el puerto a USB001 dejando
+  el problema intacto. Ahora `Unblock-QueueForTest` saca la marca offline, reanuda la cola y
+  descarta tickets de prueba viejos *antes* de probar puertos; si además hay comandas del cliente
+  bloqueando, se ofrece limpiarlas y, si no se confirma, el chequeo dice
+  **"prueba bloqueada por la cola"** en vez de afirmar que ningún puerto imprime.
+- **Puertos vivos fantasma**. Un nodo `USBPRINT` cuyo descriptor dice literalmente
+  `No Printer Attached` (típico de adaptadores USB-paralelo y clones POS) ya no cuenta como
+  dispositivo conectado: el puerto existe pero del otro lado no hay impresora.
+- **Impresoras de red contadas como hardware USB**. Los devices `SWD\PRINTENUM\WSD-...` y
+  `Microsoft IPP Class Driver` inflaban "HARDWARE DE IMPRESION CONECTADO" y generaban puertos
+  candidatos que no existen. Se descartan del inventario USB.
+- **Colas de prueba acumulándose en el panel del cliente** (se llegaron a ver 10 impresoras con
+  `POS-80 (copy 1)`, `(copy 2)` y `FUDO-TEST-*`). Ahora la cola temporal se borra sola salvo que
+  haya impreso de verdad; `-KeepTestPrinter` sigue forzando que se conserve.
+
+### Agregado
+- Chequeo `hw.noPortBound`: la impresora está presente y enumerada pero **Windows no le asignó
+  ningún puerto USB** (no hay nodo `USBPRINT` con `PortName`). En ese estado ninguna cola puede
+  imprimirle y cambiar el puerto de la cola no sirve: la indicación es desenchufar/enchufar con la
+  impresora encendida en un puerto directo, o instalar el driver Genérico/Solo texto, que es lo que
+  crea el puerto.
+- `confirmadoPorHumano` en la evidencia de `hw.testprint`, para poder separar en la telemetría las
+  corridas verificadas de las que quedaron sin confirmar.
+- Self-test: 117 asserts (S37 sin consola no se afirma que salió papel; S38 `hw.noPortBound`).
+
 ## [2.1] - 2026-08-22
 
 ### Agregado
