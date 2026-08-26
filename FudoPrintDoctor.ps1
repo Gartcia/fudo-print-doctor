@@ -424,8 +424,12 @@ $script:Errors       = New-Object System.Collections.ArrayList   # fallas intern
 $script:TestPrintersCreated = New-Object System.Collections.ArrayList   # colas temporales creadas por el motor
 # Las colas que crea el motor no son del cliente: no pueden contarse como evidencia.
 $script:TestPrinterRx = '(?i)^FUDO-TEST-'
+# Colas creadas por el motor: las FUDO-TEST-* (siempre descartables) y la FUDO-USB00x que crea
+# hw.noPortBound cuando el cliente no tenia ninguna. Esa ultima SI es un entregable mientras el
+# puerto tenga hardware; si el hardware se va, deja de serlo (ver Remove-OrphanOwnQueues).
+$script:OwnQueueRx   = '(?i)^FUDO-(TEST-|USB\d)'
 $script:TestDocRx    = '(?i)fudo print doctor'
-$script:SchemaVersion = '3.6'
+$script:SchemaVersion = '3.7'
 $script:MenuVacios = 0
 # Distribucion: repo publico. VERSION es un archivo de una linea con la version publicada.
 $script:RepoUrl    = 'https://github.com/Gartcia/fudo-print-doctor'
@@ -1047,6 +1051,18 @@ function Test-Layer0-Environment {
 # Causa muy frecuente: la App Nativa queda bloqueada / en cuarentena por Defender o Avast.
 # Estrategia: exclusiones quirurgicas (ruta + proceso) en vez de desactivar el antivirus.
 # ---------------------------------------------------------------------------
+function Test-NativaDegradada {
+    <#
+      La version que quedo despues de restaurar de cuarentena es MAS VIEJA que la que habia
+      antes? Tolerante: si alguna de las dos no se puede leer como version, no se afirma nada
+      (igual que Test-PortHasLiveDevice, nunca inventa un problema).
+    #>
+    param([string]$Antes, [string]$Despues)
+    if (-not $Antes -or -not $Despues) { return $false }
+    if ($Antes -eq $Despues) { return $false }
+    try { return ([bool]([version]$Despues -lt [version]$Antes)) } catch { return $false }
+}
+
 function Find-FudoNativeInstall {
     Write-StepDetail 'buscando la instalacion de la App Nativa'
     $paths = @()
@@ -1174,20 +1190,34 @@ function Test-Layer0b-NativeApp {
         # estar, marcarlo 'fixed' es un falso positivo (se vio 'fixed' con nativa.installed en
         # fail y la transicion en sigue_fallando dos corridas seguidas).
         $volvio = $false
+        # v3.7: restaurar de cuarentena puede devolver un binario VIEJO. Se vio 0.0.36 -> 0.0.18
+        # despues de una restauracion, y 0.0.18 circulando en varias PCs. Si la version baja, la
+        # Nativa quedo degradada: no alcanza con 'restaurada', hay que reinstalarla.
+        $verAntes   = ''
+        $verDespues = ''
+        $degradada  = $false
+        try { $verAntes = [string](@($install.regInfo)[0].version) } catch {}
         if ($rem.applied) {
             Start-Sleep -Milliseconds 800
             try {
                 $reCheck = Find-FudoNativeInstall
                 $volvio = ((@($reCheck.paths).Count -gt 0) -or (@($reCheck.regInfo).Count -gt 0))
+                try { $verDespues = [string](@($reCheck.regInfo)[0].version) } catch {}
             } catch {}
         }
+        $degradada = Test-NativaDegradada -Antes $verAntes -Despues $verDespues
         Add-Check -Id 'nativa.defenderQuarantine' -Layer 0 `
             -Name $(if (-not $rem.applied) { 'Nativa en cuarentena de Windows Defender' }
+                    elseif ($degradada)    { "Nativa restaurada de cuarentena pero con una version mas vieja ($verAntes -> $verDespues)" }
                     elseif ($volvio)       { 'Nativa restaurada de la cuarentena de Defender' }
                     else                   { 'Nativa en cuarentena: se restauro pero sigue sin aparecer' }) `
-            -Status $(if (-not $rem.applied) { 'fail' } elseif ($volvio) { 'fixed' } else { 'warn' }) -RootCauseCandidate $true `
-            -Evidence @{ threats = $av.fudoThreats; presenteDespues = $volvio } -ActionTaken $rem.note `
-            -Recommendation $(if ($volvio) {
+            -Status $(if (-not $rem.applied) { 'fail' } elseif ($degradada) { 'warn' } elseif ($volvio) { 'fixed' } else { 'warn' }) -RootCauseCandidate $true `
+            -Evidence @{ threats = $av.fudoThreats; presenteDespues = $volvio
+                         versionAntes = $verAntes; versionDespues = $verDespues; degradada = $degradada } -ActionTaken $rem.note `
+            -Recommendation $(if ($degradada) {
+                    "La restauracion devolvio una version mas vieja de la Nativa ($verAntes -> $verDespues): Defender habia puesto en cuarentena el binario actualizado y lo que volvio es el anterior. " +
+                    'NO darlo por resuelto: reinstalar la App Nativa desde la version vigente y recien despues verificar que la exclusion de Defender quedo puesta (ruta + proceso).'
+                } elseif ($volvio) {
                     'Se restauro de la cuarentena y se agregaron exclusiones (ruta + proceso). Reiniciar la Nativa y probar una comanda.'
                 } else {
                     'Se restauro de la cuarentena y se excluyo en Defender, pero la Nativa sigue sin aparecer instalada: el antivirus ya la habia borrado. Hay que REINSTALAR la App Nativa y despues verificar que el antivirus no la vuelva a tocar.' +
@@ -2797,6 +2827,33 @@ function Remove-StaleOwnQueues {
     return @($borradas)
 }
 
+function Remove-OrphanOwnQueues {
+    <#
+      Las colas que crea el motor (FUDO-USB00x) NO se borran como las FUDO-TEST-*: cuando el
+      cliente no tenia ninguna, esa cola es el entregable. Pero si quedo apuntando a un puerto
+      donde ya no hay ningun dispositivo, dejo de ser un entregable y pasa a ser basura que el
+      motor se diagnostica a si mismo: se vio una corrida cuya causa raiz fue "la impresora
+      'FUDO-USB001' esta desconectada", 35 segundos despues de que la corrida anterior la
+      creara en ese mismo puerto.
+      Corre DESPUES del inventario de hardware, que es lo que llena livePorts.
+    #>
+    $borradas = @()
+    try {
+        foreach ($q in @(Get-Printer -ErrorAction SilentlyContinue | Where-Object { [string]$_.Name -match $script:OwnQueueRx })) {
+            $n = [string]$q.Name
+            if (Test-PortHasLiveDevice -PortName ([string]$q.PortName)) { continue }
+            try { Get-PrintJob -PrinterName $n -ErrorAction SilentlyContinue | Remove-PrintJob -ErrorAction SilentlyContinue } catch {}
+            try { Remove-Printer -Name $n -ErrorAction Stop; $borradas += $n } catch {}
+        }
+    } catch {}
+    if (@($borradas).Count -gt 0) {
+        Add-Action -Type 'printer.remove_orphan_own' -Target ($borradas -join ', ') `
+            -Before 'cola creada por el motor, apuntando a un puerto sin dispositivo' -After 'borrada' -Reversible $true
+        Write-DoctorLog -Level 'INFO' -Message ('Colas propias huerfanas borradas antes de elegir impresora: ' + ($borradas -join ', '))
+    }
+    return @($borradas)
+}
+
 function Find-QueueForPort {
     <#
       Ya existe una cola del cliente apuntando a este puerto? Si existe y esta sana, hay que
@@ -3414,17 +3471,17 @@ function Test-Layer3-Network {
 function Test-Layer4-HardwarePrint {
     param($Printer, $DetectedInterface)
     if (-not $TestPrint) {
-        Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica de impresion' -Status 'skipped' -Evidence @{ note = 'TestPrint deshabilitado' }
+        Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica de impresion' -Status 'skipped' -Evidence @{ note = 'TestPrint deshabilitado'; skipReason = 'testprint_off' }
         return
     }
     if ($DryRun) {
-        Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica de impresion' -Status 'skipped' -Evidence @{ note = 'dry-run' }
+        Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica de impresion' -Status 'skipped' -Evidence @{ note = 'dry-run'; skipReason = 'dry_run' }
         return
     }
 
     if ($DetectedInterface -eq 'Ethernet') {
         $ip = $script:Diagnostics['printerIp']
-        if (-not $ip) { Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica (TCP 9100)' -Status 'skipped' -Evidence @{ note = 'sin IP' }; return }
+        if (-not $ip) { Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica (TCP 9100)' -Status 'skipped' -Evidence @{ note = 'sin IP'; skipReason = 'sin_ip' }; return }
         try {
             Write-StepDetail ("enviando ticket de prueba a " + $ip + ":" + $Port)
             $ok = Send-EscPosOverTcp -Ip $ip -TcpPort $Port
@@ -3439,21 +3496,44 @@ function Test-Layer4-HardwarePrint {
     } else {
         if ($null -eq $Printer) {
             Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica de impresion' -Status 'skipped' -Plane 'hardware' `
-                -Evidence @{ note = 'sin impresora real objetivo' } `
+                -Evidence @{ note = 'sin impresora real objetivo'; skipReason = 'sin_impresora' } `
                 -Recommendation 'No hay una impresora fisica instalada para probar: resolver primero la capa 1 (hardware/instalacion).'
             return
         }
         if (-not (Test-PortHasLiveDevice -PortName ([string]$Printer.PortName))) {
-            Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica de impresion' -Status 'skipped' -Plane 'hardware' `
-                -Evidence @{ printer = [string]$Printer.Name; port = [string]$Printer.PortName } `
-                -Recommendation ("No se prueba: en $($Printer.PortName) no hay ningun dispositivo conectado. " +
-                                 'Enviar un ticket ahi solo lo dejaria encolado y daria un falso OK de hardware.')
-            return
+            # v3.7: antes se salteaba y la corrida no podia cerrar nunca (6 de 8 corridas 3.6
+            # terminaron en 'skipped'). Si el fierro esta presente pero en OTRO puerto -tipico
+            # despues de un replug, o con una cola vieja mal apuntada- y ahi hay una cola del
+            # cliente, la prueba se reapunta a esa en vez de saltearse.
+            $otra = $null
+            try {
+                $vivos = @()
+                if ($script:Diagnostics.Contains('livePorts')) {
+                    $vivos = @($script:Diagnostics['livePorts'] | Where-Object { $_ -and ([string]$_ -ne [string]$Printer.PortName) })
+                }
+                foreach ($pv in $vivos) {
+                    $cand = Find-QueueForPort -PortName ([string]$pv)
+                    if ($cand) { $otra = $cand; break }
+                }
+            } catch {}
+            if ($otra) {
+                Write-StepDetail ("se reapunta la prueba a '" + [string]$otra.Name + "' (" + [string]$otra.PortName + "): ahi esta el hardware")
+                Add-Action -Type 'testprint.retarget' -Target ([string]$otra.Name) `
+                    -Before ([string]$Printer.Name + ' @ ' + [string]$Printer.PortName) `
+                    -After  ([string]$otra.Name + ' @ ' + [string]$otra.PortName) -Reversible $true
+                $Printer = $otra
+            } else {
+                Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica de impresion' -Status 'skipped' -Plane 'hardware' `
+                    -Evidence @{ printer = [string]$Printer.Name; port = [string]$Printer.PortName; skipReason = 'puerto_sin_dispositivo' } `
+                    -Recommendation ("No se prueba: en $($Printer.PortName) no hay ningun dispositivo conectado. " +
+                                     'Enviar un ticket ahi solo lo dejaria encolado y daria un falso OK de hardware.')
+                return
+            }
         }
         $v = Test-IsVirtualPrinter $Printer
         if ($v.isVirtual) {
             Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica de impresion' -Status 'skipped' -Plane 'hardware' `
-                -Evidence @{ printer = [string]$Printer.Name; reason = [string]$v.reason } `
+                -Evidence @{ printer = [string]$Printer.Name; reason = [string]$v.reason; skipReason = 'impresora_virtual' } `
                 -Recommendation "No se prueba sobre '$($Printer.Name)': es una impresora virtual y daria un falso OK de hardware."
             return
         }
@@ -3603,6 +3683,21 @@ function Resolve-Diagnosis {
     $fixed  = @($checks | Where-Object { $_.status -eq 'fixed' })
     $fails  = @($checks | Where-Object { $_.status -eq 'fail' })
     $rootCandidates = @($checks | Where-Object { $_.rootCauseCandidate -and $_.status -in @('fail','warn') })
+
+    # v3.7: una causa vieja no puede ganarle a la reparacion que la dejo sin efecto. Se vio la
+    # corrida 2 de una PC diagnosticando "la impresora 'FUDO-USB001' esta desconectada" 35
+    # segundos despues de que la corrida 1 bindeara ese puerto y creara esa cola. Si hubo un
+    # re-bind del puerto y ahi ahora hay un dispositivo, ese 'fail' quedo obsoleto.
+    $reBind = @($fixed | Where-Object { $_.id -in @('hw.noPortBound','conn.usb','printer.exists','printer.disconnected') })
+    if (@($reBind).Count -gt 0) {
+        $rootCandidates = @($rootCandidates | Where-Object {
+            $esViejo = ($_.id -in @('printer.disconnected','hw.disconnected')) -and ($_.status -eq 'fail')
+            if (-not $esViejo) { return $true }
+            $puerto = ''
+            try { $puerto = [string]$_.evidence.port } catch {}
+            -not (Test-PortHasLiveDevice -PortName $puerto)
+        })
+    }
 
     # Prioridad por capa (mas abajo primero: OS/HW antes que config)
     $ordered = @($rootCandidates | Sort-Object { $_.layer })
@@ -4095,6 +4190,7 @@ function Invoke-FudoPrintDoctor {
         $null = Invoke-Step -Name 'layer0b.nativeApp' -Body { Test-Layer0b-NativeApp }
         $null = Invoke-Step -Name 'layer0c.staleQueues' -Body { Remove-StaleOwnQueues }
         $null = Invoke-Step -Name 'layer1a.hardwareInventory' -Body { Test-Layer1a-HardwareInventory }
+        $null = Invoke-Step -Name 'layer1a.orphanOwnQueues' -Body { Remove-OrphanOwnQueues }
         $printer = Invoke-Step -Name 'layer1.resolvePrinter' -Body { Resolve-TargetPrinter }
         $wmi = Invoke-Step -Name 'layer1.printerState' -Body { Test-Layer1-PrinterState -Printer $printer }
         if ($script:ReconnectedPort -and $printer) {
@@ -4543,6 +4639,74 @@ function Invoke-SelfTest {
     $script:Diagnostics['hwDeviceCount'] = 0
     Test-Layer4-HardwarePrint -Printer ([pscustomobject]@{ Name='FUDO-TEST-USB002'; DriverName='Generic / Text Only'; PortName='USB002' }) -DetectedInterface 'USB'
     Assert-Eq 'S23 no da falso OK de hardware' 'skipped' (Get-CheckById 'hw.testprint').status
+    Assert-Eq 'S23 deja el motivo del salteo' 'puerto_sin_dispositivo' ([string](Get-CheckById 'hw.testprint').evidence.skipReason)
+
+    # Escenario 47 (v3.7): la cola apunta a un puerto muerto pero el fierro esta en otro,
+    # con una cola del cliente ahi -> la prueba se reapunta en vez de saltearse.
+    Reset-State
+    $script:PresentIdsOk = $true
+    $script:Diagnostics['livePorts'] = @('USB001')
+    $script:Diagnostics['hwDeviceCount'] = 1
+    function Find-QueueForPort { param([string]$PortName) [pscustomobject]@{ Name='CAJA'; PortName=$PortName; DriverName='Microsoft Print To PDF' } }
+    Test-Layer4-HardwarePrint -Printer ([pscustomobject]@{ Name='FUDO-USB003'; DriverName='Generic / Text Only'; PortName='USB003' }) -DetectedInterface 'USB'
+    Assert-Eq 'S47 reapunta a la cola del cliente' 'CAJA' ([string](Get-CheckById 'hw.testprint').evidence.printer)
+    Assert-Eq 'S47 no lo cuenta como puerto sin dispositivo' 'impresora_virtual' ([string](Get-CheckById 'hw.testprint').evidence.skipReason)
+    # devolver la implementacion real: los escenarios que siguen dependen de ella
+    function Find-QueueForPort {
+        param([string]$PortName)
+        $out = $null
+        try {
+            $out = @(Get-Printer -ErrorAction SilentlyContinue | Where-Object {
+                        [string]$_.PortName -eq $PortName -and
+                        -not (Test-IsVirtualPrinter $_).isVirtual -and
+                        [string]$_.Name -notmatch $script:TestPrinterRx
+                     })[0]
+        } catch {}
+        return $out
+    }
+
+    # Escenario 48 (v3.7): una causa raiz obsoleta no le gana a la reparacion que la anulo.
+    Reset-State
+    $script:PresentIdsOk = $true
+    $script:Diagnostics['livePorts'] = @('USB001')
+    $script:Diagnostics['hwDeviceCount'] = 1
+    Add-Check -Id 'printer.disconnected' -Layer 1 -Name "La impresora 'FUDO-USB001' esta desconectada (puerto USB001 sin dispositivo)" `
+        -Status 'fail' -RootCauseCandidate $true -Plane 'hardware' -Evidence @{ port = 'USB001' }
+    Add-Check -Id 'hw.noPortBound' -Layer 1 -Name 'Puerto USB asignado y cola creada' -Status 'fixed' -RootCauseCandidate $true -Plane 'os'
+    $d48 = Resolve-Diagnosis
+    Assert-Eq 'S48 no usa la causa vieja' $false ([bool]([string]$d48.rootCause -match 'esta desconectada'))
+    Assert-Eq 'S48 pide confirmar la comanda' $true ([bool]([string]$d48.rootCause -match 'falta confirmar'))
+
+    # Escenario 49 (v3.7): la cola que creo el motor deja de ser un entregable cuando su puerto
+    # se queda sin hardware -> se borra antes de diagnosticar, no se diagnostica a si misma.
+    Reset-State
+    $script:PresentIdsOk = $true
+    $script:Diagnostics['livePorts'] = @('USB002')
+    $script:Diagnostics['hwDeviceCount'] = 1
+    $script:__borradas49 = @()
+    function Get-Printer {
+        @([pscustomobject]@{ Name='FUDO-USB001'; DriverName='Generic / Text Only'; PortName='USB001' },
+          [pscustomobject]@{ Name='FUDO-USB002'; DriverName='Generic / Text Only'; PortName='USB002' },
+          [pscustomobject]@{ Name='CAJA';        DriverName='Generic / Text Only'; PortName='USB003' })
+    }
+    function Get-PrintJob { param([string]$PrinterName, $ErrorAction) @() }
+    function Remove-PrintJob { param($InputObject, $ErrorAction) }
+    function Remove-Printer { param([string]$Name, $ErrorAction) $script:__borradas49 += $Name }
+    $r49 = @(Remove-OrphanOwnQueues)
+    Assert-Eq 'S49 borra la propia sin hardware' $true ([bool](@($r49) -contains 'FUDO-USB001'))
+    Assert-Eq 'S49 conserva la propia que si tiene hardware' $false ([bool](@($r49) -contains 'FUDO-USB002'))
+    Assert-Eq 'S49 no toca las colas del cliente' $false ([bool](@($r49) -contains 'CAJA'))
+    Assert-Eq 'S49 el patron alcanza a las FUDO-USB' $true ([bool]('FUDO-USB001' -match $script:OwnQueueRx))
+    Assert-Eq 'S49 el patron alcanza a las FUDO-TEST' $true ([bool]('FUDO-TEST-USB001' -match $script:OwnQueueRx))
+    Assert-Eq 'S49 el patron no alcanza a una cola del cliente' $false ([bool]('FUDOCAJA' -match $script:OwnQueueRx))
+
+    # Escenario 50 (v3.7): restaurar de cuarentena puede devolver una Nativa mas vieja
+    Reset-State
+    Assert-Eq 'S50 detecta el downgrade' $true  (Test-NativaDegradada -Antes '0.0.36' -Despues '0.0.18')
+    Assert-Eq 'S50 misma version no es downgrade' $false (Test-NativaDegradada -Antes '0.0.36' -Despues '0.0.36')
+    Assert-Eq 'S50 upgrade no es downgrade' $false (Test-NativaDegradada -Antes '0.0.18' -Despues '0.0.36')
+    Assert-Eq 'S50 sin dato no afirma nada' $false (Test-NativaDegradada -Antes '' -Despues '0.0.18')
+    Assert-Eq 'S50 version ilegible no afirma nada' $false (Test-NativaDegradada -Antes 'beta' -Despues '0.0.18')
 
     # Escenario 24 (caso real): caja tapada con miles de trabajos + cocina sana.
     # Antes se elegia la primera cola y se devolvia "todo ok" ignorando la que fallaba.

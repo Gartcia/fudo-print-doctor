@@ -2,6 +2,40 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.7] - 2026-08-26
+
+Los hallazgos de la primera revisión diaria automática después de la migración: 12 corridas
+nuevas, 8 de ellas ya en 3.6, con `hw.testprint = skipped` en 6 y ninguna capaz de llegar a
+`resolved`.
+
+### Corregido
+- **La prueba física se reapunta en vez de saltearse.** Si la cola objetivo apunta a un puerto
+  sin dispositivo pero el hardware está presente en otro puerto y ahí hay una cola del cliente,
+  `Test-Layer4-HardwarePrint` prueba sobre esa (acción `testprint.retarget`). Sólo se saltea
+  cuando de verdad no hay dónde probar. Con `hw.testprint = ok` como único camino a `resolved`,
+  saltear era dejar la corrida sin poder cerrar nunca.
+- **Una causa raíz obsoleta ya no gana.** `Resolve-Diagnosis` descarta un `printer.disconnected`
+  / `hw.disconnected` en `fail` cuando hubo un re-bind del puerto (`hw.noPortBound`, `conn.usb`
+  o `printer.exists` en `fixed`) y el puerto ya tiene dispositivo. Una PC diagnosticaba "la
+  impresora 'FUDO-USB001' está desconectada" 35 segundos después de que la corrida anterior
+  creara esa cola en ese mismo puerto.
+- **La cola propia deja de ser un entregable cuando se queda sin hardware.**
+  `Remove-OrphanOwnQueues` (nuevo, corre después del inventario de hardware) borra las colas
+  `FUDO-USB00x` creadas por el motor si su puerto ya no tiene ningún dispositivo. Las que sí
+  tienen hardware se conservan: siguen siendo el entregable de v3.6. Patrón nuevo
+  `$script:OwnQueueRx`, que alcanza `FUDO-TEST-*` y `FUDO-USB00x`.
+- **Restaurar de cuarentena y que vuelva una versión más vieja ya no es "reparado".**
+  `Test-NativaDegradada` compara `nativaVersion` antes y después de la restauración; si baja, el
+  check queda en `warn`, con ambas versiones en la evidencia y la recomendación cambiada a
+  reinstalar. Explica el 0.0.36 → 0.0.18 de PC_ANTO y el 0.0.18 circulando en campo.
+
+### Agregado
+- `skipReason` en todo salteo de `hw.testprint` (`testprint_off`, `dry_run`, `sin_ip`,
+  `sin_impresora`, `impresora_virtual`, `puerto_sin_dispositivo`), para que la telemetría
+  distinga "no había fierro" de "no supe probar".
+- Self-test: escenarios 47 a 50.
+
+
 ## [3.6] - 2026-08-26
 
 Los tres hallazgos de la revisión diaria del 26/08, sobre 9 corridas reales en v3.5.
