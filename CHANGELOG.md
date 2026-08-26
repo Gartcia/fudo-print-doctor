@@ -2,6 +2,43 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.6] - 2026-08-26
+
+Los tres hallazgos de la revisión diaria del 26/08, sobre 9 corridas reales en v3.5.
+
+### Corregido
+- **El motor creaba una cola paralela en un puerto que ya tenía una cola sana.** Confirmado en
+  dos PCs: quedaban `FUDO-USB001 [USB001]` y la cola real del cliente `[USB001]` conviviendo,
+  el asesor tenía que reconfigurar Fudo sin necesidad, y la prueba de impresión corría **sobre
+  la cola nueva** en vez de la que el local usa (de ahí `hw.testprint = fail` con una cola
+  sana al lado). Ahora `hw.noPortBound` busca primero si el puerto ya tiene una cola del
+  cliente y, si la hay, la **adopta** sin crear nada (`Find-QueueForPort`). Solo crea cola
+  cuando no existe ninguna.
+- **`resolved = true` con `needsEscalation = true`, y la CAUSA era el nombre de la
+  reparación.** `Resolve-Diagnosis` daba por resuelta cualquier corrida con un check en
+  `fixed` y ninguno en `fail`, y tomaba el `rootCause` de ese `fixed`: salían causas como
+  "Puerto USB desmapeado" o "Exclusión preventiva de Defender", que son reparaciones. Eso
+  producía el **18% de "resueltas" con la columna "qué resolvió" vacía**, y la corrida
+  siguiente de la misma PC volvía como `sigue_fallando`. Ahora el único camino a `resolved`
+  es que la cadena imprima —`hw.testprint = ok`, que desde 3.2 requiere que un humano
+  confirme el papel—; si se repararon cosas sin confirmar, la causa lo dice literalmente
+  ("se aplicaron reparaciones; falta confirmar que la comanda sale") y `rootCauseCheckId`
+  queda vacío en vez de apuntar a un `fixed`.
+- **Las colas propias del motor entraban a la ruta de diagnóstico.** El filtro de 3.4 solo
+  llegaba al inventario, así que una corrida terminó con la CAUSA *"la impresora
+  'FUDO-TEST-USB002' está desconectada"*: el motor reportando su propia basura como el
+  problema del local. Ahora `Remove-StaleOwnQueues` borra las `FUDO-TEST-*` que quedaron de
+  corridas anteriores **antes** de diagnosticar, y ante empate de score `Get-PrinterQueues`
+  ordena las colas del cliente antes que las del motor, para no probar sobre una propia
+  cuando hay una real igual de sana.
+- **`autoFixCount` no coincidía con `autoFixesApplied`** (se vio `1` contra lista vacía):
+  contaba acciones, incluidas las que no son reparaciones. Ahora cuenta la lista; el total de
+  acciones va aparte en `accionesCount`.
+
+### Agregado
+- Self-test: 147 asserts (S5/S5b el contrato nuevo de "reparar no es resolver", S45 adopción
+  de la cola existente, S46 prioridad de la cola del cliente).
+
 ## [3.5] - 2026-08-25
 
 Caso real de un asesor en Chile: Epson L5590 conectada por USB, el motor no le ofreció

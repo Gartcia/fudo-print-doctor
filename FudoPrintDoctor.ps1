@@ -425,7 +425,7 @@ $script:TestPrintersCreated = New-Object System.Collections.ArrayList   # colas 
 # Las colas que crea el motor no son del cliente: no pueden contarse como evidencia.
 $script:TestPrinterRx = '(?i)^FUDO-TEST-'
 $script:TestDocRx    = '(?i)fudo print doctor'
-$script:SchemaVersion = '3.5'
+$script:SchemaVersion = '3.6'
 $script:MenuVacios = 0
 # Distribucion: repo publico. VERSION es un archivo de una linea con la version publicada.
 $script:RepoUrl    = 'https://github.com/Gartcia/fudo-print-doctor'
@@ -2122,7 +2122,10 @@ function Get-PrinterQueues {
             estado = $(if ($score -eq 0) { 'sana' } elseif ($score -ge 40) { 'no imprime' } else { 'con problemas' })
         }
     }
-    return @($out | Sort-Object -Property @{ Expression = { [int]$_.score }; Descending = $true })
+    # score primero; ante empate, las colas del CLIENTE antes que las del motor, para no
+    # diagnosticar (ni probar) sobre una cola nuestra cuando hay una real igual de sana.
+    return @($out | Sort-Object -Property @{ Expression = { [int]$_.score }; Descending = $true },
+                                            @{ Expression = { [bool]$_.esDePrueba }; Descending = $false })
 }
 
 function Test-PortHasLiveDevice {
@@ -2283,9 +2286,22 @@ function Test-Layer1a-HardwareInventory {
             $devPorts = @($bind.puertos)
             $script:Diagnostics['livePorts'] = @($devPorts)
             $script:Diagnostics['usbPorts']  = @($devPorts)
+            $puertoNuevo = @($devPorts)[0]
+            # Si el puerto ya tiene una cola del cliente, se adopta: no se crea nada.
+            $yaHay = Find-QueueForPort -PortName $puertoNuevo
+            if ($yaHay) {
+                Add-Check -Id 'hw.noPortBound' -Layer 1 -Name 'Puerto USB asignado (la cola que ya existia sirve)' -Status 'fixed' -RootCauseCandidate $true -Plane 'os' `
+                    -Evidence @{ impresoras = $sinPuerto; puertoNuevo = @($devPorts); colaAdoptada = [string]$yaHay.Name } `
+                    -ActionTaken ([string]$bind.nota + " | se adoptó la cola existente '" + [string]$yaHay.Name + "'") -Reversible $true `
+                    -ArticleRef 'https://soporte.fu.do/es/articles/11730817' `
+                    -Recommendation ("Windows no le habia asignado puerto USB a la impresora: se reinicio el dispositivo y quedo en $puertoNuevo. " +
+                                     "Ya existia la cola '$([string]$yaHay.Name)' apuntando a ese puerto, asi que NO se creo ninguna cola nueva: se usa esa. " +
+                                     'Probar una comanda desde Fudo.')
+                return
+            }
             $oem = ''
             try { $oem = [string](@($identified | Where-Object { $_.driverNombre })[0].driverNombre) } catch {}
-            $cola = New-FudoPrinterQueue -PortName (@($devPorts)[0]) -PreferDriver $oem
+            $cola = New-FudoPrinterQueue -PortName $puertoNuevo -PreferDriver $oem
             Add-Check -Id 'hw.noPortBound' -Layer 1 `
                 -Name $(if ($cola.ok) { 'Puerto USB asignado y cola creada' } else { 'Puerto USB asignado (falta crear la cola)' }) `
                 -Status $(if ($cola.ok) { 'fixed' } else { 'warn' }) -RootCauseCandidate $true -Plane 'os' `
@@ -2759,6 +2775,47 @@ function Test-Layer2-Queue {
 # ---------------------------------------------------------------------------
 # LAYER 3 - Conectividad / puerto
 # ---------------------------------------------------------------------------
+function Remove-StaleOwnQueues {
+    <#
+      Colas FUDO-TEST-* que quedaron de una corrida anterior. No son del cliente y si se
+      dejan, el motor las diagnostica como si lo fueran: se vio una corrida cuya CAUSA fue
+      "la impresora 'FUDO-TEST-USB002' esta desconectada", o sea el motor reportando su
+      propia basura como el problema del local.
+    #>
+    $borradas = @()
+    try {
+        foreach ($q in @(Get-Printer -ErrorAction SilentlyContinue | Where-Object { [string]$_.Name -match $script:TestPrinterRx })) {
+            $n = [string]$q.Name
+            try { Get-PrintJob -PrinterName $n -ErrorAction SilentlyContinue | Remove-PrintJob -ErrorAction SilentlyContinue } catch {}
+            try { Remove-Printer -Name $n -ErrorAction Stop; $borradas += $n } catch {}
+        }
+    } catch {}
+    if (@($borradas).Count -gt 0) {
+        Add-Action -Type 'printer.remove_stale_test' -Target ($borradas -join ', ') -Before 'cola de prueba de una corrida anterior' -After 'borrada' -Reversible $true
+        Write-DoctorLog -Level 'INFO' -Message ('Colas de prueba viejas borradas antes de diagnosticar: ' + ($borradas -join ', '))
+    }
+    return @($borradas)
+}
+
+function Find-QueueForPort {
+    <#
+      Ya existe una cola del cliente apuntando a este puerto? Si existe y esta sana, hay que
+      ADOPTARLA, no crear otra al lado. Se vieron dos PCs con 'FUDO-USB001' conviviendo con la
+      cola real en el mismo USB001: el asesor tenia que reconfigurar Fudo sin necesidad, y la
+      prueba de impresion corria sobre la cola nueva en vez de la que el local usa.
+    #>
+    param([string]$PortName)
+    $out = $null
+    try {
+        $out = @(Get-Printer -ErrorAction SilentlyContinue | Where-Object {
+                    [string]$_.PortName -eq $PortName -and
+                    -not (Test-IsVirtualPrinter $_).isVirtual -and
+                    [string]$_.Name -notmatch $script:TestPrinterRx
+                 })[0]
+    } catch {}
+    return $out
+}
+
 function Repair-BindUsbPort {
     <#
       Windows ve la impresora USB pero no le asigno puerto (no hay nodo USBPRINT con
@@ -3557,21 +3614,26 @@ function Resolve-Diagnosis {
     $confidence = 'low'
     $residual = @()
 
-    if (@($fixed).Count -gt 0 -and @($fails).Count -eq 0) {
-        # Se aplicaron fixes y no quedan fallas duras
-        if ($hwTest -and $hwTest.status -eq 'ok') {
-            $resolved = $true; $confidence = 'high'
-            $rootCause = ($fixed | Sort-Object { $_.layer } | Select-Object -First 1).name
-        } else {
-            $resolved = $true; $confidence = 'medium'
-            $rootCause = ($fixed | Sort-Object { $_.layer } | Select-Object -First 1).name
-        }
+    # OJO: aplicar una reparacion NO es cerrar el caso. Se declaraba 'resolved' con solo
+    # tener un check en 'fixed' y ninguno en 'fail', y encima la CAUSA salia del nombre de la
+    # reparacion ("Puerto USB desmapeado", "Exclusion preventiva de Defender"). Resultado: la
+    # planilla marcaba 18% de corridas resueltas con la columna "que resolvio" vacia, y la
+    # corrida siguiente de la misma PC volvia como sigue_fallando.
+    # Ahora el unico camino a 'resuelto' es que la cadena imprima: hw.testprint en 'ok', que
+    # desde 3.2 solo pasa si un humano confirmo que salio el papel.
+    if (@($fixed).Count -gt 0 -and @($fails).Count -eq 0 -and $hwTest -and $hwTest.status -eq 'ok') {
+        $resolved = $true; $confidence = 'high'
+        $rootCause = ($fixed | Sort-Object { $_.layer } | Select-Object -First 1).name
     }
 
     if (-not $resolved) {
         if (@($ordered).Count -gt 0) {
             $rootCause = $ordered[0].name
             $confidence = if ($ordered[0].plane -eq 'fudo_config') { 'medium' } else { 'medium' }
+        } elseif (@($fixed).Count -gt 0) {
+            # Se repararon cosas pero nadie confirmo que la comanda sale.
+            $rootCause = 'Se aplicaron reparaciones (' + ((@($fixed | Sort-Object { $_.layer } | ForEach-Object { $_.name })) -join '; ') + '); falta confirmar que la comanda sale'
+            $confidence = 'medium'
         } elseif ($hwTest -and $hwTest.status -eq 'ok') {
             # HW OK y nada roto en OS => casi seguro config Fudo
             $rootCause = 'Hardware imprime OK; causa probable en configuracion de Fudo (area/cocina/sala)'
@@ -3592,7 +3654,9 @@ function Resolve-Diagnosis {
     $diag = [ordered]@{
         resolved        = $resolved
         rootCause       = $rootCause
-        rootCauseCheckId = $(if (@($ordered).Count -gt 0) { [string]$ordered[0].id } elseif (@($fixed).Count -gt 0) { [string](@($fixed | Sort-Object { $_.layer })[0].id) } else { '' })
+        rootCauseCheckId = $(if (@($ordered).Count -gt 0) { [string]$ordered[0].id }
+                              elseif ($resolved -and @($fixed).Count -gt 0) { [string](@($fixed | Sort-Object { $_.layer })[0].id) }
+                              else { '' })
         confidence      = $confidence
         autoFixesApplied = @($fixed | ForEach-Object { $_.name })
         residualEscalation = $residual
@@ -4029,6 +4093,7 @@ function Invoke-FudoPrintDoctor {
     $detectedInterface = 'USB'
     if ($envOk) {
         $null = Invoke-Step -Name 'layer0b.nativeApp' -Body { Test-Layer0b-NativeApp }
+        $null = Invoke-Step -Name 'layer0c.staleQueues' -Body { Remove-StaleOwnQueues }
         $null = Invoke-Step -Name 'layer1a.hardwareInventory' -Body { Test-Layer1a-HardwareInventory }
         $printer = Invoke-Step -Name 'layer1.resolvePrinter' -Body { Resolve-TargetPrinter }
         $wmi = Invoke-Step -Name 'layer1.printerState' -Body { Test-Layer1-PrinterState -Printer $printer }
@@ -4156,7 +4221,10 @@ function Invoke-FudoPrintDoctor {
         telemetry     = [ordered]@{
             durationMs      = $durationMs
             checksTotal     = @($script:Checks).Count
-            autoFixCount    = @($script:Actions).Count
+            # Antes contaba acciones (incluidas las que no son reparaciones, como habilitar un
+            # log), asi que no coincidia con la lista de autoFixesApplied.
+            autoFixCount    = @($diag.autoFixesApplied).Count
+            accionesCount   = @($script:Actions).Count
             resolved        = $diag.resolved
             escalated       = $diag.needsEscalation
             category        = $category
@@ -4221,12 +4289,26 @@ function Invoke-SelfTest {
     Assert-Eq 'S4 categoria' 'net.ip' (Get-Category -Diag $d)
     Assert-Eq 'S4 escalado' $true $d.needsEscalation
 
-    # Escenario 5: spooler reiniciado (sin HW test) => resuelto/medium
+    # Escenario 5: se reparo algo pero NADIE confirmo que la comanda sale => NO resuelto.
+    # (Antes daba resuelto solo por tener un check en 'fixed', y la CAUSA salia del nombre de
+    # la reparacion: eso inflaba la columna 'resuelto' de la planilla y dejaba vacia la de
+    # 'que resolvio'.)
     Reset-State
     Add-Check -Id 'env.spooler' -Layer 0 -Name 'Servicio Print Spooler' -Status 'fixed' -RootCauseCandidate $true
     $d = Resolve-Diagnosis
-    Assert-Eq 'S5 resuelto' $true $d.resolved
-    Assert-Eq 'S5 categoria' 'os.spooler' (Get-Category -Diag $d)
+    Assert-Eq 'S5 reparar no es resolver' $false $d.resolved
+    Assert-Eq 'S5 lo dice explicito' $true ([bool]($d.rootCause -match 'falta confirmar'))
+    Assert-Eq 'S5 la causa no es la reparacion' $false ([bool]($d.rootCause -eq 'Servicio Print Spooler'))
+    Assert-Eq 'S5 no inventa checkId de causa' '' ([string]$d.rootCauseCheckId)
+
+    # Escenario 5b: la misma reparacion + un humano que confirmo el papel => resuelto/high
+    Reset-State
+    Add-Check -Id 'env.spooler' -Layer 0 -Name 'Servicio Print Spooler' -Status 'fixed' -RootCauseCandidate $true
+    Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica ESC/POS por USB (RAW)' -Status 'ok' -Plane 'hardware'
+    $d = Resolve-Diagnosis
+    Assert-Eq 'S5b con papel confirmado si resuelve' $true $d.resolved
+    Assert-Eq 'S5b confianza alta' 'high' ([string]$d.confidence)
+    Assert-Eq 'S5b categoria' 'os.spooler' (Get-Category -Diag $d)
 
     # Escenario 6 (REGRESION doble): solo impresoras virtuales y ningun device conectado
     #   a) no debe explotar (bug PropertyNotFoundStrict)
@@ -4790,6 +4872,39 @@ public class FudoFakeEndpoint {
     Assert-Eq 'S43 el puerto aparece y se crea la cola' 'fixed' (Get-CheckById 'hw.noPortBound').status
     Assert-Eq 'S43 usa el driver de fabricante ya instalado' 'Epson ESC/P-R V4 Class Driver' $script:__colaCreada
     Assert-Eq 'S43 no manda a desenchufar nada' $false ([bool]((Get-CheckById 'hw.noPortBound').recommendation -match 'desenchufar'))
+
+    # Escenario 45: si el puerto ya tiene una cola del cliente, se adopta (no se crea otra).
+    # Se vieron dos PCs con FUDO-USB001 conviviendo con la cola real en el mismo USB001.
+    Reset-State
+    function Repair-BindUsbPort { param([string[]]$InstanceIds) @{ puertos = @('USB001'); nota = 'device reiniciado' } }
+    function Get-DriverPlan { param($Identity) @{ kind='oem_instalado'; driverName='Epson ESC/P-R V4 Class Driver'; note='ya esta' } }
+    function Find-QueueForPort { param([string]$PortName) [pscustomobject]@{ Name = 'Impresora'; PortName = $PortName; DriverName = 'Generic / Text Only' } }
+    $script:__creoCola = $false
+    function New-FudoPrinterQueue { param([string]$PortName, [string]$PreferDriver = '', [string]$Name = '') $script:__creoCola = $true; @{ ok = $true; name = 'FUDO-USB001'; driver = ''; nota = '' } }
+    function Get-UsbPrintDevices {
+        @([ordered]@{ source='Win32_PnPEntity'; name='Epson Compatibilidad con impresoras USB'
+                      instanceId='USB\VID_04B8&PID_0E28\58374154'; portName=''; status='OK'; problem=0
+                      deteccion='driver usbprint'; certeza='alta' })
+    }
+    function Get-ProblemPrinterDevices { @() }
+    function Get-PrinterPort { @([pscustomobject]@{ Name='USB001'; Description='Puerto de impresora virtual para USB' }) }
+    function Get-Printer { @([pscustomobject]@{ Name='Impresora'; DriverName='Generic / Text Only'; PortName='USB001' }) }
+    $null = Test-Layer1a-HardwareInventory
+    Assert-Eq 'S45 no crea una cola paralela' $false $script:__creoCola
+    Assert-Eq 'S45 adopta la que ya estaba' $true ([bool]((Get-CheckById 'hw.noPortBound').recommendation -match 'NO se creo ninguna cola nueva'))
+    Assert-Eq 'S45 queda como reparado' 'fixed' (Get-CheckById 'hw.noPortBound').status
+
+    # Escenario 46: ante empate de score, la cola del cliente va antes que la del motor
+    Reset-State
+    function Get-Printer {
+        @([pscustomobject]@{ Name='FUDO-TEST-USB001'; DriverName='Generic / Text Only'; PortName='USB001' },
+          [pscustomobject]@{ Name='CAJA';             DriverName='Generic / Text Only'; PortName='USB001' })
+    }
+    function Get-PrintJob { @() }
+    function Test-PortHasLiveDevice { param([string]$PortName) $true }
+    $q46 = @(Get-PrinterQueues)
+    Assert-Eq 'S46 primero la del cliente' 'CAJA' ([string](@($q46)[0].nombre))
+    Assert-Eq 'S46 marca la propia como de prueba' $true ([bool](@($q46 | Where-Object { $_.nombre -eq 'FUDO-TEST-USB001' })[0].esDePrueba))
 
     # Escenario 44: un puerto WSD no es USB (antes la capa 3 decia 'Puerto USB OK')
     Reset-State
