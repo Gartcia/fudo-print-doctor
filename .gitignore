@@ -16,3 +16,7 @@ FudoPrintDoctor-*.json
 Thumbs.db
 desktop.ini
 *~
+
+# Contexto del proyecto para Claude Code: NO se publica.
+# Menciona el fileId de la planilla de telemetria, pcIds de clientes y nombres de asesores.
+contexto/
