@@ -429,7 +429,7 @@ $script:TestPrinterRx = '(?i)^FUDO-TEST-'
 # puerto tenga hardware; si el hardware se va, deja de serlo (ver Remove-OrphanOwnQueues).
 $script:OwnQueueRx   = '(?i)^FUDO-(TEST-|USB\d)'
 $script:TestDocRx    = '(?i)fudo print doctor'
-$script:SchemaVersion = '3.7'
+$script:SchemaVersion = '3.8'
 $script:MenuVacios = 0
 # Distribucion: repo publico. VERSION es un archivo de una linea con la version publicada.
 $script:RepoUrl    = 'https://github.com/Gartcia/fudo-print-doctor'
@@ -2442,6 +2442,10 @@ function Resolve-TargetPrinter {
         }
         Add-Check -Id 'printer.exists' -Layer 1 -Name "Impresora '$($target.Name)' presente en Windows" -Status 'ok' `
             -Evidence @{ name = [string]$target.Name; driver = [string]$target.DriverName; port = [string]$target.PortName }
+        # v3.8: a diferencia del Caso C, este camino no llamaba a Get-PrinterQueues, asi que
+        # $script:Diagnostics['colas'] quedaba sin llenar y la telemetria reportaba
+        # cantidadColas=0 pese a que printer.exists dio 'ok' (se vio en 43db236c6151dd8c).
+        $script:Diagnostics['colas'] = @(Get-PrinterQueues)
         return $target
     }
 
@@ -4707,6 +4711,22 @@ function Invoke-SelfTest {
     Assert-Eq 'S50 upgrade no es downgrade' $false (Test-NativaDegradada -Antes '0.0.18' -Despues '0.0.36')
     Assert-Eq 'S50 sin dato no afirma nada' $false (Test-NativaDegradada -Antes '' -Despues '0.0.18')
     Assert-Eq 'S50 version ilegible no afirma nada' $false (Test-NativaDegradada -Antes 'beta' -Despues '0.0.18')
+
+    # Escenario 51 (v3.8): -PrinterName explicito que matchea una cola real no dejaba
+    # $script:Diagnostics['colas'] lleno (Caso A no llamaba a Get-PrinterQueues como el Caso
+    # C). La telemetria reportaba cantidadColas=0 con printer.exists=ok (43db236c6151dd8c).
+    Reset-State
+    $script:__pn = $PrinterName
+    $PrinterName = 'CAJA'
+    function Get-Printer { @([pscustomobject]@{ Name='CAJA'; DriverName='Generic / Text Only'; PortName='USB001' }) }
+    function Get-CimInstance { [pscustomobject]@{ WorkOffline = $false; PrinterState = 0 } }
+    function Get-PrintJob { @() }
+    $r51 = Resolve-TargetPrinter
+    Assert-Eq 'S51 encuentra la impresora' 'CAJA' $(if ($r51) { $r51.Name } else { '' })
+    Assert-Eq 'S51 check ok' 'ok' (Get-CheckById 'printer.exists').status
+    Assert-Eq 'S51 llena colas para la telemetria' 1 (@($script:Diagnostics['colas'])).Count
+    Assert-Eq 'S51 la cola es la matcheada' 'CAJA' ([string]@($script:Diagnostics['colas'])[0].nombre)
+    $PrinterName = $script:__pn
 
     # Escenario 24 (caso real): caja tapada con miles de trabajos + cocina sana.
     # Antes se elegia la primera cola y se devolvia "todo ok" ignorando la que fallaba.

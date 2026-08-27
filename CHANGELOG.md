@@ -2,6 +2,30 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.8] - 2026-08-27
+
+De la bitácora del 27/08: la misma PC (`43db236c6151dd8c`) mandó dos corridas seguidas con
+`cantidadColas = 0`, `cantidadHardware = 0` e `impresoras = []`, pero con veredictos distintos
+para `printer.exists` — una vez `ok`, otra vez `fail` — para lo que la telemetría mostraba como
+el mismo estado.
+
+### Corregido
+- **`cantidadColas` podía venir en 0 aunque `printer.exists = ok`.** Cuando se invoca con
+  `-PrinterName` explícito y esa impresora existe en Windows (Caso A de `Resolve-TargetPrinter`),
+  la función devolvía el check en `ok` pero nunca llamaba a `Get-PrinterQueues`, a diferencia del
+  camino de autodetección (Caso C) que sí lo hace. `$script:Diagnostics['colas']` quedaba vacío y
+  la telemetría reportaba cero colas pese a haber encontrado una impresora real. Ahora el Caso A
+  también llena `colas`, igual que el Caso C.
+- Evaluadas y descartadas por ahora dos propuestas de la misma bitácora: auto-relanzar el motor
+  al detectar versión nueva (`engine.updateAvailable`) contradice la decisión ya tomada de que el
+  motor avisa pero no se autoactualiza (ver README/CLAUDE.md) — el aviso visible al asesor ya
+  existe en `Build-HumanSummary`, así que no hay nada que cerrar ahí; y derivar `pais` desde la
+  zona horaria en vez de la cultura, que vive en `tools/telemetria-appscript.gs` (el receptor de
+  Google Apps Script), fuera del alcance del self-test y sin forma de verificarla en esta corrida.
+
+### Agregado
+- Self-test: escenario 51.
+
 ## [3.7] - 2026-08-26
 
 Los hallazgos de la primera revisión diaria automática después de la migración: 12 corridas
