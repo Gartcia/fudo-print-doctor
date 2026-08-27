@@ -20,3 +20,7 @@ desktop.ini
 # Contexto del proyecto para Claude Code: NO se publica.
 # Menciona el fileId de la planilla de telemetria, pcIds de clientes y nombres de asesores.
 contexto/
+
+# Comandos locales de Claude Code: describen el flujo de auto-implementar y pushear a main,
+# no es algo para publicar en un repo publico.
+.claude/commands/
