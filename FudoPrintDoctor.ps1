@@ -442,12 +442,19 @@ $script:TestPrinterRx = '(?i)^FUDO-TEST-'
 # puerto tenga hardware; si el hardware se va, deja de serlo (ver Remove-OrphanOwnQueues).
 $script:OwnQueueRx   = '(?i)^FUDO-(TEST-|USB\d)'
 $script:TestDocRx    = '(?i)fudo print doctor'
-$script:SchemaVersion = '3.9'
+$script:SchemaVersion = '3.10'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
 # Hay una linea de progreso abierta (escrita con `r, sin salto)? Ver Suspend-LiveStatus.
 $script:LiveOpen = $false
+# Se corto el diagnostico porque no habia impresoras del tipo elegido y no se pidio revisar
+# las otras. Ver Confirm-ReviewOtherInterface.
+$script:AbortByMode = $false
+# Primera version de la App Nativa firmada digitalmente. Desde aca, el antivirus deja de
+# bloquearla, asi que las exclusiones preventivas de Defender ya no tienen sentido: si la
+# Nativa esta por debajo de esta version, la accion de fondo es ACTUALIZARLA, no excluirla.
+$script:NativaVersionFirmada = '0.0.37'
 $script:MenuVacios = 0
 # Distribucion: repo publico. VERSION es un archivo de una linea con la version publicada.
 $script:RepoUrl    = 'https://github.com/Gartcia/fudo-print-doctor'
@@ -843,6 +850,33 @@ function Resolve-RunMode {
     return 'Ambos'
 }
 
+function Confirm-ReviewOtherInterface {
+    <#
+      Se eligio un modo (USB o Red) y no hay ninguna impresora de ese tipo. Antes de tocar
+      NADA de la otra interfaz hay que preguntar: el motor repara e imprime, asi que seguir
+      por las bravas significa sacar papel de una impresora que el asesor no eligio.
+      Sin consola (modo agente) la respuesta es NO: nunca se actua sobre algo no pedido.
+      Devuelve $true solo si un humano dijo que si.
+    #>
+    param([string]$Modo, $Otras)
+    $lista = @($Otras)
+    if (-not (Test-IsInteractiveConsole)) { return $false }
+    Suspend-LiveStatus
+    $queSon = $(if ($Modo -eq 'Red') { 'por USB' } else { 'de red' })
+    Write-Host ''
+    Write-Host ("  No hay ninguna impresora " + $(if ($Modo -eq 'Red') { 'de red' } else { 'por USB' }) + ' instalada en esta PC.') -ForegroundColor Yellow
+    if (@($lista).Count -gt 0) {
+        Write-Host ("  Si hay " + @($lista).Count + " conectada(s) " + $queSon + ':')
+        foreach ($o in $lista) { Write-Host ('    - ' + $o) }
+    }
+    Write-Host ''
+    Write-Host '  Elegiste no revisar esas, asi que no se toco ninguna.' -ForegroundColor DarkGray
+    $ans = Read-DoctorLine -Prompt '  Las reviso igual? (s = si / Enter = no, terminar)'
+    if ($null -eq $ans) { return $false }
+    # El archivo va en ASCII puro: la i con tilde se escribe como escape del regex.
+    return ([string]$ans -match '(?i)^\s*(s|si|s\u00ED|y|yes)\s*$')
+}
+
 function Wait-QueueDrain {
     <#
       Espera a que el ticket de prueba SALGA de la cola en vez de mirar una sola vez.
@@ -955,7 +989,7 @@ function Confirm-Irreversible {
     $ans = ''
     $ans = Read-DoctorLine -Prompt '  Aplicar? (s = si / cualquier otra tecla = no)'
     if ($null -eq $ans) { return $false }
-    return ($ans -match '(?i)^\s*(s|si|sí|y|yes)\s*$')
+    return ($ans -match '(?i)^\s*(s|si|s\u00ED|y|yes)\s*$')
 }
 
 function Invoke-Remediation {
@@ -1052,8 +1086,16 @@ function Get-EscPosTestTicket {
     [void]$sb.Append("Prueba de impresion`n")
     [void]$sb.Append((Get-Date).ToString('yyyy-MM-dd HH:mm:ss') + "`n")
     [void]$sb.Append("Si lees esto, el hardware imprime OK`n")
-    [void]$sb.Append("`n`n`n")
-    [void]$sb.Append($GS + 'V' + [char]66 + [char]0) # corte parcial con feed
+    # OJO: en una termica el cabezal esta a 1-2 cm del cortador. Con pocos saltos de linea el
+    # texto recien impreso queda RETENIDO adentro del mecanismo: sale un pedazo de papel en
+    # blanco y lo impreso no asoma. El asesor mira, no ve nada y responde que no salio, asi que
+    # el motor da por fallado un hardware que anda. Caso real: el mismo puerto y el mismo driver
+    # generico imprimian bien al probarlos a mano.
+    # Se usan saltos de linea (universales, funcionan aunque la impresora no entienda ESC d) y
+    # ademas se pide el avance en el propio comando de corte.
+    [void]$sb.Append("`n`n`n`n`n`n")
+    [void]$sb.Append($ESC + 'd' + [char]3)           # feed 3 lineas (si lo soporta)
+    [void]$sb.Append($GS + 'V' + [char]66 + [char]80) # corte parcial alimentando 80 puntos (~10mm)
     return $sb.ToString()
 }
 
@@ -1237,6 +1279,25 @@ function Get-AntivirusState {
     return $state
 }
 
+function Get-NativaVersionState {
+    <#
+      La Nativa instalada, esta firmada? Devuelve:
+        version  - la que se leyo del registro ('' si no se pudo)
+        firmada  - $true / $false / $null (no se pudo determinar)
+      Comparar con [version] y no como texto: '0.0.9' es mayor que '0.0.36' alfabeticamente.
+    #>
+    param($Install)
+    $ver = ''
+    try {
+        $reg = @($Install.regInfo)
+        if (@($reg).Count -gt 0) { $ver = [string]@($reg)[0].version }
+    } catch {}
+    if (-not $ver) { return @{ version = ''; firmada = $null } }
+    $firmada = $null
+    try { $firmada = ([version]$ver -ge [version]$script:NativaVersionFirmada) } catch { $firmada = $null }
+    return @{ version = $ver; firmada = $firmada }
+}
+
 function Test-Layer0b-NativeApp {
     $install = Find-FudoNativeInstall
     $av = Get-AntivirusState
@@ -1265,6 +1326,23 @@ function Test-Layer0b-NativeApp {
             -RootCauseCandidate $false `
             -Evidence @{ paths = $install.paths; reg = $install.regInfo; running = $procRunning } `
             -Recommendation $(if($procRunning){''}else{'Esta instalada y no corriendo. Es lo esperado si Fudo no esta abierto en el navegador: la levanta el navegador cuando hace falta. Si Fudo SI esta abierto en esta PC y aun asi no corre, revisar bloqueo del antivirus.'})
+
+        # 0b.1b Version: desde la firmada, el antivirus deja de ser un tema. Por debajo, la
+        # accion de fondo es actualizar la Nativa y no pelearse con el antivirus cada vez.
+        $verState = Get-NativaVersionState -Install $install
+        $script:Diagnostics['nativaFirmada'] = $verState.firmada
+        if ($verState.firmada -eq $false) {
+            Add-Check -Id 'nativa.sinFirmar' -Layer 0 -Name ("App Nativa desactualizada (v$($verState.version)): la nueva esta firmada y el antivirus no la bloquea") `
+                -Status 'warn' -RootCauseCandidate $false -Plane 'fudo_config' `
+                -Evidence @{ version = $verState.version; versionFirmada = $script:NativaVersionFirmada } `
+                -ArticleRef 'https://soporte.fu.do/es/articles/16419361' `
+                -Recommendation ("Esta PC tiene la Nativa v$($verState.version). Desde la v$($script:NativaVersionFirmada) la App Nativa esta firmada digitalmente, " +
+                                 'asi que los antivirus dejan de ponerla en cuarentena. Si este cliente tuvo problemas de antivirus con la Nativa, ' +
+                                 'actualizarla es la solucion de fondo: evita tener que agregar exclusiones en cada PC.')
+        } elseif ($verState.firmada -eq $true) {
+            Add-Check -Id 'nativa.sinFirmar' -Layer 0 -Name ("App Nativa v$($verState.version): version firmada") -Status 'ok' -Plane 'fudo_config' `
+                -Evidence @{ version = $verState.version; versionFirmada = $script:NativaVersionFirmada }
+        }
     }
 
     # 0b.2 Amenazas/cuarentena de Defender sobre la Nativa
@@ -1334,8 +1412,12 @@ function Test-Layer0b-NativeApp {
                         } else { '' }
                       } catch { '' })
                 })
-    } elseif ($installed -and -not $procRunning -and $UseDefenderExclusions -and $av.defender) {
-        # Nativa instalada pero no corre y Defender activo: exclusion preventiva quirurgica
+    } elseif ($installed -and -not $procRunning -and $UseDefenderExclusions -and $av.defender -and
+              ($script:Diagnostics['nativaFirmada'] -ne $true)) {
+        # Nativa instalada pero no corre y Defender activo: exclusion preventiva quirurgica.
+        # Solo si la Nativa NO esta firmada: desde la v0.0.37 el antivirus no la bloquea, asi que
+        # tocar la config de Defender en la PC de un cliente ya no se justifica (y menos por una
+        # Nativa apagada, que con Fudo cerrado es lo normal).
         $rem = Invoke-Remediation -Description 'Agregar exclusiones preventivas de Defender para la Nativa' -Type 'defender.exclude' -Target 'FudoNativa' `
             -Before 'sin exclusiones' -After 'excluida' -Fix {
                 $notes = @()
@@ -2609,9 +2691,26 @@ function Resolve-TargetPrinter {
             }
             $real = $delModo
         } else {
+            # No hay ninguna del tipo elegido. Hasta v3.9 se seguia igual con todas "para no
+            # dejar el diagnostico vacio", y eso estaba mal: el motor no solo diagnostica,
+            # tambien repara e IMPRIME. Un asesor que eligio Red termino con un ticket de
+            # prueba saliendo de la impresora USB del cliente y el log del spooler modificado,
+            # sin haberlo pedido (caso reportado en el canal). Ahora se corta y, si hay alguien
+            # mirando, se le ofrece seguir; en modo agente no se sigue nunca.
+            $otras = @($real | ForEach-Object { [string]$_.Name + ' [' + [string]$_.PortName + ']' })
+            $seguir = Confirm-ReviewOtherInterface -Modo ([string]$script:RunMode) -Otras $otras
             Add-Check -Id 'printer.modeFilter' -Layer 1 -Name ("Modo $($script:RunMode): no hay ninguna impresora de ese tipo") -Status 'warn' -Plane 'os' `
-                -Evidence @{ modo = $script:RunMode; instaladas = @($real | ForEach-Object { [string]$_.Name + ' [' + [string]$_.PortName + ']' }) } `
-                -Recommendation ("Se eligio revisar $($script:RunMode) pero ninguna de las impresoras instaladas es de ese tipo. Se revisan todas igual para no dejar el diagnostico vacio.")
+                -Evidence @{ modo = $script:RunMode; instaladas = $otras; continuoIgual = $seguir } `
+                -Recommendation $(if ($seguir) {
+                        "Se eligio revisar $($script:RunMode) y no hay ninguna de ese tipo. El asesor pidio revisar igual las otras: " + ($otras -join ', ') + '.'
+                    } else {
+                        "Se eligio revisar $($script:RunMode) pero ninguna de las impresoras instaladas es de ese tipo (hay: " + ($otras -join ', ') +
+                        "). No se reviso ni se toco ninguna. Si la comandera de este cliente es una de esas, volver a correr y elegir la opcion que corresponda."
+                    })
+            if (-not $seguir) {
+                $script:AbortByMode = $true
+                return $null
+            }
         }
     }
 
@@ -2829,7 +2928,7 @@ function Invoke-ReconnectFlow {
         [Console]::Error.WriteLine('  ------------------------------------------------------------')
         $ans = ''
         $ans = [string](Read-DoctorLine -Prompt '  Espero mientras lo haces? (s = si / cualquier otra tecla = no)')
-        $quiere = ($ans -match '(?i)^\s*(s|si|sí|y|yes)\s*$')
+        $quiere = ($ans -match '(?i)^\s*(s|si|s\u00ED|y|yes)\s*$')
     }
     if (-not $quiere) { return @{ recovered = $false; note = 'no se espero la reconexion'; port = '' } }
 
@@ -3180,33 +3279,69 @@ function Repair-QueueRecreate {
     $puertoOk = ''
     $temporal = ''
 
+    # Por que fallo CADA candidato. Sin esto la nota decia solo "ninguno de los puertos
+    # probados imprimio", que colapsa tres causas muy distintas -no se pudo crear la cola /
+    # el ticket quedo encolado / el humano dijo que no salio papel- y deja el caso sin
+    # diagnosticar. Paso en un caso real: el motor no logro imprimir en USB002 y el asesor,
+    # creando la cola a mano en ese mismo puerto, imprimio sin problemas.
+    $intentos = @()
+
     Write-StepDetail "probando en que puerto responde '$nombre'"
     try {
         Initialize-RawPrinterHelper
         $ticket = [System.Text.Encoding]::GetEncoding(437).GetBytes((Get-EscPosTestTicket -Caption 'FUDO PORT TEST'))
         foreach ($cp in @($CandidatePorts)) {
             $tmp = ''
+            $paso = [ordered]@{ puerto = $cp; colaCreada = $false; envioOk = $false
+                                quedoEnCola = $null; confirmadoPorHumano = $null; resultado = '' }
             try {
                 Write-StepDetail "probando el puerto $cp"
                 $tmp = New-FudoTestPrinter -PortName $cp
-                if (-not $tmp) { continue }
-                Start-Sleep -Milliseconds 600
-                if ([FudoRawPrinter]::SendBytes($tmp, $ticket)) {
-                    $d = Wait-QueueDrain -Printer $tmp -TimeoutMs 6000
-                    if (-not $d.quedoEnCola) {
+                if (-not $tmp) {
+                    $paso.resultado = 'no se pudo crear la cola de prueba en ese puerto'
+                    $intentos += $paso
+                    continue
+                }
+                $paso.colaCreada = $true
+                # El spooler necesita un momento para dejar la cola nueva utilizable.
+                Start-Sleep -Milliseconds 1200
+                $paso.envioOk = [bool][FudoRawPrinter]::SendBytes($tmp, $ticket)
+                if (-not $paso.envioOk) {
+                    $paso.resultado = 'la cola se creo pero el envio RAW fallo'
+                } else {
+                    $d = Wait-QueueDrain -Printer $tmp -TimeoutMs 10000
+                    $paso.quedoEnCola = [bool]$d.quedoEnCola
+                    if ($d.quedoEnCola) {
+                        $paso.resultado = 'el ticket entro a la cola y no salio (la impresora no lo tomo)'
+                    } else {
                         # La cola temporal esta limpia y sin offline, asi que si el trabajo salio,
                         # el puerto responde. El papel lo confirma el humano.
                         $conf = Confirm-PaperCameOut -Printer $tmp
-                        if ($conf -ne $false) { $puertoOk = $cp; $temporal = $tmp; break }
+                        $paso.confirmadoPorHumano = $conf
+                        if ($conf -eq $false) {
+                            $paso.resultado = 'el ticket salio de la cola pero el asesor dice que no salio papel'
+                        } else {
+                            $paso.resultado = $(if ($conf) { 'imprimio (confirmado)' } else { 'imprimio (sin confirmar)' })
+                            $puertoOk = $cp; $temporal = $tmp
+                            $intentos += $paso
+                            break
+                        }
                     }
                 }
                 try { Remove-Printer -Name $tmp -ErrorAction SilentlyContinue } catch {}
-            } catch {}
+            } catch {
+                $paso.resultado = 'error al probar el puerto: ' + [string]$_.Exception.Message
+            }
+            $intentos += $paso
         }
     } catch {}
+    $script:Diagnostics['intentosPuerto'] = @($intentos)
 
     if (-not $puertoOk) {
-        return @{ applied = $false; note = "ninguno de los puertos probados ($(@($CandidatePorts) -join ', ')) imprimio un ticket de prueba" }
+        $detalle = @($intentos | ForEach-Object { [string]$_.puerto + ': ' + [string]$_.resultado })
+        return @{ applied = $false
+                  note = "ninguno de los puertos probados imprimio un ticket de prueba -- " + ($detalle -join ' | ')
+                  intentos = @($intentos) }
     }
 
     # Hay un puerto que imprime: ahora si vale reemplazar la cola vieja.
@@ -4318,6 +4453,26 @@ function Build-HumanSummary {
     }
     }
 
+    # Corte por modo: el resumen tiene que decir por que no hay diagnostico, o el asesor lee
+    # una pantalla vacia y cree que el motor fallo.
+    if ($script:AbortByMode) {
+        $mf = Get-CheckById 'printer.modeFilter'
+        Add-Line ''
+        Add-Line ('  NO SE REVISO NADA: no hay impresoras ' + $(if ($script:RunMode -eq 'Red') { 'de red' } else { 'por USB' }) + ' en esta PC')
+        if ($mf -and $mf.evidence -and $mf.evidence.instaladas) {
+            Add-Line ''
+            Add-Line '  Lo que si hay instalado (no se toco):'
+            foreach ($i in @($mf.evidence.instaladas)) { Add-Line ('    - ' + [string]$i) }
+        }
+        Add-Line ''
+        Add-Line '  QUE HACER AHORA'
+        Add-Line '    1. [asesor] Si la comandera del cliente es alguna de esas, volve a correr'
+        Add-Line '           el diagnostico y eligi la opcion que corresponda (o "ambas").'
+        Add-Line ''
+        Add-Line $bar
+        return (($L -join "`r`n") + "`r`n")
+    }
+
     # --- semaforo por area
     Add-Line ''
     Add-Line '  CHEQUEOS'
@@ -4556,6 +4711,15 @@ function Invoke-FudoPrintDoctor {
         $null = Invoke-Step -Name 'layer1a.hardwareInventory' -Body { Test-Layer1a-HardwareInventory }
         $null = Invoke-Step -Name 'layer1a.orphanOwnQueues' -Body { Remove-OrphanOwnQueues }
         $printer = Invoke-Step -Name 'layer1.resolvePrinter' -Body { Resolve-TargetPrinter }
+    }
+
+    # Si el asesor eligio un modo, no hay impresoras de ese tipo y dijo que no revisara las
+    # otras, se corta aca: nada de capas 1 a 5, ninguna reparacion y ningun ticket de prueba
+    # sobre una impresora que no eligio. El resumen explica por que quedo sin diagnosticar.
+    if ($script:AbortByMode) {
+        Write-DoctorLog -Level 'INFO' -Message ("Corte por modo " + $script:RunMode + ": no hay impresoras de ese tipo y no se pidio revisar las otras")
+    }
+    if ($envOk -and -not $script:AbortByMode) {
         $wmi = Invoke-Step -Name 'layer1.printerState' -Body { Test-Layer1-PrinterState -Printer $printer }
         if ($script:ReconnectedPort -and $printer) {
             $refrescada = Invoke-Step -Name 'layer1.refresh' -Body { Get-Printer -Name ([string]$printer.Name) -ErrorAction SilentlyContinue }
@@ -4716,6 +4880,7 @@ function Invoke-SelfTest {
         $script:Actions = New-Object System.Collections.ArrayList
         $script:Errors  = New-Object System.Collections.ArrayList
         $script:Diagnostics = [ordered]@{}
+        $script:AbortByMode = $false
     }
 
     # Escenario 1: antivirus cuarentena resuelto + HW ok  => resuelto/high/nativa.antivirus
@@ -5226,7 +5391,10 @@ function Invoke-SelfTest {
     Assert-Eq 'S56b en modo USB elige la USB' 'HP DeskJet 2130' $(if ($t56b) { [string]$t56b.Name } else { '' })
     $script:RunMode = $script:__modo56b
 
-    # Escenario 56c: si no hay ninguna del tipo elegido, no se deja el diagnostico vacio.
+    # Escenario 56c (v3.10, caso real reportado en el canal): se eligio Red y no hay ninguna
+    # impresora de red. Hasta v3.9 se seguia igual con las USB "para no dejar el diagnostico
+    # vacio", y eso termino imprimiendo un ticket de prueba en la impresora USB de un cliente
+    # sin que el asesor lo pidiera. Ahora se corta: sin consola (modo agente) nunca se sigue.
     Reset-State
     $script:PresentIdsOk = $true
     $script:Diagnostics['livePorts'] = @()
@@ -5237,8 +5405,12 @@ function Invoke-SelfTest {
     function Get-CimInstance { [pscustomobject]@{ WorkOffline=$false; PrinterState=0 } }
     function Get-PrintJob { @() }
     $t56c = Resolve-TargetPrinter
-    Assert-Eq 'S56c sin impresoras del modo igual diagnostica' 'COCINA' $(if ($t56c) { [string]$t56c.Name } else { '' })
+    Assert-Eq 'S56c sin impresoras del modo no se diagnostica nada' '' $(if ($t56c) { [string]$t56c.Name } else { '' })
+    Assert-Eq 'S56c se marca el corte' $true ([bool]$script:AbortByMode)
     Assert-Eq 'S56c y lo avisa' 'warn' ([string](Get-CheckById 'printer.modeFilter').status)
+    Assert-Eq 'S56c deja constancia de que no se siguio' $false ([bool](Get-CheckById 'printer.modeFilter').evidence.continuoIgual)
+    Assert-Eq 'S56c informa lo que si habia' 'COCINA [USB001]' ([string]@((Get-CheckById 'printer.modeFilter').evidence.instaladas)[0])
+    $script:AbortByMode = $false
     $script:RunMode = $script:__modo56c
 
     # Escenario 57 (v3.9): en modo Red la falta de hardware USB es lo esperado, no una falla.
@@ -5316,6 +5488,40 @@ function Invoke-SelfTest {
         [ordered]@{ name=''; instanceId='USB\SINNOMBRE'; portName='' }
     ))
     Assert-Eq 'S59d sin nombre no se descarta' 1 (@($f59d)).Count
+
+    # Escenario 60 (v3.10, caso real): el ticket de prueba tiene que EMPUJAR el papel fuera del
+    # mecanismo antes de cortar. Con 3 saltos de linea y corte sin avance (GS V 66 0) el texto
+    # quedaba retenido adentro: el asesor no veia nada, respondia que no salio, y el motor daba
+    # por fallado un hardware que funcionaba. Se confirmo con el mismo puerto y el mismo driver
+    # generico imprimiendo bien a mano.
+    Reset-State
+    $tk = Get-EscPosTestTicket -Caption 'FUDO HW TEST'
+    $feeds = ([regex]::Matches($tk, "`n")).Count
+    Assert-Eq 'S60 el ticket empuja el papel antes de cortar' $true ($feeds -ge 8)
+    Assert-Eq 'S60 el corte pide avance de papel' $true ($tk.Contains([char]29 + 'V' + [char]66 + [char]80))
+    Assert-Eq 'S60 ya no corta con avance cero' $false ($tk.Contains([char]29 + 'V' + [char]66 + [char]0))
+    Assert-Eq 'S60 sigue arrancando con el init ESC @' $true ($tk.StartsWith([char]27 + '@'))
+    Assert-Eq 'S60 el texto clave sigue estando' $true ($tk.Contains('el hardware imprime OK'))
+
+    # Escenario 61 (v3.10): desde la v0.0.37 la Nativa esta firmada y el antivirus no la
+    # bloquea. Por debajo de esa version, la accion de fondo es actualizarla en vez de andar
+    # agregando exclusiones de Defender en cada PC.
+    Reset-State
+    $v61a = Get-NativaVersionState -Install @{ regInfo = @([ordered]@{ name='Fudo'; version='0.0.36' }) }
+    Assert-Eq 'S61 0.0.36 no esta firmada' $false ([bool]$v61a.firmada)
+    Assert-Eq 'S61 devuelve la version leida' '0.0.36' ([string]$v61a.version)
+    $v61b = Get-NativaVersionState -Install @{ regInfo = @([ordered]@{ name='Fudo'; version='0.0.37' }) }
+    Assert-Eq 'S61 0.0.37 si esta firmada' $true ([bool]$v61b.firmada)
+    $v61c = Get-NativaVersionState -Install @{ regInfo = @([ordered]@{ name='Fudo'; version='0.1.0' }) }
+    Assert-Eq 'S61 una posterior tambien' $true ([bool]$v61c.firmada)
+    # La comparacion tiene que ser numerica: como texto, '0.0.9' > '0.0.37'.
+    $v61d = Get-NativaVersionState -Install @{ regInfo = @([ordered]@{ name='Fudo'; version='0.0.9' }) }
+    Assert-Eq 'S61 0.0.9 es anterior, no posterior' $false ([bool]$v61d.firmada)
+    # Sin dato de version no se puede afirmar nada: ni firmada ni sin firmar.
+    $v61e = Get-NativaVersionState -Install @{ regInfo = @() }
+    Assert-Eq 'S61 sin version no se afirma nada' $true ($null -eq $v61e.firmada)
+    $v61f = Get-NativaVersionState -Install @{ regInfo = @([ordered]@{ name='Fudo'; version='no-es-version' }) }
+    Assert-Eq 'S61 version ilegible tampoco' $true ($null -eq $v61f.firmada)
 
     # Escenario 24 (caso real): caja tapada con miles de trabajos + cocina sana.
     # Antes se elegia la primera cola y se devolvia "todo ok" ignorando la que fallaba.

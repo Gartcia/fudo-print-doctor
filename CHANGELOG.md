@@ -2,6 +2,67 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.10] - 2026-08-28
+
+Dos casos que un asesor probó en clientes reales el mismo día que salió la 3.9, y que entre los
+dos explican por qué el motor casi nunca llegaba a cerrar un caso.
+
+### Corregido
+- **El ticket de prueba se imprimía pero quedaba adentro de la impresora.** El ticket terminaba
+  con tres saltos de línea y `GS V 66 0` (cortar sin alimentar papel). En una térmica el cabezal
+  está a 1-2 cm del cortador: con ese margen, el texto recién impreso **queda retenido dentro del
+  mecanismo**, sale un pedazo de papel en blanco y lo impreso no asoma. El asesor mira, no ve
+  nada y responde que no salió — con razón. El motor entonces daba por fallado un hardware que
+  funcionaba, revertía el puerto y cerraba el caso como no resuelto.
+  Se confirmó descartando todo lo demás: mismo puerto y mismo driver genérico que usa el motor,
+  instalados a mano, imprimían bien y en menos de 3 segundos. Ahora el ticket empuja el papel
+  (seis saltos de línea, más `ESC d` y corte con avance de 80 puntos) antes de cortar.
+  *Esto afecta a toda prueba física que haya preguntado "¿salió el papel?": es candidato a
+  explicar buena parte de las corridas que nunca cerraron como resueltas.*
+- **Elegir "Red" ya no hace nada sobre las impresoras USB.** La 3.9, cuando no encontraba
+  ninguna impresora del tipo elegido, seguía igual con todas "para no dejar el diagnóstico
+  vacío". Estaba mal: el motor no sólo diagnostica, también repara e **imprime**. Un asesor que
+  eligió Red terminó con un ticket de prueba saliendo de la impresora USB del cliente y el log
+  del spooler modificado, sin haberlo pedido. Ahora se corta ahí: se informa lo que sí hay
+  instalado, no se toca nada, y si hay alguien en la consola se le ofrece revisarlas igual. En
+  modo agente nunca se sigue.
+
+### Agregado
+- **Evidencia de por qué falló cada puerto candidato.** `Repair-QueueRecreate` devolvía sólo
+  "ninguno de los puertos probados imprimió un ticket de prueba", que colapsa tres causas muy
+  distintas —no se pudo crear la cola / el ticket quedó encolado / el asesor dice que no salió
+  papel— y dejaba el caso sin diagnosticar. Ahora cada intento queda registrado con su resultado
+  en `diagnostics.intentosPuerto` y en la nota de la acción. Sin esto no se habría podido
+  aislar el bug del ticket.
+- **El motor sabe que la App Nativa nueva está firmada.** Desde la **v0.0.37** la Nativa está
+  firmada digitalmente y los antivirus dejan de ponerla en cuarentena. El motor ya leía
+  `nativaVersion`; ahora la compara y actúa en consecuencia:
+  - Por debajo de 0.0.37 agrega `nativa.sinFirmar` en `warn`, diciendo que actualizar es la
+    solución de fondo — en vez de agregar exclusiones de antivirus PC por PC.
+  - En 0.0.37 o superior **ya no aplica la exclusión preventiva de Defender**. Tocar la
+    configuración del antivirus en la PC de un cliente deja de justificarse, y menos disparado
+    por una Nativa apagada, que con Fudo cerrado es el estado normal.
+  - La comparación es numérica (`[version]`), no de texto: como texto `0.0.9` sería mayor que
+    `0.0.37`. Si no se puede leer la versión no se afirma nada en ninguna dirección.
+- Self-test: escenarios 56c (reescrito), 60 y 61 (227 asserts).
+
+### Cambiado
+- La espera para que el spooler deje utilizable una cola recién creada pasa de 0,6 a 1,2 s, y el
+  drenaje de la cola de prueba de 6 a 10 s. No eran la causa del caso reportado (esa impresora
+  tardaba menos de 3 s), pero el margen era ajustado.
+
+### Pendiente, con dato nuevo del canal
+- **Impresoras de red que existen pero Windows no tiene instaladas.** Reportado: si la impresora
+  no está en el rango de red de la PC, el motor no la ve, mientras que el software del
+  fabricante (3nStar) sí la detecta. El motor sólo mira las colas instaladas en Windows: no
+  descubre nada por la red. Habilitarlo implica escanear, que es lento e invasivo en la red de
+  un local, así que queda para decidir aparte.
+- **Distribuir el instalador de la Nativa firmada.** El motor ya sabe instalarla
+  (`-NativeInstallerUrl` / `-NativeInstallerPath`, y `Find-LocalNativeInstaller` la busca en
+  Descargas y Escritorio antes de descargar nada). Falta decidir por dónde viaja el `.msi`: la
+  opción sana es que la URL vaya en el `.cmd` interno, como ya viaja la de telemetría — el
+  instalador no debería entrar a este repo, que es público.
+
 ## [3.9] - 2026-08-28
 
 De la bitácora del 28/08, la primera con v3.8 en campo (22 de 27 corridas nuevas): el camino a
