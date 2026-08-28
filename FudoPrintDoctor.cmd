@@ -42,14 +42,20 @@ echo.
 echo  ================================================================
 echo   FUDO PRINT DOCTOR
 echo  ================================================================
-echo   Va a revisar toda la cadena de impresion y reparar lo que pueda:
+echo   Va a revisar la cadena de impresion y reparar lo que pueda:
 echo     - servicio de cola de impresion (spooler)
 echo     - impresora en modo offline o pausada
 echo     - App Nativa de Fudo en cuarentena del antivirus
 echo     - puerto USB cambiado
 echo     - driver e instalacion de la impresora, si falta
 echo.
+echo   Primero te pregunta si la impresora es USB, de red, o las dos.
+echo   Si no sabes, elegi las dos.
+echo.
 echo   Va a IMPRIMIR UN TICKET DE PRUEBA: avisale al cliente.
+echo   Despues te pregunta si salio el papel: es la unica forma de
+echo   saber si quedo resuelto, asi que conviene tener la impresora
+echo   a la vista.
 echo   Si hay comandas trabadas en la cola, primero te pregunta.
 echo.
 echo   Enter para empezar, o cerra esta ventana para cancelar.

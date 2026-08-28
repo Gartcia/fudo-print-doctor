@@ -2,6 +2,112 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.9] - 2026-08-28
+
+De la bitácora del 28/08, la primera con v3.8 en campo (22 de 27 corridas nuevas): el camino a
+`resolved` por fin funcionó, y al funcionar dejó a la vista tres agujeros. Una corrida cerró
+`resolved = true` teniendo la App Nativa caída y volvió como `sigue_fallando` 111 segundos
+después; el `skipReason` que agregó la 3.7 no llegaba a la planilla, así que nada de la capa 4
+se podía auditar; y un asesor reportó un cliente con dos impresoras de red al que el motor le
+contestaba que no tenía ninguna impresora conectada.
+
+### Corregido
+- **Que salga el papel ya no alcanza para cerrar el caso si Fudo nunca llegó a mandar una
+  comanda.** `Resolve-Diagnosis` exigía `hw.testprint = ok` y ningún check en `fail`, pero un
+  `warn` no bloqueaba: una corrida cerró como resuelta y la corrida siguiente de esa misma PC,
+  111 segundos después, volvió como `sigue_fallando` con `usoPrevio =
+  imprimio_pero_no_comandas_de_fudo`. Sale papel de la prueba física, no salen las comandas.
+  Ahora también tiene que haber evidencia de que la cadena de Fudo funciona; si no, el caso
+  escala. Es el mismo falso positivo de siempre, esta vez en la capa de Fudo: **imprimir no es
+  imprimir comandas.** La evidencia es el historial del spooler (`fudo.usoReal`), no que la
+  Nativa esté corriendo — ver abajo.
+- **La App Nativa apagada deja de ser un problema y una causa raíz.** Probado contra hardware
+  real: la Nativa es un *native messaging host* (los manifiestos
+  `do.fu.native_extension_chrome/firefox.json` lo confirman), así que el navegador la levanta
+  cuando Fudo la necesita y la cierra después. Con Fudo cerrado —lo habitual cuando el asesor
+  entra por acceso remoto— que no esté corriendo es el estado normal. El motor la daba como
+  CAUSA del caso ("La App Nativa de Fudo NO está en ejecución") y recomendaba revisar el
+  antivirus. Ahora `env.fudoApp`, `nativa.installed` (instalada pero apagada) y
+  `nativa.defenderExclusion` dejan de ser candidatos a causa raíz, y el texto explica que sólo
+  es un problema si Fudo está abierto en esa PC y aun así no corre. Que la Nativa **no esté
+  instalada** sigue siendo causa y sigue bloqueando el cierre.
+- **Una sola impresora se contaba como dos.** Encontrado con una Xprinter XP-410B enchufada:
+  Windows representa el mismo aparato con dos nodos —el device USB padre
+  (`USB\VID_2D37&PID_8327\...`) y su interfaz de impresión hija (`USBPRINT\...&USB002`), que es
+  la única que trae el `PortName`— y la deduplicación sólo comparaba `instanceId`. El resumen
+  decía "Impresoras físicas detectadas: 2", listaba una segunda impresora "sin puerto asignado"
+  que no existe, sugería `-PrinterName` para desambiguar entre una sola impresora, y mandaba
+  `cantidadHardware = 2` a la planilla. `Merge-DuplicateDevices` fusiona el nodo sin puerto
+  contra el que sí lo tiene cuando son el mismo modelo; dos impresoras iguales de verdad tienen
+  cada una su puerto, así que siguen contando como dos.
+- **El diagnóstico USB ya no gana como causa raíz en un cliente que imprime por red.** Una PC
+  con tres colas en puertos `IP_192.168.1.x`, todas sanas y sin ningún hardware USB, cerró cuatro
+  corridas seguidas con "Ninguna impresora física conectada (Administrador de dispositivos)";
+  otra tenía la térmica en `LPT1:` sana mientras el motor culpaba a una inkjet USB desconectada.
+  Cuando la impresora objetivo está en un puerto que no es USB y hay colas del cliente sanas en
+  puertos no-USB, `hw.deviceConnected`, `hw.disconnected` y `conn.usb` dejan de ser candidatos a
+  causa raíz. El asesor leía que no había impresora cuando la impresora estaba y andaba.
+
+### Agregado
+- **`skipReason` y los ids de acción viajan en la telemetría.** El payload reducido mandaba cada
+  check como `{id, status, layer}` y descartaba el `skipReason` que la 3.7 ya calculaba: hubo 22
+  corridas en v3.8 sin un solo motivo de salteo ni un solo `testprint.retarget` en la planilla, y
+  los tres `hw.testprint = skipped` no se pudieron auditar. Ahora el check reducido incluye
+  `skipReason` cuando existe y `telemetry.acciones` lleva los ids de acción, no sólo los textos
+  humanos de `autoFixesApplied`.
+- **`-Modo USB | Red | Ambos`: el motor pregunta al arrancar qué hay que revisar.** Es la otra
+  mitad del pedido del canal. La pregunta vive en el motor, no en el launcher, así que funciona
+  igual por doble clic que por línea de comandos y no hace falta redistribuir el `.cmd`. En modo
+  agente (o con la salida redirigida) equivale a `Ambos`, que es el comportamiento histórico.
+  El modo acota **qué se diagnostica**, no qué se informa: la telemetría sigue viendo todas las
+  colas del cliente. Si el filtro dejara el conjunto vacío no se fuerza — se avisa y se revisan
+  todas, porque quedarse sin candidata es peor que diagnosticar la de la otra interfaz. El modo
+  viaja en la telemetría (campo `modo`) y se muestra en el encabezado del resumen.
+- **La prueba física por red ahora también pide confirmación humana.** El camino Ethernet
+  marcaba `hw.testprint = ok` con que el socket TCP aceptara los bytes, que es exactamente el
+  falso positivo que la 3.2 corrigió para USB: el envío tiene éxito igual sin rollo, con la tapa
+  abierta o con la impresora en error. Ahora pasa por `Confirm-PaperCameOut` como el camino USB,
+  y sin confirmar queda en `warn`, nunca en `ok`.
+- `diagnosis.paperOk`: distingue "no imprime nada" de "imprime, pero la comanda de Fudo todavía
+  no sale", incluso cuando el caso no cierra.
+- Self-test: escenarios 52 a 59d (212 asserts).
+
+### Cambiado
+- **El resumen en pantalla se lee de un vistazo.** El semáforo abre cada línea con un símbolo
+  fijo (`[ok] [!] [X] [+] [-]`) en vez de terminar con la palabra de estado después de una fila
+  de puntos de largo variable, así se barre la columna sin leer todo. El veredicto quedó separado
+  como una ficha con las etiquetas alineadas (`RESULTADO` / `IMPRESORA` / `CAUSA` / `SE ARREGLO`).
+  Y el color se decide por el estado real de cada línea y no adivinando por palabras del texto:
+  antes casi todo salía gris, y cualquier recomendación que contuviera la palabra "falla" se
+  pintaba de rojo aunque no lo fuera.
+- **El progreso en vivo ya no se mezcla con lo que se escribe encima.** La línea de progreso se
+  dibuja con retorno de carro y sin salto: cuando algo escribía mientras estaba abierta —un
+  prompt al asesor, un `WARN` del log, el banner de una acción irreversible— los dos textos se
+  pisaban en el mismo renglón. Ahora `Suspend-LiveStatus` la cierra antes, desde los cuatro
+  puntos por donde pasa todo: `Read-DoctorLine`, `Confirm-PaperCameOut`, `Confirm-Irreversible`
+  e `Invoke-ReconnectFlow`, más `Write-DoctorLog`, que era el más frecuente porque dispara sin
+  intervención del usuario (incluido el error que registra cualquier etapa que explote).
+- En modo Red el resumen deja de listar el hardware USB y las impresoras desconectadas: mandaba
+  al asesor a perseguir un cable que no tiene nada que ver con la impresora que está mirando.
+
+### Corregido (encontrado al revisar la salida real, no venía de la bitácora)
+- **La CAUSA mostraba el nombre de una reparación, o directamente lo contrario de lo que pasaba.**
+  El nombre de un check es el texto que sale como CAUSA, así que tiene que decir lo que se
+  encontró. `nativa.defenderExclusion` se llamaba "Exclusión preventiva de Defender para la
+  Nativa" (se lee como si el problema fuera la exclusión) y `env.fudoApp` se llamaba "App Nativa
+  de Fudo en ejecución" incluso cuando el check estaba en `warn` **porque no estaba en
+  ejecución**. Ambos pasan a tener el nombre según lo que se encontró.
+- **La causa raíz podía cambiar sola entre dos corridas con los mismos datos.** `Sort-Object` no
+  es estable, así que dos candidatas de la misma capa competían en un orden arbitrario. Ahora
+  cada check registra su orden de detección (`seq`) y ante empate de capa gana el que se detectó
+  primero.
+
+### Evaluado y no implementado
+- **`Test-IsPosPrinter` demasiado laxo.** Sigue dependiendo de una pregunta abierta (si
+  `node_printer` manda los trabajos a la cola en RAW o por driver), que es la que define si la
+  prueba física es fiel o si está mal la impresora elegida. Cambiar la priorización a ciegas
+  puede hacer que el motor deje de diagnosticar la cola que realmente falla.
+
 ## [3.8] - 2026-08-27
 
 De la bitácora del 27/08: la misma PC (`43db236c6151dd8c`) mandó dos corridas seguidas con

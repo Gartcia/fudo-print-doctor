@@ -101,6 +101,17 @@
     Actualizar-FudoPrintDoctor.cmd del asesor. El chequeo ya se saltea solo en modo
     agente (-Quiet / -Json / salida redirigida) y nunca bloquea el diagnostico.
 
+.PARAMETER Modo
+    Que parte de la cadena revisar: USB | Red | Ambos. Default 'auto', que en consola
+    interactiva le PREGUNTA al asesor al arrancar y en modo agente equivale a 'Ambos'.
+    Nace de un caso real: un cliente con dos impresoras de red sanas recibia como diagnostico
+    "ninguna impresora fisica conectada", porque el camino USB gana y en esa PC no hay USB.
+      USB   - solo colas y hardware USB. Las impresoras de red se listan pero no se diagnostican.
+      Red   - solo colas en puertos de red (IP_*, *9100*, WSD-*). No se reporta la falta de
+              hardware USB como problema.
+      Ambos - revisa las dos y reporta lo que encuentra en cada una (comportamiento historico).
+    El modo elegido viaja en la telemetria (campo modo) y se muestra en el encabezado.
+
 .PARAMETER CheckUpdate
     Solo consulta la version publicada, informa y termina. No diagnostica nada.
 
@@ -367,6 +378,8 @@ CHANGELOG
 [CmdletBinding()]
 param(
     [string]$PrinterName,
+    [ValidateSet('auto','USB','Red','Ambos')]
+    [string]$Modo = 'auto',
     [ValidateSet('auto','USB','Ethernet')]
     [string]$Interface = 'auto',
     [string]$PrinterIp,
@@ -429,7 +442,12 @@ $script:TestPrinterRx = '(?i)^FUDO-TEST-'
 # puerto tenga hardware; si el hardware se va, deja de serlo (ver Remove-OrphanOwnQueues).
 $script:OwnQueueRx   = '(?i)^FUDO-(TEST-|USB\d)'
 $script:TestDocRx    = '(?i)fudo print doctor'
-$script:SchemaVersion = '3.8'
+$script:SchemaVersion = '3.9'
+# Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
+# (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
+$script:RunMode = 'Ambos'
+# Hay una linea de progreso abierta (escrita con `r, sin salto)? Ver Suspend-LiveStatus.
+$script:LiveOpen = $false
 $script:MenuVacios = 0
 # Distribucion: repo publico. VERSION es un archivo de una linea con la version publicada.
 $script:RepoUrl    = 'https://github.com/Gartcia/fudo-print-doctor'
@@ -489,6 +507,9 @@ function Write-DoctorLog {
     [void]$script:Log.Add($entry)
     # A stderr: stdout queda reservado exclusivamente para el JSON (contrato con el agente).
     if ($VerbosePreference -eq 'Continue' -or $Level -in @('WARN','ERROR')) {
+        # Un WARN/ERROR puede caer en cualquier momento, incluso en medio de una etapa: si la
+        # linea de progreso esta abierta, hay que cerrarla o los dos textos se pisan.
+        Suspend-LiveStatus
         [Console]::Error.WriteLine(("[{0}] {1}" -f $Level, $Message))
     }
 }
@@ -514,6 +535,10 @@ function Add-Check {
     )
     $check = [ordered]@{
         id                 = $Id
+        # Orden de registro. Sort-Object no es estable, asi que sin este desempate dos checks
+        # de la misma capa competian por ser la causa raiz en un orden arbitrario: el resumen
+        # llegaba a mostrar la reparacion intentada en vez del hallazgo que la motivo.
+        seq                = @($script:Checks).Count
         layer              = $Layer
         name               = $Name
         status             = $Status
@@ -550,6 +575,7 @@ function Write-LiveStatus {
     $line = '  ' + $Text
     if ($line.Length -gt $script:LiveWidth) { $line = $line.Substring(0, $script:LiveWidth - 1) + '.' }
     Write-Host ("`r" + $line + (' ' * [Math]::Max(0, $script:LiveWidth - $line.Length))) -NoNewline
+    $script:LiveOpen = $true
 }
 
 function Complete-LiveStatus {
@@ -558,6 +584,22 @@ function Complete-LiveStatus {
     if (-not (Test-IsInteractiveConsole)) { return }
     $line = '  ' + $Text
     Write-Host ("`r" + $line + (' ' * [Math]::Max(0, $script:LiveWidth - $line.Length))) -ForegroundColor $Color
+    $script:LiveOpen = $false
+}
+
+function Suspend-LiveStatus {
+    <#
+      Cierra la linea de progreso en curso ANTES de escribir cualquier otra cosa en pantalla.
+      La linea de progreso se dibuja con `r y sin salto de linea: si algo escribe encima sin
+      cerrarla (un prompt al asesor, un WARN del log, el banner de una accion irreversible),
+      los dos textos se pisan y el asesor ve un renglon mezclado. Con esto, lo que venga
+      despues arranca en una linea limpia.
+    #>
+    if (-not $script:LiveOpen) { return }
+    $script:LiveOpen = $false
+    if (-not (Test-IsInteractiveConsole)) { return }
+    # Borra los restos de la linea viva y baja el cursor.
+    Write-Host ("`r" + (' ' * $script:LiveWidth) + "`r") -NoNewline
 }
 
 function Write-StepDetail {
@@ -709,6 +751,7 @@ function Read-DoctorLine {
       que tratarlos distinto.
     #>
     param([string]$Prompt = '')
+    Suspend-LiveStatus
     if ($Prompt) { Write-Host ($Prompt + ': ') -NoNewline }
     try {
         $l = [Console]::In.ReadLine()
@@ -749,6 +792,55 @@ function Test-IsInteractiveConsole {
         if ([Console]::IsOutputRedirected -or [Console]::IsInputRedirected) { return $false }
     } catch { return $false }
     return $true
+}
+
+function Test-IsNetworkPort {
+    <#
+      El puerto de esta cola es de RED? Cubre las tres formas en que Windows nombra un
+      puerto de red: IP_x.x.x.x, la IP pelada, el 9100 en el nombre, y los puertos WSD
+      (descubrimiento automatico, sin IP en el nombre).
+    #>
+    param([string]$PortName)
+    if (-not $PortName) { return $false }
+    if ($PortName -match '^(?i)IP_')                      { return $true }
+    if ($PortName -match '9100')                          { return $true }
+    if ($PortName -match '^\d{1,3}(\.\d{1,3}){3}')        { return $true }
+    if ($PortName -match '(?i)^WSD-')                     { return $true }
+    if ($PortName -match '(?i)^\{?[0-9a-f]{8}-[0-9a-f]{4}-') { return $true }
+    return $false
+}
+
+function Resolve-RunMode {
+    <#
+      Que revisar: USB, Red o Ambos.
+      Nace de un caso real: un cliente con dos impresoras de red sanas recibia como
+      diagnostico "ninguna impresora fisica conectada", porque el camino USB gana y en esa
+      PC no hay nada por USB. Preguntarlo al arrancar evita ese diagnostico enganoso.
+      'auto' = preguntar si hay un humano; en modo agente equivale a 'Ambos' (historico).
+    #>
+    if ($Modo -ne 'auto') { return $Modo }
+    if (-not (Test-IsInteractiveConsole)) { return 'Ambos' }
+
+    Write-Host ''
+    Write-Host '  Que impresora hay que revisar?' -ForegroundColor Cyan
+    Write-Host '    1  USB    - la impresora esta enchufada a esta PC con un cable USB'
+    Write-Host '    2  Red    - la impresora tiene IP propia (cable de red o wifi)'
+    Write-Host '    3  Ambas  - revisar las dos'
+    Write-Host ''
+    Write-Host '    Si no sabes, elegi 3.' -ForegroundColor DarkGray
+
+    for ($i = 0; $i -lt 3; $i++) {
+        $k = Read-DoctorKey -Prompt '  Opcion (1/2/3, Enter = ambas)'
+        # $null = no hay teclado de ninguna forma (no es lo mismo que Enter pelado).
+        if ($null -eq $k) { return 'Ambos' }
+        $k = ([string]$k).Trim()
+        if ($k -eq '')  { return 'Ambos' }
+        if ($k -eq '1') { return 'USB' }
+        if ($k -eq '2') { return 'Red' }
+        if ($k -eq '3') { return 'Ambos' }
+        Write-Host '    Opcion invalida. Escribi 1, 2 o 3.' -ForegroundColor Yellow
+    }
+    return 'Ambos'
 }
 
 function Wait-QueueDrain {
@@ -797,6 +889,7 @@ function Confirm-PaperCameOut {
     #>
     param([string]$Printer)
     if (-not (Test-IsInteractiveConsole)) { return $null }
+    Suspend-LiveStatus
     Write-Host ''
     Write-Host ("  Mira la impresora: salio el ticket de prueba de '" + $Printer + "'?") -ForegroundColor Cyan
     $ans = ''
@@ -852,6 +945,7 @@ function Confirm-Irreversible {
     if ($script:BoundParams -and $script:BoundParams.ContainsKey('AllowQueuePurge')) { return [bool]$AllowQueuePurge }
     if (-not (Test-IsInteractiveConsole)) { return $false }
 
+    Suspend-LiveStatus
     [Console]::Error.WriteLine('')
     [Console]::Error.WriteLine('  ------------------------------------------------------------')
     [Console]::Error.WriteLine("  Hace falta una accion que NO se puede deshacer:")
@@ -1037,11 +1131,21 @@ function Test-Layer0-Environment {
     $fudoSvc = @()
     try { $fudoSvc = @(Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*$FudoAppProcess*" -or $_.DisplayName -like "*$FudoAppProcess*" }) } catch {}
     $fudoPresent = (@($fudoProc).Count -gt 0) -or (@($fudoSvc).Count -gt 0)
-    Add-Check -Id 'env.fudoApp' -Layer 0 -Name 'App Nativa de Fudo en ejecucion' -Status $(if($fudoPresent){'ok'}else{'warn'}) `
-        -RootCauseCandidate (-not $fudoPresent) `
+    # El nombre sale como CAUSA: tiene que decir lo que se encontro. Con el nombre fijo, una PC
+    # con la Nativa caida mostraba "CAUSA: App Nativa de Fudo en ejecucion", justo lo contrario.
+    #
+    # Y NO es candidata a causa raiz: la Nativa es un native messaging host, el navegador la
+    # levanta cuando Fudo la necesita y la cierra despues. Con Fudo cerrado -lo habitual cuando
+    # el asesor entra por acceso remoto- que no este corriendo es el estado normal, no una
+    # falla. Se informa, pero la causa de que no salga la comanda tiene que salir de evidencia
+    # real (fudo.usoReal: el historial del spooler).
+    Add-Check -Id 'env.fudoApp' -Layer 0 `
+        -Name $(if($fudoPresent){'App Nativa de Fudo en ejecucion'}else{'La App Nativa de Fudo no esta corriendo ahora'}) `
+        -Status $(if($fudoPresent){'ok'}else{'warn'}) `
+        -RootCauseCandidate $false `
         -Evidence @{ processes = @($fudoProc | Select-Object -First 5 | ForEach-Object { $_.Name }); services = @($fudoSvc | ForEach-Object { $_.Name }) } `
         -ArticleRef 'https://soporte.fu.do/es/articles/16419361' `
-        -Recommendation $(if($fudoPresent){''}else{'La App Nativa de Fudo es prerequisito para imprimir. Verificar instalacion/arranque.'})
+        -Recommendation $(if($fudoPresent){''}else{'La Nativa arranca sola cuando se abre Fudo en el navegador: si Fudo esta cerrado, esto es normal y no hay nada que hacer. Solo es un problema si Fudo esta abierto en esta PC y aun asi no corre (ahi si, revisar el antivirus).'})
 
     return $true
 }
@@ -1154,11 +1258,13 @@ function Test-Layer0b-NativeApp {
             -ArticleRef 'https://soporte.fu.do/es/articles/16419361' `
             -Recommendation 'La App Nativa no aparece instalada (no hay archivos ni entradas de registro). Sin la Nativa, Fudo no puede mandar ninguna comanda a la impresora: instalar Nativa + extension del navegador (frecuentemente bloqueada por antivirus).'
     } else {
-        Add-Check -Id 'nativa.installed' -Layer 0 -Name $(if($procRunning){'App Nativa de Fudo instalada y corriendo'}else{'App Nativa de Fudo instalada pero NO esta corriendo'}) `
+        # Instalada pero apagada NO es causa raiz: es un native messaging host y con Fudo
+        # cerrado no corre. Que NO este instalada (rama de arriba, status fail) si lo es.
+        Add-Check -Id 'nativa.installed' -Layer 0 -Name $(if($procRunning){'App Nativa de Fudo instalada y corriendo'}else{'App Nativa de Fudo instalada (no corre ahora: arranca con Fudo)'}) `
             -Status $(if($procRunning){'ok'}else{'warn'}) `
-            -RootCauseCandidate (-not $procRunning) `
+            -RootCauseCandidate $false `
             -Evidence @{ paths = $install.paths; reg = $install.regInfo; running = $procRunning } `
-            -Recommendation $(if($procRunning){''}else{'La Nativa esta instalada pero no en ejecucion: posible bloqueo por antivirus.'})
+            -Recommendation $(if($procRunning){''}else{'Esta instalada y no corriendo. Es lo esperado si Fudo no esta abierto en el navegador: la levanta el navegador cuando hace falta. Si Fudo SI esta abierto en esta PC y aun asi no corre, revisar bloqueo del antivirus.'})
     }
 
     # 0b.2 Amenazas/cuarentena de Defender sobre la Nativa
@@ -1237,7 +1343,16 @@ function Test-Layer0b-NativeApp {
                 try { Add-MpPreference -ExclusionProcess "$FudoAppProcess*.exe" -ErrorAction SilentlyContinue; $notes += 'excl process' } catch {}
                 ($notes -join ' | ')
             }
-        Add-Check -Id 'nativa.defenderExclusion' -Layer 0 -Name 'Exclusion preventiva de Defender para la Nativa' -Status $(if($rem.applied){'fixed'}else{'warn'}) -RootCauseCandidate $true `
+        # El nombre del check es el texto que sale como CAUSA, asi que tiene que decir lo que se
+        # ENCONTRO, no la reparacion que se intento. Salia "CAUSA: Exclusion preventiva de
+        # Defender para la Nativa", que se lee como si el problema fuera la exclusion.
+        # La exclusion se sigue aplicando (es quirurgica y reversible), pero NO es causa raiz:
+        # se dispara por la Nativa apagada, que con Fudo cerrado es el estado normal. Si Defender
+        # de verdad tiene la Nativa en cuarentena, eso lo reporta nativa.defenderQuarantine.
+        Add-Check -Id 'nativa.defenderExclusion' -Layer 0 `
+            -Name $(if($rem.applied){'Se excluyo la App Nativa del antivirus (no estaba corriendo)'}
+                    else{'Exclusion de Defender para la Nativa: no se pudo aplicar'}) `
+            -Status $(if($rem.applied){'fixed'}else{'warn'}) -RootCauseCandidate $false `
             -Evidence @{ realTime = $av.realTime; paths = $install.paths } -ActionTaken $rem.note `
             -Recommendation 'Tras excluir, reiniciar la Nativa. Si sigue sin correr, reinstalar la Nativa.'
     }
@@ -1668,7 +1783,49 @@ function Get-UsbPrintDevices {
         if (-not $byId.Contains($key)) { $byId[$key] = $d }
         elseif (-not $byId[$key].portName -and $d.portName) { $byId[$key] = $d }
     }
-    return @($byId.Values)
+    return @(Merge-DuplicateDevices -Devices @($byId.Values))
+}
+
+function Get-DeviceNameKey {
+    <#
+      Clave para comparar nombres de dispositivo: sin mayusculas, sin espacios ni signos.
+      'Xprinter XP-410B' y 'XPrinter XP410B' son el mismo aparato.
+    #>
+    param([string]$Name)
+    if (-not $Name) { return '' }
+    return (([string]$Name).ToLower() -replace '[^a-z0-9]', '')
+}
+
+function Merge-DuplicateDevices {
+    <#
+      La MISMA impresora puede aparecer dos veces con instanceId distinto, porque Windows la
+      representa con dos nodos -el device USB padre (USB\VID_xxxx&PID_xxxx\serie) y su
+      interfaz de impresion hija (USBPRINT\Modelo\...&USB00x)- y solo el hijo trae el
+      PortName. Se vio contra hardware real: una sola Xprinter XP-410B reportada como
+      "Impresoras fisicas detectadas: 2", con la segunda "sin puerto asignado", y
+      cantidadHardware = 2 viajando a la telemetria.
+      Solo se fusiona el nodo SIN puerto contra uno CON puerto del mismo modelo: dos
+      impresoras iguales de verdad tienen cada una su propio puerto, asi que siguen siendo dos.
+    #>
+    param($Devices)
+    $lista = @($Devices)
+    $nombresConPuerto = @($lista | Where-Object { [string]$_.portName } |
+                          ForEach-Object { Get-DeviceNameKey -Name ([string]$_.name) } |
+                          Where-Object { $_ })
+    $out = @()
+    $vistosSinPuerto = @()
+    foreach ($d in $lista) {
+        if ([string]$d.portName) { $out += $d; continue }
+        $k = Get-DeviceNameKey -Name ([string]$d.name)
+        if (-not $k) { $out += $d; continue }
+        # ya hay un nodo con puerto de este mismo modelo -> es el mismo aparato
+        if (@($nombresConPuerto) -contains $k) { continue }
+        # dos nodos sin puerto del mismo modelo tampoco son dos impresoras distintas
+        if (@($vistosSinPuerto) -contains $k) { continue }
+        $vistosSinPuerto += $k
+        $out += $d
+    }
+    return @($out)
 }
 
 function Get-ProblemPrinterDevices {
@@ -2266,6 +2423,15 @@ function Test-Layer1a-HardwareInventory {
 
     # 1a.1 Hay una impresora fisica conectada?
     if (@($devices).Count -eq 0 -and @($problems).Count -eq 0) {
+        # En modo Red la ausencia de hardware USB no es un problema: es lo esperado. Reportarla
+        # como 'fail' era lo que producia el diagnostico "ninguna impresora fisica conectada" en
+        # locales que imprimen por IP y tienen todas sus colas sanas.
+        if ($script:RunMode -eq 'Red') {
+            Add-Check -Id 'hw.deviceConnected' -Layer 1 -Name 'Hardware USB: no se revisa (modo Red)' -Status 'skipped' -Plane 'hardware' `
+                -Evidence @{ usbPrintDevices = 0; skipReason = 'modo_red' } `
+                -Recommendation 'Se eligio revisar solo impresoras de red: no se evalua el hardware USB.'
+            return
+        }
         $yaSabemos = @()
         if ($script:Diagnostics.Contains('impresorasDesconectadas')) { $yaSabemos = @($script:Diagnostics['impresorasDesconectadas']) }
         Add-Check -Id 'hw.deviceConnected' -Layer 1 -Name 'Ninguna impresora fisica conectada (Administrador de dispositivos)' -Status 'fail' -RootCauseCandidate (@($yaSabemos).Count -eq 0) -Plane 'hardware' `
@@ -2424,6 +2590,31 @@ function Resolve-TargetPrinter {
     $real = @($allPrinters | Where-Object { -not (Test-IsVirtualPrinter $_).isVirtual })
     $virtualNames = @($inventory | Where-Object { $_.isVirtual } | ForEach-Object { $_.name })
 
+    # El modo acota QUE colas son candidatas a diagnosticarse. Si el filtro deja el conjunto
+    # vacio no se fuerza: se avisa y se sigue con todas, porque quedarse sin candidata es peor
+    # que diagnosticar una de la otra interfaz.
+    if ($script:RunMode -in @('USB','Red') -and @($real).Count -gt 0) {
+        $delModo = @($real | Where-Object {
+            $esRed = Test-IsNetworkPort -PortName ([string]$_.PortName)
+            if ($script:RunMode -eq 'Red') { $esRed } else { -not $esRed }
+        })
+        if (@($delModo).Count -gt 0) {
+            $descartadasPorModo = @($real | Where-Object { [string]$_.Name -notin @($delModo | ForEach-Object { [string]$_.Name }) } | ForEach-Object { [string]$_.Name })
+            if (@($descartadasPorModo).Count -gt 0) {
+                Add-Check -Id 'printer.modeFilter' -Layer 1 -Name ("Modo $($script:RunMode): se revisan " + @($delModo).Count + ' de ' + @($real).Count + ' impresoras') -Status 'ok' `
+                    -Evidence @{ modo = $script:RunMode
+                                 seRevisan = @($delModo | ForEach-Object { [string]$_.Name + ' [' + [string]$_.PortName + ']' })
+                                 seDescartan = $descartadasPorModo } `
+                    -Recommendation ("Quedaron fuera por el modo elegido: " + ($descartadasPorModo -join ', ') + '. Para revisarlas, volver a correr y elegir la otra opcion (o "Ambas").')
+            }
+            $real = $delModo
+        } else {
+            Add-Check -Id 'printer.modeFilter' -Layer 1 -Name ("Modo $($script:RunMode): no hay ninguna impresora de ese tipo") -Status 'warn' -Plane 'os' `
+                -Evidence @{ modo = $script:RunMode; instaladas = @($real | ForEach-Object { [string]$_.Name + ' [' + [string]$_.PortName + ']' }) } `
+                -Recommendation ("Se eligio revisar $($script:RunMode) pero ninguna de las impresoras instaladas es de ese tipo. Se revisan todas igual para no dejar el diagnostico vacio.")
+        }
+    }
+
     # --- Caso A: nombre explicito
     if ($PrinterName) {
         $target = $allPrinters | Where-Object { $_.Name -eq $PrinterName } | Select-Object -First 1
@@ -2514,7 +2705,19 @@ function Resolve-TargetPrinter {
     # Primero miramos el estado de TODAS: si una esta fallando (cola tapada, offline, puerto
     # muerto) esa es la que hay que diagnosticar. Las que andan bien no se tocan.
     $colas = @(Get-PrinterQueues)
+    # La telemetria y el resumen siguen viendo TODAS las colas del cliente: el modo acota que
+    # se diagnostica, no que se informa. Sin esto, en modo Red se elegia igual la inkjet USB
+    # "enferma" y la termica de red sana quedaba sin mirar (caso real 52564e5e).
     $script:Diagnostics['colas'] = $colas
+    $colasDelModo = $colas
+    if ($script:RunMode -in @('USB','Red')) {
+        $filtradas = @($colas | Where-Object {
+            $esRed = Test-IsNetworkPort -PortName ([string]$_.puerto)
+            if ($script:RunMode -eq 'Red') { $esRed } else { -not $esRed }
+        })
+        if (@($filtradas).Count -gt 0) { $colasDelModo = $filtradas }
+    }
+    $colas = $colasDelModo
     if (@($colas).Count -gt 0) {
         $enfermas = @($colas | Where-Object { [int]$_.score -gt 0 })
         $sanas    = @($colas | Where-Object { [int]$_.score -eq 0 })
@@ -2577,7 +2780,7 @@ function Wait-ForPrinterReconnect {
     $t0 = Get-Date
     while (((Get-Date) - $t0).TotalSeconds -lt $TimeoutSec) {
         $restante = [int]($TimeoutSec - ((Get-Date) - $t0).TotalSeconds)
-        Write-LiveStatus ("  Esperando que desconectes y vuelvas a conectar el USB de la impresora... ${restante}s")
+        Write-LiveStatus ("Esperando que desconectes y vuelvas a conectar el USB de la impresora... ${restante}s")
         Start-Sleep -Seconds 3
 
         $script:PresentIds = $null
@@ -2616,6 +2819,7 @@ function Invoke-ReconnectFlow {
     if ($script:ForceWaitReconnect) { $quiere = $true }
     elseif ($script:BoundParams -and $script:BoundParams.ContainsKey('WaitReconnect')) { $quiere = [bool]$WaitReconnect }
     elseif (Test-IsInteractiveConsole) {
+        Suspend-LiveStatus
         [Console]::Error.WriteLine('')
         [Console]::Error.WriteLine('  ------------------------------------------------------------')
         [Console]::Error.WriteLine("  La cola '$($Printer.Name)' apunta a $($Printer.PortName), donde no hay ningun")
@@ -3489,9 +3693,39 @@ function Test-Layer4-HardwarePrint {
         try {
             Write-StepDetail ("enviando ticket de prueba a " + $ip + ":" + $Port)
             $ok = Send-EscPosOverTcp -Ip $ip -TcpPort $Port
-            Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica ESC/POS por red' -Status $(if($ok){'ok'}else{'fail'}) -RootCauseCandidate (-not $ok) `
-                -Plane 'hardware' -Evidence @{ ip = $ip; port = $Port; sent = $ok } `
-                -Recommendation $(if($ok){'El hardware imprime OK por red: si la comanda no sale, la causa esta en la config de Fudo (area/cocina/sala).'}else{'No se pudo enviar al hardware por red.'})
+            if (-not $ok) {
+                Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica ESC/POS por red' -Status 'fail' -RootCauseCandidate $true `
+                    -Plane 'hardware' -Evidence @{ ip = $ip; port = $Port; sent = $false } `
+                    -ArticleRef 'https://soporte.fu.do/es/articles/11730816' `
+                    -Recommendation ("No se pudo abrir la conexion a $ip por el puerto $Port. Revisar que la impresora este encendida y en la misma red, " +
+                                     'que la IP sea la correcta (self-test de la impresora: apagar, mantener FEED y encender) y que ningun firewall bloquee el 9100.')
+                return
+            }
+            # Mismo criterio que por USB: que el socket TCP acepte los bytes NO prueba que haya
+            # salido papel. Sin rollo, con la tapa abierta o con la impresora en error, el envio
+            # igual da exito. El unico juez es el humano que esta al lado.
+            $salio = Confirm-PaperCameOut -Printer ("$ip" + ':' + $Port)
+            $script:Diagnostics['ticketConfirmado'] = $salio
+            if ($salio -eq $false) {
+                Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica ESC/POS por red' -Status 'fail' -RootCauseCandidate $true `
+                    -Plane 'hardware' -Evidence @{ ip = $ip; port = $Port; sent = $true; confirmadoPorHumano = $false } `
+                    -ArticleRef 'https://soporte.fu.do/es/articles/11730816' `
+                    -Recommendation ('La impresora acepto los datos por red pero no salio papel. Eso descarta la red y Windows: ' +
+                                     'revisar rollo (que quede papel y del lado correcto) y que la tapa este bien cerrada. ' +
+                                     'Si la luz esta en rojo o titilando, es hardware.')
+                return
+            }
+            if ($null -eq $salio) {
+                Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica ESC/POS por red: enviado, sin confirmar' -Status 'warn' `
+                    -Plane 'hardware' -Evidence @{ ip = $ip; port = $Port; sent = $true; confirmadoPorHumano = $null } `
+                    -ArticleRef 'https://soporte.fu.do/es/articles/11730816' `
+                    -Recommendation ("La impresora acepto el ticket por red, que es todo lo que se puede verificar por software. " +
+                                     'Confirmar con alguien en el local si salio el papel: recien ahi se puede dar por resuelto.')
+                return
+            }
+            Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica ESC/POS por red' -Status 'ok' `
+                -Plane 'hardware' -Evidence @{ ip = $ip; port = $Port; sent = $true; confirmadoPorHumano = $true } `
+                -Recommendation 'Salio el papel por red: el hardware y la red estan bien. Si la comanda no sale, la causa esta en la config de Fudo (area/cocina/sala).'
         } catch {
             Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica ESC/POS por red' -Status 'fail' -RootCauseCandidate $true `
                 -Plane 'hardware' -Evidence @{ ip = $ip; error = $_.Exception.Message } `
@@ -3703,8 +3937,36 @@ function Resolve-Diagnosis {
         })
     }
 
-    # Prioridad por capa (mas abajo primero: OS/HW antes que config)
-    $ordered = @($rootCandidates | Sort-Object { $_.layer })
+    # v3.9: en un cliente que imprime por RED, el diagnostico USB no puede ser la causa raiz.
+    # Se vieron PCs con las colas de comandas en puertos IP_192.168.x.x sanas y cero hardware USB
+    # cerrando con "Ninguna impresora fisica conectada", y otra con la termica en LPT1: sana
+    # mientras el motor culpaba a una inkjet USB desconectada. El asesor lee que no hay impresora
+    # cuando en realidad la impresora esta y anda.
+    $puertoObjetivo = ''
+    try { if ($script:Diagnostics.Contains('printer')) { $puertoObjetivo = [string]$script:Diagnostics['printer'].port } } catch {}
+    $objetivoEsUsb = ($puertoObjetivo -match '^(?i)USB\d+')
+    $colasNoUsbSanas = @()
+    try {
+        if ($script:Diagnostics.Contains('colas')) {
+            $colasNoUsbSanas = @($script:Diagnostics['colas'] | Where-Object {
+                -not $_.esDePrueba -and [int]$_.score -eq 0 -and ([string]$_.puerto -notmatch '^(?i)USB\d+')
+            })
+        }
+    } catch {}
+
+    if ($puertoObjetivo -and -not $objetivoEsUsb -and @($colasNoUsbSanas).Count -gt 0) {
+        $script:Diagnostics['modoRedDetectado'] = [ordered]@{
+            puertoObjetivo = $puertoObjetivo
+            colasNoUsbSanas = @($colasNoUsbSanas | ForEach-Object { [string]$_.nombre + ' (' + [string]$_.puerto + ')' })
+        }
+        $rootCandidates = @($rootCandidates | Where-Object {
+            $_.id -notin @('hw.deviceConnected','hw.disconnected','conn.usb')
+        })
+    }
+
+    # Prioridad por capa (mas abajo primero: OS/HW antes que config); ante empate, el que se
+    # detecto primero, para que la causa no cambie de una corrida a otra con los mismos datos.
+    $ordered = @($rootCandidates | Sort-Object @{ Expression = { [int]$_.layer } }, @{ Expression = { [int]$_.seq } })
 
     $hwTest = $checks | Where-Object { $_.id -eq 'hw.testprint' } | Select-Object -First 1
 
@@ -3720,7 +3982,25 @@ function Resolve-Diagnosis {
     # corrida siguiente de la misma PC volvia como sigue_fallando.
     # Ahora el unico camino a 'resuelto' es que la cadena imprima: hw.testprint en 'ok', que
     # desde 3.2 solo pasa si un humano confirmo que salio el papel.
-    if (@($fixed).Count -gt 0 -and @($fails).Count -eq 0 -and $hwTest -and $hwTest.status -eq 'ok') {
+    # v3.9: que salga el papel no alcanza si la comanda de Fudo no llega a salir. Se vio una
+    # corrida cerrando resolved=true y volviendo como sigue_fallando 111 segundos despues, con
+    # usoPrevio = imprimio_pero_no_comandas_de_fudo. Sale papel de la prueba, no salen las
+    # comandas: el mismo falso positivo de siempre, ahora en la capa de Fudo.
+    #
+    # La evidencia NO es que la Nativa este apagada: la Nativa es un native messaging host que
+    # el navegador levanta cuando Fudo la necesita, asi que con Fudo cerrado estar apagada es lo
+    # normal (probado en una PC real: sin Fudo abierto el proceso no existe). Tomarlo como
+    # bloqueante habria impedido cerrar cualquier caso diagnosticado con Fudo cerrado.
+    # La evidencia real es el historial del spooler: ninguna cola recibio nunca una comanda de
+    # Fudo (fudo.usoReal en warn con plano fudo_config). Y que la Nativa no este INSTALADA si
+    # bloquea, porque sin ella no hay cadena posible.
+    $cadenaFudoRota = @($checks | Where-Object {
+        ($_.id -eq 'fudo.usoReal' -and $_.status -eq 'warn' -and $_.plane -eq 'fudo_config') -or
+        ($_.id -eq 'nativa.installed' -and $_.status -eq 'fail')
+    })
+    $paperOk = [bool]($hwTest -and $hwTest.status -eq 'ok')
+
+    if (@($fixed).Count -gt 0 -and @($fails).Count -eq 0 -and $paperOk -and @($cadenaFudoRota).Count -eq 0) {
         $resolved = $true; $confidence = 'high'
         $rootCause = ($fixed | Sort-Object { $_.layer } | Select-Object -First 1).name
     }
@@ -3752,6 +4032,9 @@ function Resolve-Diagnosis {
 
     $diag = [ordered]@{
         resolved        = $resolved
+        # Salio el papel de la prueba fisica, aunque el caso no cierre. Distingue "no imprime
+        # nada" de "imprime, pero la comanda de Fudo todavia no sale".
+        paperOk         = $paperOk
         rootCause       = $rootCause
         rootCauseCheckId = $(if (@($ordered).Count -gt 0) { [string]$ordered[0].id }
                               elseif ($resolved -and @($fixed).Count -gt 0) { [string](@($fixed | Sort-Object { $_.layer })[0].id) }
@@ -3925,13 +4208,25 @@ function Build-HumanSummary {
     param($Diag, $DetectedInterface)
     $L = New-Object System.Collections.ArrayList
     function Add-Line { param([string]$T = '') [void]$L.Add($T) }
+    # Campo con etiqueta en columna: la primera linea lleva la etiqueta y las de continuacion
+    # quedan alineadas debajo del texto, no debajo de la etiqueta.
+    function Add-Field {
+        param([string]$Label, [string]$Text, [int]$Col = 13)
+        $sangria = ' ' * $Col
+        $lineas = @(Format-Wrap -Text $Text -Width (76 - $Col) -Indent $sangria)
+        if (@($lineas).Count -eq 0) { return }
+        $etiqueta = $Label + (' ' * [Math]::Max(1, $Col - $Label.Length))
+        Add-Line ('  ' + $etiqueta + $lineas[0])
+        for ($i = 1; $i -lt @($lineas).Count; $i++) { Add-Line ('  ' + $lineas[$i]) }
+    }
 
     $bar = '=' * 78
     Add-Line $bar
     Add-Line ("  FUDO PRINT DOCTOR   v$($script:SchemaVersion)   PC: $env:COMPUTERNAME" +
               $(if ($CaseId) { "   Caso: $CaseId" } else { '' }))
-    Add-Line ("  Modo: " + $(if ($DryRun) { 'solo diagnostico (-DryRun)' } elseif ($AutoFix) { 'diagnostico + reparacion' } else { 'solo diagnostico' }) +
-              "   Interfaz: $DetectedInterface")
+    Add-Line ("  Revisado: " + $(switch ([string]$script:RunMode) { 'USB' { 'solo USB' } 'Red' { 'solo red' } default { 'USB y red' } }) +
+              "   Interfaz: $DetectedInterface" +
+              "   " + $(if ($DryRun) { 'solo diagnostico (-DryRun)' } elseif ($AutoFix) { 'diagnostico + reparacion' } else { 'solo diagnostico' }))
     Add-Line $bar
 
     if ($script:UpdateNote) {
@@ -3960,12 +4255,29 @@ function Build-HumanSummary {
     }
 
     # --- hardware fisico detectado
+    # En modo Red no se revisa el hardware USB, asi que listarlo (y sobre todo listar las
+    # "desconectadas") contradice el propio semaforo y manda al asesor a perseguir un cable
+    # que no tiene nada que ver con la impresora que esta diagnosticando.
     $conn = @()
     if ($script:Diagnostics.Contains('printersConnected')) { $conn = @($script:Diagnostics['printersConnected']) }
-    Add-Line ''
-    Add-Line ("  HARDWARE DE IMPRESION CONECTADO: " + @($conn).Count)
+    $modoRed = ($script:RunMode -eq 'Red')
+    if ($modoRed) {
+        $colasRed = @($colas | Where-Object { Test-IsNetworkPort -PortName ([string]$_.puerto) })
+        Add-Line ''
+        Add-Line ("  IMPRESORAS DE RED: " + @($colasRed).Count)
+        foreach ($cr in $colasRed) {
+            Add-Line ('    - ' + [string]$cr.nombre + '  [' + [string]$cr.puerto + ']  ' + [string]$cr.estado)
+        }
+        if (@($colasRed).Count -eq 0) {
+            Add-Line '    (ninguna instalada en Windows con puerto de red)'
+        }
+        Add-Line '    (el hardware USB no se revisa en este modo)'
+    }
     $desc = @()
     if ($script:Diagnostics.Contains('descartadosNoImpresora')) { $desc = @($script:Diagnostics['descartadosNoImpresora']) }
+    if (-not $modoRed) {
+    Add-Line ''
+    Add-Line ("  HARDWARE DE IMPRESION CONECTADO: " + @($conn).Count)
     if (@($conn).Count -eq 0) {
         Add-Line '    (ninguna: Windows no ve hardware de impresion conectado)'
     } else {
@@ -4004,6 +4316,7 @@ function Build-HumanSummary {
         }
         Add-Line '      -> encender la impresora y conectar el USB, preferentemente en el mismo puerto'
     }
+    }
 
     # --- semaforo por area
     Add-Line ''
@@ -4019,25 +4332,54 @@ function Build-HumanSummary {
         @{ t = 'Configuracion de Fudo';   ids = @('fudo.') },
         @{ t = 'Motor (fallas internas)'; ids = @('engine.') }
     )
+    # Un simbolo fijo al principio de cada linea: se barre la columna de un vistazo y se ve
+    # donde esta el problema sin leer todo. Antes el estado iba al final, despues de una fila
+    # de puntos de largo variable, y habia que recorrer la linea entera para encontrarlo.
     foreach ($a in $areas) {
         $st = Get-AreaStatus -Ids $a.ids
         if ($st -eq '-' -and $a.t -eq 'Motor (fallas internas)') { continue }
-        $dots = '.' * [Math]::Max(3, (30 - ([string]$a.t).Length))
-        Add-Line ("    " + $a.t + ' ' + $dots + ' ' + $st)
+        $sim = switch ($st) {
+            'FALLA'    { '[X]' }
+            'REVISAR'  { '[!]' }
+            'REPARADO' { '[+]' }
+            'OK'       { '[ok]' }
+            'omitido'  { '[-]' }
+            default    { '[-]' }
+        }
+        $nota = switch ($st) {
+            'FALLA'    { 'falla' }
+            'REVISAR'  { 'revisar' }
+            'REPARADO' { 'reparado' }
+            'OK'       { 'ok' }
+            'omitido'  { 'no se reviso' }
+            default    { 'no aplica' }
+        }
+        $pad = ' ' * [Math]::Max(1, 5 - $sim.Length)
+        $dots = '.' * [Math]::Max(3, (32 - ([string]$a.t).Length))
+        Add-Line ('    ' + $sim + $pad + $a.t + ' ' + $dots + ' ' + $nota)
     }
 
     # --- resultado
+    # El veredicto es lo unico que el asesor tiene que leer si o si: va separado del resto por
+    # una linea propia y con las etiquetas alineadas en columna, para que se lea como una ficha
+    # y no como un parrafo mas.
     $conf = switch ([string]$Diag.confidence) { 'high' { 'alta' } 'medium' { 'media' } default { 'baja' } }
     Add-Line ''
+    Add-Line ('  ' + ('-' * 76))
     $target = ''
     if ($script:Diagnostics.Contains('printer')) { $target = [string]$script:Diagnostics['printer'].name }
-    if ($target) { Add-Line ("  IMPRESORA DIAGNOSTICADA: $target") }
-    if ($Diag.resolved) { Add-Line ("  RESULTADO: RESUELTO   (confianza $conf)") }
-    else { Add-Line ("  RESULTADO: NO RESUELTO AUTOMATICAMENTE   (confianza $conf)") }
-    foreach ($ln in @(Format-Wrap -Text ("CAUSA: " + [string]$Diag.rootCause) -Indent '         ')) { Add-Line ("  $ln") }
-    if (@($Diag.autoFixesApplied).Count -gt 0) {
-        foreach ($ln in @(Format-Wrap -Text ("SE ARREGLO: " + (@($Diag.autoFixesApplied) -join '; ')) -Indent '         ')) { Add-Line ("  $ln") }
+    if ($Diag.resolved) { Add-Line ("  RESULTADO    RESUELTO                    (confianza $conf)") }
+    else { Add-Line ("  RESULTADO    NO RESUELTO AUTOMATICAMENTE  (confianza $conf)") }
+    if ($target) { Add-Line ("  IMPRESORA    $target") }
+    Add-Field -Label 'CAUSA' -Text ([string]$Diag.rootCause)
+    # Salio el papel pero el caso no cierra: sin esto se lee como si no hubiera imprimido nada.
+    if ($Diag.paperOk -and -not $Diag.resolved) {
+        Add-Field -Label 'OJO' -Text 'la prueba SI imprimio papel; lo que falta es la cadena de Fudo'
     }
+    if (@($Diag.autoFixesApplied).Count -gt 0) {
+        Add-Field -Label 'SE ARREGLO' -Text ((@($Diag.autoFixesApplied) -join '; '))
+    }
+    Add-Line ('  ' + ('-' * 76))
 
     # --- que hacer ahora (maximo 3)
     $short = Get-ShortActions -Diag $Diag -Max 3
@@ -4091,15 +4433,30 @@ function Write-HumanReport {
         foreach ($ln in $lines) { [Console]::Error.WriteLine($ln) }
         return
     }
+    # El color se decide por el simbolo de estado al principio de la linea, que lo pone
+    # Build-HumanSummary, en vez de adivinar por palabras sueltas del texto. Antes casi todo
+    # terminaba en gris y las lineas con la palabra "falla" adentro de una recomendacion se
+    # pintaban de rojo aunque no fueran una falla.
     foreach ($ln in $lines) {
         $color = 'Gray'
-        if ($ln -match '^=+$')                              { $color = 'DarkGray' }
+        if     ($ln -match '^\s*=+$')                       { $color = 'DarkGray' }
+        elseif ($ln -match '^\s*-+$')                       { $color = 'DarkGray' }
         elseif ($ln -match 'FUDO PRINT DOCTOR')             { $color = 'Cyan' }
-        elseif ($ln -match '\bFALLA\b|NO RESUELTO')         { $color = 'Red' }
-        elseif ($ln -match '\bREVISAR\b')                   { $color = 'Yellow' }
-        elseif ($ln -match '\bREPARADO\b|RESUELTO|SE ARREGLO') { $color = 'Green' }
-        elseif ($ln -match '^\s{2}[A-Z][A-Z ()/]+$')        { $color = 'White' }
-        elseif ($ln -match 'CAUSA:')                        { $color = 'Magenta' }
+        elseif ($ln -match '^\s{4}\[X\]')                   { $color = 'Red' }
+        elseif ($ln -match '^\s{4}\[!\]')                   { $color = 'Yellow' }
+        elseif ($ln -match '^\s{4}\[\+\]')                  { $color = 'Green' }
+        elseif ($ln -match '^\s{4}\[ok\]')                  { $color = 'Green' }
+        elseif ($ln -match '^\s{4}\[-\]')                   { $color = 'DarkGray' }
+        elseif ($ln -match '^\s{2}RESULTADO\s+RESUELTO')    { $color = 'Green' }
+        elseif ($ln -match '^\s{2}RESULTADO\s+NO RESUELTO') { $color = 'Red' }
+        elseif ($ln -match '^\s{2}CAUSA\s')                 { $color = 'Magenta' }
+        elseif ($ln -match '^\s{2}OJO\s')                   { $color = 'Yellow' }
+        elseif ($ln -match '^\s{2}SE ARREGLO\s')            { $color = 'Green' }
+        elseif ($ln -match '^\s{2}IMPRESORA\s')             { $color = 'White' }
+        elseif ($ln -match '^\s{2}QUE HACER AHORA\s*$')     { $color = 'White' }
+        elseif ($ln -match '^\s{2}[A-Z][A-Z0-9 ()/:.]+$')   { $color = 'White' }
+        elseif ($ln -match 'NO IMPRIME')                    { $color = 'Red' }
+        elseif ($ln -match 'con problemas')                 { $color = 'Yellow' }
         Write-Host $ln -ForegroundColor $color
     }
 }
@@ -4164,11 +4521,14 @@ function Test-Preflight {
 # MAIN
 # ---------------------------------------------------------------------------
 function Invoke-FudoPrintDoctor {
-    Write-DoctorLog -Level 'INFO' -Message "Inicio FudoPrintDoctor (AutoFix=$AutoFix, DryRun=$DryRun, Interface=$Interface)"
+    # Se pregunta ANTES de arrancar el diagnostico: una vez que empieza el progreso en vivo,
+    # cualquier pregunta pisa la linea que se esta reescribiendo.
+    $script:RunMode = Resolve-RunMode
+    Write-DoctorLog -Level 'INFO' -Message "Inicio FudoPrintDoctor (AutoFix=$AutoFix, DryRun=$DryRun, Interface=$Interface, Modo=$($script:RunMode))"
 
     if (Test-IsInteractiveConsole) {
         Write-Host ''
-        Write-Host '  Revisando la cadena de impresion...' -ForegroundColor Cyan
+        Write-Host ('  Revisando la cadena de impresion (' + $(switch ($script:RunMode) { 'USB' { 'solo USB' } 'Red' { 'solo red' } default { 'USB y red' } }) + ')...') -ForegroundColor Cyan
         Write-Host ''
     }
 
@@ -4275,6 +4635,7 @@ function Invoke-FudoPrintDoctor {
         host          = $env:COMPUTERNAME
         timestamp     = (Get-Date).ToString('o')
         interface     = $detectedInterface
+        modo          = [string]$script:RunMode
         dryRun        = [bool]$DryRun
         autoFix       = [bool]$AutoFix
         printer       = $(if ($script:Diagnostics.Contains('printer')) { $script:Diagnostics['printer'] } else { $null })
@@ -4727,6 +5088,234 @@ function Invoke-SelfTest {
     Assert-Eq 'S51 llena colas para la telemetria' 1 (@($script:Diagnostics['colas'])).Count
     Assert-Eq 'S51 la cola es la matcheada' 'CAJA' ([string]@($script:Diagnostics['colas'])[0].nombre)
     $PrinterName = $script:__pn
+
+    # Escenario 52 (v3.9): salio el papel pero el historial dice que Fudo nunca mando una
+    # comanda. Antes cerraba resolved=true y la corrida siguiente de esa PC volvia como
+    # sigue_fallando con usoPrevio = imprimio_pero_no_comandas_de_fudo.
+    Reset-State
+    Add-Check -Id 'conn.usb' -Layer 3 -Name 'Puerto USB desmapeado' -Status 'fixed' -RootCauseCandidate $true
+    Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica de impresion' -Status 'ok'
+    Add-Check -Id 'fudo.usoReal' -Layer 5 -Name 'Ninguna cola recibio comandas de Fudo en el historial' -Status 'warn' -RootCauseCandidate $true -Plane 'fudo_config'
+    $d52 = Resolve-Diagnosis
+    Assert-Eq 'S52 no cierra si Fudo nunca mando una comanda' $false ([bool]$d52.resolved)
+    Assert-Eq 'S52 deja constancia de que salio el papel' $true ([bool]$d52.paperOk)
+    Assert-Eq 'S52 la causa apunta al uso real' 'fudo.usoReal' ([string]$d52.rootCauseCheckId)
+    Assert-Eq 'S52 escala' $true ([bool]$d52.needsEscalation)
+
+    # Escenario 52b: con el historial confirmando que Fudo manda comandas, si cierra (no se
+    # rompio el camino a resolved que se valido en campo con v3.8).
+    Reset-State
+    Add-Check -Id 'conn.usb' -Layer 3 -Name 'Puerto USB desmapeado' -Status 'fixed' -RootCauseCandidate $true
+    Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica de impresion' -Status 'ok'
+    Add-Check -Id 'fudo.usoReal' -Layer 5 -Name 'Fudo le manda comandas a: CAJA' -Status 'ok' -Plane 'fudo_config'
+    $d52b = Resolve-Diagnosis
+    Assert-Eq 'S52b cierra cuando Fudo si manda comandas' $true ([bool]$d52b.resolved)
+    Assert-Eq 'S52b marca el papel' $true ([bool]$d52b.paperOk)
+
+    # Escenario 52c (probado contra hardware real): la Nativa apagada porque Fudo esta cerrado
+    # NO puede impedir el cierre. Es un native messaging host: lo levanta el navegador cuando
+    # hace falta. Si esto bloqueara, ningun caso diagnosticado con Fudo cerrado podria cerrar.
+    Reset-State
+    Add-Check -Id 'conn.usb' -Layer 3 -Name 'Puerto USB desmapeado' -Status 'fixed' -RootCauseCandidate $true
+    Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica de impresion' -Status 'ok'
+    Add-Check -Id 'env.fudoApp' -Layer 0 -Name 'La App Nativa de Fudo no esta corriendo ahora' -Status 'warn' -RootCauseCandidate $false
+    Add-Check -Id 'nativa.installed' -Layer 0 -Name 'App Nativa de Fudo instalada (no corre ahora: arranca con Fudo)' -Status 'warn' -RootCauseCandidate $false
+    Add-Check -Id 'fudo.usoReal' -Layer 5 -Name 'Fudo le manda comandas a: CAJA' -Status 'ok' -Plane 'fudo_config'
+    $d52c = Resolve-Diagnosis
+    Assert-Eq 'S52c la Nativa apagada no impide cerrar' $true ([bool]$d52c.resolved)
+
+    # Escenario 52d: que la Nativa no este INSTALADA si bloquea (sin ella no hay cadena).
+    Reset-State
+    Add-Check -Id 'conn.usb' -Layer 3 -Name 'Puerto USB desmapeado' -Status 'fixed' -RootCauseCandidate $true
+    Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica de impresion' -Status 'ok'
+    Add-Check -Id 'nativa.installed' -Layer 0 -Name 'App Nativa de Fudo NO instalada' -Status 'fail' -RootCauseCandidate $true -Plane 'fudo_config'
+    $d52d = Resolve-Diagnosis
+    Assert-Eq 'S52d sin la Nativa instalada no cierra' $false ([bool]$d52d.resolved)
+    Assert-Eq 'S52d y la causa es la Nativa ausente' 'nativa.installed' ([string]$d52d.rootCauseCheckId)
+
+    # Escenario 52e: el historial apagado (plano 'os') no alcanza como evidencia para bloquear.
+    Reset-State
+    Add-Check -Id 'conn.usb' -Layer 3 -Name 'Puerto USB desmapeado' -Status 'fixed' -RootCauseCandidate $true
+    Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica de impresion' -Status 'ok'
+    Add-Check -Id 'fudo.usoReal' -Layer 5 -Name 'Historial de impresion no disponible' -Status 'warn' -Plane 'os'
+    $d52e = Resolve-Diagnosis
+    Assert-Eq 'S52e sin historial no se bloquea el cierre' $true ([bool]$d52e.resolved)
+
+    # Escenario 53 (v3.9, pedido de un asesor): cliente que imprime por RED. Las colas de red
+    # estan sanas y no hay hardware USB; el diagnostico USB no puede ganar como causa raiz.
+    Reset-State
+    $script:Diagnostics['printer'] = [ordered]@{ name='COMANDA'; driver='Generic / Text Only'; port='IP_192.168.1.230' }
+    $script:Diagnostics['colas'] = @(
+        [ordered]@{ nombre='COMANDA'; puerto='IP_192.168.1.230'; esDePrueba=$false; score=0; estado='sana' },
+        [ordered]@{ nombre='CAJA';    puerto='IP_192.168.1.235'; esDePrueba=$false; score=0; estado='sana' }
+    )
+    Add-Check -Id 'hw.deviceConnected' -Layer 1 -Name 'Ninguna impresora fisica conectada (Administrador de dispositivos)' -Status 'fail' -RootCauseCandidate $true -Plane 'hardware'
+    Add-Check -Id 'fudo.printerRegistered' -Layer 5 -Name 'No se pudo verificar la impresora registrada en Fudo' -Status 'warn' -RootCauseCandidate $true -Plane 'fudo_config'
+    $d53 = Resolve-Diagnosis
+    Assert-Eq 'S53 el diagnostico USB no gana en cliente de red' $false ([string]$d53.rootCauseCheckId -eq 'hw.deviceConnected')
+    Assert-Eq 'S53 la causa pasa a la capa que si aplica' 'fudo.printerRegistered' ([string]$d53.rootCauseCheckId)
+    Assert-Eq 'S53 deja registro del modo red' $true ([bool]$script:Diagnostics.Contains('modoRedDetectado'))
+
+    # Escenario 53b: con la impresora objetivo en USB, el diagnostico USB sigue ganando.
+    Reset-State
+    $script:Diagnostics['printer'] = [ordered]@{ name='COCINA'; driver='Generic / Text Only'; port='USB001' }
+    $script:Diagnostics['colas'] = @(
+        [ordered]@{ nombre='COCINA'; puerto='USB001'; esDePrueba=$false; score=30; estado='con problemas' }
+    )
+    Add-Check -Id 'hw.deviceConnected' -Layer 1 -Name 'Ninguna impresora fisica conectada (Administrador de dispositivos)' -Status 'fail' -RootCauseCandidate $true -Plane 'hardware'
+    $d53b = Resolve-Diagnosis
+    Assert-Eq 'S53b en USB la causa de hardware se mantiene' 'hw.deviceConnected' ([string]$d53b.rootCauseCheckId)
+    Assert-Eq 'S53b no marca modo red' $false ([bool]$script:Diagnostics.Contains('modoRedDetectado'))
+
+    # Escenario 54 (v3.9): el motivo del salteo y los ids de accion tienen que sobrevivir al
+    # payload reducido de telemetria. Con {id,status,layer} no se podia auditar nada de capa 4.
+    Reset-State
+    Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica de impresion' -Status 'skipped' -Evidence @{ note = 'sin impresora real objetivo'; skipReason = 'sin_impresora' }
+    Add-Check -Id 'env.spooler' -Layer 0 -Name 'Servicio de cola de impresion' -Status 'ok'
+    Add-Action -Type 'testprint.retarget' -Target 'CAJA' -Before 'COCINA' -After 'CAJA'
+    $reducidos54 = @(ConvertTo-TelemetryChecks -Checks @($script:Checks))
+    Assert-Eq 'S54 el motivo del salteo viaja' 'sin_impresora' ([string]@($reducidos54 | Where-Object { $_.id -eq 'hw.testprint' })[0].skipReason)
+    Assert-Eq 'S54 un check sin motivo no inventa el campo' $false ([bool]@($reducidos54 | Where-Object { $_.id -eq 'env.spooler' })[0].Contains('skipReason'))
+    Assert-Eq 'S54 los ids de accion estan disponibles' 'testprint.retarget' ((@($script:Actions | ForEach-Object { [string]$_.type })) -join ',')
+
+    # Escenario 55 (v3.9): reconocer un puerto de red en todas las formas en que Windows lo
+    # nombra. El motor tiene que saber cual cola es de red para poder acotar el modo.
+    Reset-State
+    Assert-Eq 'S55 IP_ es red'        $true  (Test-IsNetworkPort -PortName 'IP_192.168.1.230')
+    Assert-Eq 'S55 IP pelada es red'  $true  (Test-IsNetworkPort -PortName '192.168.1.230')
+    Assert-Eq 'S55 9100 es red'       $true  (Test-IsNetworkPort -PortName 'COMANDA_9100')
+    Assert-Eq 'S55 WSD es red'        $true  (Test-IsNetworkPort -PortName 'WSD-fedd4304-37e2-467d-91c1-bdce0e2ec1e9')
+    Assert-Eq 'S55 USB no es red'     $false (Test-IsNetworkPort -PortName 'USB001')
+    Assert-Eq 'S55 LPT no es red'     $false (Test-IsNetworkPort -PortName 'LPT1:')
+    Assert-Eq 'S55 vacio no es red'   $false (Test-IsNetworkPort -PortName '')
+
+    # Escenario 56 (v3.9, caso real 52564e5e): el cliente imprime por red y ademas tiene una
+    # inkjet USB desconectada. En modo Red la inkjet "enferma" no puede ganar la eleccion.
+    Reset-State
+    $script:PresentIdsOk = $true
+    $script:Diagnostics['livePorts'] = @()
+    $script:Diagnostics['hwDeviceCount'] = 0
+    $script:__modo56 = $script:RunMode
+    $script:RunMode = 'Red'
+    function Get-Printer { @(
+        [pscustomobject]@{ Name='HP DeskJet 2130'; DriverName='HP DeskJet'; PortName='USB001' },
+        [pscustomobject]@{ Name='COMANDA';         DriverName='Generic / Text Only'; PortName='IP_192.168.123.100' }
+    ) }
+    function Get-CimInstance { [pscustomobject]@{ WorkOffline=$false; PrinterState=0 } }
+    function Get-PrintJob { @() }
+    $t56 = Resolve-TargetPrinter
+    Assert-Eq 'S56 en modo Red elige la de red' 'COMANDA' $(if ($t56) { [string]$t56.Name } else { '' })
+    Assert-Eq 'S56 avisa que descarto la USB' $true ([bool]((Get-CheckById 'printer.modeFilter') -ne $null))
+    Assert-Eq 'S56 la telemetria igual ve las dos colas' 2 (@($script:Diagnostics['colas'])).Count
+    $script:RunMode = $script:__modo56
+
+    # Escenario 56b: el mismo parque de impresoras en modo USB elige la USB.
+    Reset-State
+    $script:PresentIdsOk = $true
+    $script:Diagnostics['livePorts'] = @()
+    $script:Diagnostics['hwDeviceCount'] = 0
+    $script:__modo56b = $script:RunMode
+    $script:RunMode = 'USB'
+    function Get-Printer { @(
+        [pscustomobject]@{ Name='HP DeskJet 2130'; DriverName='HP DeskJet'; PortName='USB001' },
+        [pscustomobject]@{ Name='COMANDA';         DriverName='Generic / Text Only'; PortName='IP_192.168.123.100' }
+    ) }
+    function Get-CimInstance { [pscustomobject]@{ WorkOffline=$false; PrinterState=0 } }
+    function Get-PrintJob { @() }
+    $t56b = Resolve-TargetPrinter
+    Assert-Eq 'S56b en modo USB elige la USB' 'HP DeskJet 2130' $(if ($t56b) { [string]$t56b.Name } else { '' })
+    $script:RunMode = $script:__modo56b
+
+    # Escenario 56c: si no hay ninguna del tipo elegido, no se deja el diagnostico vacio.
+    Reset-State
+    $script:PresentIdsOk = $true
+    $script:Diagnostics['livePorts'] = @()
+    $script:Diagnostics['hwDeviceCount'] = 0
+    $script:__modo56c = $script:RunMode
+    $script:RunMode = 'Red'
+    function Get-Printer { @([pscustomobject]@{ Name='COCINA'; DriverName='Generic / Text Only'; PortName='USB001' }) }
+    function Get-CimInstance { [pscustomobject]@{ WorkOffline=$false; PrinterState=0 } }
+    function Get-PrintJob { @() }
+    $t56c = Resolve-TargetPrinter
+    Assert-Eq 'S56c sin impresoras del modo igual diagnostica' 'COCINA' $(if ($t56c) { [string]$t56c.Name } else { '' })
+    Assert-Eq 'S56c y lo avisa' 'warn' ([string](Get-CheckById 'printer.modeFilter').status)
+    $script:RunMode = $script:__modo56c
+
+    # Escenario 57 (v3.9): en modo Red la falta de hardware USB es lo esperado, no una falla.
+    # Es lo que producia "Ninguna impresora fisica conectada" en locales que imprimen por IP.
+    Reset-State
+    $script:__modo57 = $script:RunMode
+    $script:RunMode = 'Red'
+    function Get-UsbPrintDevices { @() }
+    function Get-ProblemPrinterDevices { @() }
+    function Get-PrinterPort { @() }
+    function Get-Printer { @([pscustomobject]@{ Name='COMANDA'; DriverName='Generic / Text Only'; PortName='IP_192.168.1.230' }) }
+    $null = Test-Layer1a-HardwareInventory
+    Assert-Eq 'S57 no marca falla de hardware USB' 'skipped' ([string](Get-CheckById 'hw.deviceConnected').status)
+    Assert-Eq 'S57 deja el motivo' 'modo_red' ([string](Get-CheckById 'hw.deviceConnected').evidence.skipReason)
+    Assert-Eq 'S57 no es causa raiz' $false ([bool](Get-CheckById 'hw.deviceConnected').rootCauseCandidate)
+    $script:RunMode = $script:__modo57
+
+    # Escenario 58 (v3.9): dos candidatas en la MISMA capa. Sort-Object no es estable, asi que
+    # la causa raiz salia en orden arbitrario: se vio el resumen mostrando la reparacion
+    # intentada ("Exclusion preventiva de Defender") en vez del hallazgo que la motivo.
+    Reset-State
+    Add-Check -Id 'nativa.installed' -Layer 0 -Name 'App Nativa de Fudo instalada pero NO esta corriendo' -Status 'warn' -RootCauseCandidate $true -Plane 'fudo_config'
+    Add-Check -Id 'nativa.defenderExclusion' -Layer 0 -Name 'La App Nativa no esta corriendo y Defender puede estar bloqueandola' -Status 'warn' -RootCauseCandidate $true
+    $d58 = Resolve-Diagnosis
+    Assert-Eq 'S58 gana el hallazgo detectado primero' 'nativa.installed' ([string]$d58.rootCauseCheckId)
+    Assert-Eq 'S58 el seq se registra en orden' '0,1' ((@($script:Checks | ForEach-Object { [string]$_.seq })) -join ',')
+
+    # Escenario 58b: el mismo par en el orden inverso de deteccion respeta ese orden.
+    Reset-State
+    Add-Check -Id 'nativa.defenderExclusion' -Layer 0 -Name 'La App Nativa no esta corriendo y Defender puede estar bloqueandola' -Status 'warn' -RootCauseCandidate $true
+    Add-Check -Id 'nativa.installed' -Layer 0 -Name 'App Nativa de Fudo instalada pero NO esta corriendo' -Status 'warn' -RootCauseCandidate $true -Plane 'fudo_config'
+    $d58b = Resolve-Diagnosis
+    Assert-Eq 'S58b sigue ganando el primero detectado' 'nativa.defenderExclusion' ([string]$d58b.rootCauseCheckId)
+
+    # Escenario 58c: una capa mas baja le sigue ganando a una mas alta aunque se detecte despues.
+    Reset-State
+    Add-Check -Id 'fudo.printerRegistered' -Layer 5 -Name 'No se pudo verificar la impresora en Fudo' -Status 'warn' -RootCauseCandidate $true -Plane 'fudo_config'
+    Add-Check -Id 'env.spooler' -Layer 0 -Name 'Servicio de cola de impresion detenido' -Status 'fail' -RootCauseCandidate $true
+    $d58c = Resolve-Diagnosis
+    Assert-Eq 'S58c la capa manda sobre el orden' 'env.spooler' ([string]$d58c.rootCauseCheckId)
+
+    # Escenario 59 (v3.9, primer caso contra hardware real): una sola Xprinter XP-410B
+    # enchufada se reportaba como "Impresoras fisicas detectadas: 2", porque Windows la
+    # representa con dos nodos (el device USB padre y su interfaz USBPRINT hija) y el dedup
+    # solo miraba instanceId. Inflaba cantidadHardware en la telemetria y el resumen listaba
+    # una segunda impresora "sin puerto asignado" que no existe.
+    Reset-State
+    Assert-Eq 'S59 normaliza el nombre' 'xprinterxp410b' (Get-DeviceNameKey -Name 'Xprinter XP-410B')
+    Assert-Eq 'S59 tolera variantes de escritura' (Get-DeviceNameKey -Name 'XPrinter XP410B') (Get-DeviceNameKey -Name 'Xprinter XP-410B')
+    # La forma exacta del par observado en una PC con la impresora enchufada: el nodo USBPRINT
+    # hijo (unico que trae PortName) y el nodo USB padre con VID/PID y numero de serie.
+    $f59 = @(Merge-DuplicateDevices -Devices @(
+        [ordered]@{ source='registry.USBPRINT'; name='Xprinter XP-410B'; instanceId='USBPRINT\XprinterXP-410B\6&0&USB002'; portName='USB002'; status='enumerado'; problem=0 },
+        [ordered]@{ source='Win32_PnPEntity';   name='Xprinter XP-410B'; instanceId='USB\VID_2D37&PID_8327\SERIE'; portName=''; status='OK'; problem=0 }
+    ))
+    Assert-Eq 'S59 una impresora se cuenta una vez' 1 (@($f59)).Count
+    Assert-Eq 'S59 sobrevive la que tiene puerto' 'USB002' ([string]@($f59)[0].portName)
+
+    # Escenario 59b: dos impresoras iguales de verdad, cada una con su puerto, siguen siendo dos.
+    $f59b = @(Merge-DuplicateDevices -Devices @(
+        [ordered]@{ name='Xprinter XP-410B'; instanceId='USBPRINT\A\1'; portName='USB001' },
+        [ordered]@{ name='Xprinter XP-410B'; instanceId='USBPRINT\B\1'; portName='USB002' }
+    ))
+    Assert-Eq 'S59b dos impresoras reales siguen siendo dos' 2 (@($f59b)).Count
+
+    # Escenario 59c: dos modelos distintos, ninguno con puerto, no se fusionan entre si.
+    $f59c = @(Merge-DuplicateDevices -Devices @(
+        [ordered]@{ name='Xprinter XP-410B'; instanceId='USB\A'; portName='' },
+        [ordered]@{ name='3nStar RPT008';    instanceId='USB\B'; portName='' }
+    ))
+    Assert-Eq 'S59c modelos distintos sin puerto se conservan' 2 (@($f59c)).Count
+
+    # Escenario 59d: un device sin nombre no se pierde por no tener con que compararlo.
+    $f59d = @(Merge-DuplicateDevices -Devices @(
+        [ordered]@{ name=''; instanceId='USB\SINNOMBRE'; portName='' }
+    ))
+    Assert-Eq 'S59d sin nombre no se descarta' 1 (@($f59d)).Count
 
     # Escenario 24 (caso real): caja tapada con miles de trabajos + cocina sana.
     # Antes se elegia la primera cola y se devolvia "todo ok" ignorando la que fallaba.
@@ -5792,6 +6381,22 @@ function Save-TelemetryUrl {
     }
 }
 
+function ConvertTo-TelemetryChecks {
+    <#
+      Version reducida de los checks para el payload de telemetria.
+      v3.9: antes era solo {id, status, layer} y se perdia el skipReason que la 3.7 ya calculaba.
+      En la planilla habia hw.testprint=skipped sin ningun motivo posible de auditar.
+    #>
+    param($Checks)
+    return @(@($Checks) | ForEach-Object {
+        $c = [ordered]@{ id = [string]$_.id; status = [string]$_.status; layer = $_.layer }
+        $sr = ''
+        try { if ($_.evidence) { $sr = [string]$_.evidence.skipReason } } catch {}
+        if ($sr) { $c['skipReason'] = $sr }
+        $c
+    })
+}
+
 function Send-Telemetry {
     <#
       Manda el resultado a un endpoint para no depender de que el asesor guarde el JSON.
@@ -5827,6 +6432,7 @@ function Send-Telemetry {
                 host          = [string]$Result.host
                 timestamp     = [string]$Result.timestamp
                 interface     = [string]$Result.interface
+                modo          = [string]$Result.modo
                 dryRun        = [bool]$Result.dryRun
                 rootCause     = [string]$Result.diagnosis.rootCause
                 rootCauseCheckId = [string]$Result.diagnosis.rootCauseCheckId
@@ -5842,11 +6448,15 @@ function Send-Telemetry {
                     $t['cantidadColas'] = @($colasCliente).Count
                     $t['cantidadHardware'] = @($(if ($script:Diagnostics.Contains('printersConnected')) { $script:Diagnostics['printersConnected'] } else { @() })).Count
                     $t['historialFudo'] = @($(if ($script:Diagnostics.Contains('historialImpresion')) { $script:Diagnostics['historialImpresion'].porImpresora } else { @() }))
+                    # v3.9: los ids de accion (testprint.retarget, queue.rebind, ...) no viajaban:
+                    # autoFixesApplied solo trae los textos humanos de las reparaciones. Sin esto
+                    # no habia forma de auditar en la planilla si una ruta nueva se ejecuto.
+                    $t['acciones'] = @($script:Actions | ForEach-Object { [string]$_.type } | Where-Object { $_ })
                     $t['entorno'] = $Result.entorno
                     $t
                 )
                 entorno       = $Result.entorno
-                checks        = @($Result.checks | ForEach-Object { [ordered]@{ id = [string]$_.id; status = [string]$_.status; layer = $_.layer } })
+                checks        = @(ConvertTo-TelemetryChecks -Checks $Result.checks)
             }
         }
         $body = $payload | ConvertTo-Json -Depth 8 -Compress
