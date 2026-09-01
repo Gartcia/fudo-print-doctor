@@ -442,7 +442,7 @@ $script:TestPrinterRx = '(?i)^FUDO-TEST-'
 # puerto tenga hardware; si el hardware se va, deja de serlo (ver Remove-OrphanOwnQueues).
 $script:OwnQueueRx   = '(?i)^FUDO-(TEST-|USB\d)'
 $script:TestDocRx    = '(?i)fudo print doctor'
-$script:SchemaVersion = '3.10'
+$script:SchemaVersion = '3.11'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -487,8 +487,10 @@ $script:StepPlan = [ordered]@{
     'layer3.network'            = 'Conexion de red'
     'layer4.hardwarePrint'      = 'Prueba de impresion'
     'layer5.fudoConfig'         = 'Configuracion de Fudo'
+    'final.rescan'              = 'Estado final de las impresoras'
+    'final.otherQueues'         = 'Comandas encoladas'
 }
-$script:StepTotal   = 9      # usb y red son excluyentes
+$script:StepTotal   = 11     # usb y red son excluyentes
 $script:StepIndex   = 0
 $script:StepLabel   = ''
 $script:StepNote    = ''
@@ -1958,7 +1960,7 @@ function Get-GenericTextDriverName {
     $drivers = @()
     try { $drivers = @(Get-PrinterDriver -ErrorAction Stop | ForEach-Object { [string]$_.Name }) } catch {}
     foreach ($d in $drivers) {
-        if ($d -match '(?i)generic|gen[eé]rico' -and $d -match '(?i)text|texto') { return $d }
+        if ($d -match '(?i)generic|gen[e\xe9]rico' -and $d -match '(?i)text|texto') { return $d }
     }
     return ''
 }
@@ -2365,10 +2367,18 @@ function Get-PrinterQueues {
         $jobs = @()
         try { $jobs = @(Get-PrintJob -PrinterName $nombre -ErrorAction Stop) } catch {}
         $masViejo = ''
+        # Minutos que lleva esperando el trabajo mas viejo (-1 = no se pudo saber). La fecha
+        # formateada sirve para el resumen en pantalla; para decidir si una cola esta trabada
+        # hace falta el numero: una rafaga recien encolada drena sola, 93 trabajos de hace tres
+        # horas no.
+        $minViejo = -1
         if (@($jobs).Count -gt 0) {
             try {
                 $t = @($jobs | Where-Object { $_.SubmittedTime } | Sort-Object SubmittedTime | Select-Object -First 1)
-                if (@($t).Count -gt 0) { $masViejo = ([datetime]@($t)[0].SubmittedTime).ToString('dd/MM HH:mm') }
+                if (@($t).Count -gt 0) {
+                    $masViejo = ([datetime]@($t)[0].SubmittedTime).ToString('dd/MM HH:mm')
+                    $minViejo = [int]((Get-Date) - [datetime]@($t)[0].SubmittedTime).TotalMinutes
+                }
             } catch {}
         }
 
@@ -2386,6 +2396,7 @@ function Get-PrinterQueues {
             nombre = $nombre; puerto = $puerto; driver = [string]$q.DriverName
             esDePrueba = [bool]($nombre -match $script:TestPrinterRx)
             offline = $offline; pausada = $pausada; trabajos = @($jobs).Count; trabajoMasViejo = $masViejo
+            minutosMasViejo = [int]$minViejo
             puertoVivo = [bool]$puertoVivo; esPos = (Test-IsPosPrinter $q)
             score = $score; sintomas = @($sintomas)
             estado = $(if ($score -eq 0) { 'sana' } elseif ($score -ge 40) { 'no imprime' } else { 'con problemas' })
@@ -2570,7 +2581,7 @@ function Test-Layer1a-HardwareInventory {
             if ($yaHay) {
                 Add-Check -Id 'hw.noPortBound' -Layer 1 -Name 'Puerto USB asignado (la cola que ya existia sirve)' -Status 'fixed' -RootCauseCandidate $true -Plane 'os' `
                     -Evidence @{ impresoras = $sinPuerto; puertoNuevo = @($devPorts); colaAdoptada = [string]$yaHay.Name } `
-                    -ActionTaken ([string]$bind.nota + " | se adoptó la cola existente '" + [string]$yaHay.Name + "'") -Reversible $true `
+                    -ActionTaken ([string]$bind.nota + " | se adopto la cola existente '" + [string]$yaHay.Name + "'") -Reversible $true `
                     -ArticleRef 'https://soporte.fu.do/es/articles/11730817' `
                     -Recommendation ("Windows no le habia asignado puerto USB a la impresora: se reinicio el dispositivo y quedo en $puertoNuevo. " +
                                      "Ya existia la cola '$([string]$yaHay.Name)' apuntando a ese puerto, asi que NO se creo ninguna cola nueva: se usa esa. " +
@@ -3107,6 +3118,126 @@ function Test-Layer2-Queue {
         Add-Check -Id 'queue.health' -Layer 2 -Name 'Cola de impresion' -Status 'warn' `
             -Evidence @{ jobs = @($jobs).Count; note = 'trabajos presentes pero no evidentemente trabados' }
     }
+}
+
+function Test-Layer2-OtherQueuesBacklog {
+    <#
+      v3.11: la capa 2 solo miraba la cola OBJETIVO. En una PC del parque, BARRA
+      [192.168.0.17] tenia 93 trabajos sin drenar y COCINA [192.168.0.50] otros 13, y la causa
+      raiz que gano fue "Ninguna impresora fisica conectada" teniendo una POS-80 en LPT1: sana.
+      El mismo caso lo cerro un asesor a mano preguntando "cola de impresion?".
+      Una cola del cliente con comandas encoladas que nadie drena es un sintoma de primera
+      clase, y ademas es el sintoma que MAS informacion trae: si Fudo llego a encolar comandas,
+      el problema no esta en la configuracion de Fudo sino en esa cola o en su impresora.
+    #>
+    param($Printer)
+    $objetivo = ''
+    if ($Printer) { $objetivo = [string]$Printer.Name }
+    $colas = @()
+    try { if ($script:Diagnostics.Contains('colas')) { $colas = @($script:Diagnostics['colas']) } } catch {}
+    $delCliente = @($colas | Where-Object { -not $_.esDePrueba })
+    $conTrabajos = @($delCliente | Where-Object {
+        ([string]$_.nombre -ne $objetivo) -and ([int]$_.trabajos -ge 3)
+    })
+    if (@($conTrabajos).Count -eq 0) {
+        Add-Check -Id 'queue.otherBacklog' -Layer 2 -Name 'Ninguna otra cola con comandas acumuladas' -Status 'ok' `
+            -Evidence @{ colasRevisadas = @($delCliente).Count; objetivo = $objetivo }
+        return
+    }
+
+    # Trabada = acumula Y el trabajo mas viejo lleva rato esperando. Si el mas viejo es
+    # reciente puede ser una rafaga drenando, asi que queda en 'warn' y no bloquea el cierre.
+    $trabadas = @($conTrabajos | Where-Object { [int]$_.minutosMasViejo -ge 5 })
+    # Si el puerto de la cola trabada sigue sirviendo (esta vivo, o no es un USB), entonces el
+    # veredicto "no hay ninguna impresora conectada" es demostrablemente falso: hay una cola
+    # real recibiendo comandas. Eso es lo que habilita bajar de rango al diagnostico USB.
+    $puertoUtil = (@($trabadas | Where-Object {
+        [bool]$_.puertoVivo -or ([string]$_.puerto -notmatch '^(?i)USB\d+')
+    }).Count -gt 0)
+
+    $lista = @($conTrabajos | ForEach-Object {
+        [string]$_.nombre + ' [' + [string]$_.puerto + ']: ' + [int]$_.trabajos + ' trabajo(s) sin imprimir' +
+        $(if ([string]$_.trabajoMasViejo) { ' (el mas viejo del ' + [string]$_.trabajoMasViejo + ')' } else { '' })
+    })
+    $peor = @($conTrabajos | Sort-Object -Property @{ Expression = { [int]$_.trabajos }; Descending = $true })[0]
+
+    Add-Check -Id 'queue.otherBacklog' -Layer 2 `
+        -Name ('Otra cola con comandas acumuladas que no salen: ' + [string]$peor.nombre + ' (' + [int]$peor.trabajos + ' trabajos)') `
+        -Status $(if (@($trabadas).Count -gt 0) { 'fail' } else { 'warn' }) -RootCauseCandidate $true -Plane 'os' `
+        -Evidence @{ colas = @($lista); conTrabajos = @($conTrabajos).Count; trabadas = @($trabadas).Count
+                     puertoUtil = [bool]$puertoUtil; objetivo = $objetivo } `
+        -ArticleRef 'https://soporte.fu.do/es/articles/11730815' `
+        -Recommendation ('Hay comandas encoladas que no salen en: ' + ($lista -join ' | ') +
+                         '. Que Fudo las haya encolado prueba que el problema NO es la configuracion de Fudo, sino esa cola o su impresora. Revisar esa impresora (encendida, con papel, en linea y no pausada) y despues limpiar la cola: Get-PrintJob -PrinterName ''' + [string]$peor.nombre + ''' | Remove-PrintJob. Si esa es la impresora de comandas del local, volver a correr el diagnostico apuntando a ella con -PrinterName ''' + [string]$peor.nombre + '''.')
+}
+
+function Update-PrintInventory {
+    <#
+      v3.11: el veredicto se armaba con la foto de la capa 1, tomada ANTES de reparar. Una
+      impresora que el motor acababa de poner en linea seguia contando como offline, una cola
+      que acababa de purgar seguia contando como trabada, y un puerto recien re-bindeado seguia
+      figurando sin dispositivo. Todo eso llegaba asi a la pantalla y a la telemetria.
+      Aca se vuelve a leer el estado real: se invalida el cache de presencia de dispositivos, se
+      re-mapea que puertos tienen algo enchufado y se releen todas las colas con sus trabajos.
+      Es solo lectura: no repara ni toca nada.
+    #>
+    $previas = @()
+    try { if ($script:Diagnostics.Contains('colas')) { $previas = @($script:Diagnostics['colas']) } } catch {}
+    $script:Diagnostics['colasIniciales'] = @($previas)
+
+    # El cache de InstanceIds presentes es de antes del re-bind: hay que tirarlo.
+    $script:PresentIds   = $null
+    $script:PresentIdsOk = $false
+    $devices = @()
+    try { $devices = @(Get-UsbPrintDevices) } catch {}
+    # Get-UsbPrintDevices deja el cache de presencia armado al pasar por Get-PresentDeviceIds.
+    # Si no llego a hacerlo, se vuelve a pedir explicitamente: con PresentIdsOk en false
+    # Test-PortHasLiveDevice contesta siempre "hay algo detras del puerto" -es su regla de no
+    # inventar desconexiones-, y el re-escaneo dejaria de ver justo los puertos que quedaron
+    # vacios, que es la mitad de para lo que existe.
+    if (-not $script:PresentIdsOk) { $null = Get-PresentDeviceIds }
+    $script:Diagnostics['livePorts'] = @(@($devices | Where-Object { $_.portName } |
+        ForEach-Object { [string]$_.portName }) | Select-Object -Unique)
+    $script:Diagnostics['hwDeviceCount'] = @($devices).Count
+
+    $colas = @()
+    try { $colas = @(Get-PrinterQueues) } catch {}
+    $script:Diagnostics['colas'] = @($colas)
+
+    $delCliente = @($colas | Where-Object { -not $_.esDePrueba })
+    $rotas = @($delCliente | Where-Object { [int]$_.score -gt 0 })
+    $sanas = @($delCliente | Where-Object { [int]$_.score -eq 0 })
+    Set-StepNote ("$(@($sanas).Count) sana(s), $(@($rotas).Count) con problemas")
+
+    # Cuantas dejaron de estar rotas respecto de la foto inicial: es la medida directa de si las
+    # reparaciones sirvieron, y hasta ahora no se podia calcular.
+    $rotasAntes = @(@($previas | Where-Object { -not $_.esDePrueba -and [int]$_.score -gt 0 }) |
+        ForEach-Object { [string]$_.nombre })
+    $rotasAhora = @($rotas | ForEach-Object { [string]$_.nombre })
+    $mejoraron  = @($rotasAntes | Where-Object { $rotasAhora -notcontains $_ })
+    $script:Diagnostics['colasQueMejoraron'] = @($mejoraron)
+
+    $detalle = @($rotas | ForEach-Object {
+        [string]$_.nombre + ' [' + [string]$_.puerto + ']: ' + (@($_.sintomas) -join ', ')
+    })
+
+    if (@($rotas).Count -eq 0) {
+        Add-Check -Id 'printer.coverage' -Layer 1 `
+            -Name ('Todas las impresoras del cliente quedaron en condiciones de imprimir (' + @($sanas).Count + ')') -Status 'ok' -Plane 'os' `
+            -Evidence @{ sanas = @($sanas | ForEach-Object { [string]$_.nombre }); rotas = @(); mejoraron = @($mejoraron) }
+    } else {
+        # Informativo a proposito: NO bloquea el cierre ni compite como causa raiz. Un local
+        # puede tener una impresora vieja apagada que no tiene nada que ver con las comandas.
+        # Lo que si bloquea es una cola con comandas encoladas sin drenar (queue.otherBacklog).
+        Add-Check -Id 'printer.coverage' -Layer 1 `
+            -Name ('Quedan ' + @($rotas).Count + ' de ' + @($delCliente).Count + ' impresoras del cliente sin poder imprimir') `
+            -Status 'warn' -RootCauseCandidate $false -Plane 'os' `
+            -Evidence @{ rotas = @($detalle); sanas = @($sanas | ForEach-Object { [string]$_.nombre }); mejoraron = @($mejoraron) } `
+            -Recommendation ('Despues de todo lo que hizo el motor, estas colas siguen sin poder imprimir: ' +
+                             ($detalle -join ' | ') +
+                             '. Si alguna de estas es una impresora de comandas del local, volver a correr el diagnostico apuntando a ella con -PrinterName. Si son impresoras que el cliente ya no usa, conviene borrarlas para que dejen de ensuciar el diagnostico.')
+    }
+    return $colas
 }
 
 # ---------------------------------------------------------------------------
@@ -4099,6 +4230,21 @@ function Resolve-Diagnosis {
         })
     }
 
+    # v3.11: si una cola del cliente tiene comandas encoladas que no drenan y su puerto sigue
+    # sirviendo, el veredicto "no hay ninguna impresora conectada" es demostrablemente falso:
+    # alguien recibio esas comandas. Se vio una PC con BARRA [192.168.0.17] con 93 trabajos y
+    # COCINA [192.168.0.50] con 13 cerrando como hardware.no_conectada mientras tenia una
+    # POS-80 en LPT1: sana, y ese mismo caso lo resolvio un asesor a mano mirando la cola.
+    $backlog = $checks | Where-Object { $_.id -eq 'queue.otherBacklog' -and $_.status -eq 'fail' } | Select-Object -First 1
+    $backlogUtil = $false
+    try { if ($backlog) { $backlogUtil = [bool]$backlog.evidence.puertoUtil } } catch {}
+    if ($backlogUtil) {
+        $script:Diagnostics['colaAtascadaGana'] = @($backlog.evidence.colas)
+        $rootCandidates = @($rootCandidates | Where-Object {
+            $_.id -notin @('hw.deviceConnected','hw.disconnected','conn.usb')
+        })
+    }
+
     # Prioridad por capa (mas abajo primero: OS/HW antes que config); ante empate, el que se
     # detecto primero, para que la causa no cambie de una corrida a otra con los mismos datos.
     $ordered = @($rootCandidates | Sort-Object @{ Expression = { [int]$_.layer } }, @{ Expression = { [int]$_.seq } })
@@ -4117,27 +4263,38 @@ function Resolve-Diagnosis {
     # corrida siguiente de la misma PC volvia como sigue_fallando.
     # Ahora el unico camino a 'resuelto' es que la cadena imprima: hw.testprint en 'ok', que
     # desde 3.2 solo pasa si un humano confirmo que salio el papel.
-    # v3.9: que salga el papel no alcanza si la comanda de Fudo no llega a salir. Se vio una
-    # corrida cerrando resolved=true y volviendo como sigue_fallando 111 segundos despues, con
-    # usoPrevio = imprimio_pero_no_comandas_de_fudo. Sale papel de la prueba, no salen las
-    # comandas: el mismo falso positivo de siempre, ahora en la capa de Fudo.
-    #
     # La evidencia NO es que la Nativa este apagada: la Nativa es un native messaging host que
     # el navegador levanta cuando Fudo la necesita, asi que con Fudo cerrado estar apagada es lo
     # normal (probado en una PC real: sin Fudo abierto el proceso no existe). Tomarlo como
     # bloqueante habria impedido cerrar cualquier caso diagnosticado con Fudo cerrado.
-    # La evidencia real es el historial del spooler: ninguna cola recibio nunca una comanda de
-    # Fudo (fudo.usoReal en warn con plano fudo_config). Y que la Nativa no este INSTALADA si
-    # bloquea, porque sin ella no hay cadena posible.
-    $cadenaFudoRota = @($checks | Where-Object {
-        ($_.id -eq 'fudo.usoReal' -and $_.status -eq 'warn' -and $_.plane -eq 'fudo_config') -or
-        ($_.id -eq 'nativa.installed' -and $_.status -eq 'fail')
+    #
+    # v3.11 - CRITERIO DE CIERRE, decision de alcance. Lo que este motor diagnostica y repara es
+    # la cadena de impresion de WINDOWS: el caso cierra cuando la impresora imprime. Dos gates
+    # anteriores se sacan porque hacian que casi nada pudiera cerrar:
+    #  1) v3.9 exigia que el historial del spooler mostrara alguna comanda de Fudo
+    #     (fudo.usoReal). Eso vive en el backend de Fudo, no se puede verificar desde la PC del
+    #     cliente y por lo tanto iba a quedar pendiente SIEMPRE. Ahora no bloquea: baja la
+    #     confianza a 'medium' y se avisa en pantalla que falta ese tramo.
+    #  2) Se exigia @($fixed).Count -gt 0, o sea al menos una reparacion. Una PC que ya estaba
+    #     sana y donde el ticket de prueba salio bien NO podia cerrar: caia en "Hardware imprime
+    #     OK; causa probable en configuracion de Fudo". Si imprime, esta OK, se haya tocado algo
+    #     o no.
+    # Lo que sigue bloqueando: cualquier check en 'fail' (ahi entra la Nativa no instalada, la
+    # cola atascada, el puerto sin dispositivo) y que no haya confirmacion humana de que salio
+    # el papel (hw.testprint distinto de 'ok').
+    $fudoSinUso = @($checks | Where-Object {
+        $_.id -eq 'fudo.usoReal' -and $_.status -eq 'warn' -and $_.plane -eq 'fudo_config'
     })
     $paperOk = [bool]($hwTest -and $hwTest.status -eq 'ok')
 
-    if (@($fixed).Count -gt 0 -and @($fails).Count -eq 0 -and $paperOk -and @($cadenaFudoRota).Count -eq 0) {
-        $resolved = $true; $confidence = 'high'
-        $rootCause = ($fixed | Sort-Object { $_.layer } | Select-Object -First 1).name
+    if (@($fails).Count -eq 0 -and $paperOk) {
+        $resolved = $true
+        $confidence = $(if (@($fudoSinUso).Count -gt 0) { 'medium' } else { 'high' })
+        $rootCause = $(if (@($fixed).Count -gt 0) {
+                ($fixed | Sort-Object { $_.layer } | Select-Object -First 1).name
+            } else {
+                'La impresora ya imprimia bien desde Windows: el ticket de prueba salio sin necesidad de reparar nada'
+            })
     }
 
     if (-not $resolved) {
@@ -4163,13 +4320,34 @@ function Resolve-Diagnosis {
         ($_.status -in @('fail','warn')) -and ($_.plane -eq 'fudo_config' -or ($_.rootCauseCandidate -and $_.status -eq 'fail'))
     } | ForEach-Object { @{ id = $_.id; name = $_.name; plane = $_.plane; recommendation = $_.recommendation; articleRef = $_.articleRef } })
 
-    $needsEscalation = (-not $resolved) -or (@($residual).Count -gt 0)
+    # v3.11: needsEscalation era SIEMPRE $true, y con eso ninguna corrida podia salir con
+    # status 'resolved'. $residual toma cualquier check en warn con plano 'fudo_config', y la
+    # capa 5 agrega cuatro (fudo.printerRegistered, fudo.printerKitchen, fudo.categoryKitchen,
+    # fudo.rooms) que nacen en 'warn' por construccion: no se pueden verificar desde la PC del
+    # cliente, hacen falta la web app de Fudo o su backend. Lo que se vio en la planilla fueron
+    # 5 filas con resolved=true y status=needs_escalation a la vez: la columna "resuelto"
+    # sumaba, el asesor leia ESCALAR en pantalla, y el bloque "que resolvio" -que mira status-
+    # quedaba vacio desde el dia uno del proyecto.
+    # Ahora hay una sola fuente de verdad: si el caso cerro, no se escala, y el status se
+    # decide aca y no en tres lugares distintos. $residual sigue viajando por lo que es: la
+    # lista informativa de lo que igual conviene revisar en Fudo.
+    $needsEscalation = (-not $resolved)
+    $status = $(if ($resolved) { 'resolved' }
+                elseif (@($script:Errors).Count -gt 0) { 'partial_engine_error' }
+                else { 'needs_escalation' })
 
     $diag = [ordered]@{
         resolved        = $resolved
+        # Unico lugar donde se decide el status del caso. La telemetria, el historial local y
+        # el codigo de salida lo leen de aca.
+        status          = $status
         # Salio el papel de la prueba fisica, aunque el caso no cierre. Distingue "no imprime
         # nada" de "imprime, pero la comanda de Fudo todavia no sale".
         paperOk         = $paperOk
+        # El historial del spooler esta disponible y no muestra ni una comanda de Fudo. No
+        # impide cerrar (es config del backend de Fudo, fuera del alcance del motor) pero hay
+        # que decirlo: es el tramo que queda por confirmar despues de que el papel salga.
+        fudoSinUso      = [bool](@($fudoSinUso).Count -gt 0)
         rootCause       = $rootCause
         rootCauseCheckId = $(if (@($ordered).Count -gt 0) { [string]$ordered[0].id }
                               elseif ($resolved -and @($fixed).Count -gt 0) { [string](@($fixed | Sort-Object { $_.layer })[0].id) }
@@ -4256,6 +4434,10 @@ function Get-NextActions {
 function Get-Category {
     param($Diag)
     # Categorizacion para telemetria: permite agrupar los casos por causa
+    # v3.11: una PC que ya estaba sana y donde el ticket salio bien ahora cierra. Sin este caso
+    # la causa ("...salio sin necesidad de reparar nada") caia en el regex de 'fisic' y se
+    # contaba como un problema de hardware.
+    if ([bool]$Diag.resolved -and @($Diag.autoFixesApplied).Count -eq 0) { return 'ok.ya_funcionaba' }
     $rc = [string]$Diag.rootCause
     switch -Regex ($rc) {
         'DESCONECTADA|esta desconectada|sin dispositivo' { return 'hardware.desconectada' }
@@ -4527,6 +4709,13 @@ function Build-HumanSummary {
     else { Add-Line ("  RESULTADO    NO RESUELTO AUTOMATICAMENTE  (confianza $conf)") }
     if ($target) { Add-Line ("  IMPRESORA    $target") }
     Add-Field -Label 'CAUSA' -Text ([string]$Diag.rootCause)
+    # El caso cierra porque la impresora imprime, que es lo que este motor arregla. Pero si el
+    # historial de Windows no muestra ni una comanda de Fudo, falta el ultimo tramo y el asesor
+    # tiene que saberlo antes de dar el caso por terminado con el cliente.
+    if ($Diag.resolved -and $Diag.fudoSinUso) {
+        Add-Field -Label 'FALTA' -Text ('la impresora YA IMPRIME, pero en el historial de Windows no hay ninguna comanda de Fudo todavia. ' +
+                                        'Confirmar en Fudo que esta impresora este dada de alta con su cocina/area y mandar una comanda de prueba.')
+    }
     # Salio el papel pero el caso no cierra: sin esto se lee como si no hubiera imprimido nada.
     if ($Diag.paperOk -and -not $Diag.resolved) {
         Add-Field -Label 'OJO' -Text 'la prueba SI imprimio papel; lo que falta es la cadena de Fudo'
@@ -4781,6 +4970,16 @@ function Invoke-FudoPrintDoctor {
         }
     }
 
+    # Re-lectura final: el veredicto y la telemetria tienen que salir del estado en el que
+    # queda la PC, no de la foto de la capa 1. Va DESPUES de limpiar las colas de prueba, para
+    # que las propias del motor no entren en el conteo, y antes de decidir la causa raiz.
+    # El chequeo de comandas encoladas se corre aca por lo mismo: si el motor purgo la cola
+    # trabada, ya no tiene que bloquear el cierre.
+    if ($envOk -and -not $script:AbortByMode) {
+        $null = Invoke-Step -Name 'final.rescan'      -Body { Update-PrintInventory }
+        $null = Invoke-Step -Name 'final.otherQueues' -Body { Test-Layer2-OtherQueuesBacklog -Printer $printer }
+    }
+
     if (Test-IsInteractiveConsole) { Write-Host '' }
 
     $diag = Resolve-Diagnosis
@@ -4791,9 +4990,7 @@ function Invoke-FudoPrintDoctor {
         schemaVersion = $script:SchemaVersion
         updateAvailable = [string]$script:UpdateNote
         telemetria    = $script:TelemetryStatus
-        status        = $(if ($diag.resolved -and -not $diag.needsEscalation) { 'resolved' }
-                          elseif (@($script:Errors).Count -gt 0) { 'partial_engine_error' }
-                          else { 'needs_escalation' })
+        status        = [string]$diag.status
         caseId        = $CaseId
         clientId      = $ClientId
         host          = $env:COMPUTERNAME
@@ -4808,7 +5005,7 @@ function Invoke-FudoPrintDoctor {
             $h = Invoke-Step -Name 'env.history' -Body { Get-LocalRunHistory }
             if (-not $h) { $h = [ordered]@{ corridas = 0; ultimoStatus = ''; ultimaCausa = ''; ultimaFecha = '' } }
             $nro = ([int]$h.corridas + 1)
-            $st = $(if ($diag.resolved -and -not $diag.needsEscalation) { 'resolved' } elseif (@($script:Errors).Count -gt 0) { 'partial_engine_error' } else { 'needs_escalation' })
+            $st = [string]$diag.status
             $trans = 'primera'
             if ([int]$h.corridas -gt 0) {
                 if ($st -eq 'resolved' -and [string]$h.ultimoStatus -ne 'resolved') { $trans = 'se_resolvio' }
@@ -4899,13 +5096,20 @@ function Invoke-SelfTest {
     Assert-Eq 'S2 resuelto' $true $d.resolved
     Assert-Eq 'S2 categoria' 'os.usb_port' (Get-Category -Diag $d)
 
-    # Escenario 3: nada roto en OS + HW ok => no resuelto, apunta a config Fudo
+    # Escenario 3 (revisado en v3.11): nada roto en OS + el papel salio. Hasta la 3.10 esto
+    # NO cerraba y se escalaba a "config de Fudo", porque el criterio exigia al menos una
+    # reparacion aplicada y ademas los chequeos de capa 5 -que nacen en 'warn' porque solo se
+    # verifican en la web app de Fudo- forzaban el escalamiento. Con el criterio de la 3.11 la
+    # impresora imprime desde Windows, que es lo que este motor arregla: el caso cierra.
+    # Lo de Fudo sigue listado como lo que hay que revisar, pero ya no impide cerrar.
     Reset-State
     Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica' -Status 'ok' -Plane 'hardware'
     Add-Check -Id 'fudo.printerKitchen' -Layer 5 -Name 'Impresora con Cocina/Area asignada' -Status 'warn' -Plane 'fudo_config'
     $d = Resolve-Diagnosis
-    Assert-Eq 'S3 escalado' $true $d.needsEscalation
-    Assert-Eq 'S3 categoria' 'fudo_config' (Get-Category -Diag $d)
+    Assert-Eq 'S3 cierra: imprime desde Windows' $true $d.resolved
+    Assert-Eq 'S3 no escala' $false $d.needsEscalation
+    Assert-Eq 'S3 categoria' 'ok.ya_funcionaba' (Get-Category -Diag $d)
+    Assert-Eq 'S3 pero deja lo de Fudo para revisar' 1 (@($d.residualEscalation | Where-Object { $_.id -eq 'fudo.printerKitchen' })).Count
 
     # Escenario 4: impresora de red inalcanzable => no resuelto, net.ip, escalado
     Reset-State
@@ -5254,18 +5458,44 @@ function Invoke-SelfTest {
     Assert-Eq 'S51 la cola es la matcheada' 'CAJA' ([string]@($script:Diagnostics['colas'])[0].nombre)
     $PrinterName = $script:__pn
 
-    # Escenario 52 (v3.9): salio el papel pero el historial dice que Fudo nunca mando una
-    # comanda. Antes cerraba resolved=true y la corrida siguiente de esa PC volvia como
-    # sigue_fallando con usoPrevio = imprimio_pero_no_comandas_de_fudo.
+    # Escenario 52 (v3.9, revisado en v3.11): salio el papel pero el historial dice que Fudo
+    # nunca mando una comanda. La 3.9 lo tomaba como bloqueante del cierre; la 3.11 lo saca por
+    # alcance -lo que arregla el motor es que la impresora imprima en Windows; que este dada de
+    # alta en Fudo vive en el backend de Fudo, no se puede verificar desde la PC y por lo tanto
+    # iba a quedar pendiente siempre-. El caso cierra, con confianza 'medium' y avisando que
+    # falta ese tramo.
     Reset-State
     Add-Check -Id 'conn.usb' -Layer 3 -Name 'Puerto USB desmapeado' -Status 'fixed' -RootCauseCandidate $true
     Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica de impresion' -Status 'ok'
     Add-Check -Id 'fudo.usoReal' -Layer 5 -Name 'Ninguna cola recibio comandas de Fudo en el historial' -Status 'warn' -RootCauseCandidate $true -Plane 'fudo_config'
     $d52 = Resolve-Diagnosis
-    Assert-Eq 'S52 no cierra si Fudo nunca mando una comanda' $false ([bool]$d52.resolved)
+    Assert-Eq 'S52 cierra: la impresora imprime en Windows' $true ([bool]$d52.resolved)
     Assert-Eq 'S52 deja constancia de que salio el papel' $true ([bool]$d52.paperOk)
-    Assert-Eq 'S52 la causa apunta al uso real' 'fudo.usoReal' ([string]$d52.rootCauseCheckId)
-    Assert-Eq 'S52 escala' $true ([bool]$d52.needsEscalation)
+    Assert-Eq 'S52 pero no con confianza alta' 'medium' ([string]$d52.confidence)
+    Assert-Eq 'S52 y marca que falta el tramo de Fudo' $true ([bool]$d52.fudoSinUso)
+    Assert-Eq 'S52 no escala si cerro' $false ([bool]$d52.needsEscalation)
+    # El chequeo sigue vivo: aparece en la lista de lo que el asesor tiene que revisar en Fudo.
+    Assert-Eq 'S52 sigue en la lista de que revisar' 1 (@($d52.residualEscalation | Where-Object { $_.id -eq 'fudo.usoReal' })).Count
+
+    # Escenario 52f (v3.11): la PC ya estaba sana y el ticket de prueba salio. Antes NO cerraba,
+    # porque el criterio exigia al menos una reparacion aplicada: caia en "Hardware imprime OK;
+    # causa probable en configuracion de Fudo" y la corrida entraba como sigue_fallando.
+    Reset-State
+    Add-Check -Id 'printer.exists' -Layer 1 -Name 'Impresora instalada' -Status 'ok'
+    Add-Check -Id 'queue.health' -Layer 2 -Name 'Cola de impresion' -Status 'ok'
+    Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica de impresion' -Status 'ok'
+    Add-Check -Id 'fudo.usoReal' -Layer 5 -Name 'Fudo le manda comandas a: CAJA' -Status 'ok' -Plane 'fudo_config'
+    $d52f = Resolve-Diagnosis
+    Assert-Eq 'S52f si imprime, esta OK aunque no se haya reparado nada' $true ([bool]$d52f.resolved)
+    Assert-Eq 'S52f sin reparaciones que listar' 0 (@($d52f.autoFixesApplied)).Count
+    Assert-Eq 'S52f no se cuenta como problema de hardware' 'ok.ya_funcionaba' (Get-Category -Diag $d52f)
+
+    # Escenario 52g: si el papel NO salio, no cierra por mas que no haya nada roto.
+    Reset-State
+    Add-Check -Id 'printer.exists' -Layer 1 -Name 'Impresora instalada' -Status 'ok'
+    Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica de impresion' -Status 'skipped'
+    $d52g = Resolve-Diagnosis
+    Assert-Eq 'S52g sin papel confirmado no cierra' $false ([bool]$d52g.resolved)
 
     # Escenario 52b: con el historial confirmando que Fudo manda comandas, si cierra (no se
     # rompio el camino a resolved que se valido en campo con v3.8).
@@ -5276,6 +5506,8 @@ function Invoke-SelfTest {
     $d52b = Resolve-Diagnosis
     Assert-Eq 'S52b cierra cuando Fudo si manda comandas' $true ([bool]$d52b.resolved)
     Assert-Eq 'S52b marca el papel' $true ([bool]$d52b.paperOk)
+    Assert-Eq 'S52b con el historial a favor, confianza alta' 'high' ([string]$d52b.confidence)
+    Assert-Eq 'S52b no falta nada de Fudo' $false ([bool]$d52b.fudoSinUso)
 
     # Escenario 52c (probado contra hardware real): la Nativa apagada porque Fudo esta cerrado
     # NO puede impedir el cierre. Es un native messaging host: lo levanta el navegador cuando
@@ -5295,6 +5527,7 @@ function Invoke-SelfTest {
     Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica de impresion' -Status 'ok'
     Add-Check -Id 'nativa.installed' -Layer 0 -Name 'App Nativa de Fudo NO instalada' -Status 'fail' -RootCauseCandidate $true -Plane 'fudo_config'
     $d52d = Resolve-Diagnosis
+    # Sigue bloqueando, pero ahora por la regla general (es un 'fail'), no por un gate propio.
     Assert-Eq 'S52d sin la Nativa instalada no cierra' $false ([bool]$d52d.resolved)
     Assert-Eq 'S52d y la causa es la Nativa ausente' 'nativa.installed' ([string]$d52d.rootCauseCheckId)
 
@@ -5522,6 +5755,165 @@ function Invoke-SelfTest {
     Assert-Eq 'S61 sin version no se afirma nada' $true ($null -eq $v61e.firmada)
     $v61f = Get-NativaVersionState -Install @{ regInfo = @([ordered]@{ name='Fudo'; version='no-es-version' }) }
     Assert-Eq 'S61 version ilegible tampoco' $true ($null -eq $v61f.firmada)
+
+    # Escenario 62 (v3.11): los 4 chequeos de capa 5 que nacen en 'warn' por construccion
+    # (solo se pueden verificar en la web app de Fudo) hacian que needsEscalation fuera SIEMPRE
+    # true. Y como el status se armaba con (resolved -and -not needsEscalation), ninguna corrida
+    # podia salir 'resolved': se vieron 5 filas con resolved=true y status=needs_escalation a la
+    # vez, la columna "resuelto" sumando y el bloque "que resolvio" vacio.
+    Reset-State
+    Add-Check -Id 'conn.usb' -Layer 3 -Name 'Puerto USB desmapeado' -Status 'fixed' -RootCauseCandidate $true
+    Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica' -Status 'ok' -Plane 'hardware'
+    Add-Check -Id 'fudo.usoReal' -Layer 5 -Name 'Fudo le manda comandas a: CAJA' -Status 'ok' -Plane 'fudo_config'
+    foreach ($idc62 in @('fudo.printerRegistered','fudo.printerKitchen','fudo.categoryKitchen','fudo.rooms')) {
+        Add-Check -Id $idc62 -Layer 5 -Name 'Verificable solo en la web app de Fudo' -Status 'warn' -Plane 'fudo_config'
+    }
+    $d62 = Resolve-Diagnosis
+    Assert-Eq 'S62 cierra el caso' $true ([bool]$d62.resolved)
+    Assert-Eq 'S62 el status lo dice' 'resolved' ([string]$d62.status)
+    Assert-Eq 'S62 y entonces no escala' $false ([bool]$d62.needsEscalation)
+    # Que no escale no borra la lista: los 4 de capa 5 siguen viajando como informativos.
+    Assert-Eq 'S62 igual deja que revisar en Fudo' $true (@($d62.residualEscalation).Count -ge 4)
+
+    # Escenario 62b: si no cierra, escala, y el status es el mismo dato.
+    Reset-State
+    Add-Check -Id 'printer.exists' -Layer 1 -Name 'Sin impresora real instalada' -Status 'fail' -RootCauseCandidate $true
+    $d62b = Resolve-Diagnosis
+    Assert-Eq 'S62b no cierra' $false ([bool]$d62b.resolved)
+    Assert-Eq 'S62b status coherente' 'needs_escalation' ([string]$d62b.status)
+    Assert-Eq 'S62b escala' $true ([bool]$d62b.needsEscalation)
+
+    # Escenario 63 (v3.11, caso real): la capa 2 solo miraba la cola OBJETIVO. En una PC con
+    # BARRA [192.168.0.17] acumulando 93 trabajos y COCINA [192.168.0.50] otros 13, gano como
+    # causa "Ninguna impresora fisica conectada" teniendo una POS-80 en LPT1: sana. Un asesor
+    # cerro ese mismo caso a mano preguntando "cola de impresion?".
+    Reset-State
+    $script:Diagnostics['colas'] = @(
+        [ordered]@{ nombre='POS-80'; puerto='LPT1:';            esDePrueba=$false; score=0;  estado='sana';       trabajos=0;  minutosMasViejo=-1;  trabajoMasViejo='';            puertoVivo=$true },
+        [ordered]@{ nombre='BARRA';  puerto='IP_192.168.0.17';  esDePrueba=$false; score=40; estado='no imprime'; trabajos=93; minutosMasViejo=180; trabajoMasViejo='31/08 19:05'; puertoVivo=$false },
+        [ordered]@{ nombre='COCINA'; puerto='IP_192.168.0.50';  esDePrueba=$false; score=40; estado='no imprime'; trabajos=13; minutosMasViejo=95;  trabajoMasViejo='31/08 20:30'; puertoVivo=$false }
+    )
+    Test-Layer2-OtherQueuesBacklog -Printer ([pscustomobject]@{ Name='POS-80' })
+    $c63 = Get-CheckById 'queue.otherBacklog'
+    Assert-Eq 'S63 la cola atascada de otra impresora se levanta' 'fail' ([string]$c63.status)
+    Assert-Eq 'S63 es candidata a causa raiz' $true ([bool]$c63.rootCauseCandidate)
+    Assert-Eq 'S63 nombra la peor cola' $true ([bool]([string]$c63.name -match 'BARRA'))
+    Assert-Eq 'S63 cuenta las dos colas con trabajos' 2 ([int]$c63.evidence.conTrabajos)
+    Add-Check -Id 'hw.deviceConnected' -Layer 1 -Name 'Ninguna impresora fisica conectada (Administrador de dispositivos)' -Status 'fail' -RootCauseCandidate $true
+    $d63 = Resolve-Diagnosis
+    Assert-Eq 'S63 el veredicto USB ya no gana' 'queue.otherBacklog' ([string]$d63.rootCauseCheckId)
+    Assert-Eq 'S63 categoria' 'os.queue' (Get-Category -Diag $d63)
+    Assert-Eq 'S63 no cierra con comandas sin salir' $false ([bool]$d63.resolved)
+
+    # Escenario 63b: la cola objetivo no se cuenta dos veces (ya la mira Test-Layer2-Queue), y
+    # una cola con 1 o 2 trabajos no es un atasco.
+    Reset-State
+    $script:Diagnostics['colas'] = @(
+        [ordered]@{ nombre='CAJA';   puerto='USB001'; esDePrueba=$false; score=40; estado='no imprime'; trabajos=50; minutosMasViejo=200; trabajoMasViejo='31/08 18:00'; puertoVivo=$true },
+        [ordered]@{ nombre='COCINA'; puerto='USB002'; esDePrueba=$false; score=10; estado='con problemas'; trabajos=2; minutosMasViejo=1; trabajoMasViejo='31/08 21:00'; puertoVivo=$true }
+    )
+    Test-Layer2-OtherQueuesBacklog -Printer ([pscustomobject]@{ Name='CAJA' })
+    Assert-Eq 'S63b la cola objetivo no se duplica' 'ok' ([string](Get-CheckById 'queue.otherBacklog').status)
+
+    # Escenario 63c: una rafaga recien encolada puede estar drenando sola. Queda en warn (se
+    # informa y compite como causa) pero no bloquea el cierre como un atasco de hace horas.
+    Reset-State
+    $script:Diagnostics['colas'] = @(
+        [ordered]@{ nombre='CAJA';   puerto='USB001'; esDePrueba=$false; score=0;  estado='sana'; trabajos=0; minutosMasViejo=-1; trabajoMasViejo=''; puertoVivo=$true },
+        [ordered]@{ nombre='COCINA'; puerto='USB002'; esDePrueba=$false; score=40; estado='no imprime'; trabajos=4; minutosMasViejo=1; trabajoMasViejo='31/08 21:00'; puertoVivo=$true }
+    )
+    Test-Layer2-OtherQueuesBacklog -Printer ([pscustomobject]@{ Name='CAJA' })
+    Assert-Eq 'S63c una rafaga reciente no es atasco' 'warn' ([string](Get-CheckById 'queue.otherBacklog').status)
+    Assert-Eq 'S63c y no baja de rango el diagnostico USB' $false ([bool](Get-CheckById 'queue.otherBacklog').evidence.puertoUtil)
+
+    # Escenario 63d: las colas de prueba del propio motor no cuentan como atasco del cliente.
+    Reset-State
+    $script:Diagnostics['colas'] = @(
+        [ordered]@{ nombre='FUDO-TEST-USB001'; puerto='USB001'; esDePrueba=$true; score=40; estado='no imprime'; trabajos=9; minutosMasViejo=30; trabajoMasViejo='31/08 20:00'; puertoVivo=$true }
+    )
+    Test-Layer2-OtherQueuesBacklog -Printer ([pscustomobject]@{ Name='CAJA' })
+    Assert-Eq 'S63d la cola de prueba propia no cuenta' 'ok' ([string](Get-CheckById 'queue.otherBacklog').status)
+
+    # Escenario 64 (v3.11): una corrida que aborta mandaba a la planilla
+    # checks: [{"id":"","status":"","layer":null}] y autoFixesApplied: [null], porque
+    # @($null) es un array de un elemento nulo. Ese ruido entraba como si fuera un check real.
+    Reset-State
+    Assert-Eq 'S64 sin checks no se inventa ninguno' 0 (@(ConvertTo-TelemetryChecks -Checks $null)).Count
+    Assert-Eq 'S64 un array vacio tampoco' 0 (@(ConvertTo-TelemetryChecks -Checks @())).Count
+    Add-Check -Id 'env.spooler' -Layer 0 -Name 'Spooler' -Status 'ok'
+    Assert-Eq 'S64 los checks reales si viajan' 1 (@(ConvertTo-TelemetryChecks -Checks @($script:Checks))).Count
+    Assert-Eq 'S64 con su id' 'env.spooler' ([string]@(ConvertTo-TelemetryChecks -Checks @($script:Checks))[0].id)
+
+
+    # Escenario 65 (v3.11): el veredicto salia de la foto de la capa 1, tomada ANTES de reparar.
+    # Una impresora que el motor acababa de poner en linea seguia contando como offline y una
+    # cola recien purgada seguia contando como trabada, en pantalla y en la telemetria.
+    # Aca: CAJA estaba offline y con 40 trabajos al empezar; al re-escanear quedo sana.
+    Reset-State
+    $script:Diagnostics['colas'] = @(
+        [ordered]@{ nombre='CAJA';   puerto='USB001'; esDePrueba=$false; score=65; estado='no imprime'; trabajos=40; minutosMasViejo=90; trabajoMasViejo='01/09 08:00'; puertoVivo=$true; offline=$true;  pausada=$false; sintomas=@('40 trabajos encolados','marcada como sin conexion (offline)') },
+        [ordered]@{ nombre='COCINA'; puerto='USB002'; esDePrueba=$false; score=0;  estado='sana';       trabajos=0;  minutosMasViejo=-1; trabajoMasViejo='';            puertoVivo=$true; offline=$false; pausada=$false; sintomas=@() }
+    )
+    $script:PresentIdsOk = $true
+    function Get-UsbPrintDevices {
+        @([ordered]@{ source='registry.USBPRINT'; name='POS-80'; instanceId='USBPRINT\POS80'; portName='USB001'; status='enumerado'; problem=0 },
+          [ordered]@{ source='registry.USBPRINT'; name='POS-58'; instanceId='USBPRINT\POS58'; portName='USB002'; status='enumerado'; problem=0 })
+    }
+    function Get-Printer { @(
+        [pscustomobject]@{ Name='CAJA';   DriverName='Generic / Text Only'; PortName='USB001' },
+        [pscustomobject]@{ Name='COCINA'; DriverName='Generic / Text Only'; PortName='USB002' }
+    ) }
+    function Get-CimInstance { [pscustomobject]@{ WorkOffline=$false; PrinterState=0 } }
+    function Get-PrintJob { @() }
+    $r65 = @(Update-PrintInventory)
+    Assert-Eq 'S65 relee las colas del cliente' 2 (@($r65)).Count
+    Assert-Eq 'S65 CAJA ya no figura rota' 0 ([int](@($r65 | Where-Object { $_.nombre -eq 'CAJA' })[0].score))
+    Assert-Eq 'S65 la cobertura queda en ok' 'ok' ([string](Get-CheckById 'printer.coverage').status)
+    Assert-Eq 'S65 registra que CAJA mejoro' 'CAJA' ((@($script:Diagnostics['colasQueMejoraron'])) -join ',')
+    Assert-Eq 'S65 guarda la foto inicial para comparar' 2 (@($script:Diagnostics['colasIniciales'])).Count
+    # Y re-mapea que puertos tienen algo enchufado (antes quedaba el cache del arranque).
+    Assert-Eq 'S65 refresca los puertos con dispositivo' 'USB001,USB002' ((@($script:Diagnostics['livePorts'])) -join ',')
+
+    # Escenario 65b: si despues de todo queda una impresora sin poder imprimir, se dice -pero no
+    # bloquea el cierre: un local puede tener una impresora vieja apagada que no es la de comandas.
+    Reset-State
+    $script:PresentIdsOk = $true
+    function Get-UsbPrintDevices { @([ordered]@{ source='registry.USBPRINT'; name='POS-80'; instanceId='USBPRINT\POS80'; portName='USB002'; status='enumerado'; problem=0 }) }
+    function Get-Printer { @(
+        [pscustomobject]@{ Name='VIEJA';  DriverName='Generic / Text Only'; PortName='USB001' },
+        [pscustomobject]@{ Name='COCINA'; DriverName='Generic / Text Only'; PortName='USB002' }
+    ) }
+    function Get-CimInstance { [pscustomobject]@{ WorkOffline=$false; PrinterState=0 } }
+    function Get-PrintJob { @() }
+    $null = Update-PrintInventory
+    $c65b = Get-CheckById 'printer.coverage'
+    Assert-Eq 'S65b avisa que queda una sin poder imprimir' 'warn' ([string]$c65b.status)
+    Assert-Eq 'S65b la nombra' $true ([bool]([string]@($c65b.evidence.rotas)[0] -match 'VIEJA'))
+    Assert-Eq 'S65b no compite como causa raiz' $false ([bool]$c65b.rootCauseCandidate)
+    Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica de impresion' -Status 'ok'
+    $d65b = Resolve-Diagnosis
+    Assert-Eq 'S65b y no impide cerrar si la de comandas imprime' $true ([bool]$d65b.resolved)
+
+    # Escenario 65c: la cola de prueba del propio motor no cuenta como impresora del cliente.
+    Reset-State
+    $script:PresentIdsOk = $true
+    function Get-UsbPrintDevices { @([ordered]@{ source='registry.USBPRINT'; name='POS-80'; instanceId='USBPRINT\POS80'; portName='USB001'; status='enumerado'; problem=0 }) }
+    function Get-Printer { @(
+        [pscustomobject]@{ Name='FUDO-TEST-USB001'; DriverName='Generic / Text Only'; PortName='USB001' },
+        [pscustomobject]@{ Name='COCINA';           DriverName='Generic / Text Only'; PortName='USB001' }
+    ) }
+    function Get-CimInstance { [pscustomobject]@{ WorkOffline=$false; PrinterState=0 } }
+    function Get-PrintJob { @() }
+    $null = Update-PrintInventory
+    Assert-Eq 'S65c no cuenta la cola de prueba del motor' $true ([bool]([string](Get-CheckById 'printer.coverage').name -match 'imprimir \(1\)'))
+
+
+    # Escenario 66 (v3.11): el self-test nunca puede escribir en la planilla. Se descubrio
+    # solo: un error dentro del self-test sale al catch global, y ese catch manda telemetria.
+    # Entro una fila engine_error de una corrida que jamas toco una impresora.
+    Reset-State
+    Assert-Eq 'S66 el self-test no manda telemetria' $false ([bool](Send-Telemetry -Result @{ status = 'resolved' }))
+    Assert-Eq 'S66 y deja dicho por que' 'no se envia: corrida de self-test' ([string]$script:TelemetryStatus.detalle)
 
     # Escenario 24 (caso real): caja tapada con miles de trabajos + cocina sana.
     # Antes se elegia la primera cola y se devolvia "todo ok" ignorando la que fallaba.
@@ -6070,7 +6462,7 @@ function Invoke-MenuAction {
                 Write-Host '  Desenchufa y volve a enchufar el USB de la impresora (encendida)...' -ForegroundColor Cyan
                 $puerto = Wait-ForPrinterReconnect -TimeoutSec $ReconnectTimeoutSec
                 Write-Host ''
-                if ($puerto) { Write-Host ("  Apareció una impresora en " + $puerto) -ForegroundColor Green }
+                if ($puerto) { Write-Host ("  Aparecio una impresora en " + $puerto) -ForegroundColor Green }
                 else { Write-Host '  No se detecto ninguna impresora nueva.' -ForegroundColor Yellow }
             }
             $script:ForceWaitReconnect = $false
@@ -6594,7 +6986,10 @@ function ConvertTo-TelemetryChecks {
       En la planilla habia hw.testprint=skipped sin ningun motivo posible de auditar.
     #>
     param($Checks)
-    return @(@($Checks) | ForEach-Object {
+    # v3.11: sin el filtro, una corrida que abortaba mandaba checks: [{"id":"","status":"",
+    # "layer":null}] -- @($null) es un array de un elemento nulo-. Ese ruido llegaba a la
+    # planilla como si fuera un check real.
+    return @(@($Checks) | Where-Object { $_ -and [string]$_.id } | ForEach-Object {
         $c = [ordered]@{ id = [string]$_.id; status = [string]$_.status; layer = $_.layer }
         $sr = ''
         try { if ($_.evidence) { $sr = [string]$_.evidence.skipReason } } catch {}
@@ -6609,6 +7004,16 @@ function Send-Telemetry {
       Nunca corta el diagnostico: timeout corto y errores silenciados.
     #>
     param($Result)
+    # v3.11: el self-test no puede escribir en la planilla. Si algo explotaba adentro de
+    # -SelfTest, la excepcion salia al catch global y ese catch manda telemetria: entraba una
+    # fila engine_error de una corrida que nunca toco una impresora, con el host de quien estaba
+    # desarrollando. Ensucia el conteo y hace perder tiempo en la revision del dia siguiente.
+    if ($SelfTest) {
+        $script:TelemetryStatus = [ordered]@{
+            enviada = $false; detalle = 'no se envia: corrida de self-test'; url = ''; dondeBusco = @()
+        }
+        return $false
+    }
     $url = Get-TelemetryUrl
     if ($url) { Save-TelemetryUrl -Url $url }
     if (-not $url) {
@@ -6645,7 +7050,26 @@ function Send-Telemetry {
                 resolved      = [bool]$Result.diagnosis.resolved
                 confidence    = [string]$Result.diagnosis.confidence
                 needsEscalation = [bool]$Result.diagnosis.needsEscalation
-                autoFixesApplied = @($Result.diagnosis.autoFixesApplied)
+                # Salio el papel de la prueba fisica, aunque el caso no cierre. Se calculaba
+                # desde la 3.9 y no viajaba: en la planilla no habia forma de separar "no sale
+                # nada" de "sale papel pero la comanda de Fudo todavia no".
+                paperOk       = [bool]$Result.diagnosis.paperOk
+                # Un engine_error sin esto era irrastreable: se vio una fila con status
+                # engine_error y ni el mensaje, ni la linea, ni el ultimo paso que corrio.
+                errorMotor    = $(
+                    if ($Result.error) {
+                        [ordered]@{
+                            mensaje     = [string]$Result.error.message
+                            tipo        = [string]$Result.error.type
+                            linea       = $Result.error.scriptLine
+                            comando     = [string]$Result.error.command
+                            stack       = [string]$Result.error.stack
+                            ultimoCheck = [string]$Result.telemetry.ultimoCheck
+                            ultimoPaso  = [string]$Result.telemetry.ultimoPaso
+                        }
+                    } else { $null }
+                )
+                autoFixesApplied = @(@($Result.diagnosis.autoFixesApplied) | Where-Object { $_ })
                 telemetry     = $(
                     $t = [ordered]@{}
                     try { foreach ($k in @($Result.telemetry.Keys)) { $t[$k] = $Result.telemetry[$k] } } catch {}
@@ -6653,6 +7077,9 @@ function Send-Telemetry {
                     $t['impresoras'] = @($colasCliente | ForEach-Object { [ordered]@{ nombre = $_.nombre; puerto = $_.puerto; estado = $_.estado; trabajos = $_.trabajos } })
                     $t['cantidadColas'] = @($colasCliente).Count
                     $t['cantidadHardware'] = @($(if ($script:Diagnostics.Contains('printersConnected')) { $script:Diagnostics['printersConnected'] } else { @() })).Count
+                    # Colas que estaban rotas al empezar y quedaron sanas al terminar. Es la
+                    # medida directa de si las reparaciones sirvieron, por cola y no por corrida.
+                    $t['colasQueMejoraron'] = @($(if ($script:Diagnostics.Contains('colasQueMejoraron')) { $script:Diagnostics['colasQueMejoraron'] } else { @() }))
                     $t['historialFudo'] = @($(if ($script:Diagnostics.Contains('historialImpresion')) { $script:Diagnostics['historialImpresion'].porImpresora } else { @() }))
                     # v3.9: los ids de accion (testprint.retarget, queue.rebind, ...) no viajaban:
                     # autoFixesApplied solo trae los textos humanos de las reparaciones. Sin esto
@@ -6662,7 +7089,9 @@ function Send-Telemetry {
                     $t
                 )
                 entorno       = $Result.entorno
-                checks        = @(ConvertTo-TelemetryChecks -Checks $Result.checks)
+                # Si el motor aborto, $Result.checks puede no existir: $script:Checks igual
+                # tiene todo lo que se alcanzo a diagnosticar antes del crash.
+                checks        = @(ConvertTo-TelemetryChecks -Checks $(if ($Result.checks) { $Result.checks } else { @($script:Checks) }))
             }
         }
         $body = $payload | ConvertTo-Json -Depth 8 -Compress
@@ -6824,7 +7253,7 @@ try {
     }
 
     if (@($script:Errors).Count -gt 0)                                   { exit 3 }
-    elseif ($final.diagnosis.resolved -and -not $final.diagnosis.needsEscalation) { exit 0 }
+    elseif ([string]$final.status -eq 'resolved')                        { exit 0 }
     else                                                                 { exit 2 }
 
 } catch {
@@ -6837,6 +7266,20 @@ try {
     try { $line  = [int]$_.InvocationInfo.ScriptLineNumber } catch {}
     try { $cmd   = ([string]$_.InvocationInfo.Line).Trim() } catch {}
     try { $stack = [string]$_.ScriptStackTrace } catch {}
+
+    # v3.11: una corrida que explota tiene que quedar rastreable. Se vio una fila con
+    # status=engine_error, pcId vacio, entorno null, corrida null, duracionMs 0,
+    # checks [{"id":""}] y autoFixesApplied [null]: no habia forma de saber en que PC fue, ni
+    # que se alcanzo a hacer, ni que fallo -- y esa corrida ya habia rebindeado un puerto USB y
+    # tocado una exclusion de Defender. Todo va con su propio try: aca ya explotamos una vez.
+    $pcIdErr = ''
+    try { $pcIdErr = [string](Get-PcId) } catch {}
+    $entornoErr = $null
+    try { $entornoErr = Get-EnvironmentInfo } catch {}
+    $duracionErr = 0
+    try { $duracionErr = [int]((Get-Date) - $script:StartTime).TotalMilliseconds } catch {}
+    $ultimoCheckErr = ''
+    try { if (@($script:Checks).Count -gt 0) { $ultimoCheckErr = [string](@($script:Checks)[-1].id) } } catch {}
 
     $human = New-Object System.Text.StringBuilder
     [void]$human.AppendLine("== FudoPrintDoctor ==")
@@ -6852,7 +7295,30 @@ try {
         caseId        = $CaseId
         clientId      = $ClientId
         host          = $env:COMPUTERNAME
+        pcId          = $pcIdErr
         timestamp     = (Get-Date).ToString('o')
+        entorno       = $entornoErr
+        checks        = @($script:Checks)
+        diagnosis     = [ordered]@{
+            resolved         = $false
+            status           = 'engine_error'
+            paperOk          = $false
+            rootCause        = ('El motor aborto: ' + $msg)
+            rootCauseCheckId = 'engine.fatal'
+            confidence       = 'low'
+            autoFixesApplied = @()
+            needsEscalation  = $true
+            engineErrorCount = (@($script:Errors).Count + 1)
+        }
+        telemetry     = [ordered]@{
+            durationMs    = $duracionErr
+            checksTotal   = @($script:Checks).Count
+            autoFixCount  = 0
+            accionesCount = @($script:Actions).Count
+            category      = 'engine_error'
+            ultimoCheck   = $ultimoCheckErr
+            ultimoPaso    = [string]$script:StepLabel
+        }
         error         = [ordered]@{
             message    = $msg
             type       = $type

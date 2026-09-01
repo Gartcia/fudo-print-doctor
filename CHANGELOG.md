@@ -2,6 +2,131 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.11] - 2026-09-01
+
+Primera revisión con las 120 filas de la planilla legibles de punta a punta. Lo que apareció fue
+que la métrica principal del proyecto —cuántos casos cierra el motor— **nunca midió nada**: el
+motor no podía cerrar un caso ni cuando lo resolvía. Esta versión redefine cuándo un caso está
+resuelto.
+
+### Cambiado
+- **Criterio de cierre: si la impresora imprime desde Windows, el caso está resuelto.** Eso es
+  lo que este motor diagnostica y repara. Se sacan dos condiciones que hacían que casi nada
+  pudiera cerrar:
+  - **Se exigía que el historial del spooler mostrara alguna comanda de Fudo** (`fudo.usoReal`,
+    gate de la 3.9). Eso vive en el backend de Fudo, no se puede verificar desde la PC del
+    cliente y por lo tanto **iba a quedar pendiente siempre**. Ahora no bloquea: el caso cierra
+    con confianza `media` en vez de `alta`, y el resumen agrega una línea **FALTA** diciendo que
+    la impresora ya imprime pero que todavía no hay ninguna comanda de Fudo en el historial —
+    hay que confirmar en Fudo que esté dada de alta con su cocina/área. El chequeo sigue vivo y
+    sigue apareciendo en lo que el asesor tiene que revisar.
+  - **Se exigía al menos una reparación aplicada.** Una PC que ya estaba sana y donde el ticket
+    de prueba salía bien **no podía cerrar**: caía en *"Hardware imprime OK; causa probable en
+    configuración de Fudo"* y la corrida entraba como `sigue_fallando`. Si imprime, está OK, se
+    haya tocado algo o no. Esos casos ahora cierran con categoría `ok.ya_funcionaba`.
+
+  *Lo que sigue bloqueando el cierre: cualquier chequeo en `fail` —ahí entran la Nativa no
+  instalada, la cola atascada, el puerto sin dispositivo— y que no haya confirmación humana de
+  que salió el papel.*
+
+### Corregido
+- **`resolved = true` y `status = needs_escalation` al mismo tiempo: el motor no podía cerrar un
+  caso.** `needsEscalation` se calculaba como "no cerró **o** quedó algo residual", y el residual
+  toma cualquier chequeo en `warn` con plano `fudo_config`. La capa 5 agrega cuatro
+  (`fudo.printerRegistered`, `printerKitchen`, `categoryKitchen`, `rooms`) que **nacen en `warn`
+  por construcción**: no se pueden verificar desde la PC, hacen falta la web app de Fudo o su
+  backend. O sea que `needsEscalation` era siempre `true`, y como el `status` se armaba con
+  `(resolved -and -not needsEscalation)`, **ninguna corrida podía salir `resolved`**.
+  En la telemetría se vieron 5 filas con las dos cosas a la vez: la columna `resuelto` sumaba,
+  el asesor leía ESCALAR en pantalla, y el bloque "qué resolvió" —que mira `status`— quedó vacío
+  desde el día uno del proyecto. Los "18 resueltos" del resumen incluían casos que el propio
+  motor mandaba a escalar.
+  Ahora hay **una sola fuente de verdad**: el `status` se decide en `Resolve-Diagnosis` y de ahí
+  lo leen la telemetría, el historial local de la PC y el código de salida.
+  *La columna "qué resolvió" empieza a llenarse y el % de resueltos por fin mide algo. Si el
+  número se mueve fuerte no es una regresión: antes medía humo.*
+- **Una cola atascada de otra impresora ya no queda invisible.** La capa 2 sólo miraba la cola
+  **objetivo**. En una PC del parque, `BARRA [192.168.0.17]` tenía **93 comandas** sin salir y
+  `COCINA [192.168.0.50]` otras 13, y la causa raíz que ganó fue *"Ninguna impresora física
+  conectada"* teniendo una `POS-80 [LPT1:]` sana. El mismo caso lo cerró un asesor a mano,
+  preguntando "¿cola de impresión?".
+  Ahora un chequeo nuevo (`queue.otherBacklog`) revisa **todas** las colas del cliente y levanta
+  las que acumulan 3 o más trabajos. Si además el trabajo más viejo lleva 5 minutos o más
+  esperando, entra como **causa raíz candidata y bloquea el cierre**; y si el puerto de esa cola
+  sigue sirviendo (está vivo, o no es un USB), el veredicto USB —`hw.deviceConnected`,
+  `hw.disconnected`, `conn.usb`— deja de poder ganar: si Fudo llegó a encolar comandas, decir
+  que no hay ninguna impresora conectada es demostrablemente falso. Una ráfaga recién encolada
+  queda en `warn` y no bloquea, porque puede estar drenando sola.
+  *Además invierte el diagnóstico: comandas encoladas prueban que Fudo **sí** está mandando, así
+  que el problema no está en la configuración de Fudo sino en esa cola o su impresora.*
+- **El veredicto se armaba con una foto vieja de la PC.** El inventario de impresoras y colas se
+  tomaba en la capa 1, **antes** de reparar, y nunca se volvía a leer. Una impresora que el motor
+  acababa de poner en línea seguía contando como offline, una cola que acababa de purgar seguía
+  contando como trabada, y un puerto recién re-bindeado seguía figurando sin dispositivo — en
+  pantalla, en el veredicto y en la telemetría.
+  Ahora hay un paso final de **re-escaneo** (`Update-PrintInventory`), después de limpiar las
+  colas de prueba y antes de decidir la causa raíz: invalida el caché de presencia de
+  dispositivos, vuelve a mapear qué puertos tienen algo enchufado y relee todas las colas con sus
+  trabajos. Es sólo lectura. El chequeo de comandas encoladas se corrió también al final, para
+  que una cola que el motor **sí** purgó deje de bloquear el cierre.
+- **Un error dentro de `-SelfTest` escribía en la planilla de telemetría.** Se descubrió solo,
+  desarrollando esta versión: una excepción adentro del self-test sale al `catch` global, y ese
+  `catch` manda telemetría. Entró una fila `engine_error` de una corrida que jamás tocó una
+  impresora, con el host de quien estaba desarrollando. Ahora `Send-Telemetry` corta de entrada
+  cuando la corrida es un self-test.
+- **Una corrida que explota ya no queda irrastreable.** Se vio una fila `engine_error` con `pcId`
+  vacío, `entorno` en `null`, `corrida` en `null`, `duracionMs = 0`,
+  `checks: [{"id":"","status":"","layer":null}]` y `autoFixesApplied: [null]` — y que sin embargo
+  ya había re-bindeado un puerto USB y tocado una exclusión de Defender antes de crashear, sin
+  dejar una línea de qué falló. La basura venía de que `@($null)` en PowerShell es un array de un
+  elemento nulo, y el payload reducido lo serializaba como si fuera un chequeo real.
+  Ahora el payload de `engine_error` lleva `pcId`, `entorno`, `duracionMs`, los chequeos que sí
+  se alcanzaron a hacer, y un bloque `errorMotor` con el mensaje, el tipo, la línea, el comando,
+  el stack, el último chequeo completado y el último paso que estaba corriendo. Los chequeos sin
+  `id` se descartan.
+
+### Agregado
+- **`paperOk` viaja en la telemetría.** Se calculaba desde la 3.9 y no salía de la PC. Es lo que
+  separa *"no sale nada"* de *"sale papel pero la comanda de Fudo todavía no"*, que son dos casos
+  con acciones opuestas.
+- **`fudoSinUso`**: marca las corridas que cerraron sin evidencia de que Fudo haya mandado nunca
+  una comanda. Permite medir cuántos cierres quedan a medio camino sin volver a bloquearlos.
+- **`printer.coverage`**: después del re-escaneo, dice cuántas de las impresoras del cliente
+  quedaron en condiciones de imprimir y cuáles no, con el síntoma de cada una. Es informativo a
+  propósito: no bloquea el cierre ni compite como causa raíz, porque un local puede tener una
+  impresora vieja apagada que no tiene nada que ver con las comandas.
+- **`colasQueMejoraron`**: las colas que estaban rotas al empezar y quedaron sanas al terminar.
+  Es la medida directa de si las reparaciones sirvieron, por cola y no por corrida — hasta ahora
+  no se podía calcular con nada de lo que llegaba a la planilla.
+- **Antigüedad real de los trabajos en cola.** `Get-PrinterQueues` ahora devuelve
+  `minutosMasViejo` además de la fecha formateada: sin el número no se puede distinguir una
+  ráfaga que drena sola de 93 trabajos parados desde hace tres horas.
+
+### Interno
+- **El `.ps1` quedó 100% ASCII**, como pide la regla del proyecto. Quedaban tres caracteres
+  acentuados: dos en textos de pantalla (se les sacó el acento) y uno dentro de un regex que
+  matchea el driver "Genérico / Sólo texto" de un Windows en español — ese se conservó como
+  escape `\xe9`, que .NET interpreta igual y no rompe en PCs con otra code page.
+
+### Evaluado y no se hizo
+- **Mover a un `finally` el rollback del re-bind de USB y de la exclusión de Defender.** No hay
+  tal rollback que mover: esas dos son las **reparaciones**, no cambios temporales, y deshacerlas
+  ante un crash dejaría al cliente peor. Lo que sí puede quedar colgado tras un crash es una cola
+  `FUDO-TEST-*`, y eso ya lo limpia `Remove-StaleOwnQueues` en la corrida siguiente.
+- **Mapear `pais` desde `paisProbable`.** Sigue viviendo en el receptor de telemetría
+  (`tools/telemetria-appscript.gs`), fuera del alcance del self-test: no se toca a ciegas.
+
+### Pendiente decidir
+- **Un ticket de prueba por impresora.** El re-escaneo ya dice cuáles quedaron en condiciones de
+  imprimir, pero la única con prueba física confirmada sigue siendo la cola objetivo. Probar
+  todas implica un ticket y una confirmación del asesor por cada una: es un cambio de flujo para
+  el asesor, va aparte.
+- **Que `printer.coverage` bloquee el cierre.** Hoy avisa en `warn`. Hacerlo bloqueante es
+  literalmente "todas las impresoras detectadas imprimiendo", pero un local con una impresora
+  vieja apagada no cerraría nunca — que es justo el problema del que salimos. Conviene mirar
+  primero cuántas PCs quedan con colas rotas ajenas a las comandas, que es un dato que esta
+  versión recién empieza a mandar.
+
 ## [3.10] - 2026-08-28
 
 Dos casos que un asesor probó en clientes reales el mismo día que salió la 3.9, y que entre los
