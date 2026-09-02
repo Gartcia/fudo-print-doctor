@@ -2,6 +2,65 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.12] - 2026-09-02
+
+La 3.11 cerró sus **primeros dos casos** —los primeros del proyecto— y uno de los dos fue un
+**cierre falso**: cerró `resolved` a las 18:19:22 y 34 segundos después la misma PC volvió como
+`volvio_a_fallar` re-aplicando exactamente las mismas dos reparaciones. Los dos cierres tenían la
+misma causa raíz: la cuarentena de Defender sobre la App Nativa. Esta versión apuntala esa causa,
+porque mientras siga disparando de más la métrica de cierre no mide nada.
+
+### Corregido
+- **La reparación del antivirus se ejecutaba en PCs donde no había nada que reparar.** El motor
+  leía las detecciones de Defender con `Get-MpThreatDetection`, que devuelve el **historial de
+  detecciones y no la cuarentena actual**: una detección de hace semanas sigue listada para
+  siempre. Cualquier entrada de ese historial disparaba restaurar la Nativa de cuarentena y
+  agregar exclusiones de Defender. En la telemetría aparecieron **6 corridas con la Nativa
+  `0.0.37` —la firmada— instalada y presente que igual "repararon" el antivirus**, y esa quedó
+  como la causa raíz de las dos únicas corridas que cerraron.
+  Ahora la prueba de que la Nativa **no** está en cuarentena es que el archivo está en disco, y
+  vale más que cualquier registro histórico: si está presente, no se toca la configuración del
+  antivirus y la detección se informa como histórica, sin competir como causa raíz. Si el archivo
+  **falta**, se repara igual que antes, incluso con la versión firmada: ahí el chequeo de versión
+  no alcanza porque el archivo de verdad no está.
+  *El gate de la 3.10 ("con la 0.0.37 el motor deja de tocar el antivirus") cubría la exclusión
+  preventiva pero no esta rama.*
+- **La categoría del caso salía de un regex sobre el texto de la causa.** Y ese texto lo escribe
+  cada chequeo para que lo lea el asesor: *"App Nativa de Fudo NO instalada"* pegaba en el regex
+  `no instalada` y caía en `os.driver_faltante`. En la planilla, **un mismo chequeo
+  (`nativa.installed`) aparecía repartido en 4 categorías** (`nativa.install` ×12,
+  `nativa.antivirus` ×5, `os.driver_faltante` ×4, `os.usb_port` ×2), así que la tabla CAUSA del
+  dashboard no se podía agregar. Ahora la categoría sale del **id** del chequeo que ganó como
+  causa; el texto para el asesor no cambió. Los ids cuya categoría depende del hallazgo concreto
+  (`printer.exists`, que puede ser "no hay ninguna impresora real" o "solo hay virtuales") siguen
+  resolviéndose por el texto.
+- **Las corridas que reparaban algo sin confirmar el papel viajaban sin id de causa.** El
+  `rootCauseCheckId` salía únicamente de la lista de candidatos, así que la rama *"se aplicaron
+  reparaciones; falta confirmar que la comanda sale"* —**4 de 19 corridas** de la 3.11— llegaba
+  vacía a la planilla y su categoría terminaba sin relación con la causa. Esa rama y las otras dos
+  sin candidato tienen ahora id propio: `repair.pendingConfirm`, `fudo.configProbable` y
+  `engine.inconclusive`.
+- **`fudoSinUso` no viajaba en ningún payload.** Se calcula desde la 3.11 y era el dato que
+  faltaba para separar el cierre completo del cierre a medio camino (la impresora imprime, pero
+  todavía no salió ninguna comanda de Fudo). Sin eso no se puede saber si el criterio de cierre
+  nuevo está midiendo bien. Ahora viaja, junto con `paperOk`, dentro del bloque de telemetría.
+
+### Cambiado
+- **Una cola con un solo trabajo trabado ya se informa.** El umbral eran 3 trabajos, y con eso
+  `queue.otherBacklog` —el chequeo que la 3.11 agregó para mirar *todas* las colas— **no disparó
+  ni una vez en 19 corridas**. El caso que se perdía: una PC con 8 colas arrastrando
+  `REPOSTERIA [192.168.1.202]` con **un** trabajo trabado 28 minutos en tres corridas seguidas.
+  Ahora entra desde 1 trabajo cuando el más viejo lleva 5 minutos o más, pero **solo informa**:
+  lo que bloquea el cierre y compite como causa raíz sigue siendo el atasco de verdad (3 o más y
+  de hace rato), para que un trabajo viejo no le gane la causa a nada. Una comanda recién
+  encolada sigue sin decir nada: sería ruido en cada corrida de un local que imprime normal.
+- **`printer.coverage` publica el valor y no solo el estado.** Viajaba como `ok`/`warn` sin el
+  número, así que no había con qué decidir si la cobertura tiene que bloquear el cierre.
+
+### Pendiente (no entró en esta versión)
+- **Columnas propias de `fudoSinUso` y `paperOk` en la planilla.** Los dos datos ya viajan en el
+  payload y se pueden leer del JSON, pero el receptor tiene una lista fija de columnas y
+  agregarlas es un cambio en Apps Script que no cubre el self-test.
 ## [3.11] - 2026-09-01
 
 Primera revisión con las 120 filas de la planilla legibles de punta a punta. Lo que apareció fue

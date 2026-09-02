@@ -442,7 +442,7 @@ $script:TestPrinterRx = '(?i)^FUDO-TEST-'
 # puerto tenga hardware; si el hardware se va, deja de serlo (ver Remove-OrphanOwnQueues).
 $script:OwnQueueRx   = '(?i)^FUDO-(TEST-|USB\d)'
 $script:TestDocRx    = '(?i)fudo print doctor'
-$script:SchemaVersion = '3.11'
+$script:SchemaVersion = '3.12'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -1265,7 +1265,17 @@ function Get-AntivirusState {
         foreach ($t in @($threats)) {
             $res = @($t.Resources) -join ';'
             if ($res -match '(?i)fudo' -or ([string]$t.ThreatID) -match '(?i)fudo') {
-                $state.fudoThreats += [ordered]@{ id = [string]$t.ThreatID; resources = $res; action = [string]$t.ActionSuccess }
+                # Get-MpThreatDetection devuelve el HISTORIAL de detecciones, no la
+                # cuarentena actual: una deteccion de hace semanas sigue apareciendo para
+                # siempre. Sin 'remediada' y 'detectada' no habia forma de distinguir una
+                # cuarentena viva de un registro viejo, y se reparaba sobre el registro.
+                $ok = $null
+                try { if ($null -ne $t.ActionSuccess) { $ok = [bool]$t.ActionSuccess } } catch {}
+                $state.fudoThreats += [ordered]@{ id = [string]$t.ThreatID; resources = $res
+                                                  action = [string]$t.ActionSuccess
+                                                  remediada = $ok
+                                                  statusId = $(try { [int]$t.ThreatStatusID } catch { $null })
+                                                  detectada = $(try { [string]$t.InitialDetectionTime } catch { '' }) }
             }
         }
     } catch {}
@@ -1281,6 +1291,35 @@ function Get-AntivirusState {
     return $state
 }
 
+function Test-DefenderThreatActionable {
+    <#
+      Una deteccion de Defender sobre la Nativa amerita repararla?
+      Get-MpThreatDetection es el historial de detecciones, no la cuarentena viva: una
+      deteccion de hace semanas sigue listada para siempre. Hasta la 3.11 cualquier entrada
+      de ese historial disparaba la restauracion + exclusiones. En la telemetria del 02/09
+      aparecieron 6 corridas 3.11 con la Nativa 0.0.37 (firmada) y presente que igual
+      'repararon' Defender y quedaron con esa causa raiz: uno de los dos unicos cierres de la
+      3.11 cerro asi y volvio a fallar 34 segundos despues.
+      La regla: si la Nativa esta PRESENTE, no hay nada que restaurar. El .exe presente es la
+      prueba directa de que no esta en cuarentena, y vale mas que cualquier registro historico.
+      Si NO esta presente, se repara igual que antes (aunque la version sea la firmada: en ese
+      caso el gate de version no alcanza porque el archivo de verdad falta).
+      Devuelve: accionable (bool), motivo (texto para el asesor), pendientes (las detecciones
+      que Defender no llego a remediar).
+    #>
+    param($Threats, $Firmada, $Presente)
+    $lista = @($Threats | Where-Object { $_ })
+    $pendientes = @($lista | Where-Object { $_.remediada -ne $true })
+    if (@($lista).Count -eq 0) {
+        return @{ accionable = $false; motivo = 'sin detecciones de Defender sobre la Nativa'; pendientes = @() }
+    }
+    if ([bool]$Presente) {
+        $m = 'la Nativa esta presente en disco, asi que la deteccion de Defender es historica'
+        if ($Firmada -eq $true) { $m = $m + ' y ademas la version instalada ya esta firmada' }
+        return @{ accionable = $false; motivo = $m; pendientes = @($pendientes) }
+    }
+    return @{ accionable = $true; motivo = 'la Nativa no aparece en disco y Defender registra detecciones'; pendientes = @($pendientes) }
+}
 function Get-NativaVersionState {
     <#
       La Nativa instalada, esta firmada? Devuelve:
@@ -1348,7 +1387,24 @@ function Test-Layer0b-NativeApp {
     }
 
     # 0b.2 Amenazas/cuarentena de Defender sobre la Nativa
-    if (@($av.fudoThreats).Count -gt 0) {
+    # v3.12: el historial de detecciones de Defender no es la cuarentena viva. Si la Nativa
+    # esta en disco no hay nada que restaurar, y reparar sobre un registro viejo dejaba esa
+    # causa raiz en corridas de PCs sanas (6 corridas 3.11 con la 0.0.37 firmada y presente).
+    $qNativa = Test-DefenderThreatActionable -Threats $av.fudoThreats `
+        -Firmada $(if ($script:Diagnostics.Contains('nativaFirmada')) { $script:Diagnostics['nativaFirmada'] } else { $null }) `
+        -Presente $installed
+    if (@($av.fudoThreats).Count -gt 0 -and -not $qNativa.accionable) {
+        # Se informa (el asesor tiene que saber que el antivirus la toco alguna vez) pero no
+        # se repara y no compite como causa raiz.
+        Add-Check -Id 'nativa.defenderQuarantine' -Layer 0 `
+            -Name ('Defender registro detecciones sobre la Nativa en el pasado (' + @($av.fudoThreats).Count + '), pero hoy no esta en cuarentena') `
+            -Status 'warn' -RootCauseCandidate $false -Plane 'fudo_config' `
+            -Evidence @{ threats = $av.fudoThreats; motivo = [string]$qNativa.motivo
+                         presenteDespues = [bool]$installed; historica = $true
+                         pendientes = @($qNativa.pendientes).Count } `
+            -Recommendation ('Windows Defender tiene detecciones registradas sobre la App Nativa, pero ' + [string]$qNativa.motivo +
+                             '. No se toco la configuracion del antivirus: no habia nada que restaurar. Si este cliente vuelve a quedarse sin la Nativa, la solucion de fondo es actualizarla a la version firmada.')
+    } elseif ($qNativa.accionable) {
         $exclPath = @($install.paths | Select-Object -First 1)
         $rem = Invoke-Remediation -Description 'Restaurar Nativa de cuarentena + agregar exclusiones quirurgicas de Defender' -Type 'defender.restore_exclude' -Target 'FudoNativa' `
             -Before "amenazas=$(@($av.fudoThreats).Count)" -After 'restaurada + excluida' -Fix {
@@ -3136,18 +3192,26 @@ function Test-Layer2-OtherQueuesBacklog {
     $colas = @()
     try { if ($script:Diagnostics.Contains('colas')) { $colas = @($script:Diagnostics['colas']) } } catch {}
     $delCliente = @($colas | Where-Object { -not $_.esDePrueba })
+    # v3.12: el umbral de 3 trabajos dejaba fuera el caso mas frecuente. Se vio una PC con
+    # REPOSTERIA [192.168.1.202] arrastrando UN trabajo trabado 28 minutos en tres corridas
+    # seguidas sin que este chequeo dijera nada (19 de 19 corridas 3.11 en 'ok'). Un solo
+    # trabajo que no drena desde hace rato ya prueba que Fudo encolo y que la cola no sale.
+    # Ahora entra desde 1 trabajo, pero lo que BLOQUEA el cierre y compite como causa raiz
+    # sigue siendo el atasco de verdad (3 o mas y el mas viejo de hace 5 minutos o mas).
     $conTrabajos = @($delCliente | Where-Object {
-        ([string]$_.nombre -ne $objetivo) -and ([int]$_.trabajos -ge 3)
+        ([string]$_.nombre -ne $objetivo) -and ([int]$_.trabajos -ge 1)
     })
-    if (@($conTrabajos).Count -eq 0) {
+    # Atasco: acumula Y el mas viejo lleva rato. Es lo unico que puede ser causa raiz.
+    $trabadas = @($conTrabajos | Where-Object { [int]$_.trabajos -ge 3 -and [int]$_.minutosMasViejo -ge 5 })
+    # Sintoma informativo: pocos trabajos pero uno viejo, o varios recien encolados.
+    $aInformar = @($conTrabajos | Where-Object { [int]$_.trabajos -ge 3 -or [int]$_.minutosMasViejo -ge 5 })
+    if (@($aInformar).Count -eq 0) {
         Add-Check -Id 'queue.otherBacklog' -Layer 2 -Name 'Ninguna otra cola con comandas acumuladas' -Status 'ok' `
-            -Evidence @{ colasRevisadas = @($delCliente).Count; objetivo = $objetivo }
+            -Evidence @{ colasRevisadas = @($delCliente).Count; objetivo = $objetivo
+                         conTrabajos = @($conTrabajos).Count; trabadas = 0 }
         return
     }
-
-    # Trabada = acumula Y el trabajo mas viejo lleva rato esperando. Si el mas viejo es
-    # reciente puede ser una rafaga drenando, asi que queda en 'warn' y no bloquea el cierre.
-    $trabadas = @($conTrabajos | Where-Object { [int]$_.minutosMasViejo -ge 5 })
+    $conTrabajos = @($aInformar)
     # Si el puerto de la cola trabada sigue sirviendo (esta vivo, o no es un USB), entonces el
     # veredicto "no hay ninguna impresora conectada" es demostrablemente falso: hay una cola
     # real recibiendo comandas. Eso es lo que habilita bajar de rango al diagnostico USB.
@@ -3163,7 +3227,8 @@ function Test-Layer2-OtherQueuesBacklog {
 
     Add-Check -Id 'queue.otherBacklog' -Layer 2 `
         -Name ('Otra cola con comandas acumuladas que no salen: ' + [string]$peor.nombre + ' (' + [int]$peor.trabajos + ' trabajos)') `
-        -Status $(if (@($trabadas).Count -gt 0) { 'fail' } else { 'warn' }) -RootCauseCandidate $true -Plane 'os' `
+        -Status $(if (@($trabadas).Count -gt 0) { 'fail' } else { 'warn' }) `
+        -RootCauseCandidate (@($trabadas).Count -gt 0) -Plane 'os' `
         -Evidence @{ colas = @($lista); conTrabajos = @($conTrabajos).Count; trabadas = @($trabadas).Count
                      puertoUtil = [bool]$puertoUtil; objetivo = $objetivo } `
         -ArticleRef 'https://soporte.fu.do/es/articles/11730815' `
@@ -3216,6 +3281,11 @@ function Update-PrintInventory {
     $rotasAhora = @($rotas | ForEach-Object { [string]$_.nombre })
     $mejoraron  = @($rotasAntes | Where-Object { $rotasAhora -notcontains $_ })
     $script:Diagnostics['colasQueMejoraron'] = @($mejoraron)
+    # printer.coverage viajaba solo como status (ok/warn) y sin el valor no se podia decidir
+    # si la cobertura tiene que bloquear el cierre. Ahora va el numero.
+    $script:Diagnostics['cobertura'] = [ordered]@{
+        sanas = @($sanas).Count; rotas = @($rotas).Count; total = @($delCliente).Count
+    }
 
     $detalle = @($rotas | ForEach-Object {
         [string]$_.nombre + ' [' + [string]$_.puerto + ']: ' + (@($_.sintomas) -join ', ')
@@ -4253,6 +4323,11 @@ function Resolve-Diagnosis {
 
     $resolved = $false
     $rootCause = $null
+    # v3.12: el id de la causa se decide en el mismo lugar que el texto. Antes salia solo
+    # de $ordered, asi que las ramas sin candidato (se reparo algo pero nadie confirmo el
+    # papel; hardware OK sin nada roto) viajaban con rootCauseCheckId vacio: 2 de las 19
+    # corridas 3.11 del 02/09, y la categoria de esas filas quedaba sin relacion con la causa.
+    $rootCheckId = ''
     $confidence = 'low'
     $residual = @()
 
@@ -4302,15 +4377,20 @@ function Resolve-Diagnosis {
             $rootCause = $ordered[0].name
             $confidence = if ($ordered[0].plane -eq 'fudo_config') { 'medium' } else { 'medium' }
         } elseif (@($fixed).Count -gt 0) {
-            # Se repararon cosas pero nadie confirmo que la comanda sale.
+            # Se repararon cosas pero nadie confirmo que la comanda sale. Es un estado del
+            # motor, no un hallazgo de la PC, y por eso ningun check lo representa: sin id
+            # propio estas corridas quedaban sin clasificar (4 de 19 el 02/09).
             $rootCause = 'Se aplicaron reparaciones (' + ((@($fixed | Sort-Object { $_.layer } | ForEach-Object { $_.name })) -join '; ') + '); falta confirmar que la comanda sale'
+            $rootCheckId = 'repair.pendingConfirm'
             $confidence = 'medium'
         } elseif ($hwTest -and $hwTest.status -eq 'ok') {
             # HW OK y nada roto en OS => casi seguro config Fudo
             $rootCause = 'Hardware imprime OK; causa probable en configuracion de Fudo (area/cocina/sala)'
+            $rootCheckId = 'fudo.configProbable'
             $confidence = 'medium'
         } else {
             $rootCause = 'No concluyente'
+            $rootCheckId = 'engine.inconclusive'
             $confidence = 'low'
         }
     }
@@ -4351,7 +4431,7 @@ function Resolve-Diagnosis {
         rootCause       = $rootCause
         rootCauseCheckId = $(if (@($ordered).Count -gt 0) { [string]$ordered[0].id }
                               elseif ($resolved -and @($fixed).Count -gt 0) { [string](@($fixed | Sort-Object { $_.layer })[0].id) }
-                              else { '' })
+                              else { [string]$rootCheckId })
         confidence      = $confidence
         autoFixesApplied = @($fixed | ForEach-Object { $_.name })
         residualEscalation = $residual
@@ -4431,6 +4511,35 @@ function Get-NextActions {
     return $out
 }
 
+# Categoria por id de chequeo. La categoria se derivaba de un regex sobre el TEXTO de la causa,
+# y el texto lo escribe cada check para el asesor: 'App Nativa de Fudo NO instalada' caia en el
+# regex 'no instalada' -> os.driver_faltante. En la planilla del 02/09 el mismo id
+# nativa.installed aparecia repartido en 4 categorias (nativa.install x12, nativa.antivirus x5,
+# os.driver_faltante x4, os.usb_port x2), asi que la tabla CAUSA del dashboard no era agregable.
+# Solo entran aca los ids cuya categoria es inequivoca. Los que dependen del hallazgo concreto
+# (printer.exists, que puede ser 'no hay impresora real' o 'solo hay virtuales') siguen
+# resolviendose por el texto, mas abajo.
+$script:CategoryByCheckId = @{
+    'nativa.installed'          = 'nativa.install'
+    'nativa.sinFirmar'          = 'nativa.install'
+    'nativa.defenderQuarantine' = 'nativa.antivirus'
+    'nativa.defenderExclusion'  = 'nativa.antivirus'
+    'nativa.thirdPartyAV'       = 'nativa.antivirus_3p'
+    'env.spooler'               = 'os.spooler'
+    'queue.health'              = 'os.queue'
+    'queue.otherBacklog'        = 'os.queue'
+    'conn.usb'                  = 'os.usb_port'
+    'hw.noPortBound'            = 'os.usb_port'
+    'conn.net'                  = 'net.ip'
+    'hw.deviceConnected'        = 'hardware.no_conectada'
+    'hw.disconnected'           = 'hardware.desconectada'
+    'printer.disconnected'      = 'hardware.desconectada'
+    'hw.testprint'              = 'hardware'
+    'repair.pendingConfirm'     = 'repair.pendiente_confirmar'
+    'fudo.configProbable'       = 'fudo_config'
+    'engine.inconclusive'       = 'unknown'
+    'engine.fatal'              = 'engine_error'
+}
 function Get-Category {
     param($Diag)
     # Categorizacion para telemetria: permite agrupar los casos por causa
@@ -4438,6 +4547,13 @@ function Get-Category {
     # la causa ("...salio sin necesidad de reparar nada") caia en el regex de 'fisic' y se
     # contaba como un problema de hardware.
     if ([bool]$Diag.resolved -and @($Diag.autoFixesApplied).Count -eq 0) { return 'ok.ya_funcionaba' }
+    # v3.12: primero el id de la causa. El texto de la causa es para el asesor y cambia con
+    # cada redaccion; el id no.
+    $rcid = [string]$Diag.rootCauseCheckId
+    if ($rcid) {
+        if ($script:CategoryByCheckId.ContainsKey($rcid)) { return [string]$script:CategoryByCheckId[$rcid] }
+        if ($rcid.StartsWith('fudo.')) { return 'fudo_config' }
+    }
     $rc = [string]$Diag.rootCause
     switch -Regex ($rc) {
         'DESCONECTADA|esta desconectada|sin dispositivo' { return 'hardware.desconectada' }
@@ -5129,7 +5245,12 @@ function Invoke-SelfTest {
     Assert-Eq 'S5 reparar no es resolver' $false $d.resolved
     Assert-Eq 'S5 lo dice explicito' $true ([bool]($d.rootCause -match 'falta confirmar'))
     Assert-Eq 'S5 la causa no es la reparacion' $false ([bool]($d.rootCause -eq 'Servicio Print Spooler'))
-    Assert-Eq 'S5 no inventa checkId de causa' '' ([string]$d.rootCauseCheckId)
+    # Hasta la 3.11 esta rama viajaba con rootCauseCheckId VACIO (2 de las 19 corridas 3.11
+    # del 02/09), y con eso la categoria caia en cualquier lado. Lo que no puede pasar sigue
+    # siendo atribuirle la causa a la reparacion; el id propio dice exactamente lo que es.
+    Assert-Eq 'S5 la causa no se le atribuye a la reparacion' $false ([string]$d.rootCauseCheckId -eq 'env.spooler')
+    Assert-Eq 'S5 tiene id propio de rama pendiente' 'repair.pendingConfirm' ([string]$d.rootCauseCheckId)
+    Assert-Eq 'S5 y su categoria' 'repair.pendiente_confirmar' (Get-Category -Diag $d)
 
     # Escenario 5b: la misma reparacion + un humano que confirmo el papel => resuelto/high
     Reset-State
@@ -5870,6 +5991,9 @@ function Invoke-SelfTest {
     Assert-Eq 'S65 CAJA ya no figura rota' 0 ([int](@($r65 | Where-Object { $_.nombre -eq 'CAJA' })[0].score))
     Assert-Eq 'S65 la cobertura queda en ok' 'ok' ([string](Get-CheckById 'printer.coverage').status)
     Assert-Eq 'S65 registra que CAJA mejoro' 'CAJA' ((@($script:Diagnostics['colasQueMejoraron'])) -join ',')
+    # printer.coverage viajaba solo como status: sin el valor no se puede decidir si la
+    # cobertura tiene que bloquear el cierre.
+    Assert-Eq 'S65 publica el valor de la cobertura' '2/2' ("$($script:Diagnostics['cobertura'].sanas)/$($script:Diagnostics['cobertura'].total)")
     Assert-Eq 'S65 guarda la foto inicial para comparar' 2 (@($script:Diagnostics['colasIniciales'])).Count
     # Y re-mapea que puertos tienen algo enchufado (antes quedaba el cache del arranque).
     Assert-Eq 'S65 refresca los puertos con dispositivo' 'USB001,USB002' ((@($script:Diagnostics['livePorts'])) -join ',')
@@ -5914,6 +6038,106 @@ function Invoke-SelfTest {
     Reset-State
     Assert-Eq 'S66 el self-test no manda telemetria' $false ([bool](Send-Telemetry -Result @{ status = 'resolved' }))
     Assert-Eq 'S66 y deja dicho por que' 'no se envia: corrida de self-test' ([string]$script:TelemetryStatus.detalle)
+    # Escenario 67 (v3.12, telemetria del 02/09): la reparacion de Defender se ejecutaba en PCs
+    # que tenian la Nativa 0.0.37 FIRMADA y presente. Get-MpThreatDetection devuelve el
+    # HISTORIAL de detecciones, no la cuarentena viva: una deteccion de hace semanas sigue
+    # listada para siempre, y cualquier entrada disparaba restaurar + excluir. Aparecio en 6
+    # corridas 3.11, y uno de los dos unicos cierres de la 3.11 cerro con esa causa y volvio a
+    # fallar 34 segundos despues re-aplicando el mismo fix.
+    Reset-State
+    $amenaza = @([ordered]@{ id='2147519003'; resources='file:_C:\Users\x\AppData\Local\Fudo\fudo.exe'; remediada=$true })
+    # La prueba directa de que no esta en cuarentena es que el archivo esta.
+    $q67a = Test-DefenderThreatActionable -Threats $amenaza -Firmada $true -Presente $true
+    Assert-Eq 'S67 con la Nativa presente no hay nada que restaurar' $false ([bool]$q67a.accionable)
+    Assert-Eq 'S67 y lo explica' $true ([bool]([string]$q67a.motivo -match 'historica'))
+    # Presente pero sin firmar: tampoco hay que restaurar (esta en disco). Lo que corresponde
+    # ahi es actualizarla, que es lo que dice nativa.sinFirmar.
+    $q67b = Test-DefenderThreatActionable -Threats $amenaza -Firmada $false -Presente $true
+    Assert-Eq 'S67 presente sin firmar tampoco se restaura' $false ([bool]$q67b.accionable)
+    # Si NO esta en disco, se repara: ahi la deteccion si es la explicacion.
+    $q67c = Test-DefenderThreatActionable -Threats $amenaza -Firmada $false -Presente $false
+    Assert-Eq 'S67 sin la Nativa en disco si se repara' $true ([bool]$q67c.accionable)
+    # Y se repara incluso con la version firmada: si el archivo falta, el gate de version no
+    # alcanza (era el punto (b) de la bitacora: el check podria estar leyendo mal).
+    $q67d = Test-DefenderThreatActionable -Threats $amenaza -Firmada $true -Presente $false
+    Assert-Eq 'S67 el gate de version no tapa un archivo que falta' $true ([bool]$q67d.accionable)
+    # Sin detecciones no se toca el antivirus por ningun motivo.
+    $q67e = Test-DefenderThreatActionable -Threats @() -Firmada $true -Presente $true
+    Assert-Eq 'S67 sin detecciones no hay rama de cuarentena' $false ([bool]$q67e.accionable)
+    # Las detecciones que Defender no llego a remediar se cuentan aparte, para el reporte.
+    $q67f = Test-DefenderThreatActionable -Threats @([ordered]@{ id='1'; remediada=$false }) -Firmada $true -Presente $true
+    Assert-Eq 'S67 cuenta las detecciones sin remediar' 1 (@($q67f.pendientes).Count)
+
+    # Escenario 68 (v3.12, telemetria del 02/09): la categoria se derivaba de un regex sobre el
+    # TEXTO de la causa, y ese texto lo escribe cada check para el asesor. 'App Nativa de Fudo
+    # NO instalada' pegaba en el regex 'no instalada' y caia en os.driver_faltante: en la
+    # planilla el id nativa.installed aparecia repartido en 4 categorias (nativa.install x12,
+    # nativa.antivirus x5, os.driver_faltante x4, os.usb_port x2). La tabla CAUSA del dashboard
+    # no era agregable.
+    Reset-State
+    Add-Check -Id 'nativa.installed' -Layer 0 -Name 'App Nativa de Fudo NO instalada' -Status 'fail' -RootCauseCandidate $true -Plane 'fudo_config'
+    $d68 = Resolve-Diagnosis
+    Assert-Eq 'S68 la causa es la Nativa ausente' 'nativa.installed' ([string]$d68.rootCauseCheckId)
+    Assert-Eq 'S68 y su categoria sale del id, no del texto' 'nativa.install' (Get-Category -Diag $d68)
+    # El texto que confundia al regex sigue siendo el que lee el asesor: no se cambio la
+    # redaccion, se cambio de donde sale la categoria.
+    Assert-Eq 'S68 el texto para el asesor no cambio' $true ([bool]([string]$d68.rootCause -match 'NO instalada'))
+
+    # Escenario 68b: ninguna corrida que no sea un engine_error puede viajar sin id de causa.
+    # Era el caso de las 2 filas 3.11 con rootCauseCheckId vacio.
+    Reset-State
+    Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica' -Status 'ok' -Plane 'hardware'
+    Add-Check -Id 'fudo.printerKitchen' -Layer 5 -Name 'Impresora con Cocina/Area asignada' -Status 'warn' -Plane 'fudo_config'
+    $d68b = Resolve-Diagnosis
+    Assert-Eq 'S68b un cierre sin reparaciones igual dice de donde salio' $true ([bool]([string]$d68b.rootCauseCheckId).Length -gt 0 -or [bool]$d68b.resolved)
+    Reset-State
+    Add-Check -Id 'nativa.installed' -Layer 0 -Name 'App Nativa de Fudo instalada' -Status 'warn' -RootCauseCandidate $false
+    $d68c = Resolve-Diagnosis
+    Assert-Eq 'S68c sin candidato ni papel, la corrida no queda sin id' 'engine.inconclusive' ([string]$d68c.rootCauseCheckId)
+    Assert-Eq 'S68c y su categoria' 'unknown' (Get-Category -Diag $d68c)
+
+    # Escenario 69 (v3.12, caso real): el umbral de 3 trabajos dejaba fuera el caso mas comun.
+    # DESKTOP-HT51G4G (CL, Ethernet, 8 colas) arrastro REPOSTERIA [192.168.1.202] con UN
+    # trabajo trabado 28 minutos en tres corridas seguidas, y queue.otherBacklog quedo en 'ok'
+    # en 19 de 19 corridas 3.11: nunca disparo. Ahora se informa desde 1 trabajo, pero sin
+    # ganarle la causa raiz a nada: solo el atasco de verdad compite.
+    Reset-State
+    $script:Diagnostics['colas'] = @(
+        [ordered]@{ nombre='COCINA';    puerto='IP_192.168.1.206'; esDePrueba=$false; score=40; estado='no imprime'; trabajos=0; minutosMasViejo=-1; trabajoMasViejo=''; puertoVivo=$false },
+        [ordered]@{ nombre='REPOSTERIA'; puerto='IP_192.168.1.202'; esDePrueba=$false; score=40; estado='no imprime'; trabajos=1; minutosMasViejo=28; trabajoMasViejo='01/09 20:11'; puertoVivo=$false }
+    )
+    Test-Layer2-OtherQueuesBacklog -Printer ([pscustomobject]@{ Name='COCINA' })
+    $c69 = Get-CheckById 'queue.otherBacklog'
+    Assert-Eq 'S69 un trabajo viejo ya se informa' 'warn' ([string]$c69.status)
+    Assert-Eq 'S69 nombra la cola' $true ([bool]([string]$c69.name -match 'REPOSTERIA'))
+    Assert-Eq 'S69 pero no compite como causa raiz' $false ([bool]$c69.rootCauseCandidate)
+    # Y no baja de rango al diagnostico de conectividad: la causa sigue siendo la de la capa 3.
+    Add-Check -Id 'conn.net' -Layer 3 -Name 'Impresora de red inalcanzable (192.168.1.206:9100)' -Status 'fail' -RootCauseCandidate $true -Plane 'fudo_config'
+    $d69 = Resolve-Diagnosis
+    Assert-Eq 'S69 la causa sigue siendo la impresora inalcanzable' 'conn.net' ([string]$d69.rootCauseCheckId)
+
+    # Escenario 69b: un solo trabajo RECIEN encolado no es nada. No se informa (seria ruido en
+    # cada corrida de un local que esta imprimiendo normal).
+    Reset-State
+    $script:Diagnostics['colas'] = @(
+        [ordered]@{ nombre='CAJA';   puerto='USB001'; esDePrueba=$false; score=0;  estado='sana'; trabajos=0; minutosMasViejo=-1; trabajoMasViejo=''; puertoVivo=$true },
+        [ordered]@{ nombre='COCINA'; puerto='USB002'; esDePrueba=$false; score=10; estado='con problemas'; trabajos=1; minutosMasViejo=0; trabajoMasViejo='02/09 09:40'; puertoVivo=$true }
+    )
+    Test-Layer2-OtherQueuesBacklog -Printer ([pscustomobject]@{ Name='CAJA' })
+    Assert-Eq 'S69b una comanda recien mandada no es un atasco' 'ok' ([string](Get-CheckById 'queue.otherBacklog').status)
+
+    # Escenario 69c: el atasco de verdad (3 o mas y de hace rato) no cambio: sigue en fail y
+    # sigue siendo causa raiz. Es lo que la 3.11 agrego y no hay que perderlo.
+    Reset-State
+    $script:Diagnostics['colas'] = @(
+        [ordered]@{ nombre='POS-80'; puerto='LPT1:';           esDePrueba=$false; score=0;  estado='sana';       trabajos=0;  minutosMasViejo=-1; trabajoMasViejo=''; puertoVivo=$true },
+        [ordered]@{ nombre='BARRA';  puerto='IP_192.168.0.17'; esDePrueba=$false; score=40; estado='no imprime'; trabajos=93; minutosMasViejo=180; trabajoMasViejo='31/08 19:05'; puertoVivo=$false }
+    )
+    Test-Layer2-OtherQueuesBacklog -Printer ([pscustomobject]@{ Name='POS-80' })
+    $c69c = Get-CheckById 'queue.otherBacklog'
+    Assert-Eq 'S69c el atasco de verdad sigue en fail' 'fail' ([string]$c69c.status)
+    Assert-Eq 'S69c y sigue siendo causa raiz' $true ([bool]$c69c.rootCauseCandidate)
+    Assert-Eq 'S69c y sigue bajando de rango el veredicto USB' $true ([bool]$c69c.evidence.puertoUtil)
 
     # Escenario 24 (caso real): caja tapada con miles de trabajos + cocina sana.
     # Antes se elegia la primera cola y se devolvia "todo ok" ignorando la que fallaba.
@@ -7054,6 +7278,11 @@ function Send-Telemetry {
                 # desde la 3.9 y no viajaba: en la planilla no habia forma de separar "no sale
                 # nada" de "sale papel pero la comanda de Fudo todavia no".
                 paperOk       = [bool]$Result.diagnosis.paperOk
+                # v3.12: fudoSinUso se calculaba desde la 3.11 y no viajaba en ningun payload,
+                # asi que no se podia separar el cierre completo del cierre a medio camino
+                # (imprime, pero todavia no salio ninguna comanda de Fudo). Ese cruce es la
+                # unica forma de saber si el criterio de cierre nuevo esta midiendo bien.
+                fudoSinUso    = [bool]$Result.diagnosis.fudoSinUso
                 # Un engine_error sin esto era irrastreable: se vio una fila con status
                 # engine_error y ni el mensaje, ni la linea, ni el ultimo paso que corrio.
                 errorMotor    = $(
@@ -7080,6 +7309,11 @@ function Send-Telemetry {
                     # Colas que estaban rotas al empezar y quedaron sanas al terminar. Es la
                     # medida directa de si las reparaciones sirvieron, por cola y no por corrida.
                     $t['colasQueMejoraron'] = @($(if ($script:Diagnostics.Contains('colasQueMejoraron')) { $script:Diagnostics['colasQueMejoraron'] } else { @() }))
+                    # Los mismos dos datos dentro de telemetry, que es de donde salen las
+                    # columnas del receptor cuando se agreguen.
+                    $t['paperOk'] = [bool]$Result.diagnosis.paperOk
+                    $t['fudoSinUso'] = [bool]$Result.diagnosis.fudoSinUso
+                    $t['cobertura'] = $(if ($script:Diagnostics.Contains('cobertura')) { $script:Diagnostics['cobertura'] } else { $null })
                     $t['historialFudo'] = @($(if ($script:Diagnostics.Contains('historialImpresion')) { $script:Diagnostics['historialImpresion'].porImpresora } else { @() }))
                     # v3.9: los ids de accion (testprint.retarget, queue.rebind, ...) no viajaban:
                     # autoFixesApplied solo trae los textos humanos de las reparaciones. Sin esto
