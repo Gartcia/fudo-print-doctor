@@ -2,6 +2,71 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.14] - 2026-09-03
+
+Tres pedidos del equipo, no hallazgos de telemetría. Los tres apuntan al mismo problema de fondo:
+**la calidad de lo que llega a la planilla y la versión con la que se corre.** El 03/09 una sola
+corrida con la 3.8 reprodujo cuatro bugs ya corregidos y sumó una fila a *"resueltas"* que no lo
+estaba.
+
+### Agregado
+- **El motor no corre si está desactualizado.** Antes avisaba y seguía. Ahora, si confirma que hay
+  una versión más nueva publicada, corta antes de diagnosticar (código de salida `5`) y explica
+  cómo actualizar.
+  *Criterio deliberado: se bloquea sólo cuando se **confirma** que hay una más nueva. Si no se pudo
+  consultar —cliente sin internet, la red del local bloqueando GitHub— **no** se bloquea: eso no es
+  "versión vieja", es "no se sabe", y bloquear ahí dejaría al asesor sin herramienta justo donde
+  más se la necesita. `-NoUpdateCheck` no consulta y por lo tanto no bloquea; es un opt-out
+  explícito, no un bypass silencioso, y viaja en la telemetría para que se vea si alguien lo usa
+  de atajo.*
+  **Ojo con el alcance:** esto sólo sirve de acá en adelante. Las copias que ya están en la calle
+  (3.8, 3.11) no tienen este código y no se van a bloquear solas — eso se arregla con distribución.
+- **El ID de conversación pasa a ser obligatorio.** Eran 15 dígitos: *verificado contra la API de
+  Intercom* (`215475776099648`, `215475776190952`, `215475755436482`). Hasta la 3.13 era opcional
+  —el launcher decía *"Enter para omitir"*— y llegaba vacío en casi todas las corridas, así que no
+  se podía cruzar una corrida con la conversación del cliente, que es lo único que cuenta qué pasó
+  de verdad en el caso.
+  Se puede **pegar la URL de la conversación** y el motor extrae el número: es lo que el asesor
+  tiene a mano en el navegador. Sin consola (agente, `-Json`, `-Quiet`) no se pregunta: corta con
+  código `6`.
+  *Esto revierte una decisión de la 2.9b, que lo había hecho opcional porque "para el análisis
+  agregado no hace falta y el pcId cubre el seguimiento del equipo". Sigue siendo cierto para el
+  agregado; lo que no cubre el pcId es leer la conversación.*
+- **El motor actualiza la App Nativa del cliente con el instalador que ya está en la PC.** Alcanza
+  con dejar el **`.msi`** de la Nativa al lado de `FudoPrintDoctor.cmd` (también lo busca en
+  Descargas y en el Escritorio). Motivo: el 03/09 la telemetría mostró la Nativa `0.0.18` en **10
+  de 24 corridas** y sólo 6 con la `0.0.37` firmada, y actualizarla es la solución de fondo —
+  la firmada ya no la pone en cuarentena el antivirus.
+  - **Un `.msi` no se encontraba**: la búsqueda de instaladores sólo miraba `*.exe`, así que el
+    formato en que se distribuye la Nativa vigente era invisible para el motor.
+  - **Un `.msi` tampoco se ejecuta directo**: ahora va por `msiexec /i ... /qn /norestart`, en
+    silencio, para no dejar un asistente abierto en la PC del cliente.
+  - **Nunca instala a ciegas.** Le lee la versión al `.msi` (`ProductVersion`) y sólo actualiza si
+    es **más nueva** que la instalada. Si el instalador no declara su versión, no toca nada:
+    instalar a ciegas puede **degradar** la Nativa, y eso ya pasó en este proyecto (una
+    restauración de cuarentena dejó `0.0.36 → 0.0.18`, y la `0.0.18` después apareció circulando
+    en varias PCs).
+  - **Verifica después de instalar.** Si la versión no subió, no se declara actualizada.
+
+### Cambiado
+- **Códigos de salida nuevos**: `5` = el motor está desactualizado y no corrió; `6` = falta el ID
+  de conversación y no corrió. *(Los de antes no cambian: `0` resuelto, `2` escalar, `3` falla del
+  motor, `4` self-test fallido.)*
+
+### Nota de distribución
+**El launcher (`FudoPrintDoctor.cmd`) no se tocó, a propósito.** Los dos requisitos nuevos viven
+enteros en el `.ps1`, que es lo único que reemplaza `Actualizar-FudoPrintDoctor.cmd`: el launcher
+**no se pisa si ya existe**, justamente porque es donde vive la URL de telemetría de cada asesor.
+Entonces:
+- Con solo correr el updater, el ID obligatorio y el bloqueo por versión vieja aplican igual, con
+  cualquier launcher.
+- Un asesor con el launcher anterior verá su pregunta vieja (*"o Enter para omitir"*) y, si la
+  omite, **el motor le pide el ID en pantalla** — la consola es interactiva, el mismo mecanismo con
+  el que ya funciona la pregunta *"¿salió el ticket?"*.
+- Se evaluó distribuir un launcher nuevo con la validación adelantada y los códigos `5`/`6`
+  explicados, y **se descartó**: el `.cmd` del repositorio público tiene la URL de telemetría
+  vacía, así que repartirlo tal cual dejaría a todo el equipo sin telemetría. No vale la pena por
+  una mejora cosmética.
 ## [3.13] - 2026-09-03
 
 La 3.12 subió el cierre de casos del 11% al 27%, y la revisión de hoy mostró que **3 de esos 4

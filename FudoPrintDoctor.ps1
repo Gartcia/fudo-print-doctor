@@ -442,7 +442,7 @@ $script:TestPrinterRx = '(?i)^FUDO-TEST-'
 # puerto tenga hardware; si el hardware se va, deja de serlo (ver Remove-OrphanOwnQueues).
 $script:OwnQueueRx   = '(?i)^FUDO-(TEST-|USB\d)'
 $script:TestDocRx    = '(?i)fudo print doctor'
-$script:SchemaVersion = '3.13'
+$script:SchemaVersion = '3.14'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -460,6 +460,10 @@ $script:MenuVacios = 0
 $script:RepoUrl    = 'https://github.com/Gartcia/fudo-print-doctor'
 $script:RawBase    = 'https://raw.githubusercontent.com/Gartcia/fudo-print-doctor/main'
 $script:UpdateNote = ''   # mensaje de "hay version nueva", si corresponde
+$script:VersionBloqueada   = $false  # se corto la corrida por motor desactualizado
+$script:VersionCheckFallo  = $false  # no se pudo consultar la version publicada (sin internet)
+$script:VersionCheckOmitido = $false # se corrio con -NoUpdateCheck
+$script:VersionPublicada   = ''      # la que contesto el repo, si contesto
 $script:JsonBegin    = '<<<FUDO_JSON_BEGIN>>>'
 $script:JsonEnd      = '<<<FUDO_JSON_END>>>'
 $script:AutoJsonPath = ''
@@ -1373,13 +1377,37 @@ function Test-Layer0b-NativeApp {
         $verState = Get-NativaVersionState -Install $install
         $script:Diagnostics['nativaFirmada'] = $verState.firmada
         if ($verState.firmada -eq $false) {
-            Add-Check -Id 'nativa.sinFirmar' -Layer 0 -Name ("App Nativa desactualizada (v$($verState.version)): la nueva esta firmada y el antivirus no la bloquea") `
-                -Status 'warn' -RootCauseCandidate $false -Plane 'fudo_config' `
-                -Evidence @{ version = $verState.version; versionFirmada = $script:NativaVersionFirmada } `
-                -ArticleRef 'https://soporte.fu.do/es/articles/16419361' `
-                -Recommendation ("Esta PC tiene la Nativa v$($verState.version). Desde la v$($script:NativaVersionFirmada) la App Nativa esta firmada digitalmente, " +
-                                 'asi que los antivirus dejan de ponerla en cuarentena. Si este cliente tuvo problemas de antivirus con la Nativa, ' +
-                                 'actualizarla es la solucion de fondo: evita tener que agregar exclusiones en cada PC.')
+            # v3.14: hasta la 3.13 esto solo AVISABA. Con la Nativa 0.0.18 en 10 de 24 corridas
+            # del 03/09 y solo 6 en la 0.0.37, avisar no alcanzaba: si hay un instalador en la
+            # PC (al lado del script, tipicamente el .msi de la version vigente) y declara una
+            # version mas nueva, se actualiza. Nunca a ciegas: si el instalador no dice su
+            # version, no se toca (instalar a ciegas puede DEGRADARLA, ya paso en este proyecto).
+            $up = @{ aplicado = $false; motivo = 'no se intento' }
+            if ($AutoFix) { $up = Update-FudoNativeFromLocal -Instalada ([string]$verState.version) }
+            $script:Diagnostics['nativaUpdate'] = $up
+            if ([bool]$up.aplicado -and [bool]$up.subio) {
+                Add-Check -Id 'nativa.sinFirmar' -Layer 0 -Name ("App Nativa actualizada de la v$($verState.version) a la v$($up.versionDespues)") `
+                    -Status 'fixed' -RootCauseCandidate $false -Plane 'fudo_config' `
+                    -Evidence @{ version = $verState.version; versionDespues = $up.versionDespues
+                                 versionFirmada = $script:NativaVersionFirmada; instalador = $up.instalador } `
+                    -ActionTaken ([string]$up.nota) -Reversible $true `
+                    -ArticleRef 'https://soporte.fu.do/es/articles/16419361' `
+                    -Recommendation ("Se actualizo la App Nativa a la v$($up.versionDespues) con el instalador que estaba en la PC. " +
+                                     'Desde la v' + $script:NativaVersionFirmada + ' esta firmada, asi que el antivirus deja de ponerla en cuarentena. ' +
+                                     'Abrir Fudo en el navegador y mandar una comanda de prueba.')
+            } else {
+                Add-Check -Id 'nativa.sinFirmar' -Layer 0 -Name ("App Nativa desactualizada (v$($verState.version)): la nueva esta firmada y el antivirus no la bloquea") `
+                    -Status 'warn' -RootCauseCandidate $false -Plane 'fudo_config' `
+                    -Evidence @{ version = $verState.version; versionFirmada = $script:NativaVersionFirmada
+                                 intentoUpdate = [string]$up.motivo; instalador = [string]$up.instalador
+                                 versionInstalador = [string]$up.versionInstalador } `
+                    -ArticleRef 'https://soporte.fu.do/es/articles/16419361' `
+                    -Recommendation ("Esta PC tiene la Nativa v$($verState.version). Desde la v$($script:NativaVersionFirmada) la App Nativa esta firmada digitalmente, " +
+                                     'asi que los antivirus dejan de ponerla en cuarentena. Si este cliente tuvo problemas de antivirus con la Nativa, ' +
+                                     'actualizarla es la solucion de fondo: evita tener que agregar exclusiones en cada PC. ' +
+                                     'El motor puede hacerlo solo: copiar el instalador (.msi) de la Nativa al lado de FudoPrintDoctor.cmd y volver a correr. ' +
+                                     'No se actualizo ahora porque ' + [string]$up.motivo + '.')
+            }
         } elseif ($verState.firmada -eq $true) {
             Add-Check -Id 'nativa.sinFirmar' -Layer 0 -Name ("App Nativa v$($verState.version): version firmada") -Status 'ok' -Plane 'fudo_config' `
                 -Evidence @{ version = $verState.version; versionFirmada = $script:NativaVersionFirmada }
@@ -5016,6 +5044,91 @@ function Test-UpdateAvailable {
     } catch {}
 }
 
+function Test-CaseIdValido {
+    <#
+      El ID de conversacion de Intercom son 15 digitos (verificado contra la API: 215475776099648,
+      215475776190952, 215475755436482). Se acepta tambien una URL pegada de Intercom, porque es lo
+      que el asesor tiene a mano en el navegador: de ahi se extraen los 15 digitos.
+      Devuelve el id normalizado, o '' si no hay ninguno valido.
+    #>
+    param([string]$Texto)
+    $t = [string]$Texto
+    if (-not $t) { return '' }
+    $t = $t.Trim()
+    # Un id pelado.
+    if ($t -match '^\d{15}$') { return $t }
+    # Una URL o un texto con el id adentro (.../conversation/215475776099648).
+    $m = [regex]::Match($t, '(?<![0-9])([0-9]{15})(?![0-9])')
+    if ($m.Success) { return [string]$m.Groups[1].Value }
+    return ''
+}
+
+function Resolve-CaseIdObligatorio {
+    <#
+      El ID de conversacion pasa a ser OBLIGATORIO. Hasta la 3.13 era opcional (el launcher decia
+      'Enter para omitir') y llegaba vacio a la planilla en casi todas las corridas: sin el no se
+      puede cruzar una corrida con la conversacion del cliente, que es lo que permite entender que
+      paso de verdad en el caso.
+      Con consola: se pregunta hasta que sea valido. Sin consola (agente, -Json, -Quiet): no se
+      pregunta, se corta con codigo 6, porque no hay nadie a quien preguntarle.
+    #>
+    param([string]$Actual)
+    $id = Test-CaseIdValido -Texto $Actual
+    if ($id) { return $id }
+    if (-not (Test-IsInteractiveConsole)) {
+        [Console]::Error.WriteLine('')
+        [Console]::Error.WriteLine('  FALTA EL ID DE CONVERSACION.')
+        [Console]::Error.WriteLine('  Es obligatorio: son los 15 digitos de la conversacion de Intercom.')
+        [Console]::Error.WriteLine('  Pasarlo con -CaseId <15 digitos> (tambien se acepta la URL de la conversacion).')
+        exit 6
+    }
+    for ($i = 1; $i -le 5; $i++) {
+        Write-Host ''
+        Write-Host '  ID de conversacion (obligatorio): son los 15 digitos de la conversacion de Intercom.' -ForegroundColor Yellow
+        Write-Host '  Se puede pegar la URL de la conversacion y el motor extrae el numero.' -ForegroundColor DarkGray
+        $resp = Read-DoctorLine -Prompt '  ID de conversacion: '
+        $id = Test-CaseIdValido -Texto $resp
+        if ($id) { return $id }
+        Write-Host '  Eso no parece un ID de conversacion (hacen falta 15 digitos).' -ForegroundColor Red
+    }
+    Write-Host ''
+    Write-Host '  Sin ID de conversacion no se puede correr el diagnostico.' -ForegroundColor Red
+    Write-Host '  Buscalo en la URL de la conversacion de Intercom y volve a abrir FudoPrintDoctor.cmd.' -ForegroundColor Yellow
+    exit 6
+}
+
+function Test-VersionBloqueada {
+    <#
+      Una corrida con motor viejo no solo da diagnosticos ya corregidos: ensucia la planilla con la
+      que se decide que arreglar. El 03/09 una sola corrida 3.8 reprodujo cuatro bugs ya
+      corregidos y sumo una fila a 'resueltas' con resolved+needsEscalation a la vez.
+      CRITERIO: se bloquea solo cuando se CONFIRMA que hay una version mas nueva. Si no se pudo
+      consultar -cliente sin internet, red del local bloqueando GitHub- NO se bloquea: eso no es
+      'version vieja', es 'no se sabe', y dejaria al asesor sin herramienta justo donde mas se usa.
+      Con -NoUpdateCheck no se consulta y por lo tanto no se bloquea (es un opt-out explicito, no
+      un bypass silencioso: queda registrado en la telemetria).
+      Devuelve $true si hay que cortar.
+    #>
+    if ($NoUpdateCheck) { $script:VersionCheckOmitido = $true; return $false }
+    $pub = Get-PublishedVersion -TimeoutSec 8
+    if (-not $pub) { $script:VersionCheckFallo = $true; return $false }
+    $script:VersionPublicada = $pub
+    $vieja = $false
+    try { $vieja = ([version]$pub -gt [version]$script:SchemaVersion) } catch { return $false }
+    if (-not $vieja) { return $false }
+    $script:VersionBloqueada = $true
+    [Console]::Error.WriteLine('')
+    [Console]::Error.WriteLine('  ESTE MOTOR ESTA DESACTUALIZADO Y NO PUEDE CORRER.')
+    [Console]::Error.WriteLine("  Version de esta copia: $($script:SchemaVersion)   |   publicada: $pub")
+    [Console]::Error.WriteLine('')
+    [Console]::Error.WriteLine('  Las versiones viejas dan diagnosticos que ya sabemos que estan mal, y las corridas')
+    [Console]::Error.WriteLine('  que generan no sirven para mejorar el motor.')
+    [Console]::Error.WriteLine('')
+    [Console]::Error.WriteLine('  COMO ACTUALIZAR: cerrar esta ventana y abrir Actualizar-FudoPrintDoctor.cmd')
+    [Console]::Error.WriteLine("  (esta en la misma carpeta). O bajar la ultima de $($script:RepoUrl)")
+    [Console]::Error.WriteLine('')
+    return $true
+}
 function Test-Preflight {
     $problems = @()
 
@@ -6342,6 +6455,87 @@ function Invoke-SelfTest {
     Reset-State
     Add-Check -Id 'hw.testprint' -Layer 4 -Name 'El ticket de prueba entro a la cola y no se imprimio: la impresora no responde' -Status 'fail' -RootCauseCandidate $true -Plane 'hardware'
     Assert-Eq 'S72c la rama de cola trabada tambien redacta' 'hardware.no_imprime' (Get-Category -Diag (Resolve-Diagnosis))
+    # Escenario 73 (v3.14, pedido del equipo): el ID de conversacion pasa a ser OBLIGATORIO.
+    # Hasta la 3.13 era opcional -el launcher decia 'Enter para omitir'- y llegaba vacio a la
+    # planilla en casi todas las corridas, asi que no se podia cruzar una corrida con la
+    # conversacion del cliente. Son 15 digitos: verificado contra la API de Intercom.
+    Reset-State
+    Assert-Eq 'S73 un id de 15 digitos sirve' '215475776099648' (Test-CaseIdValido -Texto '215475776099648')
+    Assert-Eq 'S73 con espacios alrededor tambien' '215475776190952' (Test-CaseIdValido -Texto '  215475776190952  ')
+    # Lo que el asesor tiene a mano es la URL del navegador, no el numero pelado.
+    Assert-Eq 'S73 lo saca de una URL pegada' '215475755436482' (Test-CaseIdValido -Texto 'https://app.intercom.com/a/inbox/abc/inbox/conversation/215475755436482')
+    Assert-Eq 'S73 y de un texto cualquiera que lo contenga' '215475776099648' (Test-CaseIdValido -Texto 'caso 215475776099648 del cliente')
+    # Lo que NO puede pasar por valido.
+    Assert-Eq 'S73 vacio no' '' (Test-CaseIdValido -Texto '')
+    Assert-Eq 'S73 catorce digitos no' '' (Test-CaseIdValido -Texto '21547577609964')
+    Assert-Eq 'S73 dieciseis digitos no' '' (Test-CaseIdValido -Texto '2154757760996489')
+    Assert-Eq 'S73 el ticket de ClickUp no' '' (Test-CaseIdValido -Texto 'IC-12345')
+    Assert-Eq 'S73 un numero mas largo no cuenta como id' '' (Test-CaseIdValido -Texto '99215475776099648')
+
+    # Escenario 74 (v3.14, pedido del equipo): actualizar la Nativa con el instalador que ya esta
+    # en la PC. El 03/09 la telemetria mostro la Nativa 0.0.18 en 10 de 24 corridas y solo 6 con la
+    # 0.0.37 firmada. La regla: solo si el instalador declara una version MAS NUEVA.
+    Reset-State
+    $u74a = Test-NativaNecesitaUpdate -Instalada '0.0.18' -Disponible '0.0.37'
+    Assert-Eq 'S74 con instalador mas nuevo se actualiza' $true ([bool]$u74a.actualizar)
+    $u74b = Test-NativaNecesitaUpdate -Instalada '0.0.37' -Disponible '0.0.37'
+    Assert-Eq 'S74 con la misma version no se toca' $false ([bool]$u74b.actualizar)
+    # Lo importante: NUNCA degradar. Ya paso en este proyecto (0.0.36 -> 0.0.18).
+    $u74c = Test-NativaNecesitaUpdate -Instalada '0.0.37' -Disponible '0.0.18'
+    Assert-Eq 'S74 nunca degrada la Nativa' $false ([bool]$u74c.actualizar)
+    # La comparacion tiene que ser numerica: como texto, '0.0.9' > '0.0.37'.
+    $u74d = Test-NativaNecesitaUpdate -Instalada '0.0.9' -Disponible '0.0.37'
+    Assert-Eq 'S74 compara numerico, no alfabetico' $true ([bool]$u74d.actualizar)
+    # Si el instalador no dice su version, no se instala a ciegas.
+    $u74e = Test-NativaNecesitaUpdate -Instalada '0.0.18' -Disponible ''
+    Assert-Eq 'S74 sin version del instalador no se toca nada' $false ([bool]$u74e.actualizar)
+    Assert-Eq 'S74 y dice por que' $true ([bool]([string]$u74e.motivo -match 'version legible'))
+    # Sin Nativa instalada esto no es un update: es una instalacion, y va por otro camino.
+    $u74f = Test-NativaNecesitaUpdate -Instalada '' -Disponible '0.0.37'
+    Assert-Eq 'S74 sin Nativa instalada no es un update' $false ([bool]$u74f.actualizar)
+    $u74g = Test-NativaNecesitaUpdate -Instalada '0.0.18' -Disponible 'no-es-version'
+    Assert-Eq 'S74 version ilegible del instalador tampoco' $false ([bool]$u74g.actualizar)
+    # Un .exe no tiene ProductVersion legible por esta via, y un archivo que no esta tampoco.
+    Assert-Eq 'S74 un .exe no declara version por MSI' '' (Get-MsiProductVersion -Path 'C:\no-existe\Fudo.exe')
+    Assert-Eq 'S74 un .msi inexistente no invita nada' '' (Get-MsiProductVersion -Path 'C:\no-existe\Fudo.msi')
+    Assert-Eq 'S74 sin ruta no hay version' '' (Get-MsiProductVersion -Path '')
+    Assert-Eq 'S74 sin instalador no se lanza nada' $true ($null -eq (Invoke-NativeInstallerFile -Path ''))
+
+    # Escenario 75 (v3.14, pedido del equipo): una version vieja no puede correr. El 03/09 una
+    # sola corrida 3.8 reprodujo cuatro bugs ya corregidos y sumo una fila a 'resueltas' con
+    # resolved y needsEscalation a la vez.
+    Reset-State
+    function Get-PublishedVersion { param([int]$TimeoutSec = 4) return '9.9' }
+    $script:VersionBloqueada = $false
+    Assert-Eq 'S75 con una version publicada mas nueva no corre' $true (Test-VersionBloqueada)
+    Assert-Eq 'S75 y queda registrado' $true ([bool]$script:VersionBloqueada)
+    # Al dia: corre normal.
+    function Get-PublishedVersion { param([int]$TimeoutSec = 4) return $script:SchemaVersion }
+    $script:VersionBloqueada = $false
+    Assert-Eq 'S75 al dia corre' $false (Test-VersionBloqueada)
+    # Una copia MAS nueva que la publicada tampoco se bloquea (es la PC de desarrollo).
+    function Get-PublishedVersion { param([int]$TimeoutSec = 4) return '0.1' }
+    Assert-Eq 'S75 una copia mas nueva que la publicada corre' $false (Test-VersionBloqueada)
+
+    # Escenario 75b: LO MAS IMPORTANTE de este cambio. Si no se pudo consultar la version
+    # publicada -cliente sin internet, la red del local bloqueando GitHub- NO se bloquea: eso no
+    # es 'version vieja', es 'no se sabe'. Bloquear ahi dejaria al asesor sin herramienta delante
+    # del cliente, que es justo donde se usa.
+    Reset-State
+    function Get-PublishedVersion { param([int]$TimeoutSec = 4) return '' }
+    $script:VersionCheckFallo = $false
+    Assert-Eq 'S75b sin poder consultar NO se bloquea' $false (Test-VersionBloqueada)
+    Assert-Eq 'S75b y queda constancia de que no se pudo' $true ([bool]$script:VersionCheckFallo)
+
+    # Escenario 75c: -NoUpdateCheck no consulta, asi que tampoco bloquea. Es un opt-out explicito,
+    # no un bypass silencioso: viaja en la telemetria para que se vea si alguien lo usa de atajo.
+    Reset-State
+    function Get-PublishedVersion { param([int]$TimeoutSec = 4) return '9.9' }
+    Set-Variable -Name NoUpdateCheck -Value $true -Scope Script
+    $script:VersionCheckOmitido = $false
+    Assert-Eq 'S75c con -NoUpdateCheck no se bloquea' $false (Test-VersionBloqueada)
+    Assert-Eq 'S75c y queda registrado el salteo' $true ([bool]$script:VersionCheckOmitido)
+    Set-Variable -Name NoUpdateCheck -Value $false -Scope Script
 
     # Escenario 24 (caso real): caja tapada con miles de trabajos + cocina sana.
     # Antes se elegia la primera cola y se devolvia "todo ok" ignorando la que fallaba.
@@ -7120,6 +7314,7 @@ function Invoke-MenuAction {
 #   stdout : SOLO el JSON, delimitado por <<<FUDO_JSON_BEGIN>>> / <<<FUDO_JSON_END>>>
 #   stderr : resumen humano (es-AR) y avisos. Usar -Quiet para silenciarlo.
 #   exit   : 0 = resuelto | 2 = requiere escalamiento | 3 = falla del motor | 4 = self-test fallido
+#            5 = motor desactualizado (no corrio) | 6 = falta el ID de conversacion (no corrio)
 # ---------------------------------------------------------------------------
 function Find-LocalNativeInstaller {
     <# Busca un instalador de la Nativa ya presente: al lado del script, en Descargas o en el Escritorio. #>
@@ -7132,7 +7327,10 @@ function Find-LocalNativeInstaller {
     try { $donde += (Get-Location).Path } catch {}
     if ($env:USERPROFILE) { $donde += @((Join-Path $env:USERPROFILE 'Downloads'), (Join-Path $env:USERPROFILE 'Desktop')) }
     foreach ($d in @($donde | Where-Object { $_ })) {
-        foreach ($pat in @('Fudo*.exe','*fudo*.exe','*Nativa*.exe')) {
+        # v3.14: la Nativa firmada se distribuye como .msi y esta busqueda solo miraba .exe,
+        # asi que un instalador puesto al lado del script no se encontraba nunca. El .msi va
+        # primero: es el formato de la version vigente.
+        foreach ($pat in @('Fudo*.msi','*fudo*.msi','*Nativa*.msi','Fudo*.exe','*fudo*.exe','*Nativa*.exe')) {
             try {
                 $hit = @(Get-ChildItem -Path $d -Filter $pat -File -ErrorAction SilentlyContinue |
                          Where-Object { $_.Length -gt 200KB } | Sort-Object LastWriteTime -Descending) | Select-Object -First 1
@@ -7143,6 +7341,111 @@ function Find-LocalNativeInstaller {
     return ''
 }
 
+function Get-MsiProductVersion {
+    <#
+      Version que declara un .msi, leida de su tabla Property (ProductVersion) con el COM de
+      Windows Installer. Sin esto habria que instalar a ciegas o confiar en el nombre del archivo,
+      y no se podria saber si el instalador que hay al lado del script es mas nuevo que lo que la
+      PC ya tiene. Devuelve '' si no se puede leer.
+    #>
+    param([string]$Path)
+    if (-not $Path) { return '' }
+    if ($Path -notmatch '(?i)\.msi$') { return '' }
+    if (-not (Test-Path $Path)) { return '' }
+    $ver = ''
+    $wi = $null; $db = $null; $vw = $null
+    try {
+        $wi = New-Object -ComObject WindowsInstaller.Installer
+        $db = $wi.GetType().InvokeMember('OpenDatabase', 'InvokeMethod', $null, $wi, @((Resolve-Path $Path).Path, 0))
+        $q  = "SELECT Value FROM Property WHERE Property = 'ProductVersion'"
+        $vw = $db.GetType().InvokeMember('OpenView', 'InvokeMethod', $null, $db, @($q))
+        $null = $vw.GetType().InvokeMember('Execute', 'InvokeMethod', $null, $vw, $null)
+        $rec = $vw.GetType().InvokeMember('Fetch', 'InvokeMethod', $null, $vw, $null)
+        if ($rec) { $ver = [string]$rec.GetType().InvokeMember('StringData', 'GetProperty', $null, $rec, @(1)) }
+    } catch {}
+    finally {
+        try { if ($vw) { $null = $vw.GetType().InvokeMember('Close', 'InvokeMethod', $null, $vw, $null) } } catch {}
+        foreach ($o in @($vw, $db, $wi)) {
+            try { if ($o) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($o) } } catch {}
+        }
+    }
+    return ([string]$ver).Trim()
+}
+
+function Test-NativaNecesitaUpdate {
+    <#
+      Conviene actualizar la Nativa con el instalador que hay en la PC?
+      Solo si hay instalador, hay algo instalado, y el instalador declara una version MAS NUEVA.
+      Si el instalador no dice su version no se toca nada: instalar a ciegas puede DEGRADAR la
+      Nativa, que es un problema ya visto en este proyecto (una restauracion de cuarentena dejo
+      0.0.36 -> 0.0.18, y la 0.0.18 despues aparecio circulando en varias PCs).
+      Devuelve: actualizar (bool), motivo (texto).
+    #>
+    param([string]$Instalada, [string]$Disponible)
+    if (-not $Disponible) { return @{ actualizar = $false; motivo = 'no hay instalador con version legible en la PC' } }
+    if (-not $Instalada)  { return @{ actualizar = $false; motivo = 'no hay Nativa instalada: corresponde instalar, no actualizar' } }
+    $mas = $null
+    try { $mas = ([version]$Disponible -gt [version]$Instalada) } catch { $mas = $null }
+    if ($null -eq $mas) { return @{ actualizar = $false; motivo = ('no se pudieron comparar las versiones (' + $Instalada + ' vs ' + $Disponible + ')') } }
+    if (-not $mas)      { return @{ actualizar = $false; motivo = ('el instalador no es mas nuevo (instalada ' + $Instalada + ', instalador ' + $Disponible + ')') } }
+    return @{ actualizar = $true; motivo = ('el instalador trae la ' + $Disponible + ' y la PC tiene la ' + $Instalada) }
+}
+
+function Invoke-NativeInstallerFile {
+    <#
+      Ejecuta el instalador de la Nativa. Un .msi NO se ejecuta directo: va por msiexec, y en
+      silencio, para no dejar un asistente abierto en la PC del cliente.
+      Devuelve el codigo de salida, o $null si no se pudo lanzar.
+    #>
+    param([string]$Path, [string]$ExtraArgs = '')
+    if (-not $Path) { return $null }
+    try {
+        if ($Path -match '(?i)\.msi$') {
+            $msiArgs = '/i "' + (Resolve-Path $Path).Path + '" /qn /norestart'
+            if ($ExtraArgs) { $msiArgs = $msiArgs + ' ' + $ExtraArgs }
+            $pr = Start-Process -FilePath 'msiexec.exe' -ArgumentList $msiArgs -PassThru -Wait -ErrorAction Stop
+            return [int]$pr.ExitCode
+        }
+        $pr = $(if ($ExtraArgs) { Start-Process -FilePath $Path -ArgumentList $ExtraArgs -PassThru -Wait -ErrorAction Stop }
+                else            { Start-Process -FilePath $Path -PassThru -Wait -ErrorAction Stop })
+        return [int]$pr.ExitCode
+    } catch { return $null }
+}
+
+function Update-FudoNativeFromLocal {
+    <#
+      Actualiza la Nativa con un instalador que ya esta en la PC (al lado del script, en Descargas
+      o en el Escritorio). La telemetria del 03/09 mostro la Nativa 0.0.18 en 10 de 24 corridas y
+      solo 6 con la 0.0.37 firmada: actualizarla es la solucion de fondo, porque la firmada ya no
+      la bloquea el antivirus.
+      Verifica DESPUES de instalar: si la version no subio, no se declara actualizada.
+    #>
+    param([string]$Instalada)
+    $inst = Find-LocalNativeInstaller
+    if (-not $inst) { return @{ aplicado = $false; motivo = 'no hay instalador de la Nativa en la PC' } }
+    $verInst = Get-MsiProductVersion -Path $inst
+    $dec = Test-NativaNecesitaUpdate -Instalada $Instalada -Disponible $verInst
+    if (-not $dec.actualizar) {
+        return @{ aplicado = $false; motivo = [string]$dec.motivo; instalador = $inst; versionInstalador = $verInst }
+    }
+    $rem = Invoke-Remediation -Description ('Actualizar la App Nativa a la ' + $verInst + ' con el instalador que ya esta en la PC') `
+        -Type 'nativa.update_local' -Target 'FudoNativa' -Before $Instalada -After $verInst -Reversible $true -Fix {
+            $notas = @()
+            $code = Invoke-NativeInstallerFile -Path $inst -ExtraArgs $NativeInstallerArgs
+            $notas += $(if ($null -eq $code) { 'no se pudo lanzar el instalador' } else { 'el instalador termino con codigo ' + $code })
+            Start-Sleep -Seconds 3
+            ($notas -join ' | ')
+        }
+    $verDespues = ''
+    if ($rem.applied) {
+        try { $verDespues = [string](Get-NativaVersionState -Install (Find-FudoNativeInstall)).version } catch {}
+    }
+    $subio = $false
+    try { $subio = ([bool]$verDespues -and ([version]$verDespues -gt [version]$Instalada)) } catch {}
+    return @{ aplicado = [bool]$rem.applied; subio = [bool]$subio; nota = [string]$rem.note
+              instalador = $inst; versionInstalador = $verInst; versionDespues = $verDespues
+              motivo = [string]$dec.motivo }
+}
 function Install-FudoNative {
     <#
       Instala la App Nativa de Fudo. Antes agrega las exclusiones de antivirus, porque el bloqueo
@@ -7521,6 +7824,11 @@ function Send-Telemetry {
                     $t['fudoSinUso'] = [bool]$Result.diagnosis.fudoSinUso
                     $t['fudoUsoEstado'] = [string]$Result.diagnosis.fudoUsoEstado
                     $t['cierreSinVerificarFudo'] = [bool]$Result.diagnosis.cierreSinVerificarFudo
+                    $t['versionCheck'] = [ordered]@{
+                        publicada = [string]$script:VersionPublicada
+                        omitido   = [bool]$script:VersionCheckOmitido
+                        fallo     = [bool]$script:VersionCheckFallo
+                    }
                     $t['cobertura'] = $(if ($script:Diagnostics.Contains('cobertura')) { $script:Diagnostics['cobertura'] } else { $null })
                     $t['historialFudo'] = @($(if ($script:Diagnostics.Contains('historialImpresion')) { $script:Diagnostics['historialImpresion'].porImpresora } else { @() }))
                     # v3.9: los ids de accion (testprint.retarget, queue.rebind, ...) no viajaban:
@@ -7663,6 +7971,10 @@ try {
         [Console]::Error.WriteLine("  Version local: $($script:SchemaVersion)  |  publicada: $pub  ->  al dia")
         exit 0
     }
+
+    # v3.14: dos requisitos previos. Ninguno diagnostica nada: si no se cumplen, no se corre.
+    if (Test-VersionBloqueada) { exit 5 }
+    $CaseId = Resolve-CaseIdObligatorio -Actual $CaseId
 
     $final = Invoke-FudoPrintDoctor
     Write-DoctorResult -Obj $final
