@@ -2,6 +2,65 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.13] - 2026-09-03
+
+La 3.12 subió el cierre de casos del 11% al 27%, y la revisión de hoy mostró que **3 de esos 4
+cierres no verificaron nada del lado de Fudo** — y uno era falso otra vez. Esta vez la causa no
+era el antivirus: era que el motor no distinguía *"Fudo sí imprime"* de *"no tengo idea"*.
+
+### Corregido
+- **Un caso podía cerrar diciendo que Fudo imprime cuando en realidad no había con qué saberlo.**
+  El log de impresión de Windows **viene apagado de fábrica**. El motor lo enciende en esa misma
+  corrida, así que el historial queda vacío: no hay ni una comanda que mirar. Ese chequeo salía
+  con plano `os` ("falta un dato") y no con plano `fudo_config` ("falta la comanda"), así que no
+  entraba en el cálculo y el caso cerraba con `fudoSinUso = false`, que se lee como *"Fudo está
+  imprimiendo bien"*.
+  En la telemetría fue **10 de 10 primeras corridas de cada PC**; y en la corrida siguiente de
+  esas mismas PCs, con el log ya encendido, daba `true` **5 de 5**. Una PC cerró `resolved` a las
+  11:32 y volvió como `volvio_a_fallar` 22 minutos después.
+  Ahora el último tramo tiene **tres estados** en vez de un sí/no: `con_comandas` (el historial
+  muestra comandas de Fudo), `sin_comandas` (se pudo mirar y no hay ninguna) y `sin_datos` (no hay
+  con qué saberlo). Un cierre con `sin_datos` viaja marcado como `cierreSinVerificarFudo` y **le
+  muestra al asesor una línea FALTA** diciendo que hay que mandar una comanda de prueba y volver a
+  correr: antes ese caso cerraba mudo.
+  *Consecuencia sobre la métrica: el cruce `resolved × fudoSinUso` daba 4/4 cierres completos y era
+  un artefacto. Desde esta versión se puede separar el cierre completo del cierre a medio camino.*
+- **El id de la causa y el texto de la causa salían de fuentes distintas.** Cuando el caso cerraba,
+  el texto se armaba con la reparación de menor capa pero el id se tomaba de la lista de
+  candidatos en `warn`. Se vio una fila con id `hw.notInstalled` y causa *"Puerto USB desmapeado"*
+  —que es otro chequeo—, y con eso **la categoría salió de un chequeo que no era la causa**. Si el
+  caso cerró, ahora manda la reparación: el id y el texto describen lo mismo.
+- **Una corrida podía cerrar sin decir de dónde salió el cierre.** La rama que cierra sin haber
+  reparado nada (la PC ya estaba sana) viajaba con `rootCauseCheckId` vacío. Tiene id propio:
+  `ok.yaFuncionaba`. *La aserción que iba a garantizar esto en la 3.12 estaba mal escrita y pasaba
+  siempre; ahora afirma el invariante de verdad.*
+- **La causa de una prueba de impresión fallida era el título del paso.** Se veía
+  `causaRaiz = "Prueba fisica ESC/POS por USB (RAW)"`, que no le dice nada al asesor. Las tres
+  ramas de fallo ahora explican qué pasó (el ticket quedó en la cola / no se pudo enviar / no salió
+  papel) y tienen categoría propia `hardware.no_imprime`.
+- **El motor se mostraba a sí mismo en el historial del local.** El descarte de sus propios tickets
+  de prueba estaba *después* de crear la entrada, así que una cola cuyo único trabajo fue el ticket
+  del motor figuraba igual en el historial, con total 0 y con el nombre de su documento de prueba.
+- **"No se pudo probar la impresión" decía siempre lo mismo por dos motivos distintos.** El motivo
+  era `sin_impresora` tanto cuando no había nada enchufado como cuando la impresora **sí estaba**
+  conectada y lo que faltaba era que Windows le asignara un puerto. Son dos casos con soluciones
+  distintas: ahora el segundo dice `sin_puerto_asignado` y le explica al asesor que hay que
+  reconectar el USB o instalar el driver genérico, que es lo que crea el puerto.
+
+### Evaluado y NO implementado
+- **Crear una cola de prueba cuando la impresora está conectada pero sin puerto asignado.** Se
+  propuso a partir de un caso escalado sin prueba física. No se hizo, por dos razones: el motor
+  **ya tiene** ese respaldo (cae a los puertos USB huérfanos cuando hay hardware presente sin
+  mapeo), y en el caso concreto no había *ningún* puerto —ni vivo ni huérfano— sobre el que crear
+  la cola. Inventar un puerto USB que no está respaldado por el dispositivo imprime al vacío, que
+  es exactamente el bug que corrigió la 3.7 (el motor creando una cola y reportándola después como
+  desconectada). Lo que sí se hizo es que el motivo del salteo diga la verdad, para que la próxima
+  revisión pueda distinguir los dos casos con datos.
+- **Renombrar el ticket de prueba con un prefijo propio para excluirlo del historial.** No hacía
+  falta: el ticket ya se manda con el nombre `Fudo Print Doctor Test` y ya se excluía del conteo.
+  Lo que estaba mal era el orden del descarte, corregido arriba. *El documento observado en la
+  telemetría (`"Imprimir documento"` / `"Documento de Impressão"`) no es el ticket del motor: esa
+  PC imprimió algo ajeno a Fudo de verdad.*
 ## [3.12] - 2026-09-02
 
 La 3.11 cerró sus **primeros dos casos** —los primeros del proyecto— y uno de los dos fue un

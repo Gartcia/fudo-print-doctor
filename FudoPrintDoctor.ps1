@@ -442,7 +442,7 @@ $script:TestPrinterRx = '(?i)^FUDO-TEST-'
 # puerto tenga hardware; si el hardware se va, deja de serlo (ver Remove-OrphanOwnQueues).
 $script:OwnQueueRx   = '(?i)^FUDO-(TEST-|USB\d)'
 $script:TestDocRx    = '(?i)fudo print doctor'
-$script:SchemaVersion = '3.12'
+$script:SchemaVersion = '3.13'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -2378,12 +2378,15 @@ function Get-PrintHistory {
             try { $doc = [string]$e.Properties[1].Value } catch {}
             try { $imp = [string]$e.Properties[4].Value } catch {}
             if (-not $imp) { continue }
+            # Los tickets de prueba del motor no son historial del local: contarlos hacia que
+            # la corrida siguiente creyera que esa cola imprimio (o peor: que imprimio comandas).
+            # v3.13: el descarte estaba DESPUES de crear la entrada, asi que una cola cuyo unico
+            # trabajo fue el ticket del motor igual aparecia en el historial con total=0 y con
+            # ejemploDoc = 'Fudo Print Doctor Test'. El motor se mostraba a si mismo.
+            if ($doc -match $script:TestDocRx) { continue }
             if (-not $porImp.ContainsKey($imp)) {
                 $porImp[$imp] = [ordered]@{ impresora = $imp; total = 0; deFudo = 0; ultimo = ''; ultimoDeFudo = ''; ejemploDoc = $doc }
             }
-            # Los tickets de prueba del motor no son historial del local: contarlos hacia que
-            # la corrida siguiente creyera que esa cola imprimio (o peor: que imprimio comandas).
-            if ($doc -match $script:TestDocRx) { continue }
             $porImp[$imp].total++
             if (-not $porImp[$imp].ultimo) { $porImp[$imp].ultimo = $e.TimeCreated.ToString('dd/MM HH:mm') }
             # La Nativa manda los trabajos con este nombre
@@ -4063,15 +4066,32 @@ function Test-Layer4-HardwarePrint {
                 -Plane 'hardware' -Evidence @{ ip = $ip; port = $Port; sent = $true; confirmadoPorHumano = $true } `
                 -Recommendation 'Salio el papel por red: el hardware y la red estan bien. Si la comanda no sale, la causa esta en la config de Fudo (area/cocina/sala).'
         } catch {
-            Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica ESC/POS por red' -Status 'fail' -RootCauseCandidate $true `
+            Add-Check -Id 'hw.testprint' -Layer 4 -Name 'No se pudo mandar el ticket de prueba a la impresora de red' -Status 'fail' -RootCauseCandidate $true `
                 -Plane 'hardware' -Evidence @{ ip = $ip; error = $_.Exception.Message } `
                 -ArticleRef 'https://soporte.fu.do/es/articles/11730816'
         }
     } else {
         if ($null -eq $Printer) {
-            Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica de impresion' -Status 'skipped' -Plane 'hardware' `
-                -Evidence @{ note = 'sin impresora real objetivo'; skipReason = 'sin_impresora' } `
-                -Recommendation 'No hay una impresora fisica instalada para probar: resolver primero la capa 1 (hardware/instalacion).'
+            # v3.13: el motivo decia 'sin_impresora' tambien cuando SI habia hardware presente y
+            # lo que faltaba era que Windows le asignara un puerto. Se vio una PC con
+            # hardwarePresente=1 y cantidadColas=0 escalando con skipReason='sin_impresora': el
+            # motivo no permitia distinguir 'no hay nada enchufado' de 'esta enchufada y Windows
+            # no le dio puerto', que son dos casos con soluciones distintas.
+            $hwPres = 0
+            if ($script:Diagnostics.Contains('hwDeviceCount')) { $hwPres = [int]$script:Diagnostics['hwDeviceCount'] }
+            if ($hwPres -gt 0) {
+                Add-Check -Id 'hw.testprint' -Layer 4 -Name 'No se pudo probar: la impresora esta conectada pero Windows no le asigno ningun puerto' -Status 'skipped' -Plane 'hardware' `
+                    -Evidence @{ note = 'hardware presente sin puerto asignado'; skipReason = 'sin_puerto_asignado'; hardwarePresente = $hwPres } `
+                    -ArticleRef 'https://soporte.fu.do/es/articles/11730817' `
+                    -Recommendation ('Windows ve la impresora conectada pero no le asigno puerto, asi que no hay ninguna cola por donde mandarle el ticket de prueba. ' +
+                                     'NO se crea una cola de prueba sobre un puerto inventado: imprimiria al vacio. ' +
+                                     'Con la impresora ENCENDIDA: desenchufar el USB, esperar 5 segundos y volver a enchufarlo en un puerto directo de la PC (sin hub). ' +
+                                     'Si sigue sin aparecer, instalar el driver "Generico / Solo texto", que es lo que crea el puerto USB.')
+            } else {
+                Add-Check -Id 'hw.testprint' -Layer 4 -Name 'No se pudo probar: no hay ninguna impresora fisica instalada' -Status 'skipped' -Plane 'hardware' `
+                    -Evidence @{ note = 'sin impresora real objetivo'; skipReason = 'sin_impresora'; hardwarePresente = 0 } `
+                    -Recommendation 'No hay una impresora fisica instalada para probar: resolver primero la capa 1 (hardware/instalacion).'
+            }
             return
         }
         if (-not (Test-PortHasLiveDevice -PortName ([string]$Printer.PortName))) {
@@ -4128,7 +4148,12 @@ function Test-Layer4-HardwarePrint {
                 $bloqueadoPor = [int]$drain.bloqueadoPor
             }
             if ($quedoEnCola) {
-                Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica ESC/POS por USB (RAW)' -Status 'fail' -RootCauseCandidate $true `
+                # El nombre del check es el texto que sale como CAUSA. Decia el titulo del paso
+                # ('Prueba fisica ESC/POS por USB (RAW)'), que no explica nada al asesor.
+                Add-Check -Id 'hw.testprint' -Layer 4 `
+                    -Name $(if ($bloqueadoPor -gt 0) { "El ticket de prueba quedo en la cola: hay $bloqueadoPor comanda(s) vieja(s) delante bloqueandola" }
+                            else { 'El ticket de prueba entro a la cola y no se imprimio: la impresora no responde' }) `
+                    -Status 'fail' -RootCauseCandidate $true `
                     -Plane 'hardware' -Evidence @{ printer = $Printer.Name; sent = $true; quedoEnCola = $true; trabajosDelante = $bloqueadoPor } `
                     -ArticleRef 'https://soporte.fu.do/es/articles/11730817' `
                     -Recommendation $(if ($bloqueadoPor -gt 0) {
@@ -4142,7 +4167,7 @@ function Test-Layer4-HardwarePrint {
             }
 
             if (-not $ok) {
-                Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica ESC/POS por USB (RAW)' -Status 'fail' -RootCauseCandidate $true `
+                Add-Check -Id 'hw.testprint' -Layer 4 -Name 'No se pudo enviar el ticket de prueba a la impresora (envio RAW rechazado)' -Status 'fail' -RootCauseCandidate $true `
                     -Plane 'hardware' -Evidence @{ printer = $Printer.Name; sent = $false } `
                     -ArticleRef 'https://soporte.fu.do/es/articles/12044021' `
                     -Recommendation 'El envio RAW fallo: revisar puerto/driver/cable.'
@@ -4156,7 +4181,7 @@ function Test-Layer4-HardwarePrint {
             $salio = Confirm-PaperCameOut -Printer $Printer.Name
             $script:Diagnostics['ticketConfirmado'] = $salio
             if ($salio -eq $false) {
-                Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica ESC/POS por USB (RAW)' -Status 'fail' -RootCauseCandidate $true `
+                Add-Check -Id 'hw.testprint' -Layer 4 -Name 'La impresora recibio el ticket de prueba pero no salio papel' -Status 'fail' -RootCauseCandidate $true `
                     -Plane 'hardware' -Evidence @{ printer = $Printer.Name; sent = $true; quedoEnCola = $false; confirmadoPorHumano = $false } `
                     -ArticleRef 'https://soporte.fu.do/es/articles/11730817' `
                     -Recommendation ('El spooler dice que el ticket se imprimio pero no salio papel. Eso descarta Windows y la cola: ' +
@@ -4360,6 +4385,18 @@ function Resolve-Diagnosis {
     $fudoSinUso = @($checks | Where-Object {
         $_.id -eq 'fudo.usoReal' -and $_.status -eq 'warn' -and $_.plane -eq 'fudo_config'
     })
+    # v3.13: 'fudoSinUso = false' significaba dos cosas opuestas y no habia forma de
+    # distinguirlas: 'Fudo SI imprimio' y 'no tenemos idea'. Cuando el log de impresion venia
+    # apagado (viene asi de fabrica), el motor lo habilita en esa misma corrida y el historial
+    # queda vacio: el check fudo.usoReal sale con plano 'os' -no 'fudo_config'-, no entra en el
+    # filtro de arriba, y el caso cerraba con fudoSinUso=false como si Fudo estuviera
+    # imprimiendo. En la telemetria del 02/09 fue 10 de 10 primeras corridas de cada PC, y la
+    # corrida siguiente de esas mismas PCs daba true 5 de 5. Con eso, el cruce
+    # 'resolved x fudoSinUso' daba 4/4 cierres completos y era un artefacto.
+    $usoReal = $checks | Where-Object { $_.id -eq 'fudo.usoReal' } | Select-Object -First 1
+    $fudoUsoEstado = 'sin_datos'
+    if ($usoReal -and $usoReal.status -eq 'ok') { $fudoUsoEstado = 'con_comandas' }
+    elseif (@($fudoSinUso).Count -gt 0)         { $fudoUsoEstado = 'sin_comandas' }
     $paperOk = [bool]($hwTest -and $hwTest.status -eq 'ok')
 
     if (@($fails).Count -eq 0 -and $paperOk) {
@@ -4428,9 +4465,27 @@ function Resolve-Diagnosis {
         # impide cerrar (es config del backend de Fudo, fuera del alcance del motor) pero hay
         # que decirlo: es el tramo que queda por confirmar despues de que el papel salga.
         fudoSinUso      = [bool](@($fudoSinUso).Count -gt 0)
+        # Los tres estados posibles del ultimo tramo, sin ambiguedad:
+        #   con_comandas - el historial muestra comandas de Fudo
+        #   sin_comandas - el historial esta disponible y no hay ninguna
+        #   sin_datos    - no se puede saber (log recien habilitado, apagado, o sin evaluar)
+        fudoUsoEstado   = [string]$fudoUsoEstado
+        # Un cierre que no pudo verificar el tramo de Fudo. Es el dato que hacia falta para
+        # que la metrica de cierre no cuente humo: cerro porque la impresora imprime, pero
+        # nadie pudo confirmar que la comanda de Fudo llegue.
+        cierreSinVerificarFudo = [bool]($resolved -and $fudoUsoEstado -eq 'sin_datos')
         rootCause       = $rootCause
-        rootCauseCheckId = $(if (@($ordered).Count -gt 0) { [string]$ordered[0].id }
-                              elseif ($resolved -and @($fixed).Count -gt 0) { [string](@($fixed | Sort-Object { $_.layer })[0].id) }
+        # v3.13: el id y el texto de la causa salian de fuentes distintas. Cuando el caso
+        # cerraba, el texto se armaba con la reparacion de menor capa ($fixed) pero el id se
+        # tomaba de $ordered -los candidatos en fail/warn-, asi que se vio una fila con
+        # rootCauseCheckId = 'hw.notInstalled' y causa 'Puerto USB desmapeado' (que es
+        # conn.usb), y con eso la categoria salio de un check que no era la causa. Si cerro,
+        # manda $fixed; el id y el texto tienen que describir lo mismo.
+        rootCauseCheckId = $(if ($resolved) {
+                                  if (@($fixed).Count -gt 0) { [string](@($fixed | Sort-Object { $_.layer })[0].id) }
+                                  else { 'ok.yaFuncionaba' }
+                              }
+                              elseif (@($ordered).Count -gt 0) { [string]$ordered[0].id }
                               else { [string]$rootCheckId })
         confidence      = $confidence
         autoFixesApplied = @($fixed | ForEach-Object { $_.name })
@@ -4534,7 +4589,9 @@ $script:CategoryByCheckId = @{
     'hw.deviceConnected'        = 'hardware.no_conectada'
     'hw.disconnected'           = 'hardware.desconectada'
     'printer.disconnected'      = 'hardware.desconectada'
-    'hw.testprint'              = 'hardware'
+    'hw.notInstalled'           = 'os.driver_faltante'
+    'hw.testprint'              = 'hardware.no_imprime'
+    'ok.yaFuncionaba'           = 'ok.ya_funcionaba'
     'repair.pendingConfirm'     = 'repair.pendiente_confirmar'
     'fudo.configProbable'       = 'fudo_config'
     'engine.inconclusive'       = 'unknown'
@@ -4831,6 +4888,13 @@ function Build-HumanSummary {
     if ($Diag.resolved -and $Diag.fudoSinUso) {
         Add-Field -Label 'FALTA' -Text ('la impresora YA IMPRIME, pero en el historial de Windows no hay ninguna comanda de Fudo todavia. ' +
                                         'Confirmar en Fudo que esta impresora este dada de alta con su cocina/area y mandar una comanda de prueba.')
+    }
+    # v3.13: este caso quedaba MUDO. Con el log de impresion recien habilitado no hay historial
+    # que mirar, asi que el caso cerraba sin decir que el ultimo tramo no se pudo verificar.
+    elseif ($Diag.resolved -and [string]$Diag.fudoUsoEstado -eq 'sin_datos') {
+        Add-Field -Label 'FALTA' -Text ('la impresora YA IMPRIME, pero Windows todavia no tiene historial de impresion para mirar ' +
+                                        '(el registro estaba apagado y se acaba de encender). Mandar una comanda de prueba desde Fudo y volver a correr el diagnostico: ' +
+                                        'recien ahi se puede confirmar que la comanda llega.')
     }
     # Salio el papel pero el caso no cierra: sin esto se lee como si no hubiera imprimido nada.
     if ($Diag.paperOk -and -not $Diag.resolved) {
@@ -6089,7 +6153,11 @@ function Invoke-SelfTest {
     Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica' -Status 'ok' -Plane 'hardware'
     Add-Check -Id 'fudo.printerKitchen' -Layer 5 -Name 'Impresora con Cocina/Area asignada' -Status 'warn' -Plane 'fudo_config'
     $d68b = Resolve-Diagnosis
-    Assert-Eq 'S68b un cierre sin reparaciones igual dice de donde salio' $true ([bool]([string]$d68b.rootCauseCheckId).Length -gt 0 -or [bool]$d68b.resolved)
+    # Esta asercion estaba mal escrita en la 3.12: el '-or resolved' la hacia pasar siempre y
+    # dejo pasar justo el caso que iba a garantizar. En la telemetria del 02/09 aparecio una
+    # fila cerrando resolved con rootCauseCheckId VACIO. Ahora se afirma el invariante.
+    Assert-Eq 'S68b un cierre sin reparaciones igual dice de donde salio' 'ok.yaFuncionaba' ([string]$d68b.rootCauseCheckId)
+    Assert-Eq 'S68b y no viaja sin id' $true (([string]$d68b.rootCauseCheckId).Length -gt 0)
     Reset-State
     Add-Check -Id 'nativa.installed' -Layer 0 -Name 'App Nativa de Fudo instalada' -Status 'warn' -RootCauseCandidate $false
     $d68c = Resolve-Diagnosis
@@ -6138,6 +6206,142 @@ function Invoke-SelfTest {
     Assert-Eq 'S69c el atasco de verdad sigue en fail' 'fail' ([string]$c69c.status)
     Assert-Eq 'S69c y sigue siendo causa raiz' $true ([bool]$c69c.rootCauseCandidate)
     Assert-Eq 'S69c y sigue bajando de rango el veredicto USB' $true ([bool]$c69c.evidence.puertoUtil)
+    # Escenario 70 (v3.13, telemetria del 02/09): `fudoSinUso = false` significaba dos cosas
+    # opuestas -'Fudo SI imprimio' y 'no tenemos idea'- y no habia forma de distinguirlas. El log
+    # de impresion de Windows viene APAGADO de fabrica: el motor lo habilita en esa misma corrida
+    # y el historial queda vacio, asi que el check fudo.usoReal sale con plano 'os' (no
+    # 'fudo_config'), no entra en el filtro, y el caso cerraba como si Fudo estuviera imprimiendo.
+    # Fue 10 de 10 primeras corridas de cada PC, y la corrida siguiente daba true 5 de 5. Con eso
+    # el cruce 'resolved x fudoSinUso' daba 4/4 cierres completos y era un artefacto.
+    Reset-State
+    Add-Check -Id 'fudo.usoReal' -Layer 5 -Name 'Historial de impresion no disponible' -Status 'warn' -Plane 'os'
+    Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica' -Status 'ok' -Plane 'hardware'
+    $d70 = Resolve-Diagnosis
+    Assert-Eq 'S70 cierra (la impresora imprime)' $true ([bool]$d70.resolved)
+    Assert-Eq 'S70 no se puede saber si Fudo imprime' 'sin_datos' ([string]$d70.fudoUsoEstado)
+    Assert-Eq 'S70 y el cierre queda marcado como no verificado' $true ([bool]$d70.cierreSinVerificarFudo)
+    # El bool viejo sigue significando lo mismo que antes (no hay comandas Y hay con que mirar),
+    # asi que aca es false: es justo el valor que enganaba, ahora desambiguado por el estado.
+    Assert-Eq 'S70 el bool viejo no alcanzaba' $false ([bool]$d70.fudoSinUso)
+    # Y el asesor tiene que verlo en pantalla: antes este caso cerraba mudo.
+    $txt70 = ((Build-HumanSummary -Diag $d70 -DetectedInterface 'USB') -join ' ')
+    Assert-Eq 'S70 la pantalla avisa que falta el tramo' $true ([bool]($txt70 -match 'FALTA'))
+    Assert-Eq 'S70 y explica que no hay historial' $true ([bool]($txt70 -match 'historial de impresion'))
+
+    # Escenario 70b: el log SI estaba disponible y no hay ninguna comanda de Fudo. Ese es el
+    # 'sin_comandas' de verdad, y ese cierre si esta verificado (se pudo mirar y no habia).
+    Reset-State
+    Add-Check -Id 'fudo.usoReal' -Layer 5 -Name 'Ninguna cola recibio comandas de Fudo en el historial' -Status 'warn' -RootCauseCandidate $true -Plane 'fudo_config'
+    Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica' -Status 'ok' -Plane 'hardware'
+    $d70b = Resolve-Diagnosis
+    Assert-Eq 'S70b hay datos y no hay comandas' 'sin_comandas' ([string]$d70b.fudoUsoEstado)
+    Assert-Eq 'S70b el bool viejo sigue valiendo' $true ([bool]$d70b.fudoSinUso)
+    Assert-Eq 'S70b este cierre si esta verificado' $false ([bool]$d70b.cierreSinVerificarFudo)
+
+    # Escenario 70c: Fudo le manda comandas. Cierre completo, sin FALTA.
+    Reset-State
+    Add-Check -Id 'fudo.usoReal' -Layer 5 -Name 'Fudo le manda comandas a: COCINA' -Status 'ok' -Plane 'fudo_config'
+    Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica' -Status 'ok' -Plane 'hardware'
+    $d70c = Resolve-Diagnosis
+    Assert-Eq 'S70c Fudo imprime' 'con_comandas' ([string]$d70c.fudoUsoEstado)
+    Assert-Eq 'S70c cierre completo' $false ([bool]$d70c.cierreSinVerificarFudo)
+    Assert-Eq 'S70c sin linea FALTA' $false ([bool](((Build-HumanSummary -Diag $d70c -DetectedInterface 'USB') -join ' ') -match 'FALTA'))
+
+    # Escenario 70d: si la capa 5 no llego a evaluarse, tampoco se puede afirmar nada.
+    Reset-State
+    Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica' -Status 'ok' -Plane 'hardware'
+    Assert-Eq 'S70d sin capa 5 no se afirma nada' 'sin_datos' ([string](Resolve-Diagnosis).fudoUsoEstado)
+
+    # Escenario 70e: el ticket de prueba del propio motor no puede aparecer en el historial del
+    # local. El descarte estaba DESPUES de crear la entrada, asi que una cola cuyo unico trabajo
+    # fue el ticket del motor figuraba igual con total=0 y ejemploDoc='Fudo Print Doctor Test'.
+    Reset-State
+    function Get-WinEvent {
+        if ("$args" -match '-ListLog') { return [pscustomobject]@{ IsEnabled = $true } }
+        $ev = {
+            param($doc, $imp)
+            [pscustomobject]@{ Id = 307; TimeCreated = (Get-Date); Properties = @(
+                [pscustomobject]@{ Value = '' }, [pscustomobject]@{ Value = $doc },
+                [pscustomobject]@{ Value = '' }, [pscustomobject]@{ Value = '' },
+                [pscustomobject]@{ Value = $imp }) }
+        }
+        return @(
+            (& $ev 'Fudo Print Doctor Test' 'FUDO-TEST-USB001'),
+            (& $ev 'node print job' 'COCINA'),
+            (& $ev 'Presupuesto.docx' 'HP LaserJet')
+        )
+    }
+    $h70e = Get-PrintHistory
+    Assert-Eq 'S70e el log figura habilitado' $true ([bool]$h70e.habilitado)
+    # Dos colas, no tres: la del motor no entra ni con total 0.
+    Assert-Eq 'S70e la cola de prueba del motor no aparece' 2 (@($h70e.porImpresora).Count)
+    Assert-Eq 'S70e y no queda ni el nombre de su documento' $false ([bool]((@($h70e.porImpresora | ForEach-Object { [string]$_.ejemploDoc }) -join '|') -match 'Print Doctor'))
+    $c70e = @($h70e.porImpresora | Where-Object { $_.impresora -eq 'COCINA' })[0]
+    Assert-Eq 'S70e la comanda de Fudo si cuenta' 1 ([int]$c70e.deFudo)
+    $l70e = @($h70e.porImpresora | Where-Object { $_.impresora -eq 'HP LaserJet' })[0]
+    Assert-Eq 'S70e un trabajo ajeno cuenta pero no como Fudo' 0 ([int]$l70e.deFudo)
+    Assert-Eq 'S70e y si suma al total' 1 ([int]$l70e.total)
+
+    # Escenario 71 (v3.13, caso real): el motivo del salteo de la prueba decia 'sin_impresora'
+    # tambien cuando SI habia hardware presente y lo que faltaba era que Windows le asignara un
+    # puerto. Se vio una PC con hardwarePresente=1 y cantidadColas=0 escalando asi: el motivo no
+    # dejaba distinguir 'no hay nada enchufado' de 'esta enchufada y Windows no le dio puerto'.
+    Reset-State
+    $script:Diagnostics['hwDeviceCount'] = 1
+    # Reset-State no limpia las colas ya creadas (es a proposito, lo verifica S27), asi que se
+    # mide el delta de esta corrida y no el acumulado del self-test.
+    $colas71Antes = @($script:TestPrintersCreated).Count
+    Test-Layer4-HardwarePrint -Printer $null -DetectedInterface 'USB'
+    $c71 = Get-CheckById 'hw.testprint'
+    Assert-Eq 'S71 con hardware presente el motivo es el puerto' 'sin_puerto_asignado' ([string]$c71.evidence.skipReason)
+    Assert-Eq 'S71 y lo dice en la causa' $true ([bool]([string]$c71.name -match 'no le asigno ningun puerto'))
+    Assert-Eq 'S71 deja el conteo de hardware' 1 ([int]$c71.evidence.hardwarePresente)
+    # Y no se inventa una cola de prueba sobre un puerto que no existe: imprimir al vacio fue
+    # justo el bug que la v3.7 corrigio (el motor reportando su propia cola como desconectada).
+    Assert-Eq 'S71 no crea ninguna cola' $colas71Antes (@($script:TestPrintersCreated).Count)
+
+    # Escenario 71b: sin hardware, el motivo sigue siendo el de siempre.
+    Reset-State
+    $script:Diagnostics['hwDeviceCount'] = 0
+    Test-Layer4-HardwarePrint -Printer $null -DetectedInterface 'USB'
+    Assert-Eq 'S71b sin hardware el motivo no cambia' 'sin_impresora' ([string](Get-CheckById 'hw.testprint').evidence.skipReason)
+
+    # Escenario 72 (v3.13, telemetria del 02/09): el id y el texto de la causa salian de fuentes
+    # distintas. Al cerrar, el texto se armaba con la reparacion de menor capa pero el id se tomaba
+    # de los candidatos en fail/warn: se vio una fila con rootCauseCheckId='hw.notInstalled' y
+    # causa 'Puerto USB desmapeado' (que es conn.usb), y la categoria salio de un check que no era
+    # la causa. El mismo hw.notInstalled caia en os.driver_faltante en las otras corridas.
+    Reset-State
+    Add-Check -Id 'hw.notInstalled' -Layer 1 -Name 'Impresora conectada pero no instalada en Windows' -Status 'warn' -RootCauseCandidate $true -Plane 'os'
+    Add-Check -Id 'conn.usb' -Layer 3 -Name 'Puerto USB desmapeado' -Status 'fixed' -RootCauseCandidate $true
+    Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica' -Status 'ok' -Plane 'hardware'
+    $d72 = Resolve-Diagnosis
+    Assert-Eq 'S72 cierra' $true ([bool]$d72.resolved)
+    Assert-Eq 'S72 el id de la causa es el del check reparado' 'conn.usb' ([string]$d72.rootCauseCheckId)
+    Assert-Eq 'S72 el texto describe lo mismo que el id' 'Puerto USB desmapeado' ([string]$d72.rootCause)
+    Assert-Eq 'S72 y la categoria sale de ahi' 'os.usb_port' (Get-Category -Diag $d72)
+
+    # Escenario 72b: cuando NO cierra, hw.notInstalled si es la causa, y ahora esta en la tabla
+    # (la 3.12 lo dejo afuera y caia por regex en dos categorias distintas).
+    Reset-State
+    Add-Check -Id 'hw.notInstalled' -Layer 1 -Name 'Impresora conectada pero no instalada en Windows' -Status 'warn' -RootCauseCandidate $true -Plane 'os'
+    $d72b = Resolve-Diagnosis
+    Assert-Eq 'S72b la causa es la impresora sin instalar' 'hw.notInstalled' ([string]$d72b.rootCauseCheckId)
+    Assert-Eq 'S72b categoria estable' 'os.driver_faltante' (Get-Category -Diag $d72b)
+
+    # Escenario 72c: la causa de una prueba fallida no puede ser el titulo del paso. Se vieron 3
+    # corridas con causaRaiz = 'Prueba fisica ESC/POS por USB (RAW)', que es el nombre del paso y
+    # no dice nada. Las tres ramas de fallo ahora traen causa redactada y categoria propia.
+    Reset-State
+    Add-Check -Id 'hw.testprint' -Layer 4 -Name 'La impresora recibio el ticket de prueba pero no salio papel' -Status 'fail' -RootCauseCandidate $true -Plane 'hardware'
+    $d72c = Resolve-Diagnosis
+    Assert-Eq 'S72c la prueba fallida es la causa' 'hw.testprint' ([string]$d72c.rootCauseCheckId)
+    Assert-Eq 'S72c y tiene su propia categoria' 'hardware.no_imprime' (Get-Category -Diag $d72c)
+    Assert-Eq 'S72c la causa explica que paso' $true ([bool]([string]$d72c.rootCause -match 'no salio papel'))
+    # Y el titulo del paso ya no puede ser una causa: ninguna rama de fallo lo usa como nombre.
+    Reset-State
+    Add-Check -Id 'hw.testprint' -Layer 4 -Name 'El ticket de prueba entro a la cola y no se imprimio: la impresora no responde' -Status 'fail' -RootCauseCandidate $true -Plane 'hardware'
+    Assert-Eq 'S72c la rama de cola trabada tambien redacta' 'hardware.no_imprime' (Get-Category -Diag (Resolve-Diagnosis))
 
     # Escenario 24 (caso real): caja tapada con miles de trabajos + cocina sana.
     # Antes se elegia la primera cola y se devolvia "todo ok" ignorando la que fallaba.
@@ -7283,6 +7487,8 @@ function Send-Telemetry {
                 # (imprime, pero todavia no salio ninguna comanda de Fudo). Ese cruce es la
                 # unica forma de saber si el criterio de cierre nuevo esta midiendo bien.
                 fudoSinUso    = [bool]$Result.diagnosis.fudoSinUso
+                fudoUsoEstado = [string]$Result.diagnosis.fudoUsoEstado
+                cierreSinVerificarFudo = [bool]$Result.diagnosis.cierreSinVerificarFudo
                 # Un engine_error sin esto era irrastreable: se vio una fila con status
                 # engine_error y ni el mensaje, ni la linea, ni el ultimo paso que corrio.
                 errorMotor    = $(
@@ -7313,6 +7519,8 @@ function Send-Telemetry {
                     # columnas del receptor cuando se agreguen.
                     $t['paperOk'] = [bool]$Result.diagnosis.paperOk
                     $t['fudoSinUso'] = [bool]$Result.diagnosis.fudoSinUso
+                    $t['fudoUsoEstado'] = [string]$Result.diagnosis.fudoUsoEstado
+                    $t['cierreSinVerificarFudo'] = [bool]$Result.diagnosis.cierreSinVerificarFudo
                     $t['cobertura'] = $(if ($script:Diagnostics.Contains('cobertura')) { $script:Diagnostics['cobertura'] } else { $null })
                     $t['historialFudo'] = @($(if ($script:Diagnostics.Contains('historialImpresion')) { $script:Diagnostics['historialImpresion'].porImpresora } else { @() }))
                     # v3.9: los ids de accion (testprint.retarget, queue.rebind, ...) no viajaban:
