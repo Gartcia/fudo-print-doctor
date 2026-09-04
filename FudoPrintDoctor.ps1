@@ -442,7 +442,7 @@ $script:TestPrinterRx = '(?i)^FUDO-TEST-'
 # puerto tenga hardware; si el hardware se va, deja de serlo (ver Remove-OrphanOwnQueues).
 $script:OwnQueueRx   = '(?i)^FUDO-(TEST-|USB\d)'
 $script:TestDocRx    = '(?i)fudo print doctor'
-$script:SchemaVersion = '3.14'
+$script:SchemaVersion = '3.15'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -962,7 +962,26 @@ function Unblock-QueueForTest {
         try { Set-Printer -Name $nombre -WorkOffline $false -ErrorAction Stop; $hechos += 'se quito la marca offline' } catch {}
     }
     # 2) cola pausada
-    try { if ([bool](Get-Printer -Name $nombre -ErrorAction SilentlyContinue).Paused) { Resume-PrintQueue -Name $nombre -ErrorAction Stop; $hechos += 'se reanudo la cola' } } catch {}
+    # v3.15: aca se llamaba a Resume-PrintQueue, que NO EXISTE en Windows (el modulo
+    # PrintManagement trae Resume-PrintJob, para un trabajo, no para la cola). La llamada estaba
+    # dentro de un try/catch, asi que en vez de romper fallaba en silencio: una cola pausada
+    # nunca se reanudaba, el ticket de prueba quedaba encolado y el asesor contestaba -bien- que
+    # no salio papel. Es el mismo falso negativo que la v3.10 corrigio por otra via.
+    # La via que si existe es el metodo Resume() de Win32_Printer.
+    $filtro = "Name='" + ($nombre -replace "'","''") + "'"
+    $pausada = $false
+    try { $pausada = [bool](Get-Printer -Name $nombre -ErrorAction SilentlyContinue).Paused } catch {}
+    if (-not $pausada) {
+        try { $pausada = ((([int](Get-CimInstance Win32_Printer -Filter $filtro -ErrorAction SilentlyContinue).PrinterState) -band 1) -ne 0) } catch {}
+    }
+    if ($pausada) {
+        try {
+            $wp = Get-CimInstance Win32_Printer -Filter $filtro -ErrorAction Stop
+            $rr = Invoke-CimMethod -InputObject $wp -MethodName 'Resume' -ErrorAction Stop
+            if ([int]$rr.ReturnValue -eq 0) { $hechos += 'se reanudo la cola' }
+            else { $hechos += ('no se pudo reanudar la cola (codigo ' + [int]$rr.ReturnValue + ')') }
+        } catch { $hechos += ('no se pudo reanudar la cola: ' + $_.Exception.Message) }
+    }
     # 3) tickets de prueba nuestros que hayan quedado colgados (no son comandas del cliente)
     try {
         $mios = @(Get-PrintJob -PrinterName $nombre -ErrorAction SilentlyContinue | Where-Object { [string]$_.DocumentName -match '(?i)fudo print doctor' })
@@ -1383,7 +1402,7 @@ function Test-Layer0b-NativeApp {
             # version mas nueva, se actualiza. Nunca a ciegas: si el instalador no dice su
             # version, no se toca (instalar a ciegas puede DEGRADARLA, ya paso en este proyecto).
             $up = @{ aplicado = $false; motivo = 'no se intento' }
-            if ($AutoFix) { $up = Update-FudoNativeFromLocal -Instalada ([string]$verState.version) }
+            if ($AutoFix) { $up = Update-FudoNativeFromLocal -Instalada ([string]$verState.version) -Corriendo ([bool]$procRunning) }
             $script:Diagnostics['nativaUpdate'] = $up
             if ([bool]$up.aplicado -and [bool]$up.subio) {
                 Add-Check -Id 'nativa.sinFirmar' -Layer 0 -Name ("App Nativa actualizada de la v$($verState.version) a la v$($up.versionDespues)") `
@@ -1393,8 +1412,34 @@ function Test-Layer0b-NativeApp {
                     -ActionTaken ([string]$up.nota) -Reversible $true `
                     -ArticleRef 'https://soporte.fu.do/es/articles/16419361' `
                     -Recommendation ("Se actualizo la App Nativa a la v$($up.versionDespues) con el instalador que estaba en la PC. " +
-                                     'Desde la v' + $script:NativaVersionFirmada + ' esta firmada, asi que el antivirus deja de ponerla en cuarentena. ' +
+                                     $(if ([bool]$up.quedaSinFirmar) {
+                                            'OJO: esa version sigue siendo ANTERIOR a la v' + $script:NativaVersionFirmada + ', que es la primera firmada, asi que el antivirus todavia puede ponerla en cuarentena. Para cerrar el tema hace falta el instalador de la v' + $script:NativaVersionFirmada + ' al lado de FudoPrintDoctor.cmd. '
+                                       } else {
+                                            'Desde la v' + $script:NativaVersionFirmada + ' esta firmada, asi que el antivirus deja de ponerla en cuarentena. '
+                                       }) +
                                      'Abrir Fudo en el navegador y mandar una comanda de prueba.')
+            } elseif ([bool]$up.intento) {
+                # v3.15, caso reportado por una asesora y reproducido en telemetria: el motor
+                # ejecuto nativa.update_local dos veces sobre la misma PC, la version no se movio
+                # de la 0.0.18, no reporto ninguna reparacion y el check quedo en 'warn' con el
+                # MISMO texto que cuando no se intento nada. Falla en silencio: la persona lo
+                # intento tres veces y termino reinstalando a mano.
+                # Queda en 'warn' y no en 'fail' a proposito: una Nativa vieja no impide que la
+                # impresora imprima, y un 'fail' aca volveria a bloquear el cierre de casos que
+                # la v3.11 desbloqueo. Lo que cambia es que ahora se VE, con el motivo.
+                Add-Check -Id 'nativa.sinFirmar' -Layer 0 -Name ("NO se pudo actualizar la App Nativa: sigue en la v$($verState.version)") `
+                    -Status 'warn' -RootCauseCandidate $false -Plane 'fudo_config' `
+                    -Evidence @{ version = $verState.version; versionFirmada = $script:NativaVersionFirmada
+                                 intentoUpdate = [string]$up.motivo; instalador = [string]$up.instalador
+                                 versionInstalador = [string]$up.versionInstalador
+                                 exitCode = $up.exitCode; porQueNo = [string]$up.porQueNo
+                                 nativaCorriendo = [bool]$up.nativaCorriendo } `
+                    -ActionTaken ([string]$up.nota) -Reversible $true `
+                    -ArticleRef 'https://soporte.fu.do/es/articles/16419361' `
+                    -Recommendation ('Se intento actualizar la App Nativa de la v' + [string]$verState.version + ' a la v' + [string]$up.versionInstalador +
+                                     ' con el instalador ' + [string]$up.instalador + ' y NO tomo: ' + [string]$up.porQueNo + '. ' +
+                                     $(if ([bool]$up.nativaCorriendo) { 'Cerrar Fudo en el navegador (y el proceso de la App Nativa) y volver a correr el diagnostico, o ' } else { '' }) +
+                                     'correr el instalador a mano desde la PC del cliente y verificar que la version cambie.')
             } else {
                 Add-Check -Id 'nativa.sinFirmar' -Layer 0 -Name ("App Nativa desactualizada (v$($verState.version)): la nueva esta firmada y el antivirus no la bloquea") `
                     -Status 'warn' -RootCauseCandidate $false -Plane 'fudo_config' `
@@ -2386,6 +2431,21 @@ function Get-EnvironmentInfo {
     }
 }
 
+function Test-IsGenericDocName {
+    <#
+      El nombre que Windows le pone a un trabajo cuando el programa que imprime no le pone
+      ninguno. Son los unicos que aparecieron en 146 entradas de historial de 229 corridas:
+      'Imprimir documento' (134), 'Documento de Impressao' (7) y 'Print Document' (5). Un nombre
+      asi NO distingue una comanda de Fudo de cualquier otra impresion, en ningun idioma: es
+      ausencia de dato, no evidencia de que Fudo no imprimio.
+    #>
+    param([string]$Doc)
+    $d = ([string]$Doc).Trim()
+    if (-not $d) { return $true }
+    return [bool]($d -match '(?i)^(imprimir documento|print document|impresion de documento|documento de impresion)$' -or
+                  $d -match '(?i)^documento de impress')
+}
+
 function Get-PrintHistory {
     <#
       Historial real de impresion desde el log del spooler (evento 307 = trabajo impreso).
@@ -2412,11 +2472,20 @@ function Get-PrintHistory {
             # trabajo fue el ticket del motor igual aparecia en el historial con total=0 y con
             # ejemploDoc = 'Fudo Print Doctor Test'. El motor se mostraba a si mismo.
             if ($doc -match $script:TestDocRx) { continue }
+            # v3.15: descartar por nombre de documento no alcanzaba. En la telemetria del 04/09
+            # habia 40 entradas de colas FUDO-TEST-* cuyo documento Windows reporto con el nombre
+            # generico del spooler, asi que el filtro de arriba no las veia y el motor se contaba
+            # a si mismo como historial de impresion del local.
+            if ($imp -match $script:TestPrinterRx) { continue }
             if (-not $porImp.ContainsKey($imp)) {
-                $porImp[$imp] = [ordered]@{ impresora = $imp; total = 0; deFudo = 0; ultimo = ''; ultimoDeFudo = ''; ejemploDoc = $doc }
+                $porImp[$imp] = [ordered]@{ impresora = $imp; total = 0; deFudo = 0; ultimo = ''; ultimoDeFudo = ''; ejemploDoc = $doc; docsInformativos = 0 }
             }
             $porImp[$imp].total++
             if (-not $porImp[$imp].ultimo) { $porImp[$imp].ultimo = $e.TimeCreated.ToString('dd/MM HH:mm') }
+            # Cuantos trabajos traen un nombre de documento que dice algo. Sin este conteo el
+            # motor leia "ningun trabajo se llama como Fudo" y concluia "Fudo no esta mandando":
+            # con nombres genericos esa conclusion no se puede sacar.
+            if (-not (Test-IsGenericDocName -Doc $doc)) { $porImp[$imp].docsInformativos++ }
             # La Nativa manda los trabajos con este nombre
             if ($doc -match '(?i)node print job|fudo') {
                 $porImp[$imp].deFudo++
@@ -2424,7 +2493,20 @@ function Get-PrintHistory {
             }
         }
     } catch {}
-    return [ordered]@{ habilitado = $true; porImpresora = @($porImp.Values) }
+    $trabajos = 0
+    $infoDocs = 0
+    try { $trabajos = [int](@($porImp.Values | ForEach-Object { [int]$_.total }) | Measure-Object -Sum).Sum } catch {}
+    try { $infoDocs = [int](@($porImp.Values | ForEach-Object { [int]$_.docsInformativos }) | Measure-Object -Sum).Sum } catch {}
+    return [ordered]@{
+        habilitado = $true
+        porImpresora = @($porImp.Values)
+        trabajos = $trabajos
+        docsInformativos = $infoDocs
+        # Se puede atribuir algo a partir de este historial? Solo si hay al menos un trabajo con
+        # nombre de documento util. Con el historial vacio, o con todos los nombres genericos, el
+        # matcher por nombre no dice nada: ni a favor ni en contra de que Fudo haya impreso.
+        atribuible = [bool]($infoDocs -gt 0)
+    }
 }
 
 function Get-PrinterQueues {
@@ -3418,7 +3500,7 @@ function Repair-BindUsbPort {
       PortName). Sin puerto, ninguna cola puede imprimirle y cambiar el puerto de una cola
       existente no sirve de nada.
       La receta manual es desenchufar y volver a enchufar el USB. Esto es lo mismo por
-      software: Restart-PnpDevice reinicia el device (equivale al replug) y pnputil
+      software: deshabilitar y volver a habilitar el device (equivale al replug) y pnputil
       /scan-devices fuerza una redeteccion. Despues se vuelven a leer los puertos.
       Devuelve @{ puertos = @(...); nota = '...' }
     #>
@@ -3427,10 +3509,20 @@ function Repair-BindUsbPort {
     foreach ($id in @($InstanceIds | Where-Object { $_ })) {
         try {
             Write-StepDetail 'reiniciando el dispositivo (equivale a desenchufar y enchufar)'
-            Restart-PnpDevice -InstanceId $id -Confirm:$false -ErrorAction Stop
-            $notas += 'device reiniciado'
+            # v3.15: aca se llamaba a Restart-PnpDevice, que NO EXISTE en Windows (el modulo
+            # PnpDevice trae Disable-PnpDevice y Enable-PnpDevice). Estaba dentro de un
+            # try/catch, asi que el replug por software nunca se hizo: quedaba solo el
+            # pnputil /scan-devices y la nota decia "no se pudo reiniciar el device" en todas
+            # las corridas. Deshabilitar y volver a habilitar ES el replug.
+            Disable-PnpDevice -InstanceId $id -Confirm:$false -ErrorAction Stop
+            Start-Sleep -Milliseconds 1500
+            Enable-PnpDevice -InstanceId $id -Confirm:$false -ErrorAction Stop
+            $notas += 'device reiniciado (deshabilitado y habilitado)'
         } catch {
             $notas += ('no se pudo reiniciar el device: ' + $_.Exception.Message)
+            # Si el disable anduvo y el enable no, la impresora queda deshabilitada en Windows y
+            # el cliente termina peor que antes: hay que volver a habilitarla si o si.
+            try { Enable-PnpDevice -InstanceId $id -Confirm:$false -ErrorAction SilentlyContinue } catch {}
         }
     }
     try {
@@ -4272,6 +4364,23 @@ function Test-Layer5-FudoConfig {
             Add-Check -Id 'fudo.usoReal' -Layer 5 -Name ('Fudo le manda comandas a: ' + (@($conFudo | ForEach-Object { $_.impresora }) -join ', ')) -Status 'ok' -Plane 'fudo_config' `
                 -Evidence @{ porImpresora = @($hist.porImpresora) } `
                 -Recommendation ('Historial del spooler: ' + ($detalle -join ' | ') + '. Esto confirma que en Fudo esa impresora esta configurada y recibiendo comandas; si el papel no sale, el problema esta en la impresora o su cola, no en la configuracion de Fudo.')
+        } elseif (-not $hist.atribuible) {
+            # v3.15, telemetria del 04/09: deFudo = 0 en 146 de 146 entradas de historial de 229
+            # corridas, y los unicos nombres de documento que Windows reporta son los genericos
+            # del spooler. Con eso el motor NO puede decir "Fudo no esta mandando comandas":
+            # puede decir que no tiene con que saberlo. Antes lo afirmaba igual, como causa raiz
+            # y en plano fudo_config, y mandaba al asesor a revisar la configuracion de Fudo de un
+            # local donde Fudo podia estar imprimiendo perfectamente. Es el mismo patron de los
+            # catorce falsos positivos del proyecto: una ausencia de dato leida como evidencia.
+            $otras = @($hist.porImpresora | Where-Object { [int]$_.total -gt 0 })
+            Add-Check -Id 'fudo.usoReal' -Layer 5 -Name 'No se puede saber si Fudo mando comandas (el historial no dice que programa imprimio)' `
+                -Status 'warn' -RootCauseCandidate $false -Plane 'os' `
+                -Evidence @{ porImpresora = @($hist.porImpresora); atribuible = $false
+                             trabajos = [int]$hist.trabajos; docsInformativos = [int]$hist.docsInformativos } `
+                -ArticleRef 'https://soporte.fu.do/es/articles/11730815' `
+                -Recommendation ('El historial de impresion de Windows ' +
+                                 $(if (@($otras).Count -gt 0) { 'tiene trabajos (' + (@($otras | ForEach-Object { $_.impresora }) -join ', ') + ') pero ninguno' } else { 'todavia no tiene trabajos que' }) +
+                                 ' dice que programa los mando: Windows los registra con el nombre generico del spooler. Por eso el motor no puede confirmar ni descartar que la comanda de Fudo haya salido. Hay que verificarlo a mano: mandar una comanda desde Fudo y ver si sale el papel.')
         } else {
             $otras = @($hist.porImpresora | Where-Object { [int]$_.total -gt 0 })
             Add-Check -Id 'fudo.usoReal' -Layer 5 -Name 'Ninguna cola recibio comandas de Fudo en el historial' -Status 'warn' -RootCauseCandidate $true -Plane 'fudo_config' `
@@ -4425,11 +4534,18 @@ function Resolve-Diagnosis {
     $fudoUsoEstado = 'sin_datos'
     if ($usoReal -and $usoReal.status -eq 'ok') { $fudoUsoEstado = 'con_comandas' }
     elseif (@($fudoSinUso).Count -gt 0)         { $fudoUsoEstado = 'sin_comandas' }
+    # v3.15: hay historial, pero no identifica quien imprimio. No es 'sin_comandas' (eso afirma
+    # que Fudo no mando nada) ni 'sin_datos' (eso dice que no hay historial): es que el dato que
+    # hay no alcanza para atribuir. Con el matcher por nombre de documento roto en el 100% de las
+    # corridas, este es hoy el estado real de casi todas.
+    elseif ($usoReal -and $usoReal.status -eq 'warn' -and $usoReal.evidence -and ($usoReal.evidence.atribuible -eq $false)) { $fudoUsoEstado = 'no_atribuible' }
     $paperOk = [bool]($hwTest -and $hwTest.status -eq 'ok')
 
     if (@($fails).Count -eq 0 -and $paperOk) {
         $resolved = $true
-        $confidence = $(if (@($fudoSinUso).Count -gt 0) { 'medium' } else { 'high' })
+        # No se puede cerrar con confianza alta si el ultimo tramo -que la comanda de Fudo
+        # llegue- no se pudo confirmar.
+        $confidence = $(if (@($fudoSinUso).Count -gt 0 -or $fudoUsoEstado -eq 'no_atribuible') { 'medium' } else { 'high' })
         $rootCause = $(if (@($fixed).Count -gt 0) {
                 ($fixed | Sort-Object { $_.layer } | Select-Object -First 1).name
             } else {
@@ -4493,15 +4609,18 @@ function Resolve-Diagnosis {
         # impide cerrar (es config del backend de Fudo, fuera del alcance del motor) pero hay
         # que decirlo: es el tramo que queda por confirmar despues de que el papel salga.
         fudoSinUso      = [bool](@($fudoSinUso).Count -gt 0)
-        # Los tres estados posibles del ultimo tramo, sin ambiguedad:
-        #   con_comandas - el historial muestra comandas de Fudo
-        #   sin_comandas - el historial esta disponible y no hay ninguna
-        #   sin_datos    - no se puede saber (log recien habilitado, apagado, o sin evaluar)
+        # Los estados posibles del ultimo tramo, sin ambiguedad:
+        #   con_comandas   - el historial muestra comandas de Fudo
+        #   sin_comandas   - el historial esta disponible, con nombres utiles, y no hay ninguna
+        #   no_atribuible  - hay historial pero no identifica que programa imprimio (v3.15)
+        #   sin_datos      - no hay historial (log recien habilitado, apagado, o sin evaluar)
         fudoUsoEstado   = [string]$fudoUsoEstado
         # Un cierre que no pudo verificar el tramo de Fudo. Es el dato que hacia falta para
         # que la metrica de cierre no cuente humo: cerro porque la impresora imprime, pero
         # nadie pudo confirmar que la comanda de Fudo llegue.
-        cierreSinVerificarFudo = [bool]($resolved -and $fudoUsoEstado -eq 'sin_datos')
+        # v3.15: 'no_atribuible' entra aca. Un cierre con historial que no identifica quien
+        # imprimio no verifico el tramo de Fudo, igual que uno sin historial.
+        cierreSinVerificarFudo = [bool]($resolved -and $fudoUsoEstado -in @('sin_datos','no_atribuible'))
         rootCause       = $rootCause
         # v3.13: el id y el texto de la causa salian de fuentes distintas. Cuando el caso
         # cerraba, el texto se armaba con la reparacion de menor capa ($fixed) pero el id se
@@ -4721,6 +4840,51 @@ function Get-ShortActions {
     return [ordered]@{ shown = @($list | Select-Object -First $Max); total = @($list).Count }
 }
 
+function Build-HumanSummarySafe {
+    <#
+      El resumen en pantalla es PRESENTACION: si su armado se cae, el diagnostico ya esta
+      calculado y no hay ninguna razon para perderlo. v3.15: una llamada a una funcion que no
+      existia en produccion hizo abortar la corrida completa en engine_error y el asesor se
+      quedo sin nada. Ahora un fallo del armado queda registrado como error del motor y se
+      devuelve un resumen crudo con lo minimo: resultado, causa y que hacer.
+    #>
+    param($Diag, $DetectedInterface)
+    try {
+        return (Build-HumanSummary -Diag $Diag -DetectedInterface $DetectedInterface)
+    } catch {
+        $msg = [string]$_.Exception.Message
+        $tipo = ''
+        try { $tipo = [string]$_.Exception.GetType().FullName } catch {}
+        $at = ''
+        try { $at = "linea {0}: {1}" -f $_.InvocationInfo.ScriptLineNumber, ([string]$_.InvocationInfo.Line).Trim() } catch {}
+        Add-EngineError -Step 'summary.build' -Message $msg -Type $tipo -At $at `
+            -Hint 'Fallo el armado del resumen en pantalla, no el diagnostico. El JSON de la corrida esta completo: adjuntarlo al escalamiento.'
+        $l = New-Object System.Collections.ArrayList
+        [void]$l.Add('=' * 78)
+        [void]$l.Add("  FUDO PRINT DOCTOR   v$($script:SchemaVersion)   PC: $env:COMPUTERNAME")
+        [void]$l.Add('=' * 78)
+        [void]$l.Add('')
+        [void]$l.Add('  El resumen en pantalla no se pudo armar, pero el diagnostico SI se completo.')
+        [void]$l.Add('')
+        [void]$l.Add('  RESULTADO    ' + $(if ($Diag -and $Diag.resolved) { 'RESUELTO' } else { 'NO RESUELTO AUTOMATICAMENTE' }))
+        [void]$l.Add('  CAUSA        ' + [string]$(if ($Diag -and $Diag.rootCause) { $Diag.rootCause } else { 'sin determinar' }))
+        if ($Diag -and @($Diag.nextActions).Count -gt 0) {
+            [void]$l.Add('')
+            [void]$l.Add('  QUE HACER AHORA')
+            $i = 0
+            foreach ($a in @($Diag.nextActions)) {
+                $i++
+                if ($i -gt 3) { break }
+                [void]$l.Add(('    ' + $i + '. [' + [string]$a.owner + '] ' + [string]$a.do))
+            }
+        }
+        [void]$l.Add('')
+        [void]$l.Add('  El detalle completo esta en el JSON de la corrida (resultado.json).')
+        [void]$l.Add('=' * 78)
+        return (($l -join "`r`n") + "`r`n")
+    }
+}
+
 function Build-HumanSummary {
     <# Resumen corto para humanos. El detalle completo vive en el JSON. #>
     param($Diag, $DetectedInterface)
@@ -4839,7 +5003,13 @@ function Build-HumanSummary {
     # Corte por modo: el resumen tiene que decir por que no hay diagnostico, o el asesor lee
     # una pantalla vacia y cree que el motor fallo.
     if ($script:AbortByMode) {
-        $mf = Get-CheckById 'printer.modeFilter'
+        # v3.15: aca vivia una llamada a Get-CheckById, que solo existe DENTRO de Invoke-SelfTest.
+        # En la PC del cliente la funcion no esta en scope: el resumen tiraba
+        # CommandNotFoundException y la corrida entera terminaba en engine_error con el
+        # diagnostico ya calculado y sin mostrarlo (6 minutos de trabajo, 12 checks, cero
+        # diagnostico para el asesor). El self-test no lo veia porque ahi la funcion SI existe.
+        # Lookup directo sobre la coleccion de checks, que es lo que hace el resto del motor.
+        $mf = @($script:Checks | Where-Object { $_.id -eq 'printer.modeFilter' }) | Select-Object -First 1
         Add-Line ''
         Add-Line ('  NO SE REVISO NADA: no hay impresoras ' + $(if ($script:RunMode -eq 'Red') { 'de red' } else { 'por USB' }) + ' en esta PC')
         if ($mf -and $mf.evidence -and $mf.evidence.instaladas) {
@@ -4919,6 +5089,10 @@ function Build-HumanSummary {
     }
     # v3.13: este caso quedaba MUDO. Con el log de impresion recien habilitado no hay historial
     # que mirar, asi que el caso cerraba sin decir que el ultimo tramo no se pudo verificar.
+    elseif ($Diag.resolved -and [string]$Diag.fudoUsoEstado -eq 'no_atribuible') {
+        Add-Field -Label 'FALTA' -Text ('la impresora YA IMPRIME, pero el historial de Windows no dice que programa mando cada trabajo, ' +
+                                        'asi que desde la PC no se puede confirmar que la comanda de Fudo llegue. Mandar una comanda desde Fudo y ver si sale el papel.')
+    }
     elseif ($Diag.resolved -and [string]$Diag.fudoUsoEstado -eq 'sin_datos') {
         Add-Field -Label 'FALTA' -Text ('la impresora YA IMPRIME, pero Windows todavia no tiene historial de impresion para mirar ' +
                                         '(el registro estaba apagado y se acaba de encender). Mandar una comanda de prueba desde Fudo y volver a correr el diagnostico: ' +
@@ -5346,7 +5520,7 @@ function Invoke-FudoPrintDoctor {
             confidence      = $diag.confidence
             engineErrors    = @($script:Errors).Count
         }
-        humanSummary  = (Build-HumanSummary -Diag $diag -DetectedInterface $detectedInterface)
+        humanSummary  = (Build-HumanSummarySafe -Diag $diag -DetectedInterface $detectedInterface)
         log           = @($script:Log)
     }
     return $result
@@ -5362,6 +5536,39 @@ function Invoke-SelfTest {
         else { Write-Host "  FAIL  $name (esperado '$expected', obtenido '$actual')"; $script:__f++ }
     }
     $script:__p = 0; $script:__f = 0
+
+    # Escenario 76 (v3.14 en campo, 03/09): el motor abortaba armando el resumen.
+    # Build-HumanSummary llamaba a Get-CheckById, que solo existe DENTRO de Invoke-SelfTest: en
+    # el self-test la funcion esta en scope y los 360 asserts pasaban, en la PC del cliente no
+    # existe y la corrida moria en engine_error (6 minutos, 12 checks, cero diagnostico para el
+    # asesor). Este bug NO se detecta ejecutando escenarios: hay que mirar el codigo.
+    # Va PRIMERO, antes de que el self-test defina un solo mock: en este punto la sesion tiene
+    # las funciones del motor y los cmdlets de Windows y nada mas, o sea el entorno real. Si un
+    # nombre que usa una funcion del motor no resuelve aca, en la PC del cliente tampoco.
+    # El escaneo pregunta si cada nombre resuelve. En PowerShell 7 estos modulos vienen de
+    # Windows PowerShell por capa de compatibilidad y no siempre autocargan en una busqueda de
+    # comando: se piden a mano primero, para no dar por inexistente un cmdlet que si esta.
+    foreach ($mod76 in @('PrintManagement','PnpDevice','NetAdapter','NetTCPIP','Defender','ConfigDefender','Microsoft.PowerShell.Management')) {
+        try { if (-not (Get-Module -Name $mod76)) { Import-Module $mod76 -ErrorAction SilentlyContinue -WarningAction SilentlyContinue | Out-Null } } catch {}
+    }
+    $ast76 = [System.Management.Automation.Language.Parser]::ParseFile($PSCommandPath, [ref]$null, [ref]$null)
+    $esFn76 = { param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] }
+    $esCmd76 = { param($n) $n -is [System.Management.Automation.Language.CommandAst] }
+    $todas76 = @($ast76.FindAll($esFn76, $true))
+    # Las funciones anidadas dentro de otra (los Add-Line / Add-Field del resumen) se evaluan
+    # como parte de su contenedora, que es donde estan sus hermanas en scope.
+    $anidadas76 = @()
+    foreach ($f76 in $todas76) { $anidadas76 += @($f76.Body.FindAll($esFn76, $true)) }
+    $huerfanas76 = @()
+    foreach ($fn76 in @($todas76 | Where-Object { [string]$_.Name -ne 'Invoke-SelfTest' -and $anidadas76 -notcontains $_ })) {
+        $locales76 = @($fn76.Body.FindAll($esFn76, $true) | ForEach-Object { [string]$_.Name })
+        foreach ($uso76 in @($fn76.Body.FindAll($esCmd76, $true) | ForEach-Object { [string]$_.GetCommandName() } | Where-Object { $_ } | Sort-Object -Unique)) {
+            if ($uso76 -in $locales76) { continue }
+            if (Get-Command $uso76 -ErrorAction SilentlyContinue) { continue }
+            $huerfanas76 += ([string]$fn76.Name + ' -> ' + $uso76)
+        }
+    }
+    Assert-Eq 'S76 ninguna funcion llama a algo que no existe fuera del self-test' '' ((@($huerfanas76) | Sort-Object -Unique) -join '; ')
 
     function Get-CheckById { param([string]$Id) return (@($script:Checks | Where-Object { $_.id -eq $Id }) | Select-Object -First 1) }
 
@@ -6680,9 +6887,9 @@ public class FudoFakePrinter {
     # Escenario 32: con historial, se identifica a que cola le manda Fudo
     Reset-State
     function Get-PrintHistory {
-        [ordered]@{ habilitado = $true; porImpresora = @(
-            [ordered]@{ impresora='COCINA'; total=120; deFudo=118; ultimo='21/08 20:10'; ultimoDeFudo='21/08 20:10'; ejemploDoc='node print job' },
-            [ordered]@{ impresora='HP LaserJet'; total=3; deFudo=0; ultimo='19/08 11:00'; ultimoDeFudo=''; ejemploDoc='Documento1.docx' }
+        [ordered]@{ habilitado = $true; atribuible = $true; trabajos = 123; docsInformativos = 121; porImpresora = @(
+            [ordered]@{ impresora='COCINA'; total=120; deFudo=118; ultimo='21/08 20:10'; ultimoDeFudo='21/08 20:10'; ejemploDoc='node print job'; docsInformativos=120 },
+            [ordered]@{ impresora='HP LaserJet'; total=3; deFudo=0; ultimo='19/08 11:00'; ultimoDeFudo=''; ejemploDoc='Documento1.docx'; docsInformativos=3 }
         ) }
     }
     Test-Layer5-FudoConfig -DetectedInterface 'USB'
@@ -6694,8 +6901,8 @@ public class FudoFakePrinter {
     # Escenario 33: historial habilitado pero sin trabajos de Fudo => sospecha de config
     Reset-State
     function Get-PrintHistory {
-        [ordered]@{ habilitado = $true; porImpresora = @(
-            [ordered]@{ impresora='CAJA'; total=2; deFudo=0; ultimo='20/08 10:00'; ultimoDeFudo=''; ejemploDoc='Test Page' }
+        [ordered]@{ habilitado = $true; atribuible = $true; trabajos = 2; docsInformativos = 2; porImpresora = @(
+            [ordered]@{ impresora='CAJA'; total=2; deFudo=0; ultimo='20/08 10:00'; ultimoDeFudo=''; ejemploDoc='Test Page'; docsInformativos=2 }
         ) }
     }
     Test-Layer5-FudoConfig -DetectedInterface 'USB'
@@ -6942,6 +7149,188 @@ public class FudoFakeEndpoint {
     Reset-State
     $verdictWsd = Test-IsPrinterDevice -Name 'Microsoft IPP Class Driver' -InstanceId 'SWD\PRINTENUM\WSD-442FB327' -PnpClass 'Printer' -Service '' -CompatibleIds @()
     Assert-Eq 'S39 la clase Printer sola la daba por USB' $true ([bool]$verdictWsd.isPrinter)
+
+    # Escenario 76b: la rama que se caia -el corte por modo, que es condicional y por eso no
+    # aparecio en las otras corridas 3.14- tiene que armar su resumen sin explotar.
+    Reset-State
+    $script:AbortByMode = $true
+    $modoAntes76 = [string]$script:RunMode
+    $script:RunMode = 'Red'
+    Add-Check -Id 'printer.modeFilter' -Layer 1 -Name 'No hay impresoras de red instaladas' -Status 'warn' -Plane 'os' `
+        -Evidence @{ instaladas = @('COCINA [USB001]'); continuoIgual = $false }
+    Add-Check -Id 'hw.noPortBound' -Layer 1 -Name 'Windows no le asigno puerto' -Status 'fixed' -Plane 'os'
+    $err76 = ''
+    $txt76 = ''
+    try { $txt76 = ((Build-HumanSummary -Diag (Resolve-Diagnosis) -DetectedInterface '') -join ' ') } catch { $err76 = [string]$_.Exception.Message }
+    $script:RunMode = $modoAntes76
+    Assert-Eq 'S76 el resumen del corte por modo no explota' '' $err76
+    Assert-Eq 'S76 y explica que no se reviso nada' $true ([bool]($txt76 -match 'NO SE REVISO NADA'))
+    Assert-Eq 'S76 y lista lo que si habia instalado' $true ([bool]($txt76 -match 'USB001'))
+
+    # Escenario 77 (v3.15): el historial de impresion no puede atribuir nada.
+    # Telemetria del 04/09: deFudo = 0 en 146 de 146 entradas de 229 corridas, y los unicos
+    # nombres de documento que Windows reporta son los genericos del spooler. El motor concluia
+    # "Fudo no esta mandando comandas" -como causa raiz- de una ausencia de dato.
+    Reset-State
+    Assert-Eq 'S77 el nombre generico en es no dice nada' $true (Test-IsGenericDocName -Doc 'Imprimir documento')
+    Assert-Eq 'S77 ni el de en' $true (Test-IsGenericDocName -Doc 'Print Document')
+    Assert-Eq 'S77 ni el de pt' $true (Test-IsGenericDocName -Doc 'Documento de Impressao')
+    Assert-Eq 'S77 ni un documento sin nombre' $true (Test-IsGenericDocName -Doc '')
+    Assert-Eq 'S77 un nombre real si dice algo' $false (Test-IsGenericDocName -Doc 'Documento1.docx')
+    Assert-Eq 'S77 y el de la Nativa tambien' $false (Test-IsGenericDocName -Doc 'node print job')
+
+    # La cola de prueba del propio motor no puede entrar al historial ni cuando Windows le pone
+    # el nombre generico al documento (40 de las 146 entradas del 04/09 eran FUDO-TEST-*).
+    # Ojo: S33 dejo un mock de Get-PrintHistory en scope. Se saca el mock local para llegar a la
+    # funcion de verdad, que es la que se quiere medir aca.
+    Reset-State
+    Remove-Item Function:\Get-PrintHistory -ErrorAction SilentlyContinue
+    function Get-WinEvent {
+        param($ListLog, $LogName, $MaxEvents, $ErrorAction)
+        if ($ListLog) { return [pscustomobject]@{ IsEnabled = $true } }
+        $ev = { param($d, $p) [pscustomobject]@{ Id = 307; TimeCreated = (Get-Date '2026-09-03 20:09:00')
+                                                 Properties = @(@{Value=1}, @{Value=$d}, @{Value='u'}, @{Value='pc'}, @{Value=$p}) } }
+        return @(
+            (& $ev 'Imprimir documento' 'FUDO-TEST-USB009'),
+            (& $ev 'Imprimir documento' 'POS-80C'),
+            (& $ev 'node print job'     'POS-80C')
+        )
+    }
+    $h77 = Get-PrintHistory
+    Assert-Eq 'S77c la cola de prueba del motor no entra al historial' 1 (@($h77.porImpresora).Count)
+    Assert-Eq 'S77c ni con nombre de documento generico' $false ([bool]((@($h77.porImpresora | ForEach-Object { [string]$_.impresora }) -join '|') -match 'FUDO-TEST'))
+    Assert-Eq 'S77c el trabajo con nombre util se cuenta' 1 ([int]$h77.docsInformativos)
+    Assert-Eq 'S77c y con eso el historial si atribuye' $true ([bool]$h77.atribuible)
+    Assert-Eq 'S77c la comanda de la Nativa cuenta como de Fudo' 1 ([int]@($h77.porImpresora)[0].deFudo)
+    Assert-Eq 'S77c y el generico suma al total igual' 2 ([int]@($h77.porImpresora)[0].total)
+
+    # Historial con TODOS los nombres genericos: no se afirma nada y no es causa raiz.
+    Reset-State
+    function Get-PrintHistory {
+        [ordered]@{ habilitado = $true; atribuible = $false; trabajos = 25; docsInformativos = 0; porImpresora = @(
+            [ordered]@{ impresora='POS-80C'; total=25; deFudo=0; ultimo='03/09 20:09'; ultimoDeFudo=''; ejemploDoc='Imprimir documento'; docsInformativos=0 }
+        ) }
+    }
+    Test-Layer5-FudoConfig -DetectedInterface 'USB'
+    $c77 = Get-CheckById 'fudo.usoReal'
+    Assert-Eq 'S77 no afirma que Fudo no mando comandas' $false ([bool]([string]$c77.name -match 'Ninguna cola recibio'))
+    Assert-Eq 'S77 dice que no se puede saber' $true ([bool]([string]$c77.name -match 'No se puede saber'))
+    Assert-Eq 'S77 y no es causa raiz' $false ([bool]$c77.rootCauseCandidate)
+    Assert-Eq 'S77 no lo carga como config de Fudo' 'os' ([string]$c77.plane)
+    # El estado del ultimo tramo tiene que ser el nuevo, no 'sin_comandas'.
+    Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Salio el papel' -Status 'ok' -Plane 'hardware'
+    $d77 = Resolve-Diagnosis
+    Assert-Eq 'S77 el estado es no_atribuible' 'no_atribuible' ([string]$d77.fudoUsoEstado)
+    Assert-Eq 'S77 no se declara que Fudo no imprime' $false ([bool]$d77.fudoSinUso)
+    Assert-Eq 'S77 cierra igual, que es lo que el motor arregla' $true ([bool]$d77.resolved)
+    Assert-Eq 'S77 pero no con confianza alta' 'medium' ([string]$d77.confidence)
+    Assert-Eq 'S77 y queda marcado como cierre sin verificar Fudo' $true ([bool]$d77.cierreSinVerificarFudo)
+    Assert-Eq 'S77 el asesor lee que falta ese tramo' $true ([bool](((Build-HumanSummary -Diag $d77 -DetectedInterface 'USB') -join ' ') -match 'FALTA'))
+
+    # Con al menos un nombre util y ninguna comanda de Fudo, la conclusion de antes sigue valiendo.
+    Reset-State
+    function Get-PrintHistory {
+        [ordered]@{ habilitado = $true; atribuible = $true; trabajos = 2; docsInformativos = 2; porImpresora = @(
+            [ordered]@{ impresora='CAJA'; total=2; deFudo=0; ultimo='20/08 10:00'; ultimoDeFudo=''; ejemploDoc='Presupuesto.pdf'; docsInformativos=2 }
+        ) }
+    }
+    Test-Layer5-FudoConfig -DetectedInterface 'USB'
+    Assert-Eq 'S77b con nombres utiles si se puede concluir' $true ([bool]([string](Get-CheckById 'fudo.usoReal').name -match 'Ninguna cola recibio'))
+    Assert-Eq 'S77b y vuelve a ser candidata a causa raiz' $true ([bool](Get-CheckById 'fudo.usoReal').rootCauseCandidate)
+
+    # Escenario 78 (v3.15, caso de una asesora reproducido en telemetria): el motor ejecuto
+    # nativa.update_local dos veces, la version no se movio de la 0.0.18, no reporto ninguna
+    # reparacion y el check quedo con el MISMO texto que cuando no se intenta nada. La persona lo
+    # intento tres veces y termino reinstalando a mano.
+    Reset-State
+    function Find-LocalNativeInstaller { 'C:\Users\test\Desktop\FudoNativa.msi' }
+    function Get-MsiProductVersion { param($Path) '0.0.27' }
+    function Find-FudoNativeInstall { [ordered]@{ found = $true; paths = @() } }
+    function Invoke-NativeInstallerFile { param($Path, $ExtraArgs) 1603 }
+    function Get-NativaVersionState { param($Install) [ordered]@{ version = '0.0.18'; firmada = $false } }
+    function Start-Sleep { param($Seconds) }
+    $u78 = Update-FudoNativeFromLocal -Instalada '0.0.18' -Corriendo $true
+    Assert-Eq 'S78 se intento' $true ([bool]$u78.intento)
+    Assert-Eq 'S78 y no subio' $false ([bool]$u78.subio)
+    Assert-Eq 'S78 el codigo de salida del instalador queda registrado' 1603 ([int]$u78.exitCode)
+    Assert-Eq 'S78 y hay un motivo para mostrar' $true ([bool]([string]$u78.porQueNo -match '1603'))
+    # El instalador que hay en la PC es mas nuevo que el instalado pero sigue por debajo de la
+    # firmada: aunque tome, el antivirus sigue siendo un tema.
+    Assert-Eq 'S78 avisa que el destino sigue sin firmar' $true ([bool]$u78.quedaSinFirmar)
+
+    # El instalador dice que anduvo y la version no cambia: tampoco puede pasar por exito.
+    Reset-State
+    function Invoke-NativeInstallerFile { param($Path, $ExtraArgs) 0 }
+    $u78b = Update-FudoNativeFromLocal -Instalada '0.0.18' -Corriendo $true
+    Assert-Eq 'S78b sin cambio de version no es exito' $false ([bool]$u78b.subio)
+    Assert-Eq 'S78b y el motivo apunta a la Nativa en uso' $true ([bool]([string]$u78b.porQueNo -match 'corriendo'))
+
+    # Cuando si sube, no se inventa ningun motivo.
+    Reset-State
+    function Get-NativaVersionState { param($Install) [ordered]@{ version = '0.0.27'; firmada = $false } }
+    $u78c = Update-FudoNativeFromLocal -Instalada '0.0.18'
+    Assert-Eq 'S78c la actualizacion que toma se reporta como tal' $true ([bool]$u78c.subio)
+    Assert-Eq 'S78c y sin motivo de falla' '' ([string]$u78c.porQueNo)
+
+    # No se intento: el motivo tiene que seguir siendo el de la decision, no una falla.
+    Reset-State
+    function Find-LocalNativeInstaller { '' }
+    $u78d = Update-FudoNativeFromLocal -Instalada '0.0.18'
+    Assert-Eq 'S78d sin instalador no se intento nada' $false ([bool]$u78d.intento)
+    Assert-Eq 'S78d y lo dice' $true ([bool]([string]$u78d.motivo -match 'no hay instalador'))
+
+    # Y si el armado del resumen se cae igual, el diagnostico no se pierde: es presentacion.
+    Reset-State
+    function Build-HumanSummary { param($Diag, $DetectedInterface) throw 'falla de presentacion' }
+    $txt79 = ((Build-HumanSummarySafe -Diag ([ordered]@{ resolved = $false; rootCause = 'Puerto USB desmapeado'
+                                                          nextActions = @([ordered]@{ owner = 'asesor'; do = 'Reconectar el USB' }) }) `
+                                       -DetectedInterface 'USB') -join ' ')
+    Assert-Eq 'S79 un fallo del resumen no se lleva la causa' $true ([bool]($txt79 -match 'Puerto USB desmapeado'))
+    Assert-Eq 'S79 ni lo que hay que hacer' $true ([bool]($txt79 -match 'Reconectar el USB'))
+    Assert-Eq 'S79 y queda registrado como error del motor' 1 (@($script:Errors | Where-Object { [string]$_.step -eq 'summary.build' }).Count)
+
+    # Escenario 80 (v3.15): las dos reparaciones que llamaban a cmdlets que no existen. Las
+    # encontro el escaneo de S76, no la telemetria: las dos estaban dentro de un try/catch, asi
+    # que no rompian nada, simplemente no hacian nada. Las dos viven en caminos que el proyecto
+    # nunca pudo probar contra hardware real (destrabar la cola antes de la prueba fisica y el
+    # replug por software), asi que el silencio no se notaba.
+    Reset-State
+    $script:llamadas80 = New-Object System.Collections.ArrayList
+    function Get-Printer { param($Name, $ErrorAction) [pscustomobject]@{ Name = 'COCINA'; Paused = $true; WorkOffline = $false } }
+    function Get-CimInstance { param($ClassName, $Filter, $ErrorAction) [pscustomobject]@{ Name = 'COCINA'; PrinterState = 1; WorkOffline = $false } }
+    function Invoke-CimMethod { param($InputObject, $MethodName, $ErrorAction) [void]$script:llamadas80.Add('cim:' + $MethodName); [pscustomobject]@{ ReturnValue = 0 } }
+    function Get-PrintJob { param($PrinterName, $ErrorAction) @() }
+    $h80 = @(Unblock-QueueForTest -Printer ([pscustomobject]@{ Name = 'COCINA' }))
+    Assert-Eq 'S80 una cola pausada se reanuda de verdad' $true ([bool]((@($h80) -join '|') -match 'se reanudo la cola'))
+    Assert-Eq 'S80 y por la via que existe (Win32_Printer.Resume)' 'cim:Resume' ((@($script:llamadas80) -join ','))
+
+    # El replug por software: deshabilitar y volver a habilitar, en ese orden.
+    # Escenarios anteriores dejaron un mock de Repair-BindUsbPort en scope -y devuelve justo
+    # 'device reiniciado', asi que sin sacarlo este escenario se aprobaba contra el mock.
+    Reset-State
+    Remove-Item Function:\Repair-BindUsbPort -ErrorAction SilentlyContinue
+    $script:llamadas80 = New-Object System.Collections.ArrayList
+    function Write-StepDetail { param($T) }
+    function Start-Sleep { param($Seconds, $Milliseconds) }
+    function Disable-PnpDevice { param($InstanceId, $Confirm, $ErrorAction) [void]$script:llamadas80.Add('disable') }
+    function Enable-PnpDevice { param($InstanceId, $Confirm, $ErrorAction) [void]$script:llamadas80.Add('enable') }
+    function Get-PrinterPort { param($ErrorAction) @([pscustomobject]@{ Name = 'USB001' }) }
+    $r80 = Repair-BindUsbPort -InstanceIds @('USB\VID_04B8&PID_0E15\ABC')
+    Assert-Eq 'S80 el replug apaga y prende el dispositivo' 'disable,enable' ((@($script:llamadas80) -join ','))
+    Assert-Eq 'S80 y lo reporta como reiniciado' $true ([bool]([string]$r80.nota -match 'device reiniciado'))
+    Assert-Eq 'S80 y devuelve el puerto que aparecio' 'USB001' ([string]@($r80.puertos)[0])
+
+    # Si el enable falla, la impresora no puede quedar deshabilitada: se reintenta habilitarla.
+    Reset-State
+    $script:llamadas80 = New-Object System.Collections.ArrayList
+    function Enable-PnpDevice {
+        param($InstanceId, $Confirm, $ErrorAction)
+        [void]$script:llamadas80.Add('enable')
+        if ($ErrorAction -eq 'Stop') { throw 'acceso denegado' }
+    }
+    $r80b = Repair-BindUsbPort -InstanceIds @('USB\VID_04B8&PID_0E15\ABC')
+    Assert-Eq 'S80b si el enable falla se reintenta habilitar' 'disable,enable,enable' ((@($script:llamadas80) -join ','))
+    Assert-Eq 'S80b y queda dicho que no se pudo' $true ([bool]([string]$r80b.nota -match 'no se pudo reiniciar el device'))
 
     Write-Host ""
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)
@@ -7420,18 +7809,23 @@ function Update-FudoNativeFromLocal {
       la bloquea el antivirus.
       Verifica DESPUES de instalar: si la version no subio, no se declara actualizada.
     #>
-    param([string]$Instalada)
+    param([string]$Instalada, [bool]$Corriendo = $false)
     $inst = Find-LocalNativeInstaller
-    if (-not $inst) { return @{ aplicado = $false; motivo = 'no hay instalador de la Nativa en la PC' } }
+    if (-not $inst) { return @{ aplicado = $false; subio = $false; intento = $false; motivo = 'no hay instalador de la Nativa en la PC' } }
     $verInst = Get-MsiProductVersion -Path $inst
     $dec = Test-NativaNecesitaUpdate -Instalada $Instalada -Disponible $verInst
     if (-not $dec.actualizar) {
-        return @{ aplicado = $false; motivo = [string]$dec.motivo; instalador = $inst; versionInstalador = $verInst }
+        return @{ aplicado = $false; subio = $false; intento = $false; motivo = [string]$dec.motivo; instalador = $inst; versionInstalador = $verInst }
     }
+    # v3.15: el codigo de salida del instalador se perdia adentro del scriptblock, asi que
+    # cuando la actualizacion no tomaba no habia con que explicar por que. Se saca por un
+    # hashtable (mutar el objeto si se ve desde afuera; reasignar la variable, no).
+    $salida = @{ code = $null }
     $rem = Invoke-Remediation -Description ('Actualizar la App Nativa a la ' + $verInst + ' con el instalador que ya esta en la PC') `
         -Type 'nativa.update_local' -Target 'FudoNativa' -Before $Instalada -After $verInst -Reversible $true -Fix {
             $notas = @()
             $code = Invoke-NativeInstallerFile -Path $inst -ExtraArgs $NativeInstallerArgs
+            $salida.code = $code
             $notas += $(if ($null -eq $code) { 'no se pudo lanzar el instalador' } else { 'el instalador termino con codigo ' + $code })
             Start-Sleep -Seconds 3
             ($notas -join ' | ')
@@ -7442,8 +7836,25 @@ function Update-FudoNativeFromLocal {
     }
     $subio = $false
     try { $subio = ([bool]$verDespues -and ([version]$verDespues -gt [version]$Instalada)) } catch {}
-    return @{ aplicado = [bool]$rem.applied; subio = [bool]$subio; nota = [string]$rem.note
+    # Por que no tomo. Es lo que faltaba en pantalla y en la planilla: un asesor lo intento tres
+    # veces sobre la misma PC y termino reinstalando a mano, sin que el motor dijera nada.
+    $porQueNo = ''
+    if ($rem.applied -and -not $subio) {
+        $porQueNo = $(
+            if ($null -eq $salida.code)      { 'no se pudo lanzar el instalador (' + $inst + ')' }
+            elseif ([int]$salida.code -ne 0) { 'el instalador termino con codigo ' + $salida.code }
+            elseif ($Corriendo)              { 'el instalador termino bien pero la version no cambio, y la App Nativa estaba corriendo: probablemente no pudo reemplazar los archivos en uso' }
+            else                             { 'el instalador termino bien pero la version instalada no cambio (sigue en la ' + $Instalada + ')' }
+        )
+    }
+    # El instalador que hay en la PC puede ser mas nuevo que el instalado y aun asi quedar por
+    # debajo de la firmada: ahi el update funciona y el antivirus sigue siendo un tema.
+    $quedaSinFirmar = $false
+    try { $quedaSinFirmar = ([bool]$verInst -and ([version]$verInst -lt [version]$script:NativaVersionFirmada)) } catch {}
+    return @{ aplicado = [bool]$rem.applied; subio = [bool]$subio; intento = [bool]$rem.applied; nota = [string]$rem.note
               instalador = $inst; versionInstalador = $verInst; versionDespues = $verDespues
+              exitCode = $salida.code; porQueNo = $porQueNo; quedaSinFirmar = [bool]$quedaSinFirmar
+              nativaCorriendo = [bool]$Corriendo
               motivo = [string]$dec.motivo }
 }
 function Install-FudoNative {
@@ -7831,6 +8242,30 @@ function Send-Telemetry {
                     }
                     $t['cobertura'] = $(if ($script:Diagnostics.Contains('cobertura')) { $script:Diagnostics['cobertura'] } else { $null })
                     $t['historialFudo'] = @($(if ($script:Diagnostics.Contains('historialImpresion')) { $script:Diagnostics['historialImpresion'].porImpresora } else { @() }))
+                    # v3.15: la columna existia en el receptor y el motor NUNCA la mando (vacia
+                    # en 229 de 229 filas), asi que no habia forma de saber a que cola le manda
+                    # Fudo en las PCs donde el historial si dice algo. Cuando no se puede
+                    # atribuir se manda 'no_atribuible', que es un dato distinto de vacio.
+                    $t['colaQueUsaFudo'] = $(
+                        $hf = $(if ($script:Diagnostics.Contains('historialImpresion')) { $script:Diagnostics['historialImpresion'] } else { $null })
+                        $topFudo = @($(if ($hf) { @($hf.porImpresora | Where-Object { [int]$_.deFudo -gt 0 } | Sort-Object -Property @{ Expression = { [int]$_.deFudo }; Descending = $true }) } else { @() }))
+                        if (@($topFudo).Count -gt 0) { [string]@($topFudo)[0].impresora }
+                        elseif ([string]$Result.diagnosis.fudoUsoEstado -eq 'no_atribuible') { 'no_atribuible' }
+                        else { '' }
+                    )
+                    # Resultado del intento de actualizar la Nativa. Sin esto, un update que no
+                    # toma es indistinguible de uno que no se intento.
+                    $t['nativaUpdate'] = $(
+                        $nu = $(if ($script:Diagnostics.Contains('nativaUpdate')) { $script:Diagnostics['nativaUpdate'] } else { $null })
+                        if ($nu) {
+                            [ordered]@{ intento = [bool]$nu.intento; subio = [bool]$nu.subio
+                                        versionInstalador = [string]$nu.versionInstalador
+                                        versionDespues = [string]$nu.versionDespues
+                                        exitCode = $nu.exitCode; porQueNo = [string]$nu.porQueNo
+                                        quedaSinFirmar = [bool]$nu.quedaSinFirmar
+                                        motivo = [string]$nu.motivo }
+                        } else { $null }
+                    )
                     # v3.9: los ids de accion (testprint.retarget, queue.rebind, ...) no viajaban:
                     # autoFixesApplied solo trae los textos humanos de las reparaciones. Sin esto
                     # no habia forma de auditar en la planilla si una ruta nueva se ejecuto.

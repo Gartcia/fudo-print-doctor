@@ -233,5 +233,11 @@ Looker Studio.
 - **`categoria`**: cuál es la causa más frecuente. Define dónde conviene invertir.
 - **`chrome` y `nativaVersion`**: si los casos se concentran en una versión vieja.
 - **`conexionPC` = wifi** con impresoras de red: candidato a problemas intermitentes.
-- **`colaQueUsaFudo` vacío** con hardware presente: sospecha de configuración en Fudo.
+- **`colaQueUsaFudo`**: la cola a la que Fudo le mandó comandas, según el historial del spooler.
+  *Ojo con la lectura, corregida en 3.15:* hasta esa versión el motor **nunca mandaba este campo**
+  (vacío en 229 de 229 filas), así que "vacío ⇒ sospecha de configuración en Fudo" era una
+  conclusión sacada de un campo que no existía. Y cuando el historial de Windows registra los
+  trabajos con el nombre genérico del spooler —lo único que aparece en la práctica— no se puede
+  atribuir ninguna impresión a Fudo: ahí el campo viaja como **`no_atribuible`**, que no es lo
+  mismo que "Fudo no está imprimiendo". Sólo un nombre de cola concreto afirma algo.
 - **`pais`**: si hay diferencias por región (marcas de impresoras distintas).

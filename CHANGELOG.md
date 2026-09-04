@@ -2,6 +2,139 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.15] - 2026-09-04
+
+De la bitácora del 04/09. El hallazgo de arranque fue un **crash en producción**: una corrida de
+la 3.14 en la PC de un cliente terminó en `engine_error` a los 6 minutos, con los 12 chequeos
+hechos y el diagnóstico calculado, porque el armado del resumen llamaba a una función que **sólo
+existe dentro del self-test**. El asesor se quedó sin nada en pantalla.
+
+Buscando otras llamadas del mismo tipo aparecieron **dos más**, las dos en reparaciones que el
+proyecto nunca pudo probar contra hardware real. Ninguna de las tres las podía encontrar el
+self-test ejecutando escenarios: en el self-test esas funciones sí existen. La lección nueva del
+día es que **un self-test que comparte scope con el motor puede tapar exactamente el tipo de bug
+que tiene que encontrar**, y que por eso hace falta un chequeo que mire el código y no sólo su
+resultado.
+
+### Corregido
+
+- **El motor abortaba al armar el resumen cuando cortaba por modo.** `Build-HumanSummary` llamaba
+  a `Get-CheckById`, que está definida adentro de `Invoke-SelfTest`: en la PC del cliente no está
+  en scope y la corrida moría con `CommandNotFoundException`. Caso real: una corrida de 6 minutos,
+  12 chequeos, `status=engine_error` y cero diagnóstico para el asesor. Estaba en una rama
+  condicional (el corte "no hay impresoras del tipo elegido"), y por eso otra corrida de la misma
+  versión con el mismo chequeo en `warn` no se cayó.
+  Ahora el lookup es el mismo que usa el resto del motor, y **el resumen dejó de poder tirar la
+  corrida**: si su armado falla, queda registrado como error del motor y se imprime un resumen
+  crudo con el resultado, la causa y qué hacer. *El resumen es presentación; el diagnóstico ya
+  está calculado y no hay ninguna razón para perderlo.*
+- **Una cola pausada no se reanudaba nunca.** Antes de la prueba física el motor destraba la cola,
+  y para eso llamaba a `Resume-PrintQueue`, que **no existe en Windows** (`PrintManagement` trae
+  `Resume-PrintJob`, para un trabajo, no para la cola). La llamada vivía dentro de un `try/catch`,
+  así que no rompía nada: simplemente no hacía nada, en silencio. Consecuencia: con la cola
+  pausada el ticket de prueba quedaba encolado, no salía papel y el asesor contestaba —bien— que
+  no salió. **Es el mismo falso negativo que la 3.10, por otra vía.** Ahora se reanuda con el
+  método `Resume()` de `Win32_Printer`, que sí existe, y si falla se dice por qué.
+- **El replug por software nunca reiniciaba el dispositivo.** Llamaba a `Restart-PnpDevice`, que
+  tampoco existe (el módulo `PnpDevice` trae `Disable-PnpDevice` y `Enable-PnpDevice`). También
+  dentro de un `try/catch`: quedaba corriendo sólo el `pnputil /scan-devices` y la nota decía
+  *"no se pudo reiniciar el device"* en todas las corridas. Ahora deshabilita y vuelve a
+  habilitar, que es literalmente el replug. **Con un resguardo:** si el `enable` falla después de
+  un `disable` que anduvo, la impresora quedaría deshabilitada en Windows y el cliente terminaría
+  peor que antes, así que se reintenta habilitarla siempre.
+- **El motor afirmaba que Fudo no manda comandas sin tener con qué saberlo.** `deFudo = 0` en
+  **146 de 146** entradas de historial de 229 corridas, y los únicos nombres de documento que
+  Windows reporta son los genéricos del spooler (*"Imprimir documento"* 134, *"Documento de
+  Impressão"* 7, *"Print Document"* 5). Con eso, el chequeo del último tramo salía en `warn`
+  **como causa raíz**, en plano `fudo_config`, diciendo *"Ninguna cola recibió comandas de Fudo"*
+  y mandando al asesor a revisar la configuración de Fudo de un local donde Fudo podía estar
+  imprimiendo perfectamente. **Es el patrón de los catorce falsos positivos del proyecto: una
+  ausencia de dato leída como evidencia.**
+  Ahora, cuando ningún trabajo del historial trae un nombre que diga algo, el motor dice que **no
+  se puede saber**: nuevo estado `no_atribuible` (ni `sin_comandas`, que afirma que Fudo no mandó
+  nada, ni `sin_datos`, que dice que no hay historial), el chequeo deja de ser causa raíz y pasa
+  a plano `os`, el cierre baja a confianza `medium` y cuenta como `cierreSinVerificarFudo`. El
+  caso **sigue cerrando** si la impresora imprime —que es lo que este motor arregla— y el asesor
+  lee la línea *FALTA* explicando que ese último tramo hay que verificarlo a mano.
+  *Cuando hay un nombre de documento útil y ninguno es de Fudo, la conclusión de antes sigue
+  valiendo: eso no cambió.*
+- **La cola de prueba del propio motor volvía a contarse como historial del local.** El descarte
+  era por nombre de documento, y **40 de las 146 entradas** eran colas `FUDO-TEST-*` cuyo trabajo
+  Windows reportó con el nombre genérico, así que el filtro no las veía. Ahora se descartan
+  también por nombre de cola. *El motor no puede contarse a sí mismo como evidencia* — tercera
+  vez que aparece este mismo bug, ahora por la variante del nombre del documento.
+- **`nativa.update_local` fallaba en silencio.** Caso reportado por una asesora (*"no me actualiza
+  la nativa, lo intenté 3 veces"*, terminó reinstalando a mano) y reproducido en telemetría: el
+  motor ejecutó la acción **dos veces** sobre la misma PC, la versión no se movió de la `0.0.18`,
+  no reportó ninguna reparación, y el chequeo quedaba en `warn` **con el mismo texto que cuando no
+  se intenta nada**. Ahora, si se intentó y la versión no subió, se dice explícitamente que **NO
+  se pudo actualizar** y por qué: código de salida del instalador, instalador no lanzable, o
+  *"terminó bien y la versión no cambió, y la App Nativa estaba corriendo"* — que es el caso
+  probable, con los archivos en uso. También avisa qué hacer: cerrar Fudo y volver a correr, o
+  correr el instalador a mano.
+  *Queda en `warn` y no en `fail` a propósito: una Nativa vieja no impide que la impresora
+  imprima, y un `fail` acá volvería a bloquear el cierre de casos que la 3.11 desbloqueó.*
+- **Una actualización de la Nativa que funciona podía dejar la PC igual de expuesta.** El
+  instalador que hay en la PC apunta hoy a la `0.0.27`, no a la `0.0.37` firmada: el update tomaba
+  y el antivirus seguía siendo un tema, sin que nadie lo dijera. Ahora, cuando el destino queda
+  por debajo de la firmada, se avisa en la recomendación. *El arreglo de fondo sigue siendo
+  distribuir el `.msi` de la `0.0.37`, que no es código.*
+
+### Agregado
+
+- **El self-test verifica que el motor no llame a nada que no exista.** Recorre el AST del propio
+  archivo y, para cada función del motor, comprueba que todo nombre que invoca resuelva en un
+  entorno donde el self-test todavía no definió ningún mock ni helper. Es lo que encontró las tres
+  llamadas fantasma de esta versión, y **corre primero**, antes que cualquier escenario.
+  *Sin esto, agregar un escenario no alcanzaba: los 360 asserts de la 3.14 pasaban con el crash
+  adentro, porque el self-test comparte scope con el motor y la función faltante sí existía ahí.*
+- **`colaQueUsaFudo` viaja en la telemetría.** La columna existía en el receptor desde el día uno
+  y el motor **nunca la mandó**: vacía en 229 de 229 filas. Cuando el historial no permite
+  atribuir, viaja como `no_atribuible`, que es un dato distinto de vacío. Se corrigió también la
+  regla de lectura en `docs/telemetria.md`, que decía que un valor vacío era sospecha de
+  configuración en Fudo.
+- **El resultado del intento de actualizar la Nativa viaja en la telemetría** (`nativaUpdate`:
+  si se intentó, si subió, código de salida, motivo, y si el destino queda sin firmar). Sin esto,
+  un update que no toma es indistinguible de uno que no se intentó — que es justamente por qué el
+  caso de la asesora no se veía en la planilla.
+- Self-test: **409 asserts** (eran 360). Escenarios nuevos para el crash del resumen y su
+  resguardo, la atribución del historial, la cola propia con nombre genérico, el update de la
+  Nativa que no toma, y las dos reparaciones que llamaban a cmdlets inexistentes.
+
+### Evaluado y NO implementado
+
+- **Atribuir las comandas de Fudo por proceso** (mejora 2 de la bitácora, punto b). El evento 307
+  del log del spooler **no trae el proceso** que originó el trabajo: trae id, documento, usuario,
+  máquina, cola, puerto y bytes. Atribuir por correlación temporal con la App Nativa corriendo
+  sería una heurística, y aplicada sobre el único camino que habilita `resolved` fabricaría
+  exactamente el tipo de falso positivo que este proyecto ya corrigió catorce veces. **Lo que sí
+  entró es la mitad honesta: dejar de afirmar lo que no se puede saber.** Para poder afirmarlo, el
+  cambio es del lado de la App Nativa: que nombre sus trabajos con un prefijo propio. Queda
+  pendiente y no es de este repo.
+- **Dedupe en el receptor de telemetría** (`tools/telemetria-appscript.gs`). Hay un duplicado
+  exacto por reintento del POST sin idempotencia, pero el receptor está fuera del alcance del
+  self-test y no hay forma de verificarlo desde acá: tocarlo a ciegas arriesga la telemetría en
+  producción. Queda para revisión manual.
+- **Contar sólo `status='resolved'` en el agregado de la planilla.** Cinco de las quince
+  "resueltas" nuevas son filas 3.8 con `resuelto=TRUE` y `needs_escalation` a la vez, un bug
+  anterior a la 3.11 que el resumen suma igual. También es del receptor, misma razón.
+
+### Pendiente (no entró en esta versión)
+
+- Cola de prueba de respaldo cuando `hw.noPortBound` no consigue puerto: se renombró el motivo del
+  salteo a `sin_puerto_asignado`, pero el fallback no se creó. Hubo una PC con 3 corridas seguidas
+  sin prueba física por esto.
+- Rama del antivirus *"instalada pero no corriendo"*: una corrida 3.12 todavía agregó una
+  exclusión con la Nativa presente, y esa exclusión se llevó la causa raíz de un cierre que en
+  realidad resolvió el rebind del USB. No se reprodujo en ninguna corrida 3.14: hay que confirmar
+  si la rama sigue viva antes de tocarla.
+- Causa raíz sin redactar en la variante de red (*"Prueba fisica ESC/POS por red"*, el título del
+  paso). La variante USB ya quedó redactada en 3.14.
+- Inventario: colas de red con `estado: "sana"` que `conn.net` da como inalcanzables.
+- Cambio de IP de impresoras de red (pedido del canal): confirmado que no hay vía genérica de
+  fabricante. Lo genérico desde Windows es reapuntar el puerto RAW y descubrir la impresora en la
+  red; sigue sin implementar.
+
 ## [3.14] - 2026-09-03
 
 Tres pedidos del equipo, no hallazgos de telemetría. Los tres apuntan al mismo problema de fondo:
