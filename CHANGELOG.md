@@ -2,6 +2,117 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.16] - 2026-09-07
+
+Pedido del canal (Karen, con aportes de Iván y datos de la bitácora del 04/09): **la impresora de
+red que el motor no podía ver porque está en otra subred que el PC.** Una comandera con IP de
+fábrica `192.168.1.x` en un local cuyo router reparte `192.168.0.x` está en el mismo cable, pero el
+PC no tiene ninguna dirección en esa subred y no le puede ni hablar. Hasta acá el motor cerraba con
+*"no se encontraron impresoras por IP en la red"*, que era falso.
+
+**El criterio de esta versión es descubrir y explicar, no escribirle a la impresora.** El motor
+resuelve todo lo que se puede resolver desde la PC —dónde está, de qué marca es, qué herramienta le
+corresponde, qué valores poner— y el asesor hace lo único que no se puede automatizar: los dos
+clicks en la utilidad del fabricante. Escribirle la IP por software queda afuera a propósito: ver
+*Evaluado y NO implementado*.
+
+### Agregado
+
+- **Se busca la impresora en las subredes donde puede estar, no sólo en la del PC.** Las candidatas
+  salen ordenadas por fuerza de la evidencia: primero la subred de una cola de Windows que apunta
+  afuera (ahí **hubo** una impresora, es lo más fuerte que se puede tener sin verla), después los
+  defaults de fábrica de las comanderas (`192.168.1`, `192.168.0`, `192.168.123`, `10.0.0`).
+- **Para poder verla, el motor le suma una IP secundaria temporal a la placa del PC y la saca al
+  terminar.** Esto es lo que destraba el caso: el bloqueo que reportó el canal era que la única
+  salida conocida —desenchufar el cable del router y conectar la impresora al PC— deja al cliente
+  **sin internet y al asesor sin asistencia remota**, y en una PC de escritorio sin WiFi no hay
+  alternativa. Una placa puede tener más de una dirección: la PC conserva la suya y suma una en la
+  subred de la impresora. No hace falta desenchufar nada, ni pedir otra notebook, y **no depende de
+  la marca**.
+  - **Va detrás de opt-in, no por default.** Es lo más invasivo que hace el motor y no está probado
+    contra hardware real: si hay consola se le pregunta al asesor, en modo agente no se hace, y
+    `-AllowNetProbe $true` lo fuerza. Cuando nadie confirma, el hallazgo **igual queda visible** con
+    el motivo y cómo habilitarlo — no desaparece en silencio.
+  - **La IP se saca siempre**, también si el motor aborta: la limpieza va en un `finally`, porque
+    los caminos de salida son varios `exit` distintos. Dejarle una dirección de más a la placa del
+    cliente sería peor que no haber revisado nada.
+- **La impresora dice quién es, en su propio protocolo.** Sobre el mismo socket 9100 se le manda
+  `GS I 66` / `GS I 67` (fabricante y modelo), que es lo que usa cualquier utilidad ESC/POS. Es
+  mejor que deducir la marca del OUI de la MAC: no hay tabla que mantener ni que adivinar, y lo
+  contesta el aparato. Si no contesta —las OEM chinas suelen no hacerlo— se dice que no se pudo
+  saber, y se guarda la **MAC**, que no cambia aunque cambie la IP.
+  - La tabla de OUIs por fabricante **arranca vacía a propósito**: poner prefijos sin verificarlos
+    sería adivinar el fabricante, que es justo la familia de falsos positivos que este proyecto
+    arrastra. Se llena con las MAC reales que empiecen a llegar por telemetría.
+- **Una instrucción única en el resumen, con los valores ya resueltos.** Bloque
+  *IMPRESORA DE RED EN OTRA SUBRED*: dónde está, la marca, la MAC, **qué IP ponerle** (probada,
+  libre, en el rango del router), máscara, gateway, y con qué herramienta. *Ahí está el rato que se
+  le quería ahorrar al asesor: no en clickear, en averiguar qué poner.*
+- **La herramienta de configuración de red se busca en la PC, por marca.** Los nombres de los
+  ejecutables salen del empaquetado que ya mantiene el equipo (Delitools › `NetConfigTools`), no se
+  adivinan — y **ninguno se llama como uno esperaría**: la de Epson es `ENConfig.exe`, no
+  `EpsonNetConfig.exe`. Se busca en la instalación de Delitools y en una carpeta `NetConfigTools`
+  al lado del script.
+  | Marca | Ejecutable |
+  |---|---|
+  | Epson | `ENConfig.exe` |
+  | Bixolon | `NetConfiguration.exe` |
+  | Sam4s | `GIANT&GCUBE Tool.exe` |
+  | XPrinter | `XPrinter.exe` |
+  | 3nStar | `POS Printer Test.exe` |
+  - **No se busca en Descargas.** Acá se termina lanzando un ejecutable, y una carpeta donde cae
+    cualquier cosa no es un lugar del que convenga ejecutar nada.
+  - 3nStar y XPrinter comparten la herramienta OEM (comparten `EnCodeQr.dll` byte por byte), así
+    que el mapa marca→herramienta no es 1 a 1. Y ninguna es un `.exe` suelto: todas necesitan su
+    carpeta al lado (DLLs, `.ini`, `Resources`), así que se lanzan con el directorio de trabajo
+    puesto ahí o arrancan rotas.
+  - Si la herramienta **no** está, el motor igual dice cuál hace falta y de dónde sale, y avisa que
+    instalando Delitools la próxima corrida la encuentra sola. *El diagnóstico es nuestro y funciona
+    igual: que la herramienta esté sólo cambia si el motor la abre.*
+- **`otraSubred` en la telemetría**: candidatas, revisadas, encontradas con MAC y OUI, y el plan.
+  Es lo que permite saber si el motor está resolviendo la instrucción completa o quedándose corto.
+- Self-test: **478 asserts** (eran 409). Escenarios nuevos para el orden de las subredes candidatas,
+  la IP libre que no puede estar ocupada, la tabla de herramientas (incluido el `&` del ejecutable de
+  SAM4S), la instrucción completa con y sin marca, el opt-in, la identidad por ESC/POS y OUI, la
+  limpieza de la IP temporal —incluido el caso de una que no se puede sacar— y el camino completo.
+
+### Corregido
+
+- **El self-test se quedaba sin imprimir su propio resultado si un escenario posterior usaba el
+  resumen.** El escenario que verifica el resguardo del resumen reemplaza `Build-HumanSummary` por
+  uno que explota a propósito, y ese mock quedaba en scope: cualquier escenario nuevo que lo usara
+  se caía, y la excepción salía del self-test entera, sin dar ni el conteo final. Ahora el mock se
+  saca en el mismo escenario que lo pone. *Es la tercera vez en dos versiones que un mock que quedó
+  en scope hace pasar o fallar un escenario por el motivo equivocado: hay que resolverlo de raíz.*
+
+### Evaluado y NO implementado
+
+- **Escribirle la IP a la impresora por software.** Es lo que uno querría, y no va. Las utilidades
+  de marca lo hacen por SNMP (Epson) o por comandos propietarios sobre 9100 que **cambian según el
+  modelo** (los clones Xprinter/3nStar). PowerShell 5.1 no trae SNMP nativo, y mandar comandos
+  adivinados a una impresora que no conocemos tiene una falla posible muy cara: **la impresora queda
+  en una IP inalcanzable y el local sin comandas**, peor que el problema que fuimos a resolver. Es
+  la misma regla que la 3.10: un diagnóstico vacío es preferible a actuar sobre algo que nadie pidió.
+- **Automatizar las GUIs de las utilidades.** Manejar `ENConfig.exe` por automatización de ventanas
+  se rompe con cada versión de la app. El motor las encuentra, dice cuál abrir y con qué valores; los
+  clicks son de una persona.
+- **Empaquetar las utilidades en este repo.** Son ejecutables de terceros: redistribuirlos es un tema
+  de licencia y el repo es público. Se apunta a lo que el equipo ya tiene instalado.
+
+### Pendiente
+
+- **Nada de esto se probó contra una impresora Ethernet real** — ni el barrido de la subred ajena, ni
+  la IP secundaria, ni la identidad por `GS I`. Es la feature más grande del proyecto sobre la capa
+  menos probada. Antes de anunciarla en el canal hace falta una térmica de red enchufada.
+- La IP temporal se saca en el `finally`, pero si el proceso se mata de una forma que no lo ejecuta
+  (corte de luz, kill), queda puesta. El motor la informa en pantalla y en la telemetría para poder
+  sacarla a mano; una limpieza automática al arrancar la corrida siguiente queda pendiente.
+- Reapuntar automáticamente el puerto de la cola cuando la impresora ya está en la IP correcta: hoy
+  el plan lo indica y la verificación existe, pero el reapuntado sigue siendo un paso aparte.
+- Alta por primera vez (impresora recién sacada de la caja, sin cola ni historial): reusa este mismo
+  descubrimiento, pero todavía no tiene su propio camino en el diagnóstico.
+- Impresoras fiscales: detectarlas por modelo y declarar que están fuera de alcance.
+
 ## [3.15] - 2026-09-04
 
 De la bitácora del 04/09. El hallazgo de arranque fue un **crash en producción**: una corrida de

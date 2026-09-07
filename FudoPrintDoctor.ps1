@@ -115,6 +115,11 @@
 .PARAMETER CheckUpdate
     Solo consulta la version publicada, informa y termina. No diagnostica nada.
 
+.PARAMETER AllowNetProbe
+    Permite que el motor le agregue una IP secundaria TEMPORAL a la placa de red del PC para
+    poder ver una impresora que esta en otra subred, y la saque al terminar. Es lo unico que
+    toca la configuracion de red del cliente. Sin este parametro se le pregunta al asesor si
+    hay consola, y en modo agente no se hace. Default: no.
 .PARAMETER AllowQueuePurge
     Decide sin preguntar si se limpia la cola de impresion (unica accion irreversible).
     Si no se pasa: en consola interactiva se le pregunta al asesor; en modo no interactivo
@@ -395,6 +400,7 @@ param(
     [bool]$InstallGenericDriver = $true,
     [switch]$SkipIrreversible,
     [bool]$AllowQueuePurge,
+    [bool]$AllowNetProbe,
     [switch]$KeepTestPrinter,
     [string]$JsonOut,
     [switch]$Quiet,
@@ -442,7 +448,7 @@ $script:TestPrinterRx = '(?i)^FUDO-TEST-'
 # puerto tenga hardware; si el hardware se va, deja de serlo (ver Remove-OrphanOwnQueues).
 $script:OwnQueueRx   = '(?i)^FUDO-(TEST-|USB\d)'
 $script:TestDocRx    = '(?i)fudo print doctor'
-$script:SchemaVersion = '3.15'
+$script:SchemaVersion = '3.16'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -1611,6 +1617,33 @@ $script:UsbVendorMap = [ordered]@{
     '067B' = 'Adaptador USB-serie (Prolific)'
 }
 # Marcas con driver propio que vale la pena usar (corte de papel, velocidad, utilitarios)
+# Herramientas de configuracion de red por marca. Los nombres de los ejecutables salen del
+# empaquetado que ya usa el equipo (Delitools > NetConfigTools): no se adivinan, y ninguno se
+# llama como uno esperaria -la de Epson es ENConfig.exe, no EpsonNetConfig.exe-.
+# Ninguna es un .exe suelto: todas necesitan su carpeta al lado (DLLs, .ini, Resources), asi que
+# hay que lanzarlas CON el directorio de trabajo puesto ahi o arrancan rotas.
+$script:NetConfigTools = @(
+    [ordered]@{ marca = 'Epson';   carpeta = 'EPSON';    exe = 'ENConfig.exe'
+                nota = 'EpsonNet Config descubre las impresoras Epson de la red aunque esten en otra subred, sin conectarlas al PC. La IP se cambia desde ahi.' },
+    [ordered]@{ marca = 'Bixolon'; carpeta = 'BIXOLON';  exe = 'NetConfiguration.exe'
+                nota = 'La utilidad de red de Bixolon lista las impresoras de la marca y permite cambiarles la IP.' },
+    [ordered]@{ marca = 'Sam4s';   carpeta = 'SAM4S';    exe = 'GIANT&GCUBE Tool.exe'
+                nota = 'Giant & GCube Tool: la configuracion de red esta en la seccion de Ethernet.' },
+    [ordered]@{ marca = 'XPrinter'; carpeta = 'XPRINTER'; exe = 'XPrinter.exe'
+                nota = 'No es una utilidad de red: es la herramienta general de la impresora. La IP se cambia en la pestana de configuracion Ethernet.' },
+    [ordered]@{ marca = '3nStar';  carpeta = '3NSTAR';   exe = 'POS Printer Test.exe'
+                nota = 'Misma herramienta OEM que la de XPrinter (comparten EnCodeQr.dll): sirve para las dos marcas. La IP se cambia en la pestana de configuracion Ethernet.' }
+)
+# Prefijos OUI (los 3 primeros bytes de la MAC) por fabricante, para identificar una impresora
+# descubierta por barrido, donde no hay nombre: solo IP y MAC.
+# ARRANCA VACIO A PROPOSITO. Poner OUIs sin verificarlos seria adivinar el fabricante, que es
+# justo la familia de falsos positivos que este proyecto arrastra. Se llena con las MAC reales
+# que empiecen a llegar por telemetria (campo 'mac' de impresorasEnRed): cada vez que una marca
+# quede confirmada, se agrega su prefijo aca. Mientras este vacio, la identidad sale del propio
+# protocolo (Get-EscPosIdentity) y el OUI viaja como dato crudo para poder armar la tabla.
+$script:PrinterOuis = @{}
+# IPs secundarias que agrego esta corrida y hay que sacar al terminar.
+$script:TempIpsAdded = New-Object System.Collections.ArrayList
 $script:BrandsWithOemDriver = @('Epson','Bixolon','Star Micronics','Citizen','Zebra','Custom','Sam4s','Sewoo','Posiflex','Hasar')
 $script:BrandSupportUrl = [ordered]@{
     'Epson'          = 'https://www.epson.com.ar'
@@ -3970,6 +4003,369 @@ function Find-NetworkPrinters {
     return @($res)
 }
 
+function Test-PathExists {
+    <# Envoltorio de Test-Path para poder probar la resolucion de rutas sin tocar el disco. #>
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    try { return [bool](Test-Path -LiteralPath $Path) } catch { return $false }
+}
+
+function Test-IpAlive {
+    <#
+      Responde algo en esa IP? Envuelto en una funcion propia a proposito: es lo que permite
+      probar la logica que decide una IP libre sin depender de la red real.
+    #>
+    param([string]$Ip, [int]$TimeoutMs = 300)
+    if (-not $Ip) { return $false }
+    try { return ((((New-Object System.Net.NetworkInformation.Ping).Send($Ip, $TimeoutMs)).Status) -eq 'Success') } catch { return $false }
+}
+
+function Convert-EscPosInfoBytes {
+    <#
+      Texto util de la respuesta a GS I n: viene con un byte de encabezado y termina en NUL, y
+      lo unico que interesa es lo imprimible. Separado del socket para poder probarlo.
+    #>
+    param([byte[]]$Bytes, [int]$Leidos = -1)
+    $n = $(if ($Leidos -ge 0) { $Leidos } else { @($Bytes).Count })
+    # GS I n contesta con un byte de encabezado (0x5F) y termina en NUL. El 0x5F es imprimible,
+    # asi que si no se saltea queda pegado al texto: '_EPSON' en vez de 'EPSON'.
+    $desde = 0
+    if ($n -gt 0 -and ([int]$Bytes[0]) -eq 0x5F) { $desde = 1 }
+    $txt = ''
+    for ($i = $desde; $i -lt $n; $i++) {
+        $b = [int]$Bytes[$i]
+        if ($b -ge 32 -and $b -le 126) { $txt += [char]$b }
+    }
+    return ([string]$txt).Trim()
+}
+
+function Resolve-BrandFromText {
+    <# Marca conocida dentro de un texto libre, contra la lista que ya usa el resto del motor. #>
+    param([string]$Texto)
+    $t = ([string]$Texto).Trim()
+    if (-not $t) { return '' }
+    foreach ($m in @($script:PosBrands)) {
+        if ($t -match ('(?i)' + [regex]::Escape($m))) { return [string]$m }
+    }
+    if ($t -match '(?i)seiko|epson') { return 'Epson' }
+    return ''
+}
+
+function Confirm-NetProbe {
+    <#
+      Decide si se le agrega una IP secundaria temporal a la placa del cliente.
+      Es reversible, pero es lo mas invasivo que hace el motor y NUNCA se probo contra hardware
+      real, asi que no va por default. Orden de decision:
+        -AllowNetProbe $true/$false -> lo que diga el invocador
+        consola interactiva         -> se le pregunta al asesor
+        modo agente                 -> NO se hace, y el motor explica que quedo sin revisar
+      OJO: no depende de -SkipIrreversible, porque esto SI se puede deshacer.
+    #>
+    param([string]$Prefijo, [string]$Motivo)
+    if ($script:BoundParams -and $script:BoundParams.ContainsKey('AllowNetProbe')) { return [bool]$AllowNetProbe }
+    if (-not (Test-IsInteractiveConsole)) { return $false }
+
+    Suspend-LiveStatus
+    [Console]::Error.WriteLine('')
+    [Console]::Error.WriteLine('  ------------------------------------------------------------')
+    [Console]::Error.WriteLine('  Puede haber una impresora de red en una subred distinta a la del PC.')
+    [Console]::Error.WriteLine(("    Subred a revisar: " + $Prefijo + '.0/24'))
+    if ($Motivo) { [Console]::Error.WriteLine("    Por que: $Motivo") }
+    [Console]::Error.WriteLine('')
+    [Console]::Error.WriteLine('  Para poder verla, el motor le agrega una segunda direccion IP a la placa de')
+    [Console]::Error.WriteLine('  red de esta PC y la saca al terminar. La PC NO pierde internet ni la conexion')
+    [Console]::Error.WriteLine('  remota: conserva su IP actual y suma una.')
+    [Console]::Error.WriteLine('  ------------------------------------------------------------')
+    $ans = Read-DoctorLine -Prompt '  Revisar esa subred? (s = si / cualquier otra tecla = no)'
+    if ($null -eq $ans) { return $false }
+    return ($ans -match '(?i)^\s*(s|si|s\u00ED|y|yes)\s*$')
+}
+
+function Get-PrimaryIpv4Interface {
+    <# La placa por la que sale el trafico: es a la que hay que sumarle la IP secundaria. #>
+    $out = [ordered]@{ indice = 0; ip = ''; prefijo = '' }
+    try {
+        $a = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
+               Where-Object { $_.IPAddress -notmatch '^(127\.|169\.254\.)' } |
+               Sort-Object -Property @{ Expression = { [int]$_.InterfaceIndex } }) | Select-Object -First 1
+        if ($a) {
+            $out.indice = [int]$a.InterfaceIndex
+            $out.ip = [string]$a.IPAddress
+            $out.prefijo = (([string]$a.IPAddress) -split '\.')[0..2] -join '.'
+        }
+    } catch {}
+    return $out
+}
+
+function Add-TempSubnetIp {
+    <#
+      Le suma una IP secundaria a la placa, en la subred que se quiere revisar. La PC conserva
+      su direccion actual: no pierde internet ni la asistencia remota, que es exactamente el
+      bloqueo que hacia que esto se resolviera desenchufando el cable del router.
+      Devuelve @{ aplicado; ip; indice; motivo }
+    #>
+    param([string]$Prefijo)
+    $nic = Get-PrimaryIpv4Interface
+    if (-not $nic.indice) { return @{ aplicado = $false; ip = ''; indice = 0; motivo = 'no se encontro una placa de red con IPv4' } }
+    $libre = Get-FreeIpInSubnet -Prefix $Prefijo
+    if (-not $libre) { return @{ aplicado = $false; ip = ''; indice = [int]$nic.indice; motivo = ('no se encontro una direccion libre en ' + $Prefijo + '.0/24') } }
+    try {
+        New-NetIPAddress -InterfaceIndex ([int]$nic.indice) -IPAddress $libre -PrefixLength 24 -ErrorAction Stop | Out-Null
+        [void]$script:TempIpsAdded.Add([ordered]@{ ip = $libre; indice = [int]$nic.indice })
+        Add-Action -Type 'net.tempIp' -Target ($libre + '/24') -Before 'sin direccion en esa subred' -After 'direccion secundaria agregada' -Reversible $true
+        Start-Sleep -Milliseconds 800
+        return @{ aplicado = $true; ip = $libre; indice = [int]$nic.indice; motivo = '' }
+    } catch {
+        return @{ aplicado = $false; ip = $libre; indice = [int]$nic.indice; motivo = ('no se pudo agregar la direccion: ' + $_.Exception.Message) }
+    }
+}
+
+function Remove-TempSubnetIps {
+    <#
+      Saca las IPs secundarias que agrego esta corrida. Se llama SIEMPRE, tambien si el
+      diagnostico fallo: dejarle una direccion de mas a la placa del cliente seria peor que no
+      haber revisado nada.
+    #>
+    $sacadas = @()
+    foreach ($t in @($script:TempIpsAdded)) {
+        try {
+            Remove-NetIPAddress -IPAddress ([string]$t.ip) -InterfaceIndex ([int]$t.indice) -Confirm:$false -ErrorAction Stop
+            $sacadas += [string]$t.ip
+        } catch {
+            Write-DoctorLog -Level 'WARN' -Message ('no se pudo sacar la IP temporal ' + [string]$t.ip + ': ' + $_.Exception.Message)
+        }
+    }
+    $script:TempIpsAdded = New-Object System.Collections.ArrayList
+    return @($sacadas)
+}
+
+function Get-DefaultGatewayIp {
+    <# El router. Es uno de los valores que hay que ponerle a la impresora. #>
+    try {
+        $r = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop |
+               Where-Object { $_.NextHop -and $_.NextHop -ne '0.0.0.0' } |
+               Sort-Object -Property @{ Expression = { [int]$_.RouteMetric } }) | Select-Object -First 1
+        if ($r) { return [string]$r.NextHop }
+    } catch {}
+    try {
+        foreach ($c in @(Get-CimInstance Win32_NetworkAdapterConfiguration -ErrorAction Stop | Where-Object { $_.IPEnabled })) {
+            foreach ($g in @($c.DefaultIPGateway)) { if ($g -match '^\d{1,3}(\.\d{1,3}){3}$') { return [string]$g } }
+        }
+    } catch {}
+    return ''
+}
+
+function Resolve-NetworkPrinterPlan {
+    <#
+      LA instruccion unica. El asesor no tiene que averiguar nada: el motor decide cual es la
+      impresora, de que marca es, con que herramienta se le cambia la IP, que valores poner y
+      que se va a verificar despues. Si esto devuelve un plan, el trabajo del asesor son dos
+      clicks en una GUI ajena; sin esto, son veinte minutos de tanteo.
+      Devuelve @{ hay; ip; marca; mac; oui; modelo; ipSugerida; mascara; gateway; herramienta; pasos }
+    #>
+    param($Encontrada, [string]$PrefijoPc, [string]$Gateway)
+    $plan = [ordered]@{
+        hay = $false; ip = ''; marca = ''; mac = ''; oui = ''; modelo = ''
+        ipSugerida = ''; mascara = '255.255.255.0'; gateway = [string]$Gateway
+        herramienta = $null; pasos = @()
+    }
+    if (-not $Encontrada) { return $plan }
+    $plan.hay = $true
+    $plan.ip = [string]$Encontrada.ip
+    $plan.mac = [string]$Encontrada.mac
+    $plan.oui = [string]$Encontrada.oui
+    $plan.modelo = [string]$Encontrada.modelo
+    $plan.marca = [string]$Encontrada.marca
+    if ($PrefijoPc) { $plan.ipSugerida = Get-FreeIpInSubnet -Prefix $PrefijoPc -Evitar @([string]$Gateway) }
+    if ($plan.marca) { $plan.herramienta = Find-NetConfigTool -Marca ([string]$plan.marca) }
+
+    $pasos = @()
+    $quien = $(if ($plan.marca) { 'La impresora es ' + $plan.marca + $(if ($plan.modelo) { ' (' + $plan.modelo + ')' } else { '' }) }
+               else { 'No se pudo identificar la marca' + $(if ($plan.oui) { ' (OUI de la MAC: ' + $plan.oui + ')' } else { '' }) })
+    $pasos += ($quien + ' y esta en ' + $plan.ip + ', que NO es la red de esta PC' +
+               $(if ($PrefijoPc) { ' (' + $PrefijoPc + '.0/24)' } else { '' }) + '.')
+    if ($plan.mac) { $pasos += ('MAC: ' + $plan.mac + ' (no cambia aunque cambie la IP: sirve para reconocerla).') }
+    if ($plan.ipSugerida) {
+        $pasos += ('Ponerle esta configuracion: IP ' + $plan.ipSugerida + ' - mascara ' + $plan.mascara +
+                   $(if ($plan.gateway) { ' - gateway ' + $plan.gateway } else { '' }) +
+                   '. Esa direccion se probo y esta libre.')
+    } else {
+        $pasos += 'No se pudo proponer una IP libre en la red del PC: elegir una a mano que no este en uso.'
+    }
+    if ($plan.herramienta -and [bool]$plan.herramienta.encontrada) {
+        $pasos += ('La herramienta para cambiarsela esta en esta PC: ' + [string]$plan.herramienta.ruta + '. ' + [string]$plan.herramienta.nota)
+    } elseif ($plan.herramienta) {
+        $pasos += ('Para cambiarsela hace falta ' + [string]$plan.herramienta.exe + ' (carpeta ' + [string]$plan.herramienta.carpeta +
+                   ' de NetConfigTools, que viene con Delitools). No esta en esta PC: instalando Delitools, la proxima corrida la encuentra sola. ' +
+                   [string]$plan.herramienta.nota)
+    } else {
+        $pasos += ('Sin marca identificada no hay herramienta que abrir: leer la IP con el self-test de la impresora ' +
+                   '(apagar, mantener FEED, encender) y cambiarla por la utilidad del fabricante o su pagina web.')
+    }
+    $pasos += ('Cuando este cambiada, volver a correr el diagnostico: el motor verifica que responda en la IP nueva y apunta la cola de Windows ahi.')
+    $plan.pasos = @($pasos)
+    return $plan
+}
+
+function Get-EscPosIdentity {
+    <#
+      Le pregunta a la impresora quien es, por su propio protocolo y por el mismo socket 9100.
+      GS I n (1D 49 n) devuelve datos del equipo: n=66 fabricante, n=67 modelo, n=1 id de modelo.
+      Es mejor que deducir la marca del OUI de la MAC: no hay tabla que mantener ni que adivinar,
+      y lo contesta el aparato. No todas lo soportan -las OEM chinas suelen no contestar-, y en
+      ese caso se devuelve vacio, que es un resultado honesto: no se pudo saber.
+      Devuelve @{ fabricante = '...'; modelo = '...'; marca = '<de PosBrands>' }
+    #>
+    param([string]$Ip, [int]$TcpPort = 9100, [int]$TimeoutMs = 1200)
+    $out = [ordered]@{ fabricante = ''; modelo = ''; marca = '' }
+    if (-not $Ip) { return $out }
+    $client = New-Object System.Net.Sockets.TcpClient
+    try {
+        $iar = $client.BeginConnect($Ip, $TcpPort, $null, $null)
+        if (-not $iar.AsyncWaitHandle.WaitOne($TimeoutMs)) { return $out }
+        $client.EndConnect($iar)
+        $stream = $client.GetStream()
+        $stream.WriteTimeout = $TimeoutMs
+        $stream.ReadTimeout  = $TimeoutMs
+        foreach ($par in @(@{ n = 66; campo = 'fabricante' }, @{ n = 67; campo = 'modelo' })) {
+            try {
+                $stream.Write([byte[]]@(0x1D, 0x49, [byte]$par.n), 0, 3)
+                $stream.Flush()
+                Start-Sleep -Milliseconds 300
+                $buf = New-Object byte[] 64
+                $leidos = 0
+                try { $leidos = $stream.Read($buf, 0, 64) } catch {}
+                if ($leidos -gt 0) { $out[$par.campo] = (Convert-EscPosInfoBytes -Bytes $buf -Leidos $leidos) }
+            } catch {}
+        }
+    } catch { return $out }
+    finally { try { $client.Close() } catch {} }
+    # La marca se resuelve contra la lista que el motor ya usa para el resto del diagnostico.
+    $out.marca = Resolve-BrandFromText -Texto ((([string]$out.fabricante) + ' ' + ([string]$out.modelo)).Trim())
+    return $out
+}
+
+function Get-MacForIp {
+    <#
+      MAC de una IP de la red local, leida de la tabla ARP. Sirve para dos cosas: identificar el
+      fabricante por OUI cuando la impresora no contesta quien es, y darle al asesor un dato que
+      no cambia aunque la IP si.
+      Se parsea por patron de IP + MAC y no por columnas, porque la salida de arp esta traducida.
+    #>
+    param([string]$Ip)
+    if (-not $Ip) { return '' }
+    try {
+        # Un paquete cualquiera primero, para que la entrada exista en la tabla ARP.
+        try { [void](New-Object System.Net.NetworkInformation.Ping).Send($Ip, 300) } catch {}
+        foreach ($linea in @(& "$env:WINDIR\System32\ARP.EXE" -a 2>$null)) {
+            $l = [string]$linea
+            if ($l -match ('(?<![\d.])' + [regex]::Escape($Ip) + '(?![\d.])') -and
+                $l -match '([0-9a-fA-F]{2}([-:])[0-9a-fA-F]{2}(\2[0-9a-fA-F]{2}){4})') {
+                return ((([string]$Matches[1]) -replace ':', '-').ToLower())
+            }
+        }
+    } catch {}
+    return ''
+}
+
+function Get-OuiBrand {
+    <#
+      Fabricante segun los 3 primeros bytes de la MAC. Devuelve @{ oui = 'aa-bb-cc'; marca = '' }.
+      Con la tabla vacia devuelve el OUI igual: el dato crudo es lo que permite armar la tabla.
+    #>
+    param([string]$Mac)
+    $out = [ordered]@{ oui = ''; marca = '' }
+    $m = ([string]$Mac) -replace ':', '-'
+    if ($m -notmatch '^([0-9a-fA-F]{2}-[0-9a-fA-F]{2}-[0-9a-fA-F]{2})') { return $out }
+    $out.oui = ([string]$Matches[1]).ToLower()
+    if ($script:PrinterOuis.ContainsKey($out.oui)) { $out.marca = [string]$script:PrinterOuis[$out.oui] }
+    return $out
+}
+
+function Get-PrinterSubnetCandidates {
+    <#
+      Subredes donde puede estar una impresora que NO esta en la del PC. Ordenadas por fuerza de
+      la evidencia:
+        1. la subred de una cola de Windows que apunta afuera -> ahi HUBO una impresora, es lo
+           mas fuerte que se puede tener sin verla;
+        2. los defaults de fabrica de las comanderas, que es como llegan de la caja.
+      Se excluyen las subredes del propio PC: esas ya las barre el camino normal.
+      Devuelve @( @{ prefijo = '192.168.1'; motivo = '...' } )
+    #>
+    param([int]$Max = 3)
+    $propias = @(Get-LocalSubnetPrefixes)
+    $out = @()
+    $vistos = @()
+    foreach ($inst in @(Get-InstalledNetworkPrinters)) {
+        $ip = [string]$inst.ip
+        if ($ip -notmatch '^\d{1,3}(\.\d{1,3}){3}$') { continue }
+        $p = ($ip -split '\.')[0..2] -join '.'
+        if ($propias -contains $p -or $vistos -contains $p) { continue }
+        $vistos += $p
+        $out += [ordered]@{ prefijo = $p
+                            motivo = ('hay una cola de Windows apuntando a ' + $ip + ', que esta fuera de la red del PC' +
+                                      $(if (@($inst.colas).Count -gt 0) { " (cola '" + (@($inst.colas) -join ', ') + "')" } else { ' (puerto sin cola)' })) }
+    }
+    # Defaults de fabrica mas frecuentes en comanderas termicas.
+    foreach ($p in @('192.168.1', '192.168.0', '192.168.123', '10.0.0')) {
+        if ($propias -contains $p -or $vistos -contains $p) { continue }
+        $vistos += $p
+        $out += [ordered]@{ prefijo = $p; motivo = 'subred de fabrica frecuente en comanderas' }
+    }
+    return @(@($out) | Select-Object -First $Max)
+}
+
+function Get-FreeIpInSubnet {
+    <#
+      Una IP libre en la subred del PC, para proponerle al asesor que se la ponga a la impresora.
+      Se prueba de verdad que no responda: proponer una IP ocupada crearia un conflicto, que es
+      uno de los problemas que venimos a resolver.
+      Se buscan primero direcciones altas (.200-.250): las bajas son las que suele repartir el
+      DHCP del router y las que ya usan los equipos del local.
+    #>
+    param([string]$Prefix, [string[]]$Evitar = @())
+    if (-not $Prefix) { return '' }
+    $ocupadas = @($Evitar | Where-Object { $_ })
+    try { $ocupadas += @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue | ForEach-Object { [string]$_.IPAddress }) } catch {}
+    try { $ocupadas += @(Get-InstalledNetworkPrinters | ForEach-Object { [string]$_.ip }) } catch {}
+    foreach ($h in @(@(200..250) + @(60..99))) {
+        $cand = "$Prefix.$h"
+        if ($ocupadas -contains $cand) { continue }
+        if (-not (Test-IpAlive -Ip $cand)) { return $cand }
+    }
+    return ''
+}
+
+function Find-NetConfigTool {
+    <#
+      La utilidad de configuracion de red de una marca, si esta en la PC.
+      Se busca primero en la instalacion de Delitools, que es el empaquetado que ya mantiene el
+      equipo (NetConfigTools queda en una ruta fija), y despues en una carpeta NetConfigTools al
+      lado del script, para quien la copie suelta.
+      NO se busca en Descargas: aca se termina LANZANDO un ejecutable, y una carpeta donde cae
+      cualquier cosa no es un lugar del que convenga ejecutar nada.
+      Devuelve @{ marca; exe; carpeta; ruta; encontrada; nota }
+    #>
+    param([string]$Marca)
+    $def = @($script:NetConfigTools | Where-Object { [string]$_.marca -eq [string]$Marca }) | Select-Object -First 1
+    if (-not $def) { return [ordered]@{ marca = [string]$Marca; encontrada = $false; ruta = ''; exe = ''; carpeta = ''; nota = '' } }
+    $bases = @()
+    foreach ($pf in @($env:ProgramFiles, ${env:ProgramFiles(x86)})) {
+        if ($pf) { $bases += (Join-Path $pf 'Delitools\NetConfigTools') }
+    }
+    try { $bases += (Join-Path (Split-Path -Parent $PSCommandPath) 'NetConfigTools') } catch {}
+    foreach ($b in @($bases | Where-Object { $_ })) {
+        $carpeta = Join-Path $b ([string]$def.carpeta)
+        $ruta = Join-Path $carpeta ([string]$def.exe)
+        if (Test-PathExists -Path $ruta) {
+            return [ordered]@{ marca = [string]$def.marca; encontrada = $true; ruta = $ruta
+                               carpeta = $carpeta; exe = [string]$def.exe; nota = [string]$def.nota }
+        }
+    }
+    return [ordered]@{ marca = [string]$def.marca; encontrada = $false; ruta = ''
+                       carpeta = [string]$def.carpeta; exe = [string]$def.exe; nota = [string]$def.nota }
+}
+
 function Get-InstalledNetworkPrinters {
     <# Colas de Windows que apuntan a una IP: para no instalar dos veces la misma impresora. #>
     $out = @()
@@ -4015,6 +4411,100 @@ function New-NetworkPrinter {
     return $Name
 }
 
+function Test-ForeignSubnetPrinters {
+    <#
+      Busca la impresora cuando NO esta en la red del PC. Es el caso que el motor no podia ver:
+      una comandera con IP de fabrica (192.168.1.x) en un local cuyo router reparte 192.168.0.x
+      esta en el mismo cable, pero el PC no tiene ninguna direccion en esa subred, asi que no le
+      puede ni hablar. El camino manual era desenchufar el cable del router -que deja al cliente
+      sin internet y al asesor sin asistencia remota- o pedir otra notebook.
+      Aca se resuelve sumandole al PC una segunda direccion IP en la subred de la impresora: el
+      PC conserva la suya, no pierde nada, y se saca al terminar.
+      Detras de opt-in (Confirm-NetProbe): es lo mas invasivo que hace el motor y no esta
+      probado contra hardware real.
+      Devuelve $true si dejo un hallazgo concluyente.
+    #>
+    param([int]$TcpPort = 9100, [int]$MaxSubredes = 2)
+    $cands = @(Get-PrinterSubnetCandidates -Max $MaxSubredes)
+    $script:Diagnostics['subredesCandidatas'] = @($cands)
+    if (@($cands).Count -eq 0) { return $false }
+
+    $revisadas = @()
+    $encontrada = $null
+    $negado = $null
+    foreach ($c in @($cands)) {
+        if (-not (Confirm-NetProbe -Prefijo ([string]$c.prefijo) -Motivo ([string]$c.motivo))) {
+            $negado = $c
+            break
+        }
+        Write-StepDetail ('sumando una IP temporal para poder ver la subred ' + [string]$c.prefijo + '.0/24')
+        $tmp = Add-TempSubnetIp -Prefijo ([string]$c.prefijo)
+        if (-not $tmp.aplicado) {
+            $revisadas += [ordered]@{ prefijo = [string]$c.prefijo; ok = $false; motivo = [string]$tmp.motivo; encontradas = 0 }
+            continue
+        }
+        $enc = @(Find-NetworkPrinters -Prefix ([string]$c.prefijo) -TcpPort $TcpPort)
+        # Identidad de cada hallazgo ANTES de sacar la IP temporal: despues ya no se le puede
+        # hablar. Se le pregunta al aparato quien es y se guarda la MAC, que no cambia.
+        $detalle = @()
+        foreach ($e in @($enc)) {
+            $mac = Get-MacForIp -Ip ([string]$e.ip)
+            $oui = Get-OuiBrand -Mac $mac
+            $ident = Get-EscPosIdentity -Ip ([string]$e.ip) -TcpPort $TcpPort
+            $marca = [string]$ident.marca
+            if (-not $marca) { $marca = [string]$oui.marca }
+            $detalle += [ordered]@{
+                ip = [string]$e.ip; puerto = $TcpPort; respondeEscPos = [bool]$e.respondeEscPos
+                mac = [string]$mac; oui = [string]$oui.oui
+                fabricante = [string]$ident.fabricante; modelo = [string]$ident.modelo; marca = $marca
+                subred = [string]$c.prefijo
+            }
+        }
+        [void](Remove-TempSubnetIps)
+        $revisadas += [ordered]@{ prefijo = [string]$c.prefijo; ok = $true; motivo = [string]$c.motivo; encontradas = @($detalle).Count }
+        if (@($detalle).Count -gt 0) {
+            # Se prefiere la que contesto como ESC/POS: es una impresora confirmada, no un
+            # equipo cualquiera con el 9100 abierto.
+            $encontrada = @(@($detalle | Where-Object { $_.respondeEscPos }) + @($detalle)) | Select-Object -First 1
+            $script:Diagnostics['impresorasOtraSubred'] = @($detalle)
+            break
+        }
+    }
+    $script:Diagnostics['subredesRevisadas'] = @($revisadas)
+
+    if ($negado) {
+        Add-Check -Id 'conn.otherSubnet' -Layer 3 -Name 'No se reviso si hay una impresora en otra subred' -Status 'skipped' -Plane 'os' `
+            -Evidence @{ candidatas = @($cands); motivoSalteo = 'sin_confirmacion' } `
+            -ArticleRef 'https://soporte.fu.do/es/articles/11730816' `
+            -Recommendation ('Puede haber una impresora de red en ' + [string]$negado.prefijo + '.0/24 (' + [string]$negado.motivo + '), ' +
+                             'que no es la subred de esta PC. Para verla el motor necesita sumarle una IP secundaria temporal a la placa ' +
+                             '(la PC no pierde internet ni la conexion remota, y se saca al terminar). No se hizo porque nadie lo confirmo: ' +
+                             'volver a correr y aceptar, o pasarle -AllowNetProbe $true.')
+        return $false
+    }
+    if (-not $encontrada) {
+        if (@($revisadas | Where-Object { $_.ok }).Count -gt 0) {
+            Add-Check -Id 'conn.otherSubnet' -Layer 3 -Name 'Tampoco hay impresoras en las otras subredes revisadas' -Status 'ok' -Plane 'os' `
+                -Evidence @{ revisadas = @($revisadas); candidatas = @($cands) } `
+                -Recommendation ('Se revisaron ' + (@($revisadas | Where-Object { $_.ok } | ForEach-Object { [string]$_.prefijo + '.0/24' }) -join ', ') +
+                                 ' y no respondio ninguna impresora. Si el cliente dice que tiene una comandera de red, esta apagada, sin cable, o en una subred distinta de las revisadas.')
+        }
+        return $false
+    }
+
+    $nic = Get-PrimaryIpv4Interface
+    $plan = Resolve-NetworkPrinterPlan -Encontrada $encontrada -PrefijoPc ([string]$nic.prefijo) -Gateway (Get-DefaultGatewayIp)
+    $script:Diagnostics['planRedImpresora'] = $plan
+    Add-Check -Id 'conn.otherSubnet' -Layer 3 `
+        -Name ('La impresora de red esta en otra subred que el PC: ' + [string]$plan.ip + $(if ($plan.marca) { ' (' + [string]$plan.marca + ')' } else { '' })) `
+        -Status 'warn' -RootCauseCandidate $true -Plane 'os' `
+        -Evidence @{ plan = $plan; encontradas = @($script:Diagnostics['impresorasOtraSubred']); revisadas = @($revisadas) } `
+        -ArticleRef 'https://soporte.fu.do/es/articles/11730816' `
+        -Recommendation ((@($plan.pasos) -join ' ') +
+                         ' Mientras la impresora y el PC esten en subredes distintas, Windows no le puede mandar ninguna comanda.')
+    return $true
+}
+
 function Test-Layer3-Network {
     param($Printer)
     $ip = $PrinterIp
@@ -4032,6 +4522,17 @@ function Test-Layer3-Network {
         $script:Diagnostics['impresorasRedInstaladas'] = @($yaInstaladas)
 
         if (@($enc).Count -eq 0) {
+            # v3.16: antes se cerraba aca con 'no hay impresoras en la red', y eso era falso
+            # cuando la impresora estaba en otra subred -el caso de la comandera con IP de
+            # fabrica-. Se busca ahi antes de afirmar que no hay nada.
+            $hayOtra = Invoke-Step -Name 'layer3.otherSubnet' -Body { Test-ForeignSubnetPrinters -TcpPort $Port }
+            if ($hayOtra) {
+                Add-Check -Id 'conn.net' -Layer 3 -Name 'No hay impresoras por IP en la red del PC (si en otra subred, ver arriba)' `
+                    -Status 'warn' -RootCauseCandidate $false -Plane 'os' `
+                    -Evidence @{ subredes = $prefijos; puerto = $Port; encontradas = 0; otraSubred = $true } `
+                    -Recommendation 'La impresora existe pero esta en otra subred: la causa y los pasos estan en el chequeo de la subred.'
+                return
+            }
             Add-Check -Id 'conn.net' -Layer 3 -Name ('No se encontraron impresoras por IP en la red' + $(if (@($prefijos).Count -gt 0) { ' (' + (@($prefijos | ForEach-Object { $_ + '.0/24' }) -join ', ') + ')' } else { '' })) `
                 -Status 'fail' -RootCauseCandidate $true -Plane 'fudo_config' `
                 -Evidence @{ subredes = $prefijos; puerto = $Port; encontradas = 0; yaInstaladas = $yaInstaladas } `
@@ -4733,6 +5234,7 @@ $script:CategoryByCheckId = @{
     'conn.usb'                  = 'os.usb_port'
     'hw.noPortBound'            = 'os.usb_port'
     'conn.net'                  = 'net.ip'
+    'conn.otherSubnet'          = 'net.otra_subred'
     'hw.deviceConnected'        = 'hardware.no_conectada'
     'hw.disconnected'           = 'hardware.desconectada'
     'printer.disconnected'      = 'hardware.desconectada'
@@ -5024,6 +5526,27 @@ function Build-HumanSummary {
         Add-Line ''
         Add-Line $bar
         return (($L -join "`r`n") + "`r`n")
+    }
+
+    # v3.16: la instruccion unica para el caso de la impresora en otra subred. Va antes de los
+    # chequeos porque es lo que el asesor tiene que hacer, y con los valores ya resueltos: sin
+    # esto la informacion existe pero repartida en el JSON, y averiguarla a mano es el rato que
+    # se le queria ahorrar.
+    if ($script:Diagnostics.Contains('planRedImpresora')) {
+        $pl = $script:Diagnostics['planRedImpresora']
+        if ($pl -and [bool]$pl.hay) {
+            Add-Line ''
+            Add-Line '  IMPRESORA DE RED EN OTRA SUBRED'
+            Add-Field -Label 'ESTA EN' -Text ([string]$pl.ip + $(if ($pl.marca) { '   marca: ' + [string]$pl.marca } else { '' }) + $(if ($pl.mac) { '   MAC: ' + [string]$pl.mac } else { '' }))
+            if ($pl.ipSugerida) {
+                Add-Field -Label 'PONERLE' -Text ('IP ' + [string]$pl.ipSugerida + '   mascara ' + [string]$pl.mascara +
+                                                  $(if ($pl.gateway) { '   gateway ' + [string]$pl.gateway } else { '' }) + '  (esa IP se probo y esta libre)')
+            }
+            if ($pl.herramienta) {
+                Add-Field -Label 'CON' -Text $(if ([bool]$pl.herramienta.encontrada) { [string]$pl.herramienta.ruta } else { [string]$pl.herramienta.exe + ' (no esta en esta PC: viene con Delitools)' })
+            }
+            Add-Field -Label 'DESPUES' -Text 'volver a correr el diagnostico: el motor verifica la IP nueva y apunta la cola de Windows ahi.'
+        }
     }
 
     # --- semaforo por area
@@ -7288,6 +7811,10 @@ public class FudoFakeEndpoint {
     Assert-Eq 'S79 un fallo del resumen no se lleva la causa' $true ([bool]($txt79 -match 'Puerto USB desmapeado'))
     Assert-Eq 'S79 ni lo que hay que hacer' $true ([bool]($txt79 -match 'Reconectar el USB'))
     Assert-Eq 'S79 y queda registrado como error del motor' 1 (@($script:Errors | Where-Object { [string]$_.step -eq 'summary.build' }).Count)
+    # Este mock hace explotar el resumen a proposito: si queda en scope, se lleva puesto a
+    # cualquier escenario posterior que lo use, y la excepcion sale del self-test sin dar ni el
+    # conteo final. Se saca aca mismo.
+    Remove-Item Function:\Build-HumanSummary -ErrorAction SilentlyContinue
 
     # Escenario 80 (v3.15): las dos reparaciones que llamaban a cmdlets que no existen. Las
     # encontro el escaneo de S76, no la telemetria: las dos estaban dentro de un try/catch, asi
@@ -7331,6 +7858,206 @@ public class FudoFakeEndpoint {
     $r80b = Repair-BindUsbPort -InstanceIds @('USB\VID_04B8&PID_0E15\ABC')
     Assert-Eq 'S80b si el enable falla se reintenta habilitar' 'disable,enable,enable' ((@($script:llamadas80) -join ','))
     Assert-Eq 'S80b y queda dicho que no se pudo' $true ([bool]([string]$r80b.nota -match 'no se pudo reiniciar el device'))
+
+    # ---------------------------------------------------------------------
+    # Escenarios 81-88 (v3.16): la impresora de red que esta en OTRA subred.
+    # El caso que el motor no podia ver: una comandera con IP de fabrica en un local cuyo router
+    # reparte otra subred esta en el mismo cable, pero el PC no tiene direccion ahi y no le puede
+    # hablar. El camino manual era desenchufar el cable del router (deja al cliente sin internet
+    # y al asesor sin asistencia remota) o pedir otra notebook.
+    # ---------------------------------------------------------------------
+
+    # Escenario 81: que subredes vale la pena revisar, y en que orden.
+    Reset-State
+    function Get-LocalSubnetPrefixes { @('192.168.0') }
+    function Get-InstalledNetworkPrinters {
+        @(
+            [ordered]@{ ip = '192.168.1.21'; puertoTcp = 9100; puertoWindows = 'IP_192.168.1.21'; colas = @('COCINA') },
+            [ordered]@{ ip = '192.168.0.30'; puertoTcp = 9100; puertoWindows = 'IP_192.168.0.30'; colas = @('CAJA') }
+        )
+    }
+    $c81 = @(Get-PrinterSubnetCandidates -Max 3)
+    # Primero la que tiene evidencia dura: hay una cola apuntando ahi.
+    Assert-Eq 'S81 primero la subred de una cola que apunta afuera' '192.168.1' ([string]@($c81)[0].prefijo)
+    Assert-Eq 'S81 y dice por que' $true ([bool]([string]@($c81)[0].motivo -match 'cola de Windows'))
+    # La subred del PC no se propone: esa ya la barre el camino normal.
+    Assert-Eq 'S81 no propone la subred del propio PC' $false ([bool]((@($c81 | ForEach-Object { [string]$_.prefijo }) -join '|') -match '192\.168\.0'))
+    # Y despues los defaults de fabrica.
+    Assert-Eq 'S81 despues los defaults de fabrica' $true ([bool]([string]@($c81)[1].motivo -match 'fabrica'))
+    Assert-Eq 'S81 respeta el maximo' 3 (@($c81).Count)
+
+    # Escenario 82: la IP que se le propone al asesor tiene que estar libre de verdad.
+    # Proponer una ocupada crearia un conflicto de IP, que es uno de los problemas que venimos a
+    # resolver (fue el pedido original del canal).
+    Reset-State
+    function Get-NetIPAddress { param($AddressFamily, $ErrorAction) @([pscustomobject]@{ IPAddress = '192.168.0.10'; InterfaceIndex = 12 }) }
+    function Get-InstalledNetworkPrinters { @([ordered]@{ ip = '192.168.0.202'; colas = @('CAJA') }) }
+    function Test-IpAlive { param($Ip, $TimeoutMs) return ([string]$Ip -in @('192.168.0.200','192.168.0.201')) }
+    Assert-Eq 'S82 saltea las que responden' '192.168.0.203' (Get-FreeIpInSubnet -Prefix '192.168.0')
+    Assert-Eq 'S82 y tampoco propone la del gateway' '192.168.0.204' (Get-FreeIpInSubnet -Prefix '192.168.0' -Evitar @('192.168.0.203'))
+    function Test-IpAlive { param($Ip, $TimeoutMs) $true }
+    Assert-Eq 'S82 si todas responden no inventa ninguna' '' (Get-FreeIpInSubnet -Prefix '192.168.0')
+
+    # Escenario 83: la herramienta de la marca. Los nombres salen del empaquetado real que usa el
+    # equipo (Delitools > NetConfigTools): ninguno se llama como uno esperaria.
+    Reset-State
+    function Test-PathExists { param($Path) return ([string]$Path -match 'EPSON') }
+    $t83 = Find-NetConfigTool -Marca 'Epson'
+    Assert-Eq 'S83 encuentra la de Epson' $true ([bool]$t83.encontrada)
+    Assert-Eq 'S83 y no se llama EpsonNetConfig' 'ENConfig.exe' ([string]$t83.exe)
+    Assert-Eq 'S83 la busca en la instalacion de Delitools' $true ([bool]([string]$t83.ruta -match 'Delitools'))
+    Assert-Eq 'S83 dentro de NetConfigTools' $true ([bool]([string]$t83.ruta -match 'NetConfigTools'))
+    # Una marca cuya carpeta no esta: se sabe que herramienta hace falta, aunque no este.
+    $t83b = Find-NetConfigTool -Marca 'Bixolon'
+    Assert-Eq 'S83b sin la carpeta no la da por encontrada' $false ([bool]$t83b.encontrada)
+    Assert-Eq 'S83b pero dice cual hace falta' 'NetConfiguration.exe' ([string]$t83b.exe)
+    # El ejecutable de SAM4S tiene un & en el nombre: si se pierde, no se abre nada.
+    Assert-Eq 'S83c el nombre con & se conserva' 'GIANT&GCUBE Tool.exe' ([string](Find-NetConfigTool -Marca 'Sam4s').exe)
+    # 3nStar y XPrinter comparten la herramienta OEM, pero cada una tiene su carpeta.
+    Assert-Eq 'S83d 3nStar tiene su carpeta' '3NSTAR' ([string](Find-NetConfigTool -Marca '3nStar').carpeta)
+    Assert-Eq 'S83d y XPrinter la suya' 'XPRINTER' ([string](Find-NetConfigTool -Marca 'XPrinter').carpeta)
+    # Una marca que no esta en la tabla no puede inventar una herramienta.
+    Assert-Eq 'S83e una marca desconocida no trae herramienta' '' ([string](Find-NetConfigTool -Marca 'Rongta').exe)
+
+    # Escenario 84: LA instruccion unica. El asesor no tiene que averiguar nada.
+    Reset-State
+    function Get-NetIPAddress { param($AddressFamily, $ErrorAction) @([pscustomobject]@{ IPAddress = '192.168.0.10'; InterfaceIndex = 12 }) }
+    function Get-InstalledNetworkPrinters { @() }
+    function Test-IpAlive { param($Ip, $TimeoutMs) $false }
+    function Test-PathExists { param($Path) return ([string]$Path -match 'EPSON') }
+    $hall84 = [ordered]@{ ip = '192.168.1.100'; respondeEscPos = $true; mac = '00-26-ab-11-22-33'
+                          oui = '00-26-ab'; marca = 'Epson'; modelo = 'TM-T20III'; subred = '192.168.1' }
+    $p84 = Resolve-NetworkPrinterPlan -Encontrada $hall84 -PrefijoPc '192.168.0' -Gateway '192.168.0.1'
+    Assert-Eq 'S84 hay plan' $true ([bool]$p84.hay)
+    Assert-Eq 'S84 dice donde esta la impresora' '192.168.1.100' ([string]$p84.ip)
+    Assert-Eq 'S84 propone una IP en la red del PC' $true ([bool]([string]$p84.ipSugerida -match '^192\.168\.0\.'))
+    Assert-Eq 'S84 con su mascara' '255.255.255.0' ([string]$p84.mascara)
+    Assert-Eq 'S84 y el gateway del local' '192.168.0.1' ([string]$p84.gateway)
+    Assert-Eq 'S84 resuelve la herramienta de la marca' $true ([bool]$p84.herramienta.encontrada)
+    $txt84 = (@($p84.pasos) -join ' ')
+    Assert-Eq 'S84 los pasos nombran la marca y el modelo' $true ([bool]($txt84 -match 'Epson' -and $txt84 -match 'TM-T20III'))
+    Assert-Eq 'S84 dan la MAC, que no cambia con la IP' $true ([bool]($txt84 -match '00-26-ab-11-22-33'))
+    Assert-Eq 'S84 dicen la ruta de la herramienta' $true ([bool]($txt84 -match 'ENConfig\.exe'))
+    Assert-Eq 'S84 y cierran diciendo que se verifica despues' $true ([bool]($txt84 -match 'volver a correr'))
+
+    # Sin marca identificada el motor no puede inventar una herramienta, pero igual sirve: dice
+    # donde esta, que ponerle y como leer la IP a mano.
+    Reset-State
+    function Get-NetIPAddress { param($AddressFamily, $ErrorAction) @([pscustomobject]@{ IPAddress = '192.168.0.10'; InterfaceIndex = 12 }) }
+    function Get-InstalledNetworkPrinters { @() }
+    function Test-IpAlive { param($Ip, $TimeoutMs) $false }
+    $p84b = Resolve-NetworkPrinterPlan -Encontrada ([ordered]@{ ip = '192.168.1.87'; mac = 'aa-bb-cc-dd-ee-ff'; oui = 'aa-bb-cc'; marca = ''; modelo = '' }) `
+                                       -PrefijoPc '192.168.0' -Gateway '192.168.0.1'
+    $txt84b = (@($p84b.pasos) -join ' ')
+    Assert-Eq 'S84b sin marca no hay herramienta' $true ([bool]($null -eq $p84b.herramienta))
+    Assert-Eq 'S84b y lo dice en vez de inventarla' $true ([bool]($txt84b -match 'Sin marca identificada'))
+    Assert-Eq 'S84b deja el OUI para poder identificarla despues' $true ([bool]($txt84b -match 'aa-bb-cc'))
+    Assert-Eq 'S84b igual propone la IP a poner' $true ([bool]([string]$p84b.ipSugerida -match '^192\.168\.0\.'))
+    # Sin hallazgo no hay plan: no se afirma nada.
+    Assert-Eq 'S84c sin impresora no hay plan' $false ([bool](Resolve-NetworkPrinterPlan -Encontrada $null -PrefijoPc '192.168.0' -Gateway '').hay)
+
+    # Escenario 85: el opt-in. Tocar la red del cliente no puede pasar por default, y en modo
+    # agente (sin consola) no se hace nunca.
+    Reset-State
+    $script:BoundParams = @{}
+    function Test-IsInteractiveConsole { $false }
+    Assert-Eq 'S85 sin consola y sin parametro no se toca la red' $false (Confirm-NetProbe -Prefijo '192.168.1' -Motivo 'x')
+    $script:BoundParams = @{ 'AllowNetProbe' = $true }
+    $AllowNetProbe = $true
+    Assert-Eq 'S85 con el parametro en true si' $true (Confirm-NetProbe -Prefijo '192.168.1' -Motivo 'x')
+    $AllowNetProbe = $false
+    Assert-Eq 'S85 y con el parametro en false no, aunque haya consola' $false (Confirm-NetProbe -Prefijo '192.168.1' -Motivo 'x')
+    $script:BoundParams = @{}
+
+    # Escenario 86: identidad por el propio protocolo de la impresora (GS I n) y por OUI.
+    Reset-State
+    $bytes86 = [byte[]]@(0x5F) + [System.Text.Encoding]::ASCII.GetBytes('EPSON') + [byte[]]@(0x00, 0x07)
+    Assert-Eq 'S86 saca el texto util de la respuesta' 'EPSON' (Convert-EscPosInfoBytes -Bytes $bytes86 -Leidos @($bytes86).Count)
+    Assert-Eq 'S86 sin respuesta no inventa nada' '' (Convert-EscPosInfoBytes -Bytes ([byte[]]@(0x00, 0x00)) -Leidos 2)
+    Assert-Eq 'S86 reconoce la marca en el texto' 'Epson' (Resolve-BrandFromText -Texto 'EPSON TM-T20III')
+    Assert-Eq 'S86 tambien por el fabricante' 'Epson' (Resolve-BrandFromText -Texto 'Seiko Epson Corp.')
+    Assert-Eq 'S86 y una marca de la lista del motor' 'Bixolon' (Resolve-BrandFromText -Texto 'BIXOLON SRP-350')
+    Assert-Eq 'S86 texto vacio no da marca' '' (Resolve-BrandFromText -Texto '')
+    Assert-Eq 'S86 un texto sin marca conocida tampoco' '' (Resolve-BrandFromText -Texto 'POS-80 PRINTER')
+    # La tabla de OUIs arranca vacia a proposito, pero el OUI crudo tiene que viajar igual: es
+    # con lo que se va a armar la tabla desde la telemetria, sin adivinar fabricantes.
+    Assert-Eq 'S86 devuelve el OUI aunque no conozca la marca' '00-26-ab' ([string](Get-OuiBrand -Mac '00-26-AB-11-22-33').oui)
+    Assert-Eq 'S86 y no inventa la marca' '' ([string](Get-OuiBrand -Mac '00-26-AB-11-22-33').marca)
+    Assert-Eq 'S86 una MAC ilegible no da OUI' '' ([string](Get-OuiBrand -Mac 'no-es-una-mac').oui)
+
+    # Escenario 87: la IP temporal se saca SIEMPRE. Dejarle una direccion de mas a la placa del
+    # cliente seria peor que no haber revisado nada.
+    Reset-State
+    $script:sacadas87 = New-Object System.Collections.ArrayList
+    function Remove-NetIPAddress { param($IPAddress, $InterfaceIndex, $Confirm, $ErrorAction) [void]$script:sacadas87.Add([string]$IPAddress) }
+    $script:TempIpsAdded = New-Object System.Collections.ArrayList
+    [void]$script:TempIpsAdded.Add([ordered]@{ ip = '192.168.1.200'; indice = 12 })
+    [void]$script:TempIpsAdded.Add([ordered]@{ ip = '192.168.123.200'; indice = 12 })
+    $r87 = @(Remove-TempSubnetIps)
+    Assert-Eq 'S87 saca todas las que agrego' '192.168.1.200,192.168.123.200' ((@($r87) -join ','))
+    Assert-Eq 'S87 y queda sin nada pendiente' 0 (@($script:TempIpsAdded).Count)
+    # Si una no se puede sacar, se intenta con las demas igual y no explota.
+    $script:TempIpsAdded = New-Object System.Collections.ArrayList
+    [void]$script:TempIpsAdded.Add([ordered]@{ ip = '10.0.0.200'; indice = 12 })
+    [void]$script:TempIpsAdded.Add([ordered]@{ ip = '10.0.0.201'; indice = 12 })
+    function Remove-NetIPAddress {
+        param($IPAddress, $InterfaceIndex, $Confirm, $ErrorAction)
+        if ([string]$IPAddress -eq '10.0.0.200') { throw 'acceso denegado' }
+        [void]$script:sacadas87.Add([string]$IPAddress)
+    }
+    $r87b = @(Remove-TempSubnetIps)
+    Assert-Eq 'S87b una que falla no impide sacar el resto' '10.0.0.201' ((@($r87b) -join ','))
+    Assert-Eq 'S87b y la lista queda limpia igual' 0 (@($script:TempIpsAdded).Count)
+
+    # Escenario 88: el camino completo. Sin confirmacion no se toca nada, pero se explica.
+    Reset-State
+    function Get-LocalSubnetPrefixes { @('192.168.0') }
+    function Get-InstalledNetworkPrinters { @([ordered]@{ ip = '192.168.1.21'; colas = @('COCINA') }) }
+    function Confirm-NetProbe { param($Prefijo, $Motivo) $false }
+    Assert-Eq 'S88 sin confirmacion no encuentra nada' $false ([bool](Test-ForeignSubnetPrinters -TcpPort 9100))
+    $c88 = Get-CheckById 'conn.otherSubnet'
+    Assert-Eq 'S88 pero deja el hallazgo visible' 'skipped' ([string]$c88.status)
+    Assert-Eq 'S88 con el motivo del salteo' 'sin_confirmacion' ([string]$c88.evidence.motivoSalteo)
+    Assert-Eq 'S88 y dice como habilitarlo' $true ([bool]([string]$c88.recommendation -match 'AllowNetProbe'))
+    Assert-Eq 'S88 no es causa raiz si no se reviso' $false ([bool]$c88.rootCauseCandidate)
+    Assert-Eq 'S88 y no toco la red' 0 (@($script:TempIpsAdded).Count)
+
+    # Con confirmacion y una impresora del otro lado: causa raiz y plan completo.
+    Reset-State
+    function Get-LocalSubnetPrefixes { @('192.168.0') }
+    function Get-InstalledNetworkPrinters { @([ordered]@{ ip = '192.168.1.21'; colas = @('COCINA') }) }
+    function Confirm-NetProbe { param($Prefijo, $Motivo) $true }
+    function Add-TempSubnetIp { param($Prefijo) @{ aplicado = $true; ip = ($Prefijo + '.200'); indice = 12; motivo = '' } }
+    function Remove-TempSubnetIps { @() }
+    function Find-NetworkPrinters { param($Prefix, $TcpPort, $WaitMs) @([ordered]@{ ip = ($Prefix + '.21'); puerto = 9100; respondeEscPos = $true; tipo = 'impresora termica (responde ESC/POS)' }) }
+    function Get-MacForIp { param($Ip) '00-26-ab-11-22-33' }
+    function Get-EscPosIdentity { param($Ip, $TcpPort, $TimeoutMs) [ordered]@{ fabricante = 'EPSON'; modelo = 'TM-T20III'; marca = 'Epson' } }
+    function Get-PrimaryIpv4Interface { [ordered]@{ indice = 12; ip = '192.168.0.10'; prefijo = '192.168.0' } }
+    function Get-DefaultGatewayIp { '192.168.0.1' }
+    function Get-NetIPAddress { param($AddressFamily, $ErrorAction) @([pscustomobject]@{ IPAddress = '192.168.0.10'; InterfaceIndex = 12 }) }
+    function Test-IpAlive { param($Ip, $TimeoutMs) $false }
+    function Test-PathExists { param($Path) return ([string]$Path -match 'EPSON') }
+    Assert-Eq 'S88b con confirmacion la encuentra' $true ([bool](Test-ForeignSubnetPrinters -TcpPort 9100))
+    $c88b = Get-CheckById 'conn.otherSubnet'
+    Assert-Eq 'S88b y es la causa raiz' $true ([bool]$c88b.rootCauseCandidate)
+    Assert-Eq 'S88b el nombre dice donde esta' $true ([bool]([string]$c88b.name -match '192\.168\.1\.21'))
+    Assert-Eq 'S88b y de que marca es' $true ([bool]([string]$c88b.name -match 'Epson'))
+    Assert-Eq 'S88b la categoria sale del id' 'net.otra_subred' ([string]$script:CategoryByCheckId['conn.otherSubnet'])
+    $pl88 = $script:Diagnostics['planRedImpresora']
+    Assert-Eq 'S88b queda el plan para el resumen' '192.168.1.21' ([string]$pl88.ip)
+    Assert-Eq 'S88b con la IP a ponerle' $true ([bool]([string]$pl88.ipSugerida -match '^192\.168\.0\.'))
+    Assert-Eq 'S88b y la MAC para la tabla de OUIs' '00-26-ab-11-22-33' ([string]$pl88.mac)
+    # El resumen tiene que mostrarlo: la informacion suelta en el JSON no le sirve al asesor.
+    $res88 = ((Build-HumanSummary -Diag (Resolve-Diagnosis) -DetectedInterface 'Ethernet') -join ' ')
+    Assert-Eq 'S88b el resumen trae el bloque' $true ([bool]($res88 -match 'IMPRESORA DE RED EN OTRA SUBRED'))
+    Assert-Eq 'S88b con la IP donde esta' $true ([bool]($res88 -match '192\.168\.1\.21'))
+    Assert-Eq 'S88b y con que herramienta' $true ([bool]($res88 -match 'ENConfig\.exe'))
+
+    # Y si en la otra subred no hay nada, se dice, sin afirmar que no hay impresoras en ningun lado.
+    Reset-State
+    function Find-NetworkPrinters { param($Prefix, $TcpPort, $WaitMs) @() }
+    Assert-Eq 'S88c sin hallazgos no hay plan' $false ([bool](Test-ForeignSubnetPrinters -TcpPort 9100))
+    Assert-Eq 'S88c y queda constancia de lo revisado' 'ok' ([string](Get-CheckById 'conn.otherSubnet').status)
 
     Write-Host ""
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)
@@ -8241,6 +8968,16 @@ function Send-Telemetry {
                         fallo     = [bool]$script:VersionCheckFallo
                     }
                     $t['cobertura'] = $(if ($script:Diagnostics.Contains('cobertura')) { $script:Diagnostics['cobertura'] } else { $null })
+                    # v3.16: impresoras vistas en una subred distinta a la del PC, con su MAC.
+                    # La MAC es lo que permite armar la tabla de OUIs por fabricante con datos
+                    # reales en vez de adivinarla, y el plan dice si el motor pudo resolver la
+                    # instruccion completa o le falto algo.
+                    $t['otraSubred'] = [ordered]@{
+                        candidatas = @($(if ($script:Diagnostics.Contains('subredesCandidatas')) { $script:Diagnostics['subredesCandidatas'] } else { @() }))
+                        revisadas  = @($(if ($script:Diagnostics.Contains('subredesRevisadas')) { $script:Diagnostics['subredesRevisadas'] } else { @() }))
+                        encontradas = @($(if ($script:Diagnostics.Contains('impresorasOtraSubred')) { $script:Diagnostics['impresorasOtraSubred'] } else { @() }))
+                        plan = $(if ($script:Diagnostics.Contains('planRedImpresora')) { $script:Diagnostics['planRedImpresora'] } else { $null })
+                    }
                     $t['historialFudo'] = @($(if ($script:Diagnostics.Contains('historialImpresion')) { $script:Diagnostics['historialImpresion'].porImpresora } else { @() }))
                     # v3.15: la columna existia en el receptor y el motor NUNCA la mando (vacia
                     # en 229 de 229 filas), asi que no habia forma de saber a que cola le manda
@@ -8533,4 +9270,15 @@ try {
     }
     Write-DoctorResult -Obj $err
     exit 3
+} finally {
+    # La IP secundaria que se agrego para poder ver una impresora de otra subred se saca SIEMPRE,
+    # tambien si el motor aborto: dejarle una direccion de mas a la placa del cliente seria peor
+    # que no haber revisado nada. Va en finally justamente porque los caminos de salida son
+    # varios exit distintos.
+    try {
+        $sacadasFin = @(Remove-TempSubnetIps)
+        if (@($sacadasFin).Count -gt 0) {
+            Write-DoctorLog -Level 'INFO' -Message ('IPs temporales retiradas: ' + (@($sacadasFin) -join ', '))
+        }
+    } catch {}
 }

@@ -241,3 +241,10 @@ Looker Studio.
   atribuir ninguna impresión a Fudo: ahí el campo viaja como **`no_atribuible`**, que no es lo
   mismo que "Fudo no está imprimiendo". Sólo un nombre de cola concreto afirma algo.
 - **`pais`**: si hay diferencias por región (marcas de impresoras distintas).
+- **`otraSubred`** (desde 3.16): impresoras vistas en una subred distinta a la del PC, con su
+  **MAC**. Es el campo con el que se arma la tabla de fabricantes por OUI: `$script:PrinterOuis`
+  arranca **vacía a propósito** —poner prefijos sin verificarlos sería adivinar el fabricante— y se
+  llena con las MAC reales que lleguen acá. Cada vez que una marca quede confirmada (porque la
+  impresora contestó quién es por ESC/POS, o porque el asesor lo dijo), se agrega su prefijo al
+  motor. Mirar también `otraSubred.plan`: dice si el motor pudo resolver la instrucción completa
+  (marca + IP a poner + herramienta) o en qué se quedó corto.
