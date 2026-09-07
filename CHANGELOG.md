@@ -2,6 +2,81 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.17] - 2026-09-07
+
+De la bitácora **semanal** del 31/08 al 06/09 (45 corridas nuevas en 33 PCs, 33 de ellas en 3.14).
+Las dos correcciones son de la misma familia y es la que más veces reapareció en este proyecto:
+**reparar y no verificar.** Una toca el antivirus del cliente sin evidencia de que el antivirus
+tenga algo que ver; la otra repara de verdad y el caso escala igual porque nadie vuelve a mirar.
+
+### Corregido
+
+- **El motor le agregaba exclusiones al antivirus del cliente sin ningún motivo.** Dos PCs en 3.14
+  (`nativaVersion` `0.0.19` y `0.0.24`) quedaron con `nativa.defenderExclusion = fixed` teniendo la
+  causa raíz en el hardware — `printer.disconnected` y `hw.disconnected`. O sea: el motor modificó
+  la configuración de seguridad de una PC ajena mientras diagnosticaba una impresora desenchufada.
+  **Es la tercera versión que corrige esta misma familia**: la 3.10 apagó la exclusión preventiva
+  para las Nativas firmadas, la 3.12 apagó la restauración sobre detecciones históricas, y la rama
+  siguió viva para las Nativas por debajo de `0.0.37`.
+  *Mirando el `if/elseif` completo el caso resultó peor de lo que decía la bitácora:* la rama de
+  arriba se queda con "hay detecciones y la Nativa está presente" y la del medio con "hay
+  detecciones y no está", así que a esta rama **sólo se llega con CERO detecciones de Defender sobre
+  la Nativa**. El único disparador real era que la Nativa estuviera apagada — que con Fudo cerrado
+  es el estado normal, como ya documentaba el código de al lado. No había nada que prevenir.
+  Ahora no se toca el antivirus: queda un chequeo que dice explícitamente que no se modificó nada y
+  por qué. Y la decisión pasó a vivir en **un solo lugar** (`Test-DefenderExclusionNeeded`), que era
+  el problema de fondo: había dos caminos distintos decidiendo lo mismo y uno se había quedado sin
+  el gate del otro. El self-test verifica que los dos decidan igual.
+- **La restauración de la cuarentena funcionaba y el caso escalaba igual.** 4 PCs en 3.14 con
+  `nativa.installed = fail`, causa *"App Nativa de Fudo NO instalada"* y `needs_escalation`; en dos
+  de ellas la corrida siguiente —1 y 3 minutos después— ya traía la `0.0.37`. **La reparación
+  andaba; el asesor tenía que correr el diagnóstico dos veces** y la transición quedaba como
+  `sigue_fallando`.
+  El motivo: `nativa.installed` se registra en la capa 0b.1, **antes** de la restauración de la capa
+  0b.2, y nadie lo volvía a mirar. *El veredicto salía de una foto vieja de la PC, que es el mismo
+  bug que la 3.11 corrigió para el inventario de colas.*
+  Faltaba un primitivo: **una reparación posterior tiene que poder corregir un hallazgo anterior**
+  (`Update-CheckFinding`). Con la Nativa de vuelta en disco, el hallazgo pasa a `fixed`, deja de ser
+  candidato a causa raíz, el caso cierra, y la versión post-reparación es la que viaja en la
+  telemetría — antes se reportaba el vacío de antes de restaurar, así que en la planilla la PC
+  figuraba sin Nativa.
+  *La corrección no se aplica si la restauración devolvió una versión más vieja: eso sigue siendo un
+  problema (lo detecta el chequeo de degradación desde la 3.7) y no puede pasar por resuelto.*
+
+### Agregado
+
+- Self-test: **502 asserts** (eran 478). Cubren las ocho combinaciones de la decisión del antivirus
+  —incluida la equivalencia con el gate de la cuarentena—, la corrección de un hallazgo anterior y,
+  sobre todo, **que el caso deje de escalar por algo que ya se arregló**, que es el daño real.
+
+### Evaluado y NO implementado
+
+- **Pasar los cuatro chequeos de capa Fudo de `warn` a `skipped`** (propuesta 3 de la bitácora).
+  **No, y la premisa no se sostiene.** El argumento era *"son 5 líneas de advertencia por corrida que
+  el asesor lee y no puede accionar"*. Leyendo el código: el semáforo del resumen muestra **una línea
+  por área**, no una por chequeo, y las acciones de Fudo ya se **colapsan en una sola línea** desde la
+  3.11 (*"Verificar en la web app de Fudo: impresora registrada, cocina/área, categorías, salas"*).
+  El asesor ve **una** línea de semáforo y **una** acción, no cinco advertencias. Las cinco filas
+  existen en el JSON y en la telemetría, no en pantalla.
+  Y aplicarlo **rompería algo**: `Get-NextActions` sólo recorre chequeos en `fail`/`warn`, así que
+  pasarlos a `skipped` eliminaría esa única acción útil — el último tramo del diagnóstico, que es
+  precisamente lo que el asesor sí tiene que hacer. Rompería además la aserción del escenario 62.
+  *Queda como pendiente real, pero de calidad de datos: cuatro filas que nunca varían son ruido para
+  el análisis agregado, no para el asesor. No justifica tocar la superficie de cierre que estabilizó
+  la 3.11.*
+
+### Pendiente
+
+- **Colas atascadas grandes que no se resuelven.** Una PC (CL, 04/09) con **218** trabajos en BARRA
+  TRAGOS y **1.182** en CAJA PRINCIPAL; `queue.purge` corrió 16 veces en la semana y esa PC siguió en
+  `sigue_fallando`. Es el hallazgo sin propuesta de esta bitácora y probablemente el más grande que
+  queda abierto: purgar no está alcanzando y hay que entender por qué.
+- `colaQueUsaFudo` vacío en 274/274 filas y `deFudo = 0`: **ya corregido en la 3.15**, que todavía no
+  está publicada. Los cinco chequeos de capa Fudo que nunca concluyen dependen de eso.
+- 27% de las corridas nuevas (12 de 45) siguen con motor viejo — 8 en 3.8 y 4 en 3.12. El gate de
+  versión existe recién desde 3.14, así que no los frena: es distribución, no código.
+- Caminos poco validados, sin novedad en toda la semana: 2 corridas Ethernet y 1 WSD.
+
 ## [3.16] - 2026-09-07
 
 Pedido del canal (Karen, con aportes de Iván y datos de la bitácora del 04/09): **la impresora de

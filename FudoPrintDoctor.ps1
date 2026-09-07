@@ -448,7 +448,7 @@ $script:TestPrinterRx = '(?i)^FUDO-TEST-'
 # puerto tenga hardware; si el hardware se va, deja de serlo (ver Remove-OrphanOwnQueues).
 $script:OwnQueueRx   = '(?i)^FUDO-(TEST-|USB\d)'
 $script:TestDocRx    = '(?i)fudo print doctor'
-$script:SchemaVersion = '3.16'
+$script:SchemaVersion = '3.17'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -646,6 +646,45 @@ function Add-EngineError {
     }
     [void]$script:Errors.Add($e)
     Write-DoctorLog -Level 'ERROR' -Message ("[{0}] {1}" -f $Step, $Message)
+}
+
+function Update-CheckFinding {
+    <#
+      Corrige un chequeo YA registrado porque una reparacion posterior lo dejo sin efecto.
+      Sin esto el veredicto se decide con una foto vieja de la PC: es el bug que la v3.11
+      corrigio para el inventario de colas y que reaparecio con la Nativa -restaurada de la
+      cuarentena en la capa 0b.2, pero seguia contada como ausente por el chequeo de la capa
+      0b.1, asi que el caso escalaba igual y el asesor tenia que correr el diagnostico otra vez-.
+      Devuelve $true si encontro el chequeo y lo actualizo.
+    #>
+    param(
+        [string]$Id,
+        [ValidateSet('ok','warn','fail','fixed','skipped')]
+        [string]$Status,
+        [string]$Name = '',
+        $RootCauseCandidate = $null,
+        [string]$ActionTaken = '',
+        [string]$Recommendation = '',
+        $EvidenceExtra = $null
+    )
+    $c = @($script:Checks | Where-Object { $_.id -eq $Id }) | Select-Object -First 1
+    if (-not $c) { return $false }
+    $antes = [string]$c.status
+    $c.status = $Status
+    if ($Name) { $c.name = $Name }
+    if ($null -ne $RootCauseCandidate) { $c.rootCauseCandidate = [bool]$RootCauseCandidate }
+    if ($ActionTaken) { $c.actionTaken = $ActionTaken }
+    if ($Recommendation) { $c.recommendation = $Recommendation }
+    if ($null -ne $EvidenceExtra) {
+        # Por que cambio queda con el chequeo: sin eso en la planilla se ve un 'fixed' sin
+        # explicacion y no hay forma de auditar la correccion.
+        try {
+            if ($null -eq $c.evidence) { $c.evidence = @{} }
+            foreach ($k in @($EvidenceExtra.Keys)) { $c.evidence[$k] = $EvidenceExtra[$k] }
+        } catch {}
+    }
+    Write-DoctorLog -Level 'INFO' -Message ("[correccion] {0}: {1} -> {2}" -f $Id, $antes, $Status)
+    return $true
 }
 
 function Get-ErrorHint {
@@ -1349,6 +1388,35 @@ function Test-DefenderThreatActionable {
     }
     return @{ accionable = $true; motivo = 'la Nativa no aparece en disco y Defender registra detecciones'; pendientes = @($pendientes) }
 }
+function Test-DefenderExclusionNeeded {
+    <#
+      Hace falta agregarle exclusiones de Defender a la Nativa en esta PC?
+      Un solo lugar donde se decide. Hasta la 3.17 habia DOS caminos distintos decidiendo lo
+      mismo -la restauracion tenia su gate desde la 3.12 y la exclusion preventiva se habia
+      quedado sin el-, y por eso la bitacora semanal encontro dos PCs 3.14 donde el motor toco
+      el antivirus del cliente teniendo la causa raiz en el hardware.
+      La regla es la misma que Test-DefenderThreatActionable: si el archivo esta en disco, no
+      hay nada que excluir ni restaurar. Y ni estar sin firmar ni estar apagada son evidencia de
+      que el antivirus la moleste -apagada con Fudo cerrado es el estado normal-.
+      Devuelve @{ haceFalta (bool); motivo (texto para el asesor) }
+    #>
+    param($Presente, $Corriendo, $Firmada, $Detecciones, $DefenderActivo)
+    $det = @($Detecciones | Where-Object { $_ })
+    if (-not [bool]$DefenderActivo) {
+        return @{ haceFalta = $false; motivo = 'Windows Defender no esta activo en esta PC' }
+    }
+    if ([bool]$Presente) {
+        return @{ haceFalta = $false
+                  motivo = ('el archivo de la App Nativa esta en disco, asi que no hay nada que excluir' +
+                            $(if (@($det).Count -gt 0) { ', y las detecciones de Defender son historicas' }
+                              else { ', y Defender no registra ninguna deteccion sobre ella' })) }
+    }
+    if (@($det).Count -gt 0) {
+        return @{ haceFalta = $true; motivo = 'la Nativa no esta en disco y Defender registra detecciones: hay algo que restaurar y excluir' }
+    }
+    return @{ haceFalta = $false; motivo = 'la Nativa no esta en disco pero Defender nunca la detecto: lo que falta es instalarla, no excluirla' }
+}
+
 function Get-NativaVersionState {
     <#
       La Nativa instalada, esta firmada? Devuelve:
@@ -1527,6 +1595,23 @@ function Test-Layer0b-NativeApp {
             } catch {}
         }
         $degradada = Test-NativaDegradada -Antes $verAntes -Despues $verDespues
+        # v3.17 (bitacora semanal 31/08-06/09): la restauracion funcionaba y el caso escalaba
+        # igual. 4 PCs con nativa.installed=fail, causa 'App Nativa de Fudo NO instalada' y
+        # needs_escalation; en dos de ellas la corrida siguiente -1 y 3 minutos despues- ya
+        # traia la 0.0.37. El motivo: nativa.installed se registra en la capa 0b.1, ANTES de
+        # esta restauracion, y nadie lo volvia a mirar. El veredicto salia de una foto vieja de
+        # la PC, el mismo bug que la 3.11 corrigio para las colas.
+        if ($rem.applied -and $volvio -and -not $degradada) {
+            [void](Update-CheckFinding -Id 'nativa.installed' -Status 'fixed' -RootCauseCandidate $false `
+                -Name ('App Nativa de Fudo restaurada de la cuarentena del antivirus' + $(if ($verDespues) { " (v$verDespues)" } else { '' })) `
+                -ActionTaken 'restaurada desde la cuarentena de Defender en esta corrida' `
+                -Recommendation ('La Nativa no estaba porque el antivirus la habia puesto en cuarentena, y se restauro en esta misma corrida. ' +
+                                 'Abrir Fudo en el navegador y mandar una comanda de prueba. Si vuelve a desaparecer, la solucion de fondo es actualizarla a la version firmada.') `
+                -EvidenceExtra @{ restauradaEnEstaCorrida = $true; versionDespues = [string]$verDespues })
+            # La version post-reparacion es la que tiene que viajar: antes se reportaba el vacio
+            # de antes de restaurar, asi que en la planilla la PC figuraba sin Nativa.
+            if ($verDespues) { $script:Diagnostics['nativaVersionPostFix'] = [string]$verDespues }
+        }
         Add-Check -Id 'nativa.defenderQuarantine' -Layer 0 `
             -Name $(if (-not $rem.applied) { 'Nativa en cuarentena de Windows Defender' }
                     elseif ($degradada)    { "Nativa restaurada de cuarentena pero con una version mas vieja ($verAntes -> $verDespues)" }
@@ -1549,31 +1634,40 @@ function Test-Layer0b-NativeApp {
                         } else { '' }
                       } catch { '' })
                 })
-    } elseif ($installed -and -not $procRunning -and $UseDefenderExclusions -and $av.defender -and
+    } elseif ($installed -and -not $procRunning -and $av.defender -and
               ($script:Diagnostics['nativaFirmada'] -ne $true)) {
-        # Nativa instalada pero no corre y Defender activo: exclusion preventiva quirurgica.
-        # Solo si la Nativa NO esta firmada: desde la v0.0.37 el antivirus no la bloquea, asi que
-        # tocar la config de Defender en la PC de un cliente ya no se justifica (y menos por una
-        # Nativa apagada, que con Fudo cerrado es lo normal).
-        $rem = Invoke-Remediation -Description 'Agregar exclusiones preventivas de Defender para la Nativa' -Type 'defender.exclude' -Target 'FudoNativa' `
-            -Before 'sin exclusiones' -After 'excluida' -Fix {
-                $notes = @()
-                foreach ($p in $install.paths) { try { Add-MpPreference -ExclusionPath $p -ErrorAction SilentlyContinue; $notes += "excl $p" } catch {} }
-                try { Add-MpPreference -ExclusionProcess "$FudoAppProcess*.exe" -ErrorAction SilentlyContinue; $notes += 'excl process' } catch {}
-                ($notes -join ' | ')
-            }
-        # El nombre del check es el texto que sale como CAUSA, asi que tiene que decir lo que se
-        # ENCONTRO, no la reparacion que se intento. Salia "CAUSA: Exclusion preventiva de
-        # Defender para la Nativa", que se lee como si el problema fuera la exclusion.
-        # La exclusion se sigue aplicando (es quirurgica y reversible), pero NO es causa raiz:
-        # se dispara por la Nativa apagada, que con Fudo cerrado es el estado normal. Si Defender
-        # de verdad tiene la Nativa en cuarentena, eso lo reporta nativa.defenderQuarantine.
+        # v3.17: aca el motor le agregaba exclusiones preventivas al antivirus del cliente. Ya no.
+        #
+        # Historia del disparador: la 3.10 lo apago para las Nativas firmadas y la 3.12 apago la
+        # restauracion sobre detecciones historicas, pero la rama siguio viva para las Nativas
+        # por debajo de 0.0.37. La bitacora semanal encontro dos PCs 3.14 (nativaVersion 0.0.19
+        # y 0.0.24) donde el motor toco la configuracion del antivirus teniendo la causa raiz en
+        # el hardware: printer.disconnected y hw.disconnected.
+        #
+        # Y mirando el if/elseif completo el caso es peor de lo que parecia: la rama de arriba se
+        # queda con "hay detecciones y la Nativa esta presente" y la del medio con "hay
+        # detecciones y no esta", asi que a ESTA rama solo se llega con CERO detecciones de
+        # Defender sobre la Nativa. O sea que el motor modificaba el antivirus de PCs donde
+        # Defender nunca habia tocado la Nativa, y el unico disparador real era que estuviera
+        # apagada -que con Fudo cerrado es el estado NORMAL, como ya documentaba el codigo de al
+        # lado-. No habia nada que prevenir.
+        #
+        # Estar sin firmar por si solo no alcanza: eso lo informa nativa.sinFirmar, y su solucion
+        # de fondo es actualizar la Nativa, no pelearse con el antivirus en cada PC. Y si el
+        # antivirus se la come mas adelante, nativa.defenderQuarantine lo detecta en la corrida
+        # siguiente y ahi si hay algo concreto que reparar.
+        $exc = Test-DefenderExclusionNeeded -Presente $installed -Corriendo $procRunning `
+                    -Firmada $(if ($script:Diagnostics.Contains('nativaFirmada')) { $script:Diagnostics['nativaFirmada'] } else { $null }) `
+                    -Detecciones $av.fudoThreats -DefenderActivo $av.defender
         Add-Check -Id 'nativa.defenderExclusion' -Layer 0 `
-            -Name $(if($rem.applied){'Se excluyo la App Nativa del antivirus (no estaba corriendo)'}
-                    else{'Exclusion de Defender para la Nativa: no se pudo aplicar'}) `
-            -Status $(if($rem.applied){'fixed'}else{'warn'}) -RootCauseCandidate $false `
-            -Evidence @{ realTime = $av.realTime; paths = $install.paths } -ActionTaken $rem.note `
-            -Recommendation 'Tras excluir, reiniciar la Nativa. Si sigue sin correr, reinstalar la Nativa.'
+            -Name 'No se toco el antivirus: la App Nativa esta en disco' `
+            -Status 'ok' -RootCauseCandidate $false `
+            -Evidence @{ realTime = $av.realTime; paths = $install.paths
+                         detecciones = @($av.fudoThreats).Count; excluida = $false
+                         motivo = [string]$exc.motivo } `
+            -Recommendation ('No se modifico la configuracion del antivirus porque ' + [string]$exc.motivo + '. ' +
+                             'Que la Nativa no este corriendo es lo esperado con Fudo cerrado. Si esta version le da problemas de antivirus a ' +
+                             'este cliente, la solucion de fondo es actualizarla a la version firmada.')
     }
 
     # 0b.3 Antivirus de terceros (Avast, etc.): no scriptable -> guiado/escalar
@@ -8058,6 +8152,67 @@ public class FudoFakeEndpoint {
     function Find-NetworkPrinters { param($Prefix, $TcpPort, $WaitMs) @() }
     Assert-Eq 'S88c sin hallazgos no hay plan' $false ([bool](Test-ForeignSubnetPrinters -TcpPort 9100))
     Assert-Eq 'S88c y queda constancia de lo revisado' 'ok' ([string](Get-CheckById 'conn.otherSubnet').status)
+
+    # Escenario 89 (v3.17, bitacora semanal 31/08-06/09): el motor le agregaba exclusiones al
+    # antivirus del cliente sin ninguna evidencia de que el antivirus tuviera algo que ver.
+    # Dos PCs 3.14 (nativaVersion 0.0.19 y 0.0.24) con la causa raiz en el hardware
+    # (printer.disconnected / hw.disconnected) quedaron con nativa.defenderExclusion=fixed.
+    # Es la tercera version que corrige esta misma familia: la 3.10 la apago para las firmadas,
+    # la 3.12 apago la restauracion sobre detecciones historicas, y la rama seguia viva.
+    Reset-State
+    # Con el archivo en disco NUNCA hace falta, con o sin detecciones, firmada o no, corriendo o no.
+    Assert-Eq 'S89 con la Nativa en disco no se toca el antivirus' $false ([bool](Test-DefenderExclusionNeeded -Presente $true -Corriendo $false -Firmada $false -Detecciones @() -DefenderActivo $true).haceFalta)
+    Assert-Eq 'S89 y lo dice' $true ([bool]([string](Test-DefenderExclusionNeeded -Presente $true -Corriendo $false -Firmada $false -Detecciones @() -DefenderActivo $true).motivo -match 'esta en disco'))
+    Assert-Eq 'S89 tampoco con detecciones historicas' $false ([bool](Test-DefenderExclusionNeeded -Presente $true -Corriendo $false -Firmada $false -Detecciones @([ordered]@{ id='1' }) -DefenderActivo $true).haceFalta)
+    Assert-Eq 'S89 ni sin firmar y apagada, que es el caso de las dos PCs' $false ([bool](Test-DefenderExclusionNeeded -Presente $true -Corriendo $false -Firmada $false -Detecciones @() -DefenderActivo $true).haceFalta)
+    Assert-Eq 'S89 ni firmada y corriendo' $false ([bool](Test-DefenderExclusionNeeded -Presente $true -Corriendo $true -Firmada $true -Detecciones @() -DefenderActivo $true).haceFalta)
+    # Sin el archivo y con detecciones si: eso es la cuarentena de verdad, y sigue reparandose.
+    Assert-Eq 'S89 sin el archivo y con detecciones si hace falta' $true ([bool](Test-DefenderExclusionNeeded -Presente $false -Corriendo $false -Firmada $false -Detecciones @([ordered]@{ id='1' }) -DefenderActivo $true).haceFalta)
+    # Sin el archivo y sin detecciones: lo que falta es instalarla, no excluirla.
+    $e89 = Test-DefenderExclusionNeeded -Presente $false -Corriendo $false -Firmada $null -Detecciones @() -DefenderActivo $true
+    Assert-Eq 'S89 sin archivo y sin detecciones no se excluye' $false ([bool]$e89.haceFalta)
+    Assert-Eq 'S89 y el motivo apunta a instalarla' $true ([bool]([string]$e89.motivo -match 'instalarla'))
+    # Sin Defender activo no hay nada que tocar.
+    Assert-Eq 'S89 sin Defender activo tampoco' $false ([bool](Test-DefenderExclusionNeeded -Presente $false -Corriendo $false -Firmada $false -Detecciones @([ordered]@{ id='1' }) -DefenderActivo $false).haceFalta)
+    # El predicado tiene que decidir igual que el de la cuarentena: era el bug de fondo, dos
+    # caminos distintos decidiendo lo mismo.
+    foreach ($pres89 in @($true, $false)) {
+        $a89 = [bool](Test-DefenderExclusionNeeded -Presente $pres89 -Corriendo $false -Firmada $false -Detecciones @([ordered]@{ id='1' }) -DefenderActivo $true).haceFalta
+        $b89 = [bool](Test-DefenderThreatActionable -Threats @([ordered]@{ id='1' }) -Firmada $false -Presente $pres89).accionable
+        Assert-Eq ('S89 los dos caminos deciden igual (presente=' + $pres89 + ')') $a89 $b89
+    }
+
+    # Escenario 90 (v3.17): una reparacion posterior tiene que poder corregir un hallazgo
+    # anterior. La restauracion de la cuarentena funcionaba y el caso escalaba igual: 4 PCs con
+    # nativa.installed=fail y needs_escalation, y en dos la corrida siguiente -1 y 3 minutos
+    # despues- ya traia la 0.0.37. El asesor tenia que correrlo dos veces.
+    Reset-State
+    Add-Check -Id 'nativa.installed' -Layer 0 -Name 'App Nativa de Fudo NO instalada' -Status 'fail' -RootCauseCandidate $true -Plane 'fudo_config' `
+        -Evidence @{ found = $false }
+    Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Salio el papel' -Status 'ok' -Plane 'hardware'
+    # Antes de corregir: el hallazgo viejo bloquea el cierre y se lleva la causa.
+    $d90a = Resolve-Diagnosis
+    Assert-Eq 'S90 con la Nativa ausente no cierra' $false ([bool]$d90a.resolved)
+    Assert-Eq 'S90 y la causa es la Nativa' 'nativa.installed' ([string]$d90a.rootCauseCheckId)
+    # La restauracion la trajo de vuelta: el hallazgo anterior ya no describe la PC.
+    Assert-Eq 'S90 el chequeo se puede corregir' $true ([bool](Update-CheckFinding -Id 'nativa.installed' -Status 'fixed' -RootCauseCandidate $false `
+        -Name 'App Nativa de Fudo restaurada de la cuarentena del antivirus (v0.0.37)' `
+        -ActionTaken 'restaurada desde la cuarentena de Defender en esta corrida' `
+        -EvidenceExtra @{ restauradaEnEstaCorrida = $true; versionDespues = '0.0.37' }))
+    $c90 = Get-CheckById 'nativa.installed'
+    Assert-Eq 'S90 queda como reparado' 'fixed' ([string]$c90.status)
+    Assert-Eq 'S90 y deja de ser candidata a causa raiz' $false ([bool]$c90.rootCauseCandidate)
+    Assert-Eq 'S90 el nombre dice lo que paso' $true ([bool]([string]$c90.name -match 'restaurada'))
+    Assert-Eq 'S90 la evidencia vieja no se pierde' $false ([bool]$c90.evidence.found)
+    Assert-Eq 'S90 y se suma la nueva' '0.0.37' ([string]$c90.evidence.versionDespues)
+    # Y lo que importa: el caso deja de escalar por algo que ya se arreglo.
+    $d90b = Resolve-Diagnosis
+    Assert-Eq 'S90 ahora si cierra' $true ([bool]$d90b.resolved)
+    Assert-Eq 'S90 y no escala' $false ([bool]$d90b.needsEscalation)
+    Assert-Eq 'S90 la causa es la reparacion, no el hallazgo viejo' $true ([bool]([string]$d90b.rootCause -match 'restaurada'))
+    # Corregir un chequeo que no existe no puede explotar ni inventarlo.
+    Assert-Eq 'S90b un id inexistente no hace nada' $false ([bool](Update-CheckFinding -Id 'no.existe' -Status 'fixed'))
+    Assert-Eq 'S90b y no agrega chequeos' 2 (@($script:Checks).Count)
 
     Write-Host ""
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)
