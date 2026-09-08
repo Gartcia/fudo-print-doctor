@@ -2,6 +2,96 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.18] - 2026-09-08
+
+Todo lo de esta versión salió de **la respuesta de un asesor a un caso concreto**, no de la
+telemetría. Es la PC con 218 y 1.182 comandas encoladas donde `queue.purge` corrió 16 veces sin
+resolver nada — el hallazgo que la bitácora semanal dejó abierto y sin propuesta. La respuesta
+descartó las dos hipótesis que teníamos y dio una tercera, y de paso trajo un bug de la App Nativa
+que la telemetría no podía ver.
+
+> *"Cuando ingresé, el cliente tenía demasiadas impresoras instaladas... imprimió, pero fue a que
+> eliminé tanta impresora que tenía instalada, algunas ya ni siquiera figuraban disponibles. Se
+> borraron [las comandas], pero al enviar una prueba de nuevo, enviaba como 50 más."*
+
+**Purgar funcionaba perfecto y no podía ganar nunca.** Cada comanda se multiplicaba por la cantidad
+de colas instaladas, así que la cola se tapaba sola más rápido de lo que se limpiaba. Lo que
+resolvió el caso fue **borrar impresoras**, que el motor no hace ni sugería.
+
+### Agregado
+
+- **El motor mide por qué purgar no alcanza.** Cuenta cuántos trabajos había, cuántos quedaron
+  después de limpiar y **cuántos volvieron dos segundos más tarde**, contra cuántas colas hay
+  instaladas y cuántas no tienen hardware presente. Si la cola se vuelve a llenar, lo dice y apunta
+  a lo que hay que revisar: *"esta PC tiene N impresoras instaladas y M no tienen hardware; cuando
+  hay muchas, una sola comanda se multiplica en decenas de trabajos"*.
+  *Se mide, no se borra.* Borrar colas del cliente es irreversible y no se hace sin datos: primero
+  hay que ver en la telemetría cuántas PCs están en esta situación.
+- **El `.msi` de la App Nativa firmada pasa a ser parte del kit del asesor.** Se chequea al
+  arrancar, **sin mirar lo que tiene el cliente**: lo que importa es si el asesor puede resolver una
+  Nativa vieja cuando aparezca. Si falta, avisa fuerte, explica qué falta (no hay ninguno / el que
+  hay es anterior a la firmada / hay un `.exe` que no declara su versión) y pide confirmación para
+  seguir. Código de salida `7` si el asesor decide cortar; `-NoNativaKitCheck` es el opt-out y viaja
+  en la telemetría.
+  *No bloquea el diagnóstico si el asesor sigue: la impresora puede estar rota por algo que no tiene
+  nada que ver con la Nativa, y dejarlo sin herramienta sería peor. Se arregla una vez —el archivo
+  va junto a los dos que ya se copian a la PC del cliente— y sirve para todos los casos. El asesor
+  del caso no sabía que había que pasarlo.*
+- Self-test: **538 asserts** (eran 502).
+
+### Corregido
+
+Los tres del camino de instalación de la App Nativa, y los tres los describió el mismo asesor:
+*"el motor dice que instala la nativa, pero al corroborar en la versión web muchas veces sigue sin
+detectarla... siento que no instala la nativa correcta o al menos una versión compatible"*. **Tenía
+razón en las tres.**
+
+- **Se instalaba el instalador que apareciera primero por fecha.** Si el cliente tenía uno viejo en
+  Descargas —muy probable, bajado meses atrás—, el motor instalaba **ese**: una versión sin firmar
+  que el antivirus vuelve a comerse. Ahora se elige **por versión declarada**, no por fecha, y
+  **nunca se degrada** lo que ya está instalado (el desastre `0.0.36 → 0.0.18` ya pasó en este
+  proyecto). Si el mejor instalador disponible queda por debajo de la firmada, se instala pero se
+  avisa que el antivirus puede volver a bloquearla.
+- **Un `.msi` se lanzaba con `Start-Process` directo**, o sea abriendo el **asistente gráfico** en la
+  pantalla del cliente y esperando a que alguien lo complete. Desde la 3.14 la Nativa se distribuye
+  como `.msi` y la búsqueda lo prefiere, así que era el caso normal. Ahora va por `msiexec /qn`, que
+  es lo que el camino de *actualización* ya hacía bien desde la 3.14. **Cuarta vez que aparece el
+  mismo patrón: dos caminos que hacen lo mismo y uno se quedó sin el arreglo del otro.**
+- **No se verificaba nada.** Se miraba el código de salida y si el proceso estaba corriendo — y el
+  proceso normalmente **no** corre, porque lo levanta el navegador. La reparación se reportaba
+  aplicada con la Nativa sin instalar. Ahora se relee el disco y el registro: si no quedó, se dice
+  que no quedó y por qué; si quedó, el hallazgo previo de *"App Nativa NO instalada"* se corrige y
+  el caso puede cerrar.
+- **Una cola con muchos trabajos ya no "confirma" que Fudo esté mandando comandas.** El texto decía
+  que N trabajos acumulados *confirman* que el problema no es Fudo. No lo confirman: con muchas
+  impresoras instaladas, unas pocas comandas se convierten en cientos de trabajos. Se vio una PC con
+  1.182 que eran unas pocas comandas multiplicadas.
+
+### Interno
+
+- **`Reset-Mocks` en el self-test.** Los mocks de un escenario quedaban en scope para todos los que
+  venían después, y eso ya hizo pasar **tres** escenarios por el motivo equivocado: uno se aprobó
+  contra un mock viejo en vez de contra el código real, otro contra un mock que devolvía justo el
+  texto esperado, y un tercero se cayó porque un mock que explota a propósito seguía vivo. *Un
+  escenario que pasa por el motivo equivocado es lo peor que le puede pasar a un self-test: se ve
+  verde y no está probando nada.* Ahora hay una foto de las funciones previas a cualquier mock y una
+  forma de volver a ese estado.
+  Todavía **no** se llama desde `Reset-State`: hay escenarios viejos escritos contando con que el
+  mock del anterior siga vivo, y migrarlos es un trabajo aparte. Los escenarios nuevos lo llaman
+  explícitamente. *Esta versión ya lo aprovechó: el escenario 92 fallaba porque el 91 y el 78 dejaban
+  mockeadas justo las dos funciones bajo prueba.*
+
+### Pendiente
+
+- **Borrar las colas que el cliente no usa.** Es lo que resolvió el caso a mano y el motor todavía no
+  lo hace. Primero hay que ver en la telemetría (`purgaMedicion`) en cuántas PCs la cola rebota
+  después de purgar y cuántas colas muertas hay, y recién entonces ofrecer borrarlas por el mismo
+  camino de confirmación que la purga.
+- Dónde se multiplica exactamente la comanda —si Fudo manda N copias, si la Nativa las fanout, o si
+  son colas duplicadas sobre el mismo puerto— sigue sin confirmarse. La medición nueva es lo que va a
+  permitir distinguirlo.
+- Nada del camino Ethernet de la 3.16 se probó contra hardware real.
+
 ## [3.17] - 2026-09-07
 
 De la bitácora **semanal** del 31/08 al 06/09 (45 corridas nuevas en 33 PCs, 33 de ellas en 3.14).

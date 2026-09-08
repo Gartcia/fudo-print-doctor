@@ -92,6 +92,11 @@
     Manda una fila de prueba al endpoint de telemetria y termina, informando si llego. Sirve para
     validar la configuracion sin correr el diagnostico.
 
+.PARAMETER NoNativaKitCheck
+    No chequea al arrancar si el instalador de la App Nativa firmada esta al lado del script.
+    Ese chequeo no mira lo que tiene el cliente: mira si el asesor trajo el .msi, porque sin el
+    el motor no puede actualizar una Nativa vieja y el antivirus vuelve a comersela. Es un
+    opt-out explicito y viaja en la telemetria.
 .PARAMETER NoUpdateCheck
     No consulta si hay una version mas nueva publicada.
     NOTA DE DISENO: el motor avisa cuando hay una version nueva, pero NUNCA se actualiza solo.
@@ -416,6 +421,7 @@ param(
     [string]$TelemetryUrl = '',
     [switch]$TelemetryFull,
     [switch]$NoUpdateCheck,
+    [switch]$NoNativaKitCheck,
     [switch]$CheckUpdate,
     [switch]$TestTelemetry,
     [switch]$SelfTest
@@ -448,7 +454,7 @@ $script:TestPrinterRx = '(?i)^FUDO-TEST-'
 # puerto tenga hardware; si el hardware se va, deja de serlo (ver Remove-OrphanOwnQueues).
 $script:OwnQueueRx   = '(?i)^FUDO-(TEST-|USB\d)'
 $script:TestDocRx    = '(?i)fudo print doctor'
-$script:SchemaVersion = '3.17'
+$script:SchemaVersion = '3.18'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -469,6 +475,8 @@ $script:UpdateNote = ''   # mensaje de "hay version nueva", si corresponde
 $script:VersionBloqueada   = $false  # se corto la corrida por motor desactualizado
 $script:VersionCheckFallo  = $false  # no se pudo consultar la version publicada (sin internet)
 $script:VersionCheckOmitido = $false # se corrio con -NoUpdateCheck
+$script:NativaKitOmitido    = $false # se corrio con -NoNativaKitCheck
+$script:NativaKit           = $null  # resultado del chequeo del .msi de la Nativa firmada
 $script:VersionPublicada   = ''      # la que contesto el repo, si contesto
 $script:JsonBegin    = '<<<FUDO_JSON_BEGIN>>>'
 $script:JsonEnd      = '<<<FUDO_JSON_END>>>'
@@ -3400,13 +3408,58 @@ function Test-Layer2-Queue {
                     Get-PrintJob -PrinterName $Printer.Name | Remove-PrintJob -ErrorAction SilentlyContinue; 'Remove-PrintJob (fallback) OK'
                 }
             }
+        # v3.18: purgar y volver a purgar no estaba alcanzando y no habia con que entender por
+        # que. Un asesor destrabo a mano un local con 218 y 1182 comandas encoladas y conto lo
+        # que el motor no podia ver: el cliente tenia DECENAS de impresoras instaladas, varias ya
+        # muertas, y cada prueba generaba unos 50 trabajos. Purgar funcionaba perfecto -las
+        # comandas se borraban- y no podia ganar nunca. Lo que resolvio el caso fue borrar
+        # impresoras. Asi que ahora se MIDE: cuantos habia, cuantos quedaron, cuantos volvieron
+        # y contra cuantas colas instaladas. Medir primero; borrar colas del cliente es
+        # irreversible y no se hace sin datos.
+        $antes = @($jobs).Count
+        $despues = $antes
+        $rebote = $antes
+        if ($rem.applied) {
+            try { $despues = @(Get-PrintJob -PrinterName $Printer.Name -ErrorAction SilentlyContinue).Count } catch {}
+            Start-Sleep -Milliseconds 2500
+            try { $rebote = @(Get-PrintJob -PrinterName $Printer.Name -ErrorAction SilentlyContinue).Count } catch {}
+        }
+        $colasTodas = @()
+        if ($script:Diagnostics.Contains('colas')) { $colasTodas = @($script:Diagnostics['colas'] | Where-Object { -not $_.esDePrueba }) }
+        $sinHw = @($colasTodas | Where-Object { $_.Contains('puertoVivo') -and (-not $_.puertoVivo) })
+        $script:Diagnostics['purgaMedicion'] = [ordered]@{
+            antes = $antes; despues = $despues; rebote = $rebote
+            volvieron = [int]([Math]::Max(0, $rebote - $despues))
+            colasInstaladas = @($colasTodas).Count; colasSinHardware = @($sinHw).Count
+        }
+        # Si volvieron trabajos despues de purgar, purgar no es la solucion: algo los esta
+        # regenerando. Con muchas colas instaladas, una sola comanda se multiplica.
+        if ($rem.applied -and $rebote -gt $despues) {
+            Add-Check -Id 'queue.rebotePurga' -Layer 2 -Name ("La cola se volvio a llenar despues de limpiarla (" + [int]($rebote - $despues) + " trabajo(s) en 2 segundos)") `
+                -Status 'warn' -RootCauseCandidate $false -Plane 'os' `
+                -Evidence @{ antes = $antes; despues = $despues; rebote = $rebote
+                             colasInstaladas = @($colasTodas).Count; colasSinHardware = @($sinHw).Count } `
+                -Recommendation ('Limpiar la cola funciono (de ' + $antes + ' trabajos a ' + $despues + ') pero volvieron ' + [int]($rebote - $despues) +
+                                 ' en dos segundos, asi que limpiarla no es la solucion: algo los esta regenerando. ' +
+                                 'Esta PC tiene ' + @($colasTodas).Count + ' impresora(s) instalada(s) en Windows' +
+                                 $(if (@($sinHw).Count -gt 0) { ' y ' + @($sinHw).Count + ' de ellas no tienen hardware presente' } else { '' }) +
+                                 '. Cuando hay muchas impresoras instaladas, una sola comanda se multiplica en decenas de trabajos y la cola se tapa sola: ' +
+                                 'revisar en Dispositivos e impresoras y borrar las que el cliente ya no usa. Un caso real se resolvio asi.')
+        }
         Add-Check -Id 'queue.health' -Layer 2 -Name 'Cola de impresion trabada' -Status $(if($rem.applied){'fixed'}else{'warn'}) -RootCauseCandidate $true `
-            -Evidence @{ jobs = @($jobs).Count; stuck = @($stuck).Count; statuses = @($jobs | ForEach-Object { [string]$_.JobStatus }) } `
+            -Evidence @{ jobs = @($jobs).Count; stuck = @($stuck).Count; statuses = @($jobs | ForEach-Object { [string]$_.JobStatus })
+                         antes = $antes; despues = $despues; rebote = $rebote
+                         colasInstaladas = @($colasTodas).Count; colasSinHardware = @($sinHw).Count } `
             -ActionTaken $rem.note -Reversible $false `
             -Recommendation $(if ($rem.applied) {
                     'Un trabajo trabado bloquea toda la cola: se limpio. Volver a imprimir desde Fudo las comandas que estaban esperando.'
                 } elseif (@($jobs).Count -ge 50) {
-                    "Hay $(@($jobs).Count) trabajos acumulados: la App Nativa siguio mandando comandas que nunca salieron. Eso confirma que el problema NO es Fudo (las comandas llegan), sino la impresora o su cola en Windows. Limpiar la cola descarta esos trabajos (son comandas viejas que ya no sirven). Para hacerlo: correr el script en la consola y responder 's' cuando pregunte, o pasar -AllowQueuePurge `$true, o a mano: Get-PrintJob -PrinterName '$($Printer.Name)' | Remove-PrintJob"
+                    # v3.18: antes esto afirmaba "eso CONFIRMA que el problema no es Fudo".
+                    # No lo confirma: con muchas impresoras instaladas una sola comanda se
+                    # multiplica en decenas de trabajos, asi que la cantidad no dice cuantas
+                    # comandas mando Fudo. Se vio una PC con 1182 trabajos que eran unas pocas
+                    # comandas multiplicadas por las colas instaladas.
+                    "Hay $(@($jobs).Count) trabajos acumulados, asi que a esta cola SI le llegaron comandas y no salieron: el problema esta en la impresora o en su cola, no en que Fudo no mande. Ojo: la cantidad no dice cuantas comandas se mandaron -- si el cliente tiene muchas impresoras instaladas en Windows, una sola comanda se multiplica en decenas de trabajos; en ese caso limpiar la cola no alcanza y hay que borrar las impresoras que ya no usa. Limpiar la cola descarta esos trabajos (son comandas viejas que ya no sirven). Para hacerlo: correr el script en la consola y responder 's' cuando pregunte, o pasar -AllowQueuePurge `$true, o a mano: Get-PrintJob -PrinterName '$($Printer.Name)' | Remove-PrintJob"
                 } else {
                     "Un trabajo trabado bloquea toda la cola: las comandas nuevas no salen hasta limpiarla. Limpiarla descarta los $(@($jobs).Count) trabajos pendientes (hay que reimprimirlos desde Fudo). Para hacerlo: correr el script en la consola y responder 's' cuando pregunte, o pasar -AllowQueuePurge `$true, o a mano: Get-PrintJob -PrinterName '$($Printer.Name)' | Remove-PrintJob"
                 })
@@ -5966,6 +6019,17 @@ function Invoke-FudoPrintDoctor {
             -Evidence @{ actual = $script:SchemaVersion } -Recommendation $script:UpdateNote
     }
 
+    if ($script:NativaKit -and -not [bool]$script:NativaKit.listo) {
+        Add-Check -Id 'env.nativaKit' -Layer 0 -Name 'Falta el instalador de la App Nativa firmada en esta PC' -Status 'warn' -Plane 'os' `
+            -Evidence @{ motivo = [string]$script:NativaKit.motivo; versionFirmada = [string]$script:NativaVersionFirmada
+                         candidatos = @(@($script:NativaKit.candidatos) | ForEach-Object { [ordered]@{ ruta = [string]$_.ruta; version = [string]$_.version } })
+                         omitido = [bool]$script:NativaKitOmitido } `
+            -ArticleRef 'https://soporte.fu.do/es/articles/16419361' `
+            -Recommendation ('No hay un instalador de la App Nativa v' + $script:NativaVersionFirmada + ' o superior en esta PC (' + [string]$script:NativaKit.motivo + '). ' +
+                             'Si este cliente tiene una version vieja, el motor no la puede actualizar y el antivirus se la va a volver a comer. ' +
+                             'Copiar el .msi junto a los dos archivos que se copian a la PC del cliente: se arregla una vez y sirve para todos los casos.')
+    }
+
     $badArgs = @(Test-Preflight)
     if (@($badArgs).Count -gt 0) {
         foreach ($b in $badArgs) {
@@ -6195,6 +6259,39 @@ function Invoke-SelfTest {
         $script:Errors  = New-Object System.Collections.ArrayList
         $script:Diagnostics = [ordered]@{}
         $script:AbortByMode = $false
+    }
+
+    # Foto de las funciones que existen ANTES de que el self-test defina un solo mock: todo lo
+    # que aparezca despues, o cambie de cuerpo, es un mock de un escenario.
+    $script:__fnBase = @{}
+    foreach ($f in @(Get-ChildItem Function: -ErrorAction SilentlyContinue)) {
+        $script:__fnBase[[string]$f.Name] = $f.ScriptBlock
+    }
+
+    function Reset-Mocks {
+        <#
+          Saca los mocks que dejaron los escenarios anteriores.
+          Hace falta porque los mocks de un escenario quedan en scope para todos los que vienen
+          despues, y eso ya hizo pasar tres escenarios por el motivo equivocado: uno se aprobo
+          contra un mock viejo en vez de contra el codigo real (Get-PrintHistory, v3.15), otro
+          contra un Repair-BindUsbPort mockeado que devolvia justo el texto esperado (v3.15), y
+          un tercero se cayo porque un mock que explota a proposito seguia vivo (v3.16). Un
+          escenario que pasa por el motivo equivocado es lo peor que le puede pasar a un
+          self-test: se ve verde y no esta probando nada.
+          Todavia NO se llama desde Reset-State: hay escenarios viejos escritos contando con que
+          el mock del anterior siga vivo, y migrarlos es un trabajo aparte. Los escenarios nuevos
+          lo llaman explicitamente.
+        #>
+        foreach ($f in @(Get-ChildItem Function: -ErrorAction SilentlyContinue)) {
+            $n = [string]$f.Name
+            # Ojo: Reset-Mocks se define DESPUES de la foto, asi que sin esta linea se borra a
+            # si misma en la primera llamada y la segunda tira CommandNotFound.
+            if ($n -eq 'Reset-Mocks') { continue }
+            $esMock = $false
+            if (-not $script:__fnBase.ContainsKey($n)) { $esMock = $true }
+            elseif ($script:__fnBase[$n] -ne $f.ScriptBlock) { $esMock = $true }
+            if ($esMock) { try { Remove-Item ('Function:\' + $n) -ErrorAction SilentlyContinue } catch {} }
+        }
     }
 
     # Escenario 1: antivirus cuarentena resuelto + HW ok  => resuelto/high/nativa.antivirus
@@ -8214,6 +8311,167 @@ public class FudoFakeEndpoint {
     Assert-Eq 'S90b un id inexistente no hace nada' $false ([bool](Update-CheckFinding -Id 'no.existe' -Status 'fixed'))
     Assert-Eq 'S90b y no agrega chequeos' 2 (@($script:Checks).Count)
 
+    # ---------------------------------------------------------------------
+    # Escenarios 91-94 (v3.18): todos salieron de la respuesta de un asesor a un caso concreto,
+    # no de la telemetria. Un local con 218 y 1182 comandas encoladas donde purgar corrio 16
+    # veces sin resolver, y el mismo asesor reportando que "el motor dice que instala la nativa
+    # pero al corroborar en la version web sigue sin detectarla".
+    # ---------------------------------------------------------------------
+
+    # Escenario 91: el .msi de la Nativa firmada es parte del kit del asesor. El chequeo NO mira
+    # lo que tiene el cliente: mira si el asesor puede resolver una Nativa vieja cuando aparezca.
+    Reset-State
+    Reset-Mocks
+    function Get-LocalNativeInstallers { @([ordered]@{ ruta='C:\kit\FudoNativa.msi'; version='0.0.37'; esMsi=$true; fecha=(Get-Date) }) }
+    $k91 = Test-NativaKitReady
+    Assert-Eq 'S91 con la firmada el kit esta listo' $true ([bool]$k91.listo)
+    Assert-Eq 'S91 y dice cual es' '0.0.37' ([string]$k91.version)
+    # Una posterior a la firmada tambien sirve: el numero no esta clavado.
+    function Get-LocalNativeInstallers { @([ordered]@{ ruta='C:\kit\FudoNativa.msi'; version='0.0.41'; esMsi=$true; fecha=(Get-Date) }) }
+    Assert-Eq 'S91 una posterior tambien sirve' $true ([bool](Test-NativaKitReady).listo)
+    # Una anterior NO alcanza, y el motivo tiene que decir cual hay.
+    function Get-LocalNativeInstallers { @([ordered]@{ ruta='C:\kit\FudoNativa.msi'; version='0.0.27'; esMsi=$true; fecha=(Get-Date) }) }
+    $k91c = Test-NativaKitReady
+    Assert-Eq 'S91 una anterior a la firmada no alcanza' $false ([bool]$k91c.listo)
+    Assert-Eq 'S91 y el motivo dice cual hay' $true ([bool]([string]$k91c.motivo -match '0\.0\.27'))
+    # Sin ningun instalador.
+    function Get-LocalNativeInstallers { @() }
+    Assert-Eq 'S91 sin instalador el kit no esta listo' $false ([bool](Test-NativaKitReady).listo)
+    Assert-Eq 'S91 y lo dice' $true ([bool]([string](Test-NativaKitReady).motivo -match 'no hay ningun instalador'))
+    # Un .exe no declara version: no se puede saber si sirve, asi que no cuenta.
+    function Get-LocalNativeInstallers { @([ordered]@{ ruta='C:\kit\FudoNativa.exe'; version=''; esMsi=$false; fecha=(Get-Date) }) }
+    $k91e = Test-NativaKitReady
+    Assert-Eq 'S91 un .exe sin version no alcanza' $false ([bool]$k91e.listo)
+    Assert-Eq 'S91 y el motivo lo explica' $true ([bool]([string]$k91e.motivo -match 'declara su version'))
+
+    # La confirmacion: no bloquea el diagnostico y en modo agente nunca pregunta.
+    Reset-State
+    function Test-IsInteractiveConsole { $false }
+    Assert-Eq 'S91b sin consola no bloquea (modo agente)' $true (Confirm-NativaKit -Kit ([ordered]@{ listo=$false; motivo='x' }))
+    Assert-Eq 'S91b con el kit listo no pregunta nada' $true (Confirm-NativaKit -Kit ([ordered]@{ listo=$true; motivo='' }))
+
+    # Escenario 92: el instalador se elige por VERSION, no por fecha. Este era el bug: el
+    # cliente tenia uno viejo en Descargas, mas reciente por fecha, y el motor instalaba ESE.
+    # Reset-Mocks es imprescindible aca: el escenario 91 deja mockeado Get-LocalNativeInstallers
+    # y el 78 deja Find-LocalNativeInstaller, que son justo las dos funciones bajo prueba.
+    Reset-State
+    Reset-Mocks
+    function Get-ChildItem {
+        param($Path, $Filter, [switch]$File, $ErrorAction)
+        @(
+            [pscustomobject]@{ FullName='C:\Users\cliente\Downloads\FudoNativa.msi'; Length=3MB; LastWriteTime=(Get-Date) },
+            [pscustomobject]@{ FullName='C:\kit\FudoNativa.msi'; Length=3MB; LastWriteTime=(Get-Date).AddDays(-90) }
+        )
+    }
+    function Get-MsiProductVersion { param($Path) $(if ($Path -match 'Downloads') { '0.0.18' } else { '0.0.37' }) }
+    $c92 = @(Get-LocalNativeInstallers)
+    Assert-Eq 'S92 no duplica el mismo archivo' 2 (@($c92).Count)
+    Assert-Eq 'S92 gana la version mas alta, no la mas reciente' '0.0.37' ([string]@($c92)[0].version)
+    Assert-Eq 'S92 y Find devuelve ese' $true ([bool]((Find-LocalNativeInstaller) -match 'kit'))
+    Assert-Eq 'S92 no el que estaba en Descargas' $false ([bool]((Find-LocalNativeInstaller) -match 'Downloads'))
+    # Los que no declaran version van al final: no se instala a ciegas si hay uno que si la dice.
+    function Get-ChildItem {
+        param($Path, $Filter, [switch]$File, $ErrorAction)
+        @(
+            [pscustomobject]@{ FullName='C:\kit\FudoNativa.exe'; Length=3MB; LastWriteTime=(Get-Date) },
+            [pscustomobject]@{ FullName='C:\kit\FudoNativa.msi'; Length=3MB; LastWriteTime=(Get-Date).AddDays(-5) }
+        )
+    }
+    function Get-MsiProductVersion { param($Path) $(if ($Path -match '\.msi$') { '0.0.37' } else { '' }) }
+    Assert-Eq 'S92b el que declara version va primero' $true ([bool]((Find-LocalNativeInstaller) -match '\.msi$'))
+
+    # Escenario 93: instalar la Nativa verificando el EFECTO. El motor reportaba la reparacion
+    # aplicada mirando solo el codigo de salida, con la Nativa sin instalar.
+    Reset-State
+    Reset-Mocks
+    function Find-LocalNativeInstaller { 'C:\kit\FudoNativa.msi' }
+    function Get-MsiProductVersion { param($Path) '0.0.37' }
+    function Get-NativaVersionState { param($Install) [ordered]@{ version=[string](@($Install.regInfo)[0].version); firmada=$true } }
+    function Invoke-NativeInstallerFile { param($Path, $ExtraArgs) 0 }
+    function Add-MpPreference { param($ExclusionPath, $ExclusionProcess, $ErrorAction) }
+    function Get-Process { param($ErrorAction) @() }
+    function Start-Sleep { param($Seconds, $Milliseconds) }
+    $script:i93 = 0
+    function Find-FudoNativeInstall {
+        $script:i93++
+        if ($script:i93 -le 1) { [ordered]@{ paths=@(); regInfo=@() } }
+        else { [ordered]@{ paths=@('C:\Users\x\AppData\Local\Fudo\fudo.exe'); regInfo=@([ordered]@{ version='0.0.37' }) } }
+    }
+    # El hallazgo previo de "no instalada" tiene que quedar corregido por la instalacion.
+    Add-Check -Id 'nativa.installed' -Layer 0 -Name 'App Nativa de Fudo NO instalada' -Status 'fail' -RootCauseCandidate $true -Plane 'fudo_config' -Evidence @{ found=$false }
+    $r93 = Install-FudoNative
+    Assert-Eq 'S93 la instalacion se reporta aplicada' $true ([bool]$r93.applied)
+    Assert-Eq 'S93 y dice que quedo instalada' $true ([bool]([string]$r93.note -match 'quedo instalada'))
+    Assert-Eq 'S93 el hallazgo viejo queda corregido' 'fixed' ([string](Get-CheckById 'nativa.installed').status)
+    Assert-Eq 'S93 y deja de ser causa raiz' $false ([bool](Get-CheckById 'nativa.installed').rootCauseCandidate)
+
+    # El instalador dice que anduvo y la Nativa no aparece: NO puede pasar por instalada.
+    Reset-State
+    function Find-FudoNativeInstall { [ordered]@{ paths=@(); regInfo=@() } }
+    function Get-NativaVersionState { param($Install) [ordered]@{ version=''; firmada=$null } }
+    $r93b = Install-FudoNative
+    Assert-Eq 'S93b sin la Nativa en disco no se declara instalada' $false ([bool]$r93b.applied)
+    Assert-Eq 'S93b y lo dice' $true ([bool]([string]$r93b.note -match 'NO quedo instalada'))
+
+    # Y nunca degradar: con una mas nueva instalada, un instalador viejo no se ejecuta.
+    Reset-State
+    function Find-FudoNativeInstall { [ordered]@{ paths=@('C:\x\fudo.exe'); regInfo=@([ordered]@{ version='0.0.37' }) } }
+    function Get-NativaVersionState { param($Install) [ordered]@{ version='0.0.37'; firmada=$true } }
+    function Get-MsiProductVersion { param($Path) '0.0.18' }
+    $script:llamoInstalador93 = $false
+    function Invoke-NativeInstallerFile { param($Path, $ExtraArgs) $script:llamoInstalador93 = $true; 0 }
+    $r93c = Install-FudoNative
+    Assert-Eq 'S93c no degrada la Nativa instalada' $false ([bool]$r93c.applied)
+    Assert-Eq 'S93c y ni siquiera corre el instalador' $false ([bool]$script:llamoInstalador93)
+    Assert-Eq 'S93c el motivo lo explica' $true ([bool]([string]$r93c.note -match 'mas viejo'))
+
+    # Escenario 94: por que purgar no alcanza. El caso real: purgar funcionaba -las comandas se
+    # borraban- pero cada prueba generaba decenas de trabajos porque el cliente tenia muchas
+    # impresoras instaladas. Purgar no podia ganar nunca y lo que resolvio fue borrar impresoras.
+    Reset-State
+    Reset-Mocks
+    $script:Diagnostics['colas'] = @(
+        [ordered]@{ nombre='POS-80C';           puerto='USB001'; esDePrueba=$false; puertoVivo=$true },
+        [ordered]@{ nombre='POS-80C (copia 1)'; puerto='USB001'; esDePrueba=$false; puertoVivo=$false },
+        [ordered]@{ nombre='POS-80C (copia 2)'; puerto='USB001'; esDePrueba=$false; puertoVivo=$false },
+        [ordered]@{ nombre='BARRA TRAGOS';      puerto='USB002'; esDePrueba=$false; puertoVivo=$false }
+    )
+    function Confirm-Irreversible { param($Description, $Impact) $true }
+    function Remove-PrintJob { param($ErrorAction) }
+    function Start-Sleep { param($Seconds, $Milliseconds) }
+    $script:j94 = 0
+    function Get-PrintJob {
+        param($PrinterName, $ErrorAction)
+        $script:j94++
+        if ($script:j94 -eq 1) { @(1..60 | ForEach-Object { [pscustomobject]@{ JobStatus='Normal'; SubmittedTime=(Get-Date).AddMinutes(-30) } }) }
+        elseif ($script:j94 -le 3) { @() }
+        else { @(1..47 | ForEach-Object { [pscustomobject]@{ JobStatus='Normal'; SubmittedTime=(Get-Date) } }) }
+    }
+    Test-Layer2-Queue -Printer ([pscustomobject]@{ Name='CAJA PRINCIPAL' }) -Wmi $null
+    $m94 = $script:Diagnostics['purgaMedicion']
+    Assert-Eq 'S94 mide cuantos habia' 60 ([int]$m94.antes)
+    Assert-Eq 'S94 cuantos quedaron' 0 ([int]$m94.despues)
+    Assert-Eq 'S94 y cuantos volvieron' 47 ([int]$m94.volvieron)
+    Assert-Eq 'S94 cuenta las colas instaladas' 4 ([int]$m94.colasInstaladas)
+    Assert-Eq 'S94 y las que no tienen hardware' 3 ([int]$m94.colasSinHardware)
+    $c94 = Get-CheckById 'queue.rebotePurga'
+    Assert-Eq 'S94 avisa que la cola se volvio a llenar' $true ([bool]($null -ne $c94))
+    Assert-Eq 'S94 y no lo da como causa raiz todavia' $false ([bool]$c94.rootCauseCandidate)
+    Assert-Eq 'S94 apunta a las impresoras instaladas' $true ([bool]([string]$c94.recommendation -match 'impresora'))
+    Assert-Eq 'S94 y a borrar las que no se usan' $true ([bool]([string]$c94.recommendation -match 'borrar'))
+    # Purgar y que NO vuelvan es el caso sano: no se avisa nada.
+    Reset-State
+    $script:j94 = 0
+    function Get-PrintJob {
+        param($PrinterName, $ErrorAction)
+        $script:j94++
+        if ($script:j94 -eq 1) { @(1..5 | ForEach-Object { [pscustomobject]@{ JobStatus='Error'; SubmittedTime=(Get-Date).AddMinutes(-30) } }) }
+        else { @() }
+    }
+    Test-Layer2-Queue -Printer ([pscustomobject]@{ Name='CAJA' }) -Wmi $null
+    Assert-Eq 'S94b si no vuelven no se avisa nada' $true ([bool]($null -eq (Get-CheckById 'queue.rebotePurga')))
+    Assert-Eq 'S94b y la cola queda reparada' 'fixed' ([string](Get-CheckById 'queue.health').status)
+
     Write-Host ""
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)
     # Salida explicita en los dos casos: si el script termina con 'return', $LASTEXITCODE
@@ -8586,30 +8844,123 @@ function Invoke-MenuAction {
 #   stderr : resumen humano (es-AR) y avisos. Usar -Quiet para silenciarlo.
 #   exit   : 0 = resuelto | 2 = requiere escalamiento | 3 = falla del motor | 4 = self-test fallido
 #            5 = motor desactualizado (no corrio) | 6 = falta el ID de conversacion (no corrio)
+#            7 = falta el .msi de la App Nativa firmada y el asesor eligio no seguir (no corrio)
 # ---------------------------------------------------------------------------
-function Find-LocalNativeInstaller {
-    <# Busca un instalador de la Nativa ya presente: al lado del script, en Descargas o en el Escritorio. #>
-    if ($NativeInstallerPath) {
-        if (Test-Path $NativeInstallerPath) { return (Resolve-Path $NativeInstallerPath).Path }
-        return ''
-    }
+function Get-LocalNativeInstallers {
+    <#
+      TODOS los instaladores de la Nativa que hay en la PC, con la version que declara cada uno.
+      Antes esto devolvia el primero que aparecia ordenando por fecha, y con eso el motor podia
+      instalar un instalador viejo que el cliente tenia en Descargas de hace meses: una version
+      sin firmar que el antivirus vuelve a comerse. Lo reporto un asesor -"siento que no instala
+      la nativa correcta o al menos una version compatible"- y tenia razon.
+      Devuelve @( @{ ruta; version; esMsi; fecha } ), ordenados por version descendente y, entre
+      los que no declaran version, por fecha.
+    #>
     $donde = @()
     try { $donde += (Split-Path -Parent $PSCommandPath) } catch {}
     try { $donde += (Get-Location).Path } catch {}
     if ($env:USERPROFILE) { $donde += @((Join-Path $env:USERPROFILE 'Downloads'), (Join-Path $env:USERPROFILE 'Desktop')) }
+    $vistos = @()
+    $out = @()
     foreach ($d in @($donde | Where-Object { $_ })) {
-        # v3.14: la Nativa firmada se distribuye como .msi y esta busqueda solo miraba .exe,
-        # asi que un instalador puesto al lado del script no se encontraba nunca. El .msi va
-        # primero: es el formato de la version vigente.
+        # El .msi va primero: es el formato de la version vigente y el unico del que se puede
+        # leer la version sin ejecutarlo.
         foreach ($pat in @('Fudo*.msi','*fudo*.msi','*Nativa*.msi','Fudo*.exe','*fudo*.exe','*Nativa*.exe')) {
             try {
-                $hit = @(Get-ChildItem -Path $d -Filter $pat -File -ErrorAction SilentlyContinue |
-                         Where-Object { $_.Length -gt 200KB } | Sort-Object LastWriteTime -Descending) | Select-Object -First 1
-                if ($hit) { return [string]$hit.FullName }
+                foreach ($f in @(Get-ChildItem -Path $d -Filter $pat -File -ErrorAction SilentlyContinue | Where-Object { $_.Length -gt 200KB })) {
+                    $ruta = [string]$f.FullName
+                    if ($vistos -contains $ruta.ToLower()) { continue }
+                    $vistos += $ruta.ToLower()
+                    $esMsi = [bool]($ruta -match '(?i)\.msi$')
+                    $ver = ''
+                    if ($esMsi) { $ver = [string](Get-MsiProductVersion -Path $ruta) }
+                    $out += [ordered]@{ ruta = $ruta; version = $ver; esMsi = $esMsi; fecha = $f.LastWriteTime }
+                }
             } catch {}
         }
     }
+    # Orden: los que declaran version primero, de mayor a menor; despues los que no, por fecha.
+    $conVer = @($out | Where-Object { $_.version } | Sort-Object -Property @{ Expression = {
+                    $v = $null; try { $v = [version]$_.version } catch { $v = [version]'0.0.0' }; $v } ; Descending = $true })
+    $sinVer = @($out | Where-Object { -not $_.version } | Sort-Object -Property fecha -Descending)
+    return @(@($conVer) + @($sinVer))
+}
+
+function Find-LocalNativeInstaller {
+    <#
+      El MEJOR instalador de la Nativa que hay en la PC: el de version mas alta, no el mas
+      reciente por fecha. Ver Get-LocalNativeInstallers para el por que.
+    #>
+    if ($NativeInstallerPath) {
+        if (Test-Path $NativeInstallerPath) { return (Resolve-Path $NativeInstallerPath).Path }
+        return ''
+    }
+    $c = @(Get-LocalNativeInstallers) | Select-Object -First 1
+    if ($c) { return [string]$c.ruta }
     return ''
+}
+
+function Test-NativaKitReady {
+    <#
+      El asesor trajo el instalador de la Nativa firmada?
+      OJO: esto NO mira lo que tiene instalado el cliente. Mira si en la PC hay un .msi que
+      declare la version firmada o superior, que es lo unico con lo que el motor puede
+      actualizar una Nativa vieja. Sin ese archivo, una PC con la 0.0.18 se queda con la 0.0.18
+      y el antivirus vuelve a comersela: el motor avisa y no tiene con que resolverlo.
+      Se chequea siempre, independientemente del cliente, porque es un item del kit del asesor
+      -se arregla una vez y sirve para todos los casos- y no algo para descubrir cliente por
+      cliente en medio de una llamada.
+      Devuelve @{ listo; ruta; version; candidatos; motivo }
+    #>
+    $cands = @(Get-LocalNativeInstallers)
+    $firmada = [string]$script:NativaVersionFirmada
+    $ok = @($cands | Where-Object {
+        $v = $null
+        try { $v = [version]$_.version } catch { $v = $null }
+        ($null -ne $v) -and ($v -ge [version]$firmada)
+    }) | Select-Object -First 1
+    if ($ok) {
+        return [ordered]@{ listo = $true; ruta = [string]$ok.ruta; version = [string]$ok.version
+                           candidatos = @($cands); motivo = '' }
+    }
+    $mejor = @($cands | Where-Object { $_.version }) | Select-Object -First 1
+    $motivo = $(if (@($cands).Count -eq 0) { 'no hay ningun instalador de la App Nativa en esta PC' }
+                elseif ($mejor) { 'el instalador que hay declara la version ' + [string]$mejor.version + ', anterior a la ' + $firmada }
+                else { 'hay instaladores pero ninguno declara su version (solo .exe): no se puede saber si sirven' })
+    return [ordered]@{ listo = $false; ruta = ''; version = ''; candidatos = @($cands); motivo = $motivo }
+}
+
+function Confirm-NativaKit {
+    <#
+      Le avisa al asesor que le falta el .msi de la Nativa firmada y le pide confirmacion para
+      seguir igual. No bloquea el diagnostico: la impresora puede estar rota por algo que no
+      tiene nada que ver con la Nativa, y dejar al asesor sin herramienta seria peor.
+      Sin consola (modo agente) no se puede preguntar: se sigue y queda registrado.
+      Devuelve $true si hay que seguir.
+    #>
+    param($Kit)
+    if ($NoNativaKitCheck) { $script:NativaKitOmitido = $true; return $true }
+    if ($Kit -and [bool]$Kit.listo) { return $true }
+    if (-not (Test-IsInteractiveConsole)) { return $true }
+
+    Suspend-LiveStatus
+    [Console]::Error.WriteLine('')
+    [Console]::Error.WriteLine('  ------------------------------------------------------------')
+    [Console]::Error.WriteLine(('  FALTA EL INSTALADOR DE LA APP NATIVA (.msi de la v' + $script:NativaVersionFirmada + ')'))
+    [Console]::Error.WriteLine('')
+    [Console]::Error.WriteLine(('  ' + [string]$Kit.motivo + '.'))
+    [Console]::Error.WriteLine('')
+    [Console]::Error.WriteLine('  Sin ese archivo, si este cliente tiene una version vieja de la App Nativa el')
+    [Console]::Error.WriteLine('  motor NO puede actualizarla, y el antivirus se la va a volver a comer. Desde')
+    [Console]::Error.WriteLine(('  la v' + $script:NativaVersionFirmada + ' esta firmada y el antivirus deja de bloquearla.'))
+    [Console]::Error.WriteLine('')
+    [Console]::Error.WriteLine('  Copia el .msi a la misma carpeta que este script y volve a correrlo. Conviene')
+    [Console]::Error.WriteLine('  tenerlo SIEMPRE junto a los dos archivos que copias a la PC del cliente: se')
+    [Console]::Error.WriteLine('  arregla una vez y sirve para todos los casos.')
+    [Console]::Error.WriteLine('  ------------------------------------------------------------')
+    $ans = Read-DoctorLine -Prompt '  Seguir igual sin poder actualizar la Nativa? (s = si / cualquier otra tecla = cortar)'
+    if ($null -eq $ans) { return $true }
+    return ($ans -match '(?i)^\s*(s|si|s\u00ED|y|yes)\s*$')
 }
 
 function Get-MsiProductVersion {
@@ -8752,9 +9103,47 @@ function Install-FudoNative {
     # (y que el antivirus borre la descarga a mitad de camino).
     $local = Find-LocalNativeInstaller
     if ($local) {
+        # v3.18: tres cosas estaban mal en este camino, y las tres las describio un asesor
+        # ("el motor dice que instala la nativa, pero al corroborar en la version web sigue sin
+        # detectarla... siento que no instala la nativa correcta").
+        #  1. Se instalaba el instalador que apareciera primero por FECHA. Si el cliente tenia
+        #     uno viejo en Descargas, el motor instalaba ESE: una version sin firmar que el
+        #     antivirus vuelve a comerse. Ahora se elige por version (Find-LocalNativeInstaller)
+        #     y no se degrada lo que ya esta instalado.
+        #  2. Un .msi se lanzaba con Start-Process directo, o sea abriendo el ASISTENTE grafico
+        #     en la pantalla del cliente y esperando a que alguien lo complete. Desde la 3.14 la
+        #     Nativa se distribuye como .msi, asi que era el caso normal. Va por msiexec /qn,
+        #     que es lo que el camino de actualizacion ya hacia bien desde la 3.14.
+        #  3. No se verificaba nada: solo el codigo de salida y si el proceso estaba corriendo.
+        #     La reparacion se reportaba aplicada con la Nativa sin instalar. Ahora se relee.
+        $verNueva = [string](Get-MsiProductVersion -Path $local)
+        $instAntes = Find-FudoNativeInstall
+        $verAntes = ''
+        try { $verAntes = [string](Get-NativaVersionState -Install $instAntes).version } catch {}
+        $yaEstaba = ((@($instAntes.paths).Count -gt 0) -or (@($instAntes.regInfo).Count -gt 0))
+        if ($yaEstaba -and $verNueva -and $verAntes) {
+            $degradaria = $false
+            try { $degradaria = ([version]$verNueva -lt [version]$verAntes) } catch { $degradaria = $false }
+            if ($degradaria) {
+                Write-Host ''
+                Write-Host ("  NO se instalo nada: el instalador que hay en la PC es la v$verNueva y la instalada es la v$verAntes.") -ForegroundColor Yellow
+                Write-Host '  Instalarlo la degradaria (ya paso en este proyecto: 0.0.36 -> 0.0.18).' -ForegroundColor Yellow
+                Write-Host ("  Conseguir el .msi de la v$($script:NativaVersionFirmada) y copiarlo al lado de este script.") -ForegroundColor Yellow
+                Write-Host ''
+                return @{ applied = $false; note = ("no se instalo: el instalador local (v$verNueva) es mas viejo que la instalada (v$verAntes)") }
+            }
+        }
         Write-Host ''
-        Write-Host ("  Instalador encontrado en la PC: " + $local) -ForegroundColor Cyan
-        return (Invoke-Remediation -Description ('Instalar la App Nativa desde ' + $local) -Type 'nativa.install_local' -Target 'FudoNativa' `
+        Write-Host ("  Instalador encontrado en la PC: " + $local + $(if ($verNueva) { " (v$verNueva)" } else { ' (no declara version)' })) -ForegroundColor Cyan
+        if ($verNueva) {
+            $bajoFirmada = $false
+            try { $bajoFirmada = ([version]$verNueva -lt [version]$script:NativaVersionFirmada) } catch {}
+            if ($bajoFirmada) {
+                Write-Host ("  OJO: es anterior a la v$($script:NativaVersionFirmada), que es la primera firmada. El antivirus puede volver a bloquearla.") -ForegroundColor Yellow
+            }
+        }
+        $salida = @{ code = $null }
+        $rem = Invoke-Remediation -Description ('Instalar la App Nativa desde ' + $local) -Type 'nativa.install_local' -Target 'FudoNativa' `
             -Before 'no instalada' -After 'instalada' -Reversible $true -Fix {
                 $notas = @()
                 if ($UseDefenderExclusions) {
@@ -8767,16 +9156,44 @@ function Install-FudoNative {
                     try { Add-MpPreference -ExclusionPath $local -ErrorAction SilentlyContinue } catch {}
                 }
                 Write-StepDetail 'ejecutando el instalador local'
-                $pr = $null
-                if ($NativeInstallerArgs) { $pr = Start-Process -FilePath $local -ArgumentList $NativeInstallerArgs -PassThru -Wait -ErrorAction Stop }
-                else { $pr = Start-Process -FilePath $local -PassThru -Wait -ErrorAction Stop }
-                $notas += "instalador finalizo con codigo $($pr.ExitCode)"
+                $code = Invoke-NativeInstallerFile -Path $local -ExtraArgs $NativeInstallerArgs
+                $salida.code = $code
+                $notas += $(if ($null -eq $code) { 'no se pudo lanzar el instalador' } else { "el instalador termino con codigo $code" })
                 Start-Sleep -Seconds 3
-                $corriendo = $false
-                try { $corriendo = (@(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*$FudoAppProcess*" }).Count -gt 0) } catch {}
-                $notas += $(if ($corriendo) { 'la Nativa esta corriendo' } else { 'la Nativa todavia no aparece corriendo: puede requerir iniciar sesion en la web app de Fudo' })
                 ($notas -join ' | ')
-            })
+            }
+        # Verificar el EFECTO, no el codigo de retorno: es la regla del proyecto y este camino
+        # no la cumplia.
+        $instDespues = Find-FudoNativeInstall
+        $quedo = ((@($instDespues.paths).Count -gt 0) -or (@($instDespues.regInfo).Count -gt 0))
+        $verDespues = ''
+        try { $verDespues = [string](Get-NativaVersionState -Install $instDespues).version } catch {}
+        $corriendo = $false
+        try { $corriendo = (@(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*$FudoAppProcess*" }).Count -gt 0) } catch {}
+        $script:Diagnostics['nativaInstall'] = [ordered]@{
+            instalador = $local; versionInstalador = $verNueva; quedoInstalada = [bool]$quedo
+            versionDespues = $verDespues; exitCode = $salida.code; corriendo = [bool]$corriendo
+        }
+        if ($quedo) {
+            Write-Host ("  App Nativa instalada" + $(if ($verDespues) { " (v$verDespues)" } else { '' }) + '.') -ForegroundColor Green
+            if (-not $corriendo) {
+                Write-Host '  Todavia no aparece corriendo, y es lo esperado: la levanta el navegador cuando abris Fudo.' -ForegroundColor DarkGray
+            }
+            [void](Update-CheckFinding -Id 'nativa.installed' -Status 'fixed' -RootCauseCandidate $false `
+                -Name ('App Nativa de Fudo instalada por el motor' + $(if ($verDespues) { " (v$verDespues)" } else { '' })) `
+                -ActionTaken ([string]$rem.note) `
+                -Recommendation 'Se instalo la App Nativa en esta corrida. Abrir Fudo en el navegador y mandar una comanda de prueba.' `
+                -EvidenceExtra @{ instaladaEnEstaCorrida = $true; versionDespues = [string]$verDespues })
+            return @{ applied = $true; note = ([string]$rem.note + ' | quedo instalada' + $(if ($verDespues) { " (v$verDespues)" } else { '' })) }
+        }
+        Write-Host ''
+        Write-Host '  NO quedo instalada.' -ForegroundColor Red
+        Write-Host ("  " + $(if ($null -eq $salida.code) { 'no se pudo lanzar el instalador.' }
+                             elseif ([int]$salida.code -ne 0) { "el instalador termino con codigo $($salida.code)." }
+                             else { 'el instalador dijo que termino bien, pero la Nativa no aparece en la PC: revisar si el antivirus la borro.' })) -ForegroundColor Red
+        Write-Host '  Instalarla a mano desde la web app de Fudo y verificar que el antivirus no la toque.' -ForegroundColor Yellow
+        Write-Host ''
+        return @{ applied = $false; note = ([string]$rem.note + ' | NO quedo instalada') }
     }
 
     if (-not $url) {
@@ -9123,6 +9540,21 @@ function Send-Telemetry {
                         fallo     = [bool]$script:VersionCheckFallo
                     }
                     $t['cobertura'] = $(if ($script:Diagnostics.Contains('cobertura')) { $script:Diagnostics['cobertura'] } else { $null })
+                    # v3.18: por que purgar no alcanza. Sin estos numeros no se puede distinguir
+                    # "purgar no borra" de "borra y se vuelve a llenar", que son dos problemas
+                    # con arreglos opuestos.
+                    $t['purgaMedicion'] = $(if ($script:Diagnostics.Contains('purgaMedicion')) { $script:Diagnostics['purgaMedicion'] } else { $null })
+                    # Si el asesor trajo el .msi de la Nativa firmada, y el resultado de la
+                    # instalacion cuando el motor la instalo.
+                    $t['nativaKit'] = $(
+                        if ($script:NativaKit) {
+                            [ordered]@{ listo = [bool]$script:NativaKit.listo; version = [string]$script:NativaKit.version
+                                        motivo = [string]$script:NativaKit.motivo
+                                        candidatos = @(@($script:NativaKit.candidatos) | ForEach-Object { [string]$_.version })
+                                        omitido = [bool]$script:NativaKitOmitido }
+                        } else { $null }
+                    )
+                    $t['nativaInstall'] = $(if ($script:Diagnostics.Contains('nativaInstall')) { $script:Diagnostics['nativaInstall'] } else { $null })
                     # v3.16: impresoras vistas en una subred distinta a la del PC, con su MAC.
                     # La MAC es lo que permite armar la tabla de OUIs por fabricante con datos
                     # reales en vez de adivinarla, y el plan dice si el motor pudo resolver la
@@ -9300,7 +9732,20 @@ try {
     }
 
     # v3.14: dos requisitos previos. Ninguno diagnostica nada: si no se cumplen, no se corre.
+    # v3.18: tres. El tercero es el .msi de la App Nativa firmada, que es parte del kit del
+    # asesor y no algo para descubrir cliente por cliente: sin el, una PC con la Nativa vieja se
+    # queda con la vieja y el antivirus se la vuelve a comer. Se chequea SIN mirar lo que tiene
+    # el cliente -lo que importa es si el asesor puede resolverlo cuando aparezca- y se pregunta
+    # antes que el ID del caso, para no hacerle pegar la conversacion de Intercom y recien
+    # despues mandarlo a buscar un archivo.
     if (Test-VersionBloqueada) { exit 5 }
+    $script:NativaKit = Test-NativaKitReady
+    if (-not (Confirm-NativaKit -Kit $script:NativaKit)) {
+        [Console]::Error.WriteLine('')
+        [Console]::Error.WriteLine(('  Cortado. Copia el .msi de la App Nativa v' + $script:NativaVersionFirmada + ' al lado de este script y volve a correrlo.'))
+        [Console]::Error.WriteLine('')
+        exit 7
+    }
     $CaseId = Resolve-CaseIdObligatorio -Actual $CaseId
 
     $final = Invoke-FudoPrintDoctor
