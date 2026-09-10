@@ -24,3 +24,8 @@ contexto/
 # Comandos locales de Claude Code: describen el flujo de auto-implementar y pushear a main,
 # no es algo para publicar en un repo publico.
 .claude/commands/
+# Carpeta de distribucion al equipo: lleva el .cmd INTERNO con la URL de
+# telemetria, el .msi de la App Nativa y utilidades de terceros (drivers,
+# NetConfigTools). Nada de eso va al repositorio publico.
+tools/FudoPrintDoctor/
+FudoPrintDoctor-interno.cmd
