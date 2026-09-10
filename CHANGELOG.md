@@ -4,6 +4,65 @@ Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado
 
 ## [3.18] - 2026-09-08
 
+### Launcher (`FudoPrintDoctor.cmd`) - 2026-09-09
+
+*Sin cambios en el motor: `VERSION` sigue en 3.18.* Cinco arreglos en el `.cmd`, y los cinco
+salieron de una sola captura que mandó un asesor.
+
+**Lo que se vio:** una PC donde el `.ps1` tiró un error de parseo en rojo y dos líneas más abajo el
+launcher escribió *"RESUELTO. Probar imprimir una comanda desde Fudo"*.
+
+- **El launcher decía RESUELTO sin que el motor corriera.** La PC tenía PowerShell 2.0, donde el
+  operador `-in` no existe (es de PS 3.0), así que **el archivo entero no parseó y no se ejecutó una
+  sola línea**. Y verificado acá: `powershell -File` con un error de parseo **sale con código 0**,
+  que es justo el código con el que el launcher escribía RESUELTO.
+  *Es el falso positivo más caro que produjo este proyecto, y estaba en el único archivo donde nunca
+  aplicamos nuestra propia regla de verificar el efecto en vez del código de retorno.*
+  Ahora el `resultado.json` anterior se borra **antes** de correr, y si al terminar no existe, el
+  launcher dice que el motor no llegó a diagnosticar y pide una captura — nunca RESUELTO.
+- **Además, no hay telemetría de esas corridas.** Sin ejecutar, no se reporta nada: *una PC donde el
+  motor nunca funcionó es invisible en la planilla*. Puede haber un grupo de clientes con Windows
+  viejo del que no tenemos un solo dato, y es candidato a explicar parte de los casos donde el
+  script no se usa.
+- **El launcher ahora verifica que la PC pueda correr el motor**, antes de todo: PowerShell 5 o
+  superior y que exista `Get-Printer`. El segundo chequeo es el que importa de verdad — `Get-Printer`
+  existe desde Windows 8, así que **en Windows 7 el motor no puede funcionar ni con PowerShell 5.1
+  instalado**. Si no se cumple, corta con un mensaje que dice explícitamente *"no es un problema del
+  cliente ni de la impresora: es esta PC"* y que hay que resolver el caso a mano.
+  *El sondeo está escrito con sintaxis de PowerShell 2.0 a propósito: tiene que poder correr en las
+  PCs que va a rechazar.*
+- **El launcher verifica que el `.ps1` sea la versión publicada, y lo actualiza si no.** Antes sólo
+  miraba si el archivo **existía**: una copia vieja se seguía usando para siempre. Es la explicación
+  de las corridas 3.8 que siguen apareciendo en la planilla con el motor ya en 3.18 — y de por qué
+  el gate de versión del motor no puede salvarnos, *porque un motor viejo no tiene el gate*. En esas
+  filas se ve `engine.updateAvailable` en `warn`: el motor sabía que había una versión más nueva y
+  seguía igual, que es lo que hacía la 3.8.
+  Se compara contra el `VERSION` publicado buscando la línea del `SchemaVersion` dentro del `.ps1`.
+  Sin internet no bloquea: usa lo que hay y **avisa** que puede estar desactualizado.
+- **El launcher dejó de preguntar el ID del caso.** Lo pide el motor desde la 3.14, así que se
+  preguntaba dos veces y el `set /p` le agregaba un espacio al final (se ve en las filas viejas como
+  `"215475858914549 "`).
+- **Deja la PC del cliente limpia.** El `telemetria.txt` se borra siempre —**lleva la URL interna de
+  reporte**, y quedaba en el disco de cada cliente— y el motor se borra preguntando, con Enter = sí.
+  Es el pedido de Gustavo, y resultó ser la causa raíz de las corridas viejas: un `.ps1` olvidado en
+  el escritorio de un cliente lo vuelve a usar el próximo que abra el `.cmd` ahí.
+
+### Agregado
+
+- **`tools/Configurar-Telemetria.cmd`**: arma la copia interna del launcher con la URL de telemetría
+  adentro, para distribuir. Se le puede arrastrar encima un `.cmd` interno que ya tenga la URL y la
+  toma de ahí sin tipearla ni mostrarla. Valida que sea una URL de Apps Script (`https://` … `/exec`)
+  y verifica el resultado antes de decir que salió bien.
+  *La sustitución la hace PowerShell y no batch: copiar un `.cmd` línea por línea con `echo` pierde
+  los `>nul 2>&1` y los `%~dp0`. Probado — cambia exactamente una línea y el resto queda byte a byte
+  idéntico.* La URL no toca el repositorio en ningún momento.
+- **Marcador `LAUNCHER-VERSION` en el `.cmd`.** El updater **no pisa** el launcher existente, a
+  propósito, porque lleva la URL: por eso este archivo nunca se actualiza solo y hay que
+  distribuirlo a mano. El marcador queda para que el updater pueda compararlo y refrescarlo
+  preservando la URL — *pendiente, y es lo que haría que el próximo cambio de launcher no requiera
+  otra distribución manual.*
+
+
 Todo lo de esta versión salió de **la respuesta de un asesor a un caso concreto**, no de la
 telemetría. Es la PC con 218 y 1.182 comandas encoladas donde `queue.purge` corrió 16 veces sin
 resolver nada — el hallazgo que la bitácora semanal dejó abierto y sin propuesta. La respuesta
