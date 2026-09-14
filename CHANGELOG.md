@@ -2,6 +2,105 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.19] - 2026-09-14
+
+De la bitácora semanal del 07/09-13/09 y, sobre todo, de tres casos que reportó un asesor en el
+canal en dos días. **Los tres eslabones que faltaban entre "la Nativa está instalada" y "Fudo
+imprime" no se estaban mirando, y el motor cerraba esas PCs con todo verde.**
+
+### Corregido
+
+- **El motor daba la Nativa por instalada cuando no lo estaba, y por eso no la instalaba.** Hasta
+  la 3.18 alcanzaba con una carpeta que matcheara `Fudo*` o una entrada en el registro de
+  desinstalación. Las dos señales mienten:
+  - **La página web agregada como aplicación desde el navegador** (Chrome › Instalar página como
+    app) se registra con `DisplayName` *Fudo* y `DisplayVersion` **1.0**. El motor leía eso como
+    "la Nativa instalada es la v1.0", y el guardarraíl anti-degradación que agregó la 3.18
+    comparaba el `.msi` 0.0.37 contra esa 1.0 y **abortaba la instalación**. En esas PCs el motor
+    no iba a instalar la Nativa nunca, por más que el asesor trajera el instalador. Lo encontró
+    Iván Ruquet, y la captura del motor lo dice con todas las letras: *"NO se instalo nada: el
+    instalador que hay en la PC es la v0.0.37 y la instalada es la v1.0"*.
+  - **El registro queda huérfano** cuando el antivirus se lleva los archivos: 12 corridas en 7 PCs
+    cerraron con `nativa.installed` en `ok`/`warn` y la carpeta de la Nativa vacía.
+
+  Ahora la única señal que cuenta es el archivo: **`fudo_native_extension` en `%LOCALAPPDATA%\Fudo`**.
+  Sin él la Nativa no está instalada, y el hallazgo dice *cuál* de los tres casos es (no está, quedó
+  el registro sin los archivos, o lo que está instalado es la app del navegador). El guardarraíl
+  anti-degradación sólo corre contra una versión que salió de un archivo en disco.
+  *El guardarraíl estaba bien; el dato con el que decidía, no.*
+
+- **La purga se declaraba reparación sin mirar la medición que la 3.18 agregó para eso.** En 11 de
+  32 corridas con medición la cola no bajó (`despues >= antes`) y **7 de esas cerraron con
+  `queue.health = fixed`** y "Cola de impresión trabada" listada como reparación aplicada. El campo
+  se escribía y no lo leía nadie. Ahora `fixed` exige que la cola haya bajado; si no bajó es `fail`
+  con causa propia y deja de figurar como reparación. *Quinta aparición del mismo patrón del
+  proyecto: reparar y no verificar el efecto.*
+
+- **El motor le hacía "replug por software" a impresoras que andan bien a propósito.** Las que
+  instala soporte de nivel 2 con Zadig (WinUSB/libusb, en Fudo "Directo USB") **no tienen cola de
+  Windows y no la necesitan**: Fudo les habla directo por USB. El motor, construido sobre el
+  supuesto contrario, las veía como "conectada pero sin puerto asignado" y **le deshabilitaba y
+  rehabilitaba el dispositivo a una impresora que estaba imprimiendo**. Ahora se reconocen por su
+  driver, se informan como Directo USB y quedan fuera de ese camino. Reportado por Iván Ruquet.
+
+### Agregado
+
+- **El motor revisa si el navegador tiene registrada a la Nativa, y la registra.** Es el eslabón
+  que explicaba el *"instalala y volvé a iniciar sesión para que la tome"*: el `.msi` deja el
+  binario, pero el navegador sólo la encuentra por una clave de registro que apunta a un manifest.
+  Sin esa clave, Fudo se comporta como si la Nativa no estuviera instalada. **Lo que falta no es la
+  sesión: es el registro.** Ejecutar la Nativa una vez lo deja hecho, sin cerrar sesión — lo
+  propuso Iván Ruquet y es lo que ahora hace el motor, verificando el efecto (vuelve a leer la
+  clave y el manifest, nunca el código de salida).
+  *Probado de punta a punta contra una instalación real: se borró la clave, el motor ejecutó la
+  Nativa, la clave volvió y no quedó ningún proceso corriendo.*
+
+- **El motor revisa la extensión de Fudo en el navegador.** Un asesor encontró PCs con la Nativa
+  instalada y el antivirus en orden donde la extensión no estaba puesta, y agregándola a mano desde
+  la tienda *la Nativa levantaba sola*. Si la Nativa está en disco y la extensión no aparece en
+  ningún perfil de Chrome/Edge, **esa es la causa raíz** y la acción es el link de la tienda.
+  *Se afirma con evidencia, para no repetir el bloqueo de cierres que destrabó la 3.11:* sólo
+  pesa como `fail` —que impide cerrar el caso— cuando la Nativa está registrada para un
+  navegador Chromium, o sea cuando sabemos que Fudo corre ahí. Si no hay ningún navegador
+  Chromium en esa cuenta queda `skipped`, y si no se sabe en cuál trabaja el cliente (la
+  Nativa también soporta Firefox, y ese registro ahora también se mira) queda `warn`: se ve
+  y puede ser la causa, pero no bloquea el cierre.
+
+- **Aviso cuando el motor corre con un usuario distinto al de la sesión.** El registro de la Nativa
+  y las extensiones viven en `HKCU` y en `%LOCALAPPDATA%`, o sea que son **por usuario**. Si el
+  cliente tiene cuenta estándar y la elevación se hizo con credenciales de administrador, el motor
+  está mirando otro perfil: ahora lo detecta, lo dice, y **no registra nada en el perfil
+  equivocado** en vez de "arreglar" algo que el Chrome del cliente no va a ver nunca.
+
+- **`nativaInstall` viaja siempre en la telemetría**, incluido el caso "no se intentó" y por qué.
+  Venía `null` en 135 de 135 corridas de la 3.18 con `nativa.install` como causa raíz #1, y el
+  motivo no era que no viajara: **es que el motor no instala la Nativa por su cuenta, sólo desde la
+  opción `F` del menú.** Ahora eso se ve en la planilla en vez de parecer un campo roto.
+
+### Self-test
+
+- **`Reset-Mocks` no hacía nada desde el escenario 92.** El escenario 92 mockea `Get-ChildItem`
+  para probar la elección del instalador, y ese mock se comía el de `Reset-Mocks`: en vez de listar
+  funciones listaba los "archivos" del mock, no encontraba ningún mock que sacar y **quedaba en
+  silencio**. Desde ahí, todos los `Reset-Mocks` eran decorativos y cada escenario corría con los
+  mocks del anterior — justo lo que esa función existe para evitar. Se descubrió porque un
+  escenario nuevo leyó `0.0.37` de un mock definido 40 líneas más arriba. Ahora los cmdlets van
+  calificados con su módulo. *Un escenario que pasa por el motivo equivocado se ve verde y no está
+  probando nada.*
+- Seis escenarios nuevos (95 a 100): la purga que no baja, la app del navegador tomada por Nativa,
+  la extensión ausente/presente/no verificable, el registro del host (queda y no queda), el perfil
+  equivocado, y Zadig. **570 asserts, todos pasando.**
+
+### Pendiente (no entró en esta versión, a propósito)
+
+- **Camino Bluetooth** (impresoras que exponen un puerto `COM`, con sus baudios): no se puede
+  probar desde acá y el motor hoy descarta activamente esos dispositivos. Esperando un caso real.
+- **Ofrecer borrar las colas muertas cuando la cola rebota** (rebote en 14 PCs): es irreversible y
+  necesita una decisión sobre cuánto puede borrar el motor con confirmación del asesor.
+- **`colaQueUsaFudo` no llega a la planilla**: viaja en el JSON en 63 de 135 corridas pero la
+  columna está vacía. Es el receptor (`tools/telemetria-appscript.gs`), no el motor, y no se toca
+  a ciegas desde acá.
+
 ## [3.18] - 2026-09-08
 
 ### Launcher (`FudoPrintDoctor.cmd`) - 2026-09-09

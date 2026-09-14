@@ -454,7 +454,7 @@ $script:TestPrinterRx = '(?i)^FUDO-TEST-'
 # puerto tenga hardware; si el hardware se va, deja de serlo (ver Remove-OrphanOwnQueues).
 $script:OwnQueueRx   = '(?i)^FUDO-(TEST-|USB\d)'
 $script:TestDocRx    = '(?i)fudo print doctor'
-$script:SchemaVersion = '3.18'
+$script:SchemaVersion = '3.19'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -467,6 +467,12 @@ $script:AbortByMode = $false
 # bloquearla, asi que las exclusiones preventivas de Defender ya no tienen sentido: si la
 # Nativa esta por debajo de esta version, la accion de fondo es ACTUALIZARLA, no excluirla.
 $script:NativaVersionFirmada = '0.0.37'
+# Id de la extension de Fudo en la Chrome Web Store. Es publico (esta en la URL de la tienda) y
+# ademas viaja dentro del manifest de native messaging que la Nativa deja en %LOCALAPPDATA%\Fudo.
+$script:FudoExtensionId  = 'npcjljaedonmjndbliillcmkhidejhmb'
+$script:FudoExtensionUrl = 'https://chromewebstore.google.com/detail/fudo/npcjljaedonmjndbliillcmkhidejhmb'
+# Nombre del host de native messaging: es la clave que busca el navegador para encontrar la Nativa.
+$script:FudoNativeHostName = 'do.fu.native_extension'
 $script:MenuVacios = 0
 # Distribucion: repo publico. VERSION es un archivo de una linea con la version publicada.
 $script:RepoUrl    = 'https://github.com/Gartcia/fudo-print-doctor'
@@ -1287,7 +1293,26 @@ function Test-NativaDegradada {
     try { return ([bool]([version]$Despues -lt [version]$Antes)) } catch { return $false }
 }
 
+function Get-FudoDataDirs {
+    # Donde la Nativa deja sus archivos. Es la misma carpeta que sondea Get-FudoNativeFingerprint.
+    $d = @()
+    try { if ($env:LOCALAPPDATA) { $d += (Join-Path $env:LOCALAPPDATA 'Fudo') } } catch {}
+    try { if ($env:APPDATA)      { $d += (Join-Path $env:APPDATA 'Fudo') } } catch {}
+    return @($d | Where-Object { $_ })
+}
+
 function Find-FudoNativeInstall {
+    <#
+      v3.19: hasta la 3.18 alcanzaba con una carpeta que matcheara 'Fudo*' o una entrada de
+      registro para dar la Nativa por instalada, y las dos senales mienten.
+      El caso que lo destapo: una app instalada desde el navegador (Chrome > Instalar pagina
+      como app) se registra con DisplayName 'Fudo' y DisplayVersion 1.0. El motor la leia como
+      una Nativa v1.0 y el guardarrail anti-degradacion de la 3.18 abortaba la instalacion del
+      .msi para "no degradar" algo que ni siquiera era la Nativa: en esas PCs el motor no iba a
+      instalar la Nativa nunca, por mas que el asesor trajera el instalador.
+      El registro tambien queda huerfano cuando el antivirus se lleva los archivos.
+      La unica senal que no miente son los archivos: fudo_native_extension en %LOCALAPPDATA%\Fudo.
+    #>
     Write-StepDetail 'buscando la instalacion de la App Nativa'
     $paths = @()
     if ($FudoNativePath) { $paths += $FudoNativePath }
@@ -1311,14 +1336,48 @@ function Find-FudoNativeInstall {
     foreach ($k in $uninstallKeys) {
         try {
             Get-ItemProperty -Path $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -like '*Fudo*' } | ForEach-Object {
-                $regInfo += [ordered]@{ name = $_.DisplayName; version = $_.DisplayVersion; location = $_.InstallLocation }
-                if ($_.InstallLocation) { $paths += $_.InstallLocation }
+                # Una app del navegador se desinstala con chrome.exe/msedge.exe --uninstall-app-id.
+                # Esa es la firma explicita de la PWA y es lo que la separa de la Nativa de verdad:
+                # sin esto, su DisplayVersion 1.0 se lee como "la Nativa instalada es la v1.0".
+                $un = [string]$_.UninstallString
+                $esPwa = [bool]($un -match '(?i)(chrome|msedge|chromium)\.exe')
+                $regInfo += [ordered]@{ name = $_.DisplayName; version = $_.DisplayVersion
+                                        location = $_.InstallLocation; esPwa = $esPwa }
+                if ($_.InstallLocation -and -not $esPwa) { $paths += $_.InstallLocation }
             }
         } catch {}
     }
+    # Los archivos reales de la Nativa. El ejecutable es el que manda. Los manifests de native
+    # messaging sirven para el registro del host, pero se reescriben en cada reinstalacion y el
+    # binario no, asi que fechar la instalacion por los .json tambien miente.
+    $exe = ''
+    $manifests = @()
+    $carpeta = ''
+    foreach ($c in @(Get-FudoDataDirs)) {
+        try { if (-not (Test-Path $c)) { continue } } catch { continue }
+        if (-not $carpeta) { $carpeta = $c }
+        if (-not $exe) {
+            try {
+                $hit = @(Get-ChildItem -Path $c -Filter 'fudo_native_extension*' -File -ErrorAction SilentlyContinue |
+                         Where-Object { $_.Extension -match '(?i)^(\.exe)?$' } | Select-Object -First 1)
+                if (@($hit).Count -gt 0) { $exe = [string]@($hit)[0].FullName }
+            } catch {}
+        }
+        foreach ($m in @('do.fu.native_extension_chrome.json','do.fu.native_extension_firefox.json')) {
+            $mp = Join-Path $c $m
+            try { if (Test-Path $mp) { $manifests += $mp } } catch {}
+        }
+    }
+    $regReales = @(@($regInfo) | Where-Object { -not $_.esPwa })
     return [ordered]@{
-        paths   = @($paths | Where-Object { $_ } | Select-Object -Unique)
-        regInfo = $regInfo
+        paths        = @($paths | Where-Object { $_ } | Select-Object -Unique)
+        regInfo      = $regInfo
+        exe          = [string]$exe
+        manifests    = @($manifests)
+        carpeta      = [string]$carpeta
+        enDisco      = [bool]$exe
+        soloRegistro = [bool]((-not $exe) -and (@($regReales).Count -gt 0))
+        pwa          = [bool](@(@($regInfo) | Where-Object { $_.esPwa }).Count -gt 0)
     }
 }
 
@@ -1435,13 +1494,215 @@ function Get-NativaVersionState {
     param($Install)
     $ver = ''
     try {
-        $reg = @($Install.regInfo)
+        # v3.19: las entradas de la app del navegador quedan afuera. Su DisplayVersion 1.0 se
+        # leia como la version de la Nativa y rompia toda comparacion de versiones.
+        $reg = @(@($Install.regInfo) | Where-Object { -not $_.esPwa })
         if (@($reg).Count -gt 0) { $ver = [string]@($reg)[0].version }
     } catch {}
-    if (-not $ver) { return @{ version = ''; firmada = $null } }
+    # confiable: si la Nativa no esta en disco, la version del registro es un recuerdo, no un
+    # hecho. Nada que decida instalar o no instalar puede apoyarse en una version no confiable.
+    $confiable = $false
+    try { $confiable = [bool]$Install.enDisco } catch {}
+    if (-not $ver) { return @{ version = ''; firmada = $null; confiable = $confiable } }
     $firmada = $null
     try { $firmada = ([version]$ver -ge [version]$script:NativaVersionFirmada) } catch { $firmada = $null }
-    return @{ version = $ver; firmada = $firmada }
+    return @{ version = $ver; firmada = $firmada; confiable = $confiable }
+}
+
+function Get-NativeMessagingState {
+    <#
+      El host de native messaging, esta REGISTRADO?
+      Es el eslabon que nunca se miro: el .msi deja el binario, pero el navegador solo lo
+      encuentra por una clave de registro que apunta a un manifest .json. Sin esa clave la
+      extension no puede hablarle a la Nativa y Fudo se comporta como si no estuviera instalada.
+      De ahi el "instalala y volve a iniciar sesion" de la web app: lo que falta no es la
+      sesion, es el registro -- y correr el ejecutable de la Nativa lo deja hecho.
+      OJO: la clave vive en HKCU, o sea que es POR USUARIO (ver Get-SesionInteractiva).
+      En Firefox no hay clave de registro: el manifest se deja como archivo en
+      %APPDATA%\Mozilla\NativeMessagingHosts. Se mira igual, porque si el cliente usa Firefox y
+      ahi SI esta registrada, decir "el navegador no la tiene registrada" seria falso.
+    #>
+    $out = [ordered]@{ registrado = $false; navegadores = @(); manifest = ''; exeDelManifest = ''
+                       exeExiste = $false; extensionIds = @(); pendientes = @() }
+    $claves = @(
+        [ordered]@{ nav = 'Chrome';   ruta = ('HKCU:\Software\Google\Chrome\NativeMessagingHosts\' + $script:FudoNativeHostName) },
+        [ordered]@{ nav = 'Edge';     ruta = ('HKCU:\Software\Microsoft\Edge\NativeMessagingHosts\' + $script:FudoNativeHostName) },
+        [ordered]@{ nav = 'Chromium'; ruta = ('HKCU:\Software\Chromium\NativeMessagingHosts\' + $script:FudoNativeHostName) }
+    )
+    foreach ($c in $claves) {
+        $json = ''
+        try { $json = [string](Get-ItemProperty -Path ([string]$c.ruta) -ErrorAction SilentlyContinue).'(default)' } catch {}
+        if (-not $json) { $out.pendientes += ([string]$c.nav + ': sin clave de registro'); continue }
+        $existe = $false
+        try { $existe = [bool](Test-Path $json) } catch {}
+        if (-not $existe) { $out.pendientes += ([string]$c.nav + ': la clave apunta a un manifest que no existe'); continue }
+        $out.navegadores += [string]$c.nav
+        if (-not $out.manifest) { $out.manifest = [string]$json }
+    }
+    # Firefox: manifest suelto, sin registro.
+    try {
+        if ($env:APPDATA) {
+            $ff = Join-Path $env:APPDATA ('Mozilla\NativeMessagingHosts\' + $script:FudoNativeHostName + '.json')
+            if (Test-Path $ff) {
+                $out.navegadores += 'Firefox'
+                if (-not $out.manifest) { $out.manifest = [string]$ff }
+            } else { $out.pendientes += 'Firefox: sin manifest' }
+        }
+    } catch {}
+    if ($out.manifest) {
+        try {
+            $txt = Get-Content -Path ([string]$out.manifest) -Raw -ErrorAction Stop
+            $mp = [regex]::Match($txt, '"path"\s*:\s*"([^"]+)"')
+            if ($mp.Success) { $out.exeDelManifest = ($mp.Groups[1].Value -replace '\\\\', '\') }
+            # Los ids de extension habilitados viajan en allowed_origins. De aca sale contra que
+            # extension hay que cruzar, sin tener que asumir una sola.
+            foreach ($m in @([regex]::Matches($txt, 'chrome-extension://([a-p]{32})'))) {
+                $id = [string]$m.Groups[1].Value
+                if (@($out.extensionIds) -notcontains $id) { $out.extensionIds += $id }
+            }
+        } catch {}
+        if ($out.exeDelManifest) { try { $out.exeExiste = [bool](Test-Path ([string]$out.exeDelManifest)) } catch {} }
+    }
+    # Registrado de verdad = hay clave Y el manifest apunta a un ejecutable que existe. Una clave
+    # que apunta a un binario que el antivirus se llevo no sirve para nada.
+    $out.registrado = [bool]((@($out.navegadores).Count -gt 0) -and $out.exeExiste)
+    return $out
+}
+
+function Get-FudoExtensionState {
+    <#
+      La extension del navegador: el otro eslabon que no se miraba. Un asesor encontro PCs con la
+      Nativa instalada y el antivirus en orden donde la extension no estaba, y agregandola a mano
+      desde la tienda la Nativa levanto sola.
+      Se busca en disco, en los perfiles del navegador: no hace falta abrir Chrome ni leer sus
+      preferencias.
+    #>
+    param([string[]]$Ids = @())
+    $ids = @(@($Ids) | Where-Object { $_ })
+    if (@($ids).Count -eq 0) { $ids = @($script:FudoExtensionId) }
+    $out = [ordered]@{ instalada = $false; ids = @($ids); encontrada = ''; navegador = ''
+                       perfil = ''; perfilesVistos = 0 }
+    $bases = @()
+    if ($env:LOCALAPPDATA) {
+        $bases += [ordered]@{ nav = 'Chrome';   ruta = (Join-Path $env:LOCALAPPDATA 'Google\Chrome\User Data') }
+        $bases += [ordered]@{ nav = 'Edge';     ruta = (Join-Path $env:LOCALAPPDATA 'Microsoft\Edge\User Data') }
+        $bases += [ordered]@{ nav = 'Chromium'; ruta = (Join-Path $env:LOCALAPPDATA 'Chromium\User Data') }
+    }
+    foreach ($b in $bases) {
+        try { if (-not (Test-Path ([string]$b.ruta))) { continue } } catch { continue }
+        $perfiles = @()
+        try {
+            $perfiles = @(Get-ChildItem -Path ([string]$b.ruta) -Directory -ErrorAction SilentlyContinue |
+                          Where-Object { $_.Name -eq 'Default' -or $_.Name -like 'Profile *' })
+        } catch {}
+        foreach ($p in @($perfiles)) {
+            $out.perfilesVistos++
+            foreach ($id in @($ids)) {
+                try {
+                    if (Test-Path (Join-Path $p.FullName ('Extensions\' + $id))) {
+                        $out.instalada = $true
+                        $out.encontrada = [string]$id
+                        $out.navegador  = [string]$b.nav
+                        $out.perfil     = [string]$p.Name
+                        return $out
+                    }
+                } catch {}
+            }
+        }
+    }
+    return $out
+}
+
+function Get-SesionInteractiva {
+    <#
+      Quien esta usando la PC, contra quien esta corriendo el motor.
+      Importa porque HKCU y %LOCALAPPDATA% son POR USUARIO: el launcher se eleva a administrador,
+      y si esa elevacion se hizo con OTRA cuenta (el cliente usa una cuenta estandar y alguien
+      tipeo credenciales de admin), el motor esta mirando -y registrando- el perfil equivocado.
+      El Chrome del cliente no se entera de nada.
+    #>
+    $out = [ordered]@{ usuarioMotor = [string]$env:USERNAME; usuarioSesion = ''; otroPerfil = $false }
+    try {
+        $ex = @(Get-CimInstance -ClassName Win32_Process -Filter "Name='explorer.exe'" -ErrorAction Stop)
+        foreach ($p in @($ex)) {
+            $o = $null
+            try { $o = Invoke-CimMethod -InputObject $p -MethodName 'GetOwner' -ErrorAction Stop } catch {}
+            if ($o -and $o.User) { $out.usuarioSesion = [string]$o.User; break }
+        }
+    } catch {}
+    if ($out.usuarioSesion -and $out.usuarioMotor) {
+        $out.otroPerfil = [bool]($out.usuarioSesion -ne $out.usuarioMotor)
+    }
+    return $out
+}
+
+function Start-FudoNativeHostProcess {
+    <#
+      Aislada para poder mockearla en el self-test: lanza el ejecutable de la Nativa y no lo deja
+      colgado. Es un host stdio, asi que sin el pipe del navegador del otro lado puede quedarse
+      esperando para siempre; se le da un rato para que registre y se lo cierra.
+    #>
+    param([string]$Exe, [int]$TimeoutSeg = 8)
+    $proc = $null
+    try { $proc = Start-Process -FilePath $Exe -PassThru -WindowStyle Hidden -ErrorAction Stop }
+    catch { return @{ lanzado = $false; quedoVivo = $false; error = [string]$_.Exception.Message } }
+    if ($null -eq $proc) { return @{ lanzado = $false; quedoVivo = $false; error = 'no se pudo lanzar el proceso' } }
+    $fin = (Get-Date).AddSeconds($TimeoutSeg)
+    while ((Get-Date) -lt $fin) {
+        $vivo = $true
+        try { $vivo = -not $proc.HasExited } catch { $vivo = $false }
+        if (-not $vivo) { break }
+        Start-Sleep -Milliseconds 500
+    }
+    $quedoVivo = $false
+    try { $quedoVivo = -not $proc.HasExited } catch {}
+    if ($quedoVivo) {
+        try { Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue } catch {}
+    }
+    return @{ lanzado = $true; quedoVivo = [bool]$quedoVivo; error = '' }
+}
+
+function Register-FudoNativeHost {
+    <#
+      Deja la Nativa registrada en el navegador corriendo su propio ejecutable: al arrancar
+      reescribe los manifests y deja la clave del navegador apuntando a ellos. Es lo mismo que
+      consigue el "cerra sesion y volve a entrar" que pide la web app, sin cerrar sesion.
+      Verifica el EFECTO -vuelve a leer la clave y el manifest-, nunca el codigo de salida.
+    #>
+    param([string]$Exe)
+    $antes = Get-NativeMessagingState
+    if ($antes.registrado) {
+        return @{ aplicado = $false; intento = $false; registrado = $true; estado = $antes
+                  motivo = 'el host ya estaba registrado'; nota = '' }
+    }
+    if (-not $Exe) {
+        return @{ aplicado = $false; intento = $false; registrado = $false; estado = $antes
+                  motivo = 'la Nativa no esta en disco: no hay nada que registrar, hay que instalarla'; nota = '' }
+    }
+    $salida = @{ lanzado = $false; quedoVivo = $false; error = '' }
+    $rem = Invoke-Remediation -Description 'Registrar la App Nativa en el navegador (ejecutandola una vez)' `
+        -Type 'nativa.registrar_host' -Target ([string]$script:FudoNativeHostName) `
+        -Before 'sin registrar' -After 'registrado' -Reversible $true -Fix {
+            Write-StepDetail 'registrando la App Nativa en el navegador'
+            $r = Start-FudoNativeHostProcess -Exe $Exe
+            $salida.lanzado   = [bool]$r.lanzado
+            $salida.quedoVivo = [bool]$r.quedoVivo
+            $salida.error     = [string]$r.error
+            $(if ([bool]$r.lanzado) {
+                'se ejecuto la App Nativa' + $(if ([bool]$r.quedoVivo) { ' (quedo corriendo y se cerro al terminar)' } else { '' })
+            } else { 'no se pudo ejecutar la App Nativa: ' + [string]$r.error })
+        }
+    $despues = Get-NativeMessagingState
+    $motivo = $(
+        if ([bool]$despues.registrado)   { 'el host quedo registrado' }
+        elseif (-not [bool]$rem.applied) { 'no se intento: ' + [string]$rem.note }
+        elseif (-not [bool]$salida.lanzado) { 'no se pudo ejecutar el archivo de la Nativa' }
+        else { 'se ejecuto la App Nativa y la clave del navegador no aparecio' }
+    )
+    return @{ aplicado = [bool]$rem.applied; intento = [bool]$rem.applied
+              registrado = [bool]$despues.registrado; estado = $despues
+              navegadores = @($despues.navegadores); nota = [string]$rem.note
+              lanzado = [bool]$salida.lanzado; motivo = [string]$motivo }
 }
 
 function Test-Layer0b-NativeApp {
@@ -1453,17 +1714,48 @@ function Test-Layer0b-NativeApp {
     $procRunning = $false
     try { $procRunning = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*$FudoAppProcess*" }).Count -gt 0 } catch {}
 
-    $installed = (@($install.paths).Count -gt 0) -or (@($install.regInfo).Count -gt 0)
+    # v3.19: instalada = el ejecutable esta en disco. Ni una carpeta que matchee 'Fudo*', ni una
+    # entrada de registro: las dos las deja tambien la app del navegador y el registro sobrevive
+    # a que el antivirus se lleve los archivos. Se midio: 12 corridas en 7 PCs daban la Nativa
+    # por instalada con la carpeta vacia.
+    $installed = [bool]$install.enDisco
 
     # 0b.1 Nativa instalada?
     if (-not $installed) {
         # OJO: el nombre del check es el texto que sale como CAUSA en la consola y en la
         # telemetria. Si dice 'App Nativa instalada' cuando el status es fail, el asesor lee
         # exactamente lo contrario de lo que pasa.
-        Add-Check -Id 'nativa.installed' -Layer 0 -Name 'App Nativa de Fudo NO instalada' -Status 'fail' -RootCauseCandidate $true -Plane 'fudo_config' `
-            -Evidence @{ found = $false; huella = $(if ($script:Diagnostics.Contains('nativaHuella')) { $script:Diagnostics['nativaHuella'] } else { $null }) } `
+        # Que NO este en disco tiene tres sabores distintos, y el asesor necesita saber cual es:
+        # no esta y nunca estuvo, quedo el registro sin los archivos (el antivirus), o lo que
+        # figura instalado es la app del navegador.
+        $nombreNoInst = 'App Nativa de Fudo NO instalada'
+        $porQue = 'La App Nativa no aparece en disco. Sin la Nativa, Fudo no puede mandar ninguna comanda a la impresora: instalar Nativa + extension del navegador (frecuentemente bloqueada por antivirus).'
+        if ([bool]$install.pwa) {
+            $nombreNoInst = 'App Nativa de Fudo NO instalada (lo que figura instalado es la pagina web agregada como aplicacion)'
+            $porQue = ('Lo que esta instalado es Fudo agregado como aplicacion desde el navegador (Instalar pagina como app), que NO es la App Nativa y no imprime. ' +
+                       'La App Nativa se instala aparte y deja sus archivos en %LOCALAPPDATA%\Fudo. Instalarla.')
+        } elseif ([bool]$install.soloRegistro) {
+            $nombreNoInst = 'App Nativa de Fudo NO instalada (figura en el registro pero no esta en disco)'
+            $porQue = ('Windows la tiene anotada como instalada pero los archivos no estan en %LOCALAPPDATA%\Fudo: el antivirus se los llevo o la desinstalaron a medias. ' +
+                       'Reinstalar la App Nativa y verificar que el antivirus no la vuelva a tocar.')
+        }
+        # v3.19: el campo que la telemetria necesitaba para responder "las instalaciones quedan?"
+        # venia null en 135 de 135 corridas, con nativa.install como causa raiz #1. El motivo no
+        # era que no viajara: es que el motor NO instala la Nativa por su cuenta -solo desde la
+        # opcion F del menu-, asi que no habia nada que contar. Ahora se cuenta eso mismo.
+        $script:Diagnostics['nativaInstall'] = [ordered]@{
+            intento = $false; instalador = ''; versionInstalador = ''; quedoInstalada = $false
+            versionDespues = ''; exitCode = $null; corriendo = $null
+            motivo = ('no se intento instalar: el motor solo instala la Nativa desde el menu (opcion F). ' +
+                      $(if ($script:NativaKit -and [bool]$script:NativaKit.listo) { 'El instalador esta disponible al lado del script.' }
+                        else { 'Ademas no hay un instalador utilizable al lado del script.' }))
+        }
+        Add-Check -Id 'nativa.installed' -Layer 0 -Name $nombreNoInst -Status 'fail' -RootCauseCandidate $true -Plane 'fudo_config' `
+            -Evidence @{ found = $false; enDisco = $false; soloRegistro = [bool]$install.soloRegistro
+                         pwa = [bool]$install.pwa; reg = $install.regInfo; carpeta = [string]$install.carpeta
+                         huella = $(if ($script:Diagnostics.Contains('nativaHuella')) { $script:Diagnostics['nativaHuella'] } else { $null }) } `
             -ArticleRef 'https://soporte.fu.do/es/articles/16419361' `
-            -Recommendation 'La App Nativa no aparece instalada (no hay archivos ni entradas de registro). Sin la Nativa, Fudo no puede mandar ninguna comanda a la impresora: instalar Nativa + extension del navegador (frecuentemente bloqueada por antivirus).'
+            -Recommendation $porQue
     } else {
         # Instalada pero apagada NO es causa raiz: es un native messaging host y con Fudo
         # cerrado no corre. Que NO este instalada (rama de arriba, status fail) si lo es.
@@ -1683,6 +1975,109 @@ function Test-Layer0b-NativeApp {
         Add-Check -Id 'nativa.thirdPartyAV' -Layer 0 -Name 'Antivirus de terceros presente' -Status 'warn' -RootCauseCandidate (-not $procRunning) -Plane 'hardware' `
             -Evidence @{ products = $av.thirdParty } -Reversible $true `
             -Recommendation "Detectado $($av.thirdParty -join ', '). Puede poner la Nativa en cuarentena. Requiere accion guiada en el AV (excluir/restaurar), no automatizable de forma segura."
+    }
+
+    # 0b.4 Los dos eslabones que faltaban entre "la Nativa esta instalada" y "Fudo imprime".
+    # Los dos salieron de casos de asesores de la misma semana y los dos terminaban igual: una
+    # PC con todo verde, el asesor escalando, y la comanda sin salir.
+    #   - El navegador encuentra a la Nativa por una clave de registro que apunta a un manifest.
+    #     Si esa clave no esta, la extension no le puede hablar. Eso es lo que arregla el
+    #     "cerra sesion y volve a entrar" que pide la web app -y tambien, sin cerrar sesion,
+    #     ejecutar la Nativa una vez-.
+    #   - Y si la extension no esta puesta en el navegador, no hay quien le hable.
+    if ($installed) {
+        Write-StepDetail 'revisando el registro de la Nativa en el navegador y la extension'
+        $sesion = Get-SesionInteractiva
+        $script:Diagnostics['sesionUsuario'] = $sesion
+        $nmh = Get-NativeMessagingState
+        $ext = Get-FudoExtensionState -Ids @($nmh.extensionIds)
+        $script:Diagnostics['nativaHost'] = $nmh
+        $script:Diagnostics['fudoExtension'] = $ext
+
+        if ([bool]$sesion.otroPerfil) {
+            # No se puede concluir NI reparar: el registro del host y las extensiones viven en el
+            # perfil del usuario, y el motor esta corriendo con otra cuenta. Registrar aca seria
+            # registrarlo para el administrador, y el Chrome del cliente no se enteraria.
+            Add-Check -Id 'nativa.hostRegistrado' -Layer 0 -Name 'No se pudo revisar el registro de la Nativa (el motor corre con otro usuario)' `
+                -Status 'skipped' -RootCauseCandidate $false -Plane 'fudo_config' `
+                -Evidence @{ skipReason = 'otro_perfil'; usuarioMotor = [string]$sesion.usuarioMotor
+                             usuarioSesion = [string]$sesion.usuarioSesion } `
+                -Recommendation ('El diagnostico corre como ' + [string]$sesion.usuarioMotor + ' y la sesion de Windows es de ' + [string]$sesion.usuarioSesion +
+                                 '. El registro de la Nativa en el navegador y las extensiones son por usuario, asi que desde aca se estaria mirando el perfil equivocado. ' +
+                                 'Correr el diagnostico desde la sesion del cliente (o revisar a mano en su Chrome) antes de sacar conclusiones sobre la Nativa.')
+        } else {
+            # Host registrado
+            $reg = @{ aplicado = $false; intento = $false; registrado = [bool]$nmh.registrado; motivo = 'no se intento'; nota = '' }
+            if ((-not $nmh.registrado) -and $AutoFix) {
+                $reg = Register-FudoNativeHost -Exe ([string]$install.exe)
+                $nmh = $reg.estado
+                $script:Diagnostics['nativaHost'] = $nmh
+                # El manifest recien escrito puede traer ids nuevos: releer la extension con esos.
+                $ext = Get-FudoExtensionState -Ids @($nmh.extensionIds)
+                $script:Diagnostics['fudoExtension'] = $ext
+            }
+            $script:Diagnostics['nativaHostRegistro'] = $reg
+            if ([bool]$nmh.registrado) {
+                Add-Check -Id 'nativa.hostRegistrado' -Layer 0 `
+                    -Name $(if ([bool]$reg.aplicado) { 'App Nativa registrada en el navegador por el motor' } else { 'App Nativa registrada en el navegador' }) `
+                    -Status $(if ([bool]$reg.aplicado) { 'fixed' } else { 'ok' }) -RootCauseCandidate $false -Plane 'fudo_config' `
+                    -Evidence @{ navegadores = @($nmh.navegadores); manifest = [string]$nmh.manifest
+                                 exe = [string]$nmh.exeDelManifest; extensionIds = @($nmh.extensionIds)
+                                 pendientes = @($nmh.pendientes) } `
+                    -ActionTaken ([string]$reg.nota) -Reversible $true `
+                    -Recommendation $(if ([bool]$reg.aplicado) {
+                            'La Nativa estaba instalada pero el navegador no la tenia registrada, que es lo que se arregla cerrando sesion en Fudo y volviendo a entrar. Se resolvio ejecutando la Nativa una vez, sin cerrar sesion. Recargar la pestana de Fudo y mandar una comanda de prueba.'
+                        } else { '' })
+            } else {
+                # fail (que bloquea el cierre del caso) SOLO si hay evidencia de que en esta
+                # cuenta hay un navegador Chromium: ahi "no esta registrada" es un hecho. Si no
+                # se encontro ningun perfil, puede ser un cliente que usa otro navegador y el
+                # motor no tiene con que afirmarlo: queda en warn, sigue siendo candidata a causa
+                # raiz y se ve igual, pero no vuelve a bloquear cierres como pasaba antes de la
+                # 3.11 con los chequeos del lado de Fudo.
+                $hayNavegador = ([int]$ext.perfilesVistos -gt 0)
+                Add-Check -Id 'nativa.hostRegistrado' -Layer 0 -Name 'La App Nativa esta instalada pero el navegador no la tiene registrada' `
+                    -Status $(if ($hayNavegador) { 'fail' } else { 'warn' }) -RootCauseCandidate $true -Plane 'fudo_config' `
+                    -Evidence @{ navegadores = @($nmh.navegadores); pendientes = @($nmh.pendientes)
+                                 manifest = [string]$nmh.manifest; exe = [string]$nmh.exeDelManifest
+                                 exeExiste = [bool]$nmh.exeExiste; intento = [bool]$reg.intento
+                                 motivo = [string]$reg.motivo } `
+                    -ActionTaken ([string]$reg.nota) -Reversible $true `
+                    -ArticleRef 'https://soporte.fu.do/es/articles/16419361' `
+                    -Recommendation ('La Nativa esta en disco pero el navegador no la encuentra: falta la clave que la registra, asi que Fudo se comporta como si no estuviera instalada. ' +
+                                     $(if ([bool]$reg.intento) { 'El motor intento registrarla y no quedo (' + [string]$reg.motivo + '). ' } else { '' }) +
+                                     'Se arregla ejecutando una vez ' + $(if ([string]$install.exe) { [string]$install.exe } else { 'el archivo fudo_native_extension de %LOCALAPPDATA%\Fudo' }) +
+                                     ', o cerrando sesion en Fudo y volviendo a entrar. Despues recargar la pestana de Fudo y mandar una comanda de prueba.')
+            }
+            # Extension del navegador
+            if ([int]$ext.perfilesVistos -eq 0) {
+                Add-Check -Id 'fudo.extension' -Layer 0 -Name 'No se pudo revisar la extension de Fudo (no se encontro Chrome ni Edge en este perfil)' `
+                    -Status 'skipped' -RootCauseCandidate $false -Plane 'fudo_config' `
+                    -Evidence @{ skipReason = 'sin_navegador'; ids = @($ext.ids) } `
+                    -Recommendation 'No se encontraron perfiles de Chrome, Edge ni Chromium en esta cuenta de Windows, asi que no se puede saber si la extension de Fudo esta puesta. Revisarlo a mano en el navegador que use el cliente.'
+            } elseif ([bool]$ext.instalada) {
+                Add-Check -Id 'fudo.extension' -Layer 0 -Name 'Extension de Fudo instalada en el navegador' -Status 'ok' `
+                    -RootCauseCandidate $false -Plane 'fudo_config' `
+                    -Evidence @{ id = [string]$ext.encontrada; navegador = [string]$ext.navegador
+                                 perfil = [string]$ext.perfil; perfilesVistos = [int]$ext.perfilesVistos }
+            } else {
+                # Mismo criterio que arriba: se afirma con evidencia. Si la Nativa esta registrada
+                # para un navegador Chromium, es que Fudo corre ahi, y que falte la extension es
+                # un hecho -> fail. Si no esta registrada en ningun lado no sabemos en que
+                # navegador trabaja el cliente (la Nativa tambien soporta Firefox): warn.
+                $navegadorSeguro = [bool](@($nmh.navegadores | Where-Object { $_ -ne 'Firefox' }).Count -gt 0)
+                Add-Check -Id 'fudo.extension' -Layer 0 -Name 'Falta la extension de Fudo en el navegador' `
+                    -Status $(if ($navegadorSeguro) { 'fail' } else { 'warn' }) `
+                    -RootCauseCandidate $true -Plane 'fudo_config' `
+                    -Evidence @{ ids = @($ext.ids); perfilesVistos = [int]$ext.perfilesVistos
+                                 navegadoresConHost = @($nmh.navegadores) } `
+                    -ArticleRef 'https://soporte.fu.do/es/articles/16419361' `
+                    -Recommendation ('La App Nativa esta instalada pero la extension de Fudo no aparece en ninguno de los ' + [int]$ext.perfilesVistos +
+                                     ' perfil(es) de navegador de esta cuenta. Sin la extension nadie le habla a la Nativa y la comanda no sale, ' +
+                                     'por mas que todo lo demas este bien. Agregarla desde ' + [string]$script:FudoExtensionUrl +
+                                     ' y recargar la pestana de Fudo. Un asesor confirmo que agregandola la Nativa levanta sola.')
+            }
+        }
     }
 }
 
@@ -1949,6 +2344,21 @@ $script:NonPrinterWordRx = '(?i)\b(mouse|mice|keyboard|teclado|hub|composite|com
 # VIDs de fabricantes de impresoras: valen como senal por si solos.
 $script:PrinterVids = @('04B8','1504','0519','2730','0A5F','0DD4','03F0','04A9','04F9','0924','043D','04E8')
 
+function Test-IsDirectoUsbDevice {
+    <#
+      La impresora, esta manejada por un driver de acceso directo (WinUSB / libusb, lo que deja
+      Zadig)? Esas impresoras NO tienen cola de Windows y no la necesitan: Fudo les habla directo
+      por USB -en la ficha de Fudo figuran como "Directo USB" en vez de "driver del sistema
+      operativo"-, y las instala soporte de nivel 2 a proposito.
+      Importa porque el motor esta construido sobre el supuesto contrario ("si no hay cola, hay
+      que crearla"): sin esto le hace un replug por software a un dispositivo que esta andando.
+      El descriptor USB no cambia con Zadig, asi que estas impresoras se siguen detectando como
+      impresoras por clase 07h o por VID; lo unico que cambia es el driver que las atiende.
+    #>
+    param([string]$Service)
+    return [bool]($Service -match '(?i)^(winusb|libusb0|libusbk|libusb)$')
+}
+
 function Test-IsPrinterDevice {
     <#
       Decide si un dispositivo USB es realmente una impresora, con la razon y el nivel de certeza.
@@ -2090,6 +2500,8 @@ function Get-UsbPrintDevices {
                     portName = ''; status = [string]$d.Status
                     problem = $(try { [int]$d.ConfigManagerErrorCode } catch { 0 })
                     deteccion = [string]$verdict.reason; certeza = [string]$verdict.confidence
+                    service = [string]$d.Service
+                    directoUsb = [bool](Test-IsDirectoUsbDevice -Service ([string]$d.Service))
                 }
             } else {
                 $rejected += [ordered]@{ nombre = [string]$d.Name; motivo = [string]$verdict.reason; instanceId = $inst }
@@ -2112,6 +2524,8 @@ function Get-UsbPrintDevices {
                         portName = ''; status = [string]$d.Status
                         problem = $(try { [int]$d.ProblemCode } catch { 0 })
                         deteccion = [string]$verdict.reason; certeza = [string]$verdict.confidence
+                        service = [string]$d.Service
+                        directoUsb = [bool](Test-IsDirectoUsbDevice -Service ([string]$d.Service))
                     }
                 } else {
                     $rejected += [ordered]@{ nombre = [string]$d.FriendlyName; motivo = [string]$verdict.reason; instanceId = $inst }
@@ -2760,6 +3174,8 @@ function Test-Layer1a-HardwareInventory {
             deteccion     = [string]$d.deteccion
             certeza       = [string]$d.certeza
             nombreCrudo   = [string]$d.name
+            service       = [string]$d.service
+            directoUsb    = [bool]$d.directoUsb
         }
     }
     $script:Diagnostics['printersConnected'] = $identified
@@ -2856,9 +3272,25 @@ function Test-Layer1a-HardwareInventory {
     # USBPRINT con PortName, asi que NINGUNA cola puede imprimirle. El motor probaba puertos
     # sueltos (USB002, USB003) que no corresponden a este device y concluia "ningun puerto
     # imprimio", cuando lo que falta es que Windows le asigne puerto.
-    if ($cant -gt 0 -and @($devPorts).Count -eq 0) {
-        $sinPuerto = @($identified | ForEach-Object { [string]$_.nombre })
-        $idsSinPuerto = @($identified | Where-Object { -not $_.puerto } | ForEach-Object { [string]$_.instanceId } | Where-Object { $_ })
+    # Las impresoras por Directo USB (Zadig: WinUSB/libusb) no llevan cola de Windows y andan
+    # asi a proposito. Antes de esto el motor las contaba como "conectada pero sin puerto
+    # asignado" y les hacia un replug por software para que Windows les diera puerto: le estaba
+    # tocando el dispositivo a una impresora que funcionaba. Quedan fuera de ese camino.
+    $directoUsb = @($identified | Where-Object { [bool]$_.directoUsb })
+    if (@($directoUsb).Count -gt 0) {
+        Add-Check -Id 'hw.directoUsb' -Layer 1 `
+            -Name ('Impresora(s) por Directo USB, sin cola de Windows a proposito: ' + ((@($directoUsb | ForEach-Object { [string]$_.nombre })) -join ' | ')) `
+            -Status 'ok' -RootCauseCandidate $false -Plane 'hardware' `
+            -Evidence @{ cantidad = @($directoUsb).Count
+                         impresoras = @($directoUsb | ForEach-Object { [ordered]@{ nombre = [string]$_.nombre; service = [string]$_.service; instanceId = [string]$_.instanceId } }) } `
+            -Recommendation ('Esta(s) impresora(s) estan instaladas con driver de acceso directo (' + ((@($directoUsb | ForEach-Object { [string]$_.service }) | Select-Object -Unique) -join ', ') +
+                             '), que es como las deja soporte de nivel 2 con Zadig. En Fudo se configuran como "Directo USB": no llevan cola de Windows y no hay que instalarles ninguna. ' +
+                             'El motor no les toca el dispositivo ni les crea cola. Si el cliente no imprime con una de estas, revisar la configuracion en Fudo, no Windows.')
+    }
+    $paraPuerto = @($identified | Where-Object { -not [bool]$_.directoUsb })
+    if ($cant -gt 0 -and @($devPorts).Count -eq 0 -and @($paraPuerto).Count -gt 0) {
+        $sinPuerto = @($paraPuerto | ForEach-Object { [string]$_.nombre })
+        $idsSinPuerto = @($paraPuerto | Where-Object { -not $_.puerto } | ForEach-Object { [string]$_.instanceId } | Where-Object { $_ })
 
         # Antes de mandarle al asesor a desenchufar el cable, hacer el replug por software.
         $bind = @{ puertos = @(); nota = '' }
@@ -3446,13 +3878,31 @@ function Test-Layer2-Queue {
                                  '. Cuando hay muchas impresoras instaladas, una sola comanda se multiplica en decenas de trabajos y la cola se tapa sola: ' +
                                  'revisar en Dispositivos e impresoras y borrar las que el cliente ya no usa. Un caso real se resolvio asi.')
         }
-        Add-Check -Id 'queue.health' -Layer 2 -Name 'Cola de impresion trabada' -Status $(if($rem.applied){'fixed'}else{'warn'}) -RootCauseCandidate $true `
+        # v3.19: la 3.18 agrego la medicion y despues nadie la leia. En 11 de 32 corridas con
+        # purgaMedicion la cola NO bajo (despues >= antes) y 7 de esas quedaron con
+        # queue.health = fixed y "Cola de impresion trabada" listada como reparacion aplicada.
+        # El motor decia que habia arreglado lo que no habia arreglado. Es la quinta vez que
+        # aparece el mismo patron en este proyecto: reparar y no verificar el efecto.
+        # Como autoFixesApplied se arma con los checks en 'fixed', sacarlo de 'fixed' tambien lo
+        # saca de la lista de reparaciones.
+        $bajo = ($despues -lt $antes)
+        $purgaVacia = ([bool]$rem.applied -and -not $bajo)
+        Add-Check -Id 'queue.health' -Layer 2 `
+            -Name $(if ($purgaVacia) { 'La cola se limpio y no bajo: sigue trabada' } else { 'Cola de impresion trabada' }) `
+            -Status $(if ($purgaVacia) { 'fail' } elseif ($rem.applied) { 'fixed' } else { 'warn' }) -RootCauseCandidate $true `
             -Evidence @{ jobs = @($jobs).Count; stuck = @($stuck).Count; statuses = @($jobs | ForEach-Object { [string]$_.JobStatus })
-                         antes = $antes; despues = $despues; rebote = $rebote
+                         antes = $antes; despues = $despues; rebote = $rebote; bajo = [bool]$bajo
                          colasInstaladas = @($colasTodas).Count; colasSinHardware = @($sinHw).Count } `
             -ActionTaken $rem.note -Reversible $false `
-            -Recommendation $(if ($rem.applied) {
-                    'Un trabajo trabado bloquea toda la cola: se limpio. Volver a imprimir desde Fudo las comandas que estaban esperando.'
+            -Recommendation $(if ($purgaVacia) {
+                    'Se ejecuto la limpieza de la cola y la cantidad de trabajos no bajo (de ' + $antes + ' a ' + $despues + '): la purga no esta ganando. ' +
+                    $(if (@($sinHw).Count -gt 0) {
+                        'Esta PC tiene ' + @($colasTodas).Count + ' impresora(s) instalada(s) en Windows y ' + @($sinHw).Count + ' de ellas sin hardware presente: cada comanda se multiplica por cada cola y la cola se vuelve a tapar mas rapido de lo que se limpia. Revisar en Dispositivos e impresoras y borrar las que el cliente ya no usa.'
+                      } else {
+                        'Revisar si hay algo regenerando trabajos (varias impresoras instaladas apuntando al mismo puerto) o si el spooler no esta drenando: reiniciar el servicio de cola de impresion y volver a correr el diagnostico.'
+                      })
+                } elseif ($rem.applied) {
+                    'Un trabajo trabado bloquea toda la cola: se limpio (de ' + $antes + ' trabajos a ' + $despues + '). Volver a imprimir desde Fudo las comandas que estaban esperando.'
                 } elseif (@($jobs).Count -ge 50) {
                     # v3.18: antes esto afirmaba "eso CONFIRMA que el problema no es Fudo".
                     # No lo confirma: con muchas impresoras instaladas una sola comanda se
@@ -5372,6 +5822,8 @@ function Get-NextActions {
 $script:CategoryByCheckId = @{
     'nativa.installed'          = 'nativa.install'
     'nativa.sinFirmar'          = 'nativa.install'
+    'nativa.hostRegistrado'     = 'nativa.sin_registrar'
+    'fudo.extension'            = 'nativa.sin_extension'
     'nativa.defenderQuarantine' = 'nativa.antivirus'
     'nativa.defenderExclusion'  = 'nativa.antivirus'
     'nativa.thirdPartyAV'       = 'nativa.antivirus_3p'
@@ -5386,6 +5838,7 @@ $script:CategoryByCheckId = @{
     'hw.disconnected'           = 'hardware.desconectada'
     'printer.disconnected'      = 'hardware.desconectada'
     'hw.notInstalled'           = 'os.driver_faltante'
+    'hw.directoUsb'             = 'hardware.directo_usb'
     'hw.testprint'              = 'hardware.no_imprime'
     'ok.yaFuncionaba'           = 'ok.ya_funcionaba'
     'repair.pendingConfirm'     = 'repair.pendiente_confirmar'
@@ -6264,7 +6717,7 @@ function Invoke-SelfTest {
     # Foto de las funciones que existen ANTES de que el self-test defina un solo mock: todo lo
     # que aparezca despues, o cambie de cuerpo, es un mock de un escenario.
     $script:__fnBase = @{}
-    foreach ($f in @(Get-ChildItem Function: -ErrorAction SilentlyContinue)) {
+    foreach ($f in @(Microsoft.PowerShell.Management\Get-ChildItem Function: -ErrorAction SilentlyContinue)) {
         $script:__fnBase[[string]$f.Name] = $f.ScriptBlock
     }
 
@@ -6281,16 +6734,24 @@ function Invoke-SelfTest {
           Todavia NO se llama desde Reset-State: hay escenarios viejos escritos contando con que
           el mock del anterior siga vivo, y migrarlos es un trabajo aparte. Los escenarios nuevos
           lo llaman explicitamente.
+          v3.19: los cmdlets van CALIFICADOS con su modulo. El escenario 92 mockea Get-ChildItem
+          para probar la eleccion del instalador, y ese mock se comia el de aca: Reset-Mocks
+          listaba los "archivos" del mock en vez de las funciones, no encontraba ningun mock que
+          sacar, y quedaba en silencio sin hacer nada. O sea que desde el escenario 92 en adelante
+          TODOS los Reset-Mocks eran decorativos y los escenarios corrian con los mocks del
+          anterior -que es exactamente lo que esta funcion existe para evitar-. Se descubrio
+          porque un escenario nuevo leyo '0.0.37' de un mock de 40 lineas mas arriba.
         #>
-        foreach ($f in @(Get-ChildItem Function: -ErrorAction SilentlyContinue)) {
+        foreach ($f in @(Microsoft.PowerShell.Management\Get-ChildItem Function: -ErrorAction SilentlyContinue)) {
             $n = [string]$f.Name
             # Ojo: Reset-Mocks se define DESPUES de la foto, asi que sin esta linea se borra a
             # si misma en la primera llamada y la segunda tira CommandNotFound.
             if ($n -eq 'Reset-Mocks') { continue }
+            if (-not $n) { continue }
             $esMock = $false
             if (-not $script:__fnBase.ContainsKey($n)) { $esMock = $true }
             elseif ($script:__fnBase[$n] -ne $f.ScriptBlock) { $esMock = $true }
-            if ($esMock) { try { Remove-Item ('Function:\' + $n) -ErrorAction SilentlyContinue } catch {} }
+            if ($esMock) { try { Microsoft.PowerShell.Management\Remove-Item ('Function:\' + $n) -ErrorAction SilentlyContinue } catch {} }
         }
     }
 
@@ -8394,8 +8855,9 @@ public class FudoFakeEndpoint {
     $script:i93 = 0
     function Find-FudoNativeInstall {
         $script:i93++
-        if ($script:i93 -le 1) { [ordered]@{ paths=@(); regInfo=@() } }
-        else { [ordered]@{ paths=@('C:\Users\x\AppData\Local\Fudo\fudo.exe'); regInfo=@([ordered]@{ version='0.0.37' }) } }
+        if ($script:i93 -le 1) { [ordered]@{ paths=@(); regInfo=@(); exe=''; enDisco=$false } }
+        else { [ordered]@{ paths=@('C:\Users\x\AppData\Local\Fudo'); regInfo=@([ordered]@{ version='0.0.37'; esPwa=$false })
+                           exe='C:\Users\x\AppData\Local\Fudo\fudo_native_extension.exe'; enDisco=$true } }
     }
     # El hallazgo previo de "no instalada" tiene que quedar corregido por la instalacion.
     Add-Check -Id 'nativa.installed' -Layer 0 -Name 'App Nativa de Fudo NO instalada' -Status 'fail' -RootCauseCandidate $true -Plane 'fudo_config' -Evidence @{ found=$false }
@@ -8415,8 +8877,9 @@ public class FudoFakeEndpoint {
 
     # Y nunca degradar: con una mas nueva instalada, un instalador viejo no se ejecuta.
     Reset-State
-    function Find-FudoNativeInstall { [ordered]@{ paths=@('C:\x\fudo.exe'); regInfo=@([ordered]@{ version='0.0.37' }) } }
-    function Get-NativaVersionState { param($Install) [ordered]@{ version='0.0.37'; firmada=$true } }
+    function Find-FudoNativeInstall { [ordered]@{ paths=@('C:\x'); regInfo=@([ordered]@{ version='0.0.37'; esPwa=$false })
+                                                  exe='C:\x\fudo_native_extension.exe'; enDisco=$true } }
+    function Get-NativaVersionState { param($Install) [ordered]@{ version='0.0.37'; firmada=$true; confiable=$true } }
     function Get-MsiProductVersion { param($Path) '0.0.18' }
     $script:llamoInstalador93 = $false
     function Invoke-NativeInstallerFile { param($Path, $ExtraArgs) $script:llamoInstalador93 = $true; 0 }
@@ -8471,6 +8934,243 @@ public class FudoFakeEndpoint {
     Test-Layer2-Queue -Printer ([pscustomobject]@{ Name='CAJA' }) -Wmi $null
     Assert-Eq 'S94b si no vuelven no se avisa nada' $true ([bool]($null -eq (Get-CheckById 'queue.rebotePurga')))
     Assert-Eq 'S94b y la cola queda reparada' 'fixed' ([string](Get-CheckById 'queue.health').status)
+
+    # Escenario 95: purgar y que la cola NO baje no es una reparacion. En 11 de 32 corridas con
+    # medicion la cola quedo igual o peor, y 7 de esas cerraron con queue.health = fixed y la
+    # purga listada como reparacion aplicada. La medicion ya existia desde la 3.18; no la leia
+    # nadie.
+    Reset-State
+    Reset-Mocks
+    $script:Diagnostics['colas'] = @(
+        [ordered]@{ nombre='CAJA'; puerto='USB001'; esDePrueba=$false; puertoVivo=$true },
+        [ordered]@{ nombre='MUERTA 1'; puerto='USB003'; esDePrueba=$false; puertoVivo=$false },
+        [ordered]@{ nombre='MUERTA 2'; puerto='USB004'; esDePrueba=$false; puertoVivo=$false }
+    )
+    function Confirm-Irreversible { param($Description, $Impact) $true }
+    function Remove-PrintJob { param($ErrorAction) }
+    function Start-Sleep { param($Seconds, $Milliseconds) }
+    function Get-PrintJob {
+        param($PrinterName, $ErrorAction)
+        @(1..8 | ForEach-Object { [pscustomobject]@{ JobStatus='Error'; SubmittedTime=(Get-Date).AddMinutes(-30) } })
+    }
+    Test-Layer2-Queue -Printer ([pscustomobject]@{ Name='CAJA' }) -Wmi $null
+    $c95 = Get-CheckById 'queue.health'
+    Assert-Eq 'S95 si la cola no bajo, la purga no reparo nada' 'fail' ([string]$c95.status)
+    Assert-Eq 'S95 y el nombre dice lo que paso' $true ([bool]([string]$c95.name -match 'no bajo'))
+    Assert-Eq 'S95 apunta a las colas sin hardware' $true ([bool]([string]$c95.recommendation -match 'sin hardware presente'))
+    $d95 = Resolve-Diagnosis
+    Assert-Eq 'S95 y no se lista como reparacion aplicada' $false ([bool](@($d95.autoFixesApplied) -match 'Cola de impresion trabada'))
+
+    # Escenario 96: la pagina web agregada como aplicacion NO es la App Nativa. Se registra con
+    # DisplayName 'Fudo' y DisplayVersion 1.0, y el guardarrail anti-degradacion de la 3.18
+    # comparaba el .msi 0.0.37 contra esa 1.0 y abortaba: en esas PCs el motor no instalaba la
+    # Nativa nunca, por mas que el asesor trajera el instalador.
+    Reset-State
+    Reset-Mocks
+    $inst96 = [ordered]@{ paths=@(); exe=''; enDisco=$false; soloRegistro=$false; pwa=$true
+                          regInfo=@([ordered]@{ name='Fudo'; version='1.0'; location=''; esPwa=$true }) }
+    $v96 = Get-NativaVersionState -Install $inst96
+    Assert-Eq 'S96 la version de la app del navegador no es la de la Nativa' '' ([string]$v96.version)
+    Assert-Eq 'S96 y sin archivos en disco la version no es confiable' $false ([bool]$v96.confiable)
+    $v96b = Get-NativaVersionState -Install ([ordered]@{ enDisco=$true
+                          regInfo=@([ordered]@{ name='Fudo'; version='1.0'; esPwa=$true },
+                                    [ordered]@{ name='Fudo Nativa'; version='0.0.37'; esPwa=$false }) })
+    Assert-Eq 'S96 con las dos, gana la Nativa de verdad' '0.0.37' ([string]$v96b.version)
+    # Y el instalador AHORA si se ejecuta.
+    Reset-State
+    function Find-LocalNativeInstaller { 'C:\kit\NATIVA FUDO.msi' }
+    function Get-MsiProductVersion { param($Path) '0.0.37' }
+    function Get-NativaVersionState { param($Install) [ordered]@{ version='1.0'; firmada=$true; confiable=$false } }
+    function Add-MpPreference { param($ExclusionPath, $ExclusionProcess, $ErrorAction) }
+    function Get-Process { param($ErrorAction) @() }
+    function Start-Sleep { param($Seconds, $Milliseconds) }
+    function Find-FudoNativeInstall { [ordered]@{ paths=@(); regInfo=@([ordered]@{ name='Fudo'; version='1.0'; esPwa=$true })
+                                                  exe=''; enDisco=$false; soloRegistro=$false; pwa=$true } }
+    $script:llamoInstalador96 = $false
+    function Invoke-NativeInstallerFile { param($Path, $ExtraArgs) $script:llamoInstalador96 = $true; 0 }
+    $r96 = Install-FudoNative
+    Assert-Eq 'S96 con la PWA instalada el instalador SI se ejecuta' $true ([bool]$script:llamoInstalador96)
+    Assert-Eq 'S96 y sin archivos no se declara instalada' $false ([bool]$r96.applied)
+
+    # Escenario 97: los dos eslabones entre "la Nativa esta instalada" y "Fudo imprime". Los dos
+    # los encontro un asesor en la misma semana, y los dos terminaban en una PC con todo verde:
+    # la Nativa sin registrar en el navegador (el "cerra sesion y volve a entrar" de la web app)
+    # y la extension sin agregar.
+    Reset-State
+    Reset-Mocks
+    function Find-FudoNativeInstall {
+        [ordered]@{ paths=@('C:\Users\x\AppData\Local\Fudo'); regInfo=@([ordered]@{ version='0.0.37'; esPwa=$false })
+                    exe='C:\Users\x\AppData\Local\Fudo\fudo_native_extension.exe'
+                    manifests=@(); carpeta='C:\Users\x\AppData\Local\Fudo'
+                    enDisco=$true; soloRegistro=$false; pwa=$false }
+    }
+    function Get-AntivirusState { [ordered]@{ defender=$null; thirdParty=@(); realTime=$null; fudoThreats=@() } }
+    function Get-NativaVersionState { param($Install) [ordered]@{ version='0.0.37'; firmada=$true; confiable=$true } }
+    function Get-Process { param($ErrorAction) @() }
+    function Get-SesionInteractiva { [ordered]@{ usuarioMotor='ana'; usuarioSesion='ana'; otroPerfil=$false } }
+    function Get-NativeMessagingState {
+        [ordered]@{ registrado=$true; navegadores=@('Chrome'); manifest='C:\Users\x\AppData\Local\Fudo\do.fu.native_extension_chrome.json'
+                    exeDelManifest='C:\Users\x\AppData\Local\Fudo\fudo_native_extension.exe'; exeExiste=$true
+                    extensionIds=@('npcjljaedonmjndbliillcmkhidejhmb'); pendientes=@() }
+    }
+    function Get-FudoExtensionState { param($Ids) [ordered]@{ instalada=$false; ids=@($Ids); encontrada=''
+                                                              navegador=''; perfil=''; perfilesVistos=2 } }
+    Test-Layer0b-NativeApp
+    $e97 = Get-CheckById 'fudo.extension'
+    Assert-Eq 'S97 sin la extension el caso tiene causa' 'fail' ([string]$e97.status)
+    Assert-Eq 'S97 y es candidata a causa raiz' $true ([bool]$e97.rootCauseCandidate)
+    Assert-Eq 'S97 con el link de la tienda' $true ([bool]([string]$e97.recommendation -match 'chromewebstore'))
+    Assert-Eq 'S97 el host registrado no molesta' 'ok' ([string](Get-CheckById 'nativa.hostRegistrado').status)
+
+    # Con la extension puesta, no hay hallazgo.
+    Reset-State
+    function Get-FudoExtensionState { param($Ids) [ordered]@{ instalada=$true; ids=@($Ids); encontrada='npcjljaedonmjndbliillcmkhidejhmb'
+                                                              navegador='Chrome'; perfil='Default'; perfilesVistos=1 } }
+    Test-Layer0b-NativeApp
+    Assert-Eq 'S97b con la extension puesta el check cierra en ok' 'ok' ([string](Get-CheckById 'fudo.extension').status)
+
+    # Sin navegador Chromium en el perfil no se puede concluir: skipped, nunca fail.
+    Reset-State
+    function Get-FudoExtensionState { param($Ids) [ordered]@{ instalada=$false; ids=@($Ids); encontrada=''
+                                                              navegador=''; perfil=''; perfilesVistos=0 } }
+    Test-Layer0b-NativeApp
+    $e97c = Get-CheckById 'fudo.extension'
+    Assert-Eq 'S97c sin navegador no se afirma nada' 'skipped' ([string]$e97c.status)
+    Assert-Eq 'S97c y se dice por que' 'sin_navegador' ([string]$e97c.evidence.skipReason)
+
+    # Escenario 98: la Nativa esta en disco y el navegador no la tiene registrada. Es lo que
+    # arregla el "cerra sesion y volve a entrar", y se puede hacer sin cerrar sesion ejecutando
+    # la Nativa una vez. Se verifica el EFECTO: vuelve a leerse la clave, no el codigo de salida.
+    Reset-State
+    Reset-Mocks
+    function Find-FudoNativeInstall {
+        [ordered]@{ paths=@('C:\Users\x\AppData\Local\Fudo'); regInfo=@([ordered]@{ version='0.0.37'; esPwa=$false })
+                    exe='C:\Users\x\AppData\Local\Fudo\fudo_native_extension.exe'
+                    manifests=@(); carpeta='C:\Users\x\AppData\Local\Fudo'
+                    enDisco=$true; soloRegistro=$false; pwa=$false }
+    }
+    function Get-AntivirusState { [ordered]@{ defender=$null; thirdParty=@(); realTime=$null; fudoThreats=@() } }
+    function Get-NativaVersionState { param($Install) [ordered]@{ version='0.0.37'; firmada=$true; confiable=$true } }
+    function Get-Process { param($ErrorAction) @() }
+    function Get-SesionInteractiva { [ordered]@{ usuarioMotor='ana'; usuarioSesion='ana'; otroPerfil=$false } }
+    function Get-FudoExtensionState { param($Ids) [ordered]@{ instalada=$true; ids=@($Ids); encontrada='npcjljaedonmjndbliillcmkhidejhmb'
+                                                              navegador='Chrome'; perfil='Default'; perfilesVistos=1 } }
+    $script:n98 = 0
+    function Get-NativeMessagingState {
+        $script:n98++
+        if ($script:n98 -le 2) {
+            [ordered]@{ registrado=$false; navegadores=@(); manifest=''; exeDelManifest=''; exeExiste=$false
+                        extensionIds=@(); pendientes=@('Chrome: sin clave de registro') }
+        } else {
+            [ordered]@{ registrado=$true; navegadores=@('Chrome'); manifest='m.json'
+                        exeDelManifest='C:\Users\x\AppData\Local\Fudo\fudo_native_extension.exe'; exeExiste=$true
+                        extensionIds=@('npcjljaedonmjndbliillcmkhidejhmb'); pendientes=@() }
+        }
+    }
+    $script:corrio98 = ''
+    function Start-FudoNativeHostProcess { param($Exe, $TimeoutSeg) $script:corrio98 = [string]$Exe; @{ lanzado=$true; quedoVivo=$false; error='' } }
+    Test-Layer0b-NativeApp
+    $h98 = Get-CheckById 'nativa.hostRegistrado'
+    Assert-Eq 'S98 registra la Nativa en el navegador' 'fixed' ([string]$h98.status)
+    Assert-Eq 'S98 ejecutando el archivo de la Nativa' 'C:\Users\x\AppData\Local\Fudo\fudo_native_extension.exe' ([string]$script:corrio98)
+    Assert-Eq 'S98 y explica que evita cerrar sesion' $true ([bool]([string]$h98.recommendation -match 'sin cerrar sesion'))
+
+    # Si se ejecuta y la clave NO aparece, no se declara reparado.
+    Reset-State
+    function Get-NativeMessagingState {
+        [ordered]@{ registrado=$false; navegadores=@(); manifest=''; exeDelManifest=''; exeExiste=$false
+                    extensionIds=@(); pendientes=@('Chrome: sin clave de registro') }
+    }
+    function Start-FudoNativeHostProcess { param($Exe, $TimeoutSeg) @{ lanzado=$true; quedoVivo=$true; error='' } }
+    Test-Layer0b-NativeApp
+    $h98b = Get-CheckById 'nativa.hostRegistrado'
+    Assert-Eq 'S98b si la clave no aparece no se declara reparado' 'fail' ([string]$h98b.status)
+    Assert-Eq 'S98b y es la causa raiz candidata' $true ([bool]$h98b.rootCauseCandidate)
+    Assert-Eq 'S98b con el motivo' $true ([bool]([string]$h98b.evidence.motivo -match 'no aparecio'))
+
+    # Y el matiz que evita repetir el bloqueo de cierres que destrabo la 3.11: sin evidencia de
+    # cual es el navegador del cliente, el hallazgo se ve pero no bloquea el cierre.
+    Reset-State
+    function Get-NativeMessagingState {
+        [ordered]@{ registrado=$false; navegadores=@(); manifest=''; exeDelManifest=''; exeExiste=$false
+                    extensionIds=@(); pendientes=@('Chrome: sin clave de registro') }
+    }
+    function Start-FudoNativeHostProcess { param($Exe, $TimeoutSeg) @{ lanzado=$true; quedoVivo=$false; error='' } }
+    function Get-FudoExtensionState { param($Ids) [ordered]@{ instalada=$false; ids=@($Ids); encontrada=''
+                                                              navegador=''; perfil=''; perfilesVistos=0 } }
+    Test-Layer0b-NativeApp
+    Assert-Eq 'S98c sin navegador en la cuenta no se bloquea el cierre' 'warn' ([string](Get-CheckById 'nativa.hostRegistrado').status)
+    Assert-Eq 'S98c pero sigue siendo candidata a causa raiz' $true ([bool](Get-CheckById 'nativa.hostRegistrado').rootCauseCandidate)
+
+    # Con el host registrado en Chrome, que falte la extension SI es un hecho.
+    Reset-State
+    function Get-NativeMessagingState {
+        [ordered]@{ registrado=$true; navegadores=@('Chrome'); manifest='m.json'
+                    exeDelManifest='C:\Users\x\AppData\Local\Fudo\fudo_native_extension.exe'; exeExiste=$true
+                    extensionIds=@('npcjljaedonmjndbliillcmkhidejhmb'); pendientes=@() }
+    }
+    function Get-FudoExtensionState { param($Ids) [ordered]@{ instalada=$false; ids=@($Ids); encontrada=''
+                                                              navegador=''; perfil=''; perfilesVistos=3 } }
+    Test-Layer0b-NativeApp
+    Assert-Eq 'S98d con el host en Chrome, la extension ausente es fail' 'fail' ([string](Get-CheckById 'fudo.extension').status)
+    # Si la Nativa solo esta registrada para Firefox, no se afirma sobre Chrome.
+    Reset-State
+    function Get-NativeMessagingState {
+        [ordered]@{ registrado=$true; navegadores=@('Firefox'); manifest='m.json'
+                    exeDelManifest='C:\Users\x\AppData\Local\Fudo\fudo_native_extension.exe'; exeExiste=$true
+                    extensionIds=@('npcjljaedonmjndbliillcmkhidejhmb'); pendientes=@('Chrome: sin clave de registro') }
+    }
+    Test-Layer0b-NativeApp
+    Assert-Eq 'S98e con Firefox no se afirma sobre la extension de Chrome' 'warn' ([string](Get-CheckById 'fudo.extension').status)
+
+    # Escenario 99: el motor elevado con OTRA cuenta no puede mirar -ni tocar- el perfil del
+    # cliente: HKCU y las extensiones son por usuario. Antes de esto habria registrado el host
+    # para el administrador y el Chrome del cliente no se enteraba.
+    Reset-State
+    function Get-SesionInteractiva { [ordered]@{ usuarioMotor='admin'; usuarioSesion='cinthia'; otroPerfil=$true } }
+    $script:corrio99 = $false
+    function Start-FudoNativeHostProcess { param($Exe, $TimeoutSeg) $script:corrio99 = $true; @{ lanzado=$true; quedoVivo=$false; error='' } }
+    Test-Layer0b-NativeApp
+    $h99 = Get-CheckById 'nativa.hostRegistrado'
+    Assert-Eq 'S99 con otro usuario no se concluye' 'skipped' ([string]$h99.status)
+    Assert-Eq 'S99 y no se toca el perfil equivocado' $false ([bool]$script:corrio99)
+    Assert-Eq 'S99 la extension tampoco se juzga' $true ([bool]($null -eq (Get-CheckById 'fudo.extension')))
+
+    # Escenario 100: impresora instalada con Zadig (Directo USB). No tiene cola de Windows y no
+    # la necesita: Fudo le habla directo. El motor le hacia replug por software para que Windows
+    # le asignara puerto, o sea que le tocaba el dispositivo a una impresora que andaba bien.
+    Reset-State
+    Reset-Mocks
+    function Get-UsbPrintDevices {
+        @([ordered]@{ source='Win32_PnPEntity'; name='POS-80 Printer'; instanceId='USB\VID_0519&PID_0001\6&1234'
+                      portName=''; status='OK'; problem=0; deteccion='clase USB 07h (Printer)'; certeza='alta'
+                      service='WinUSB'; directoUsb=$true })
+    }
+    function Get-ProblemPrinterDevices { @() }
+    function Get-PrinterPort { param($ErrorAction) @() }
+    function Get-Printer { param($ErrorAction) @() }
+    $script:replug100 = $false
+    function Repair-BindUsbPort { param($InstanceIds) $script:replug100 = $true; @{ puertos=@(); nota='no deberia llamarse' } }
+    Test-Layer1a-HardwareInventory
+    $z100 = Get-CheckById 'hw.directoUsb'
+    Assert-Eq 'S100 reconoce la impresora por Directo USB' $true ([bool]($null -ne $z100))
+    Assert-Eq 'S100 y no la reporta como problema' 'ok' ([string]$z100.status)
+    Assert-Eq 'S100 no le hace replug por software' $false ([bool]$script:replug100)
+    Assert-Eq 'S100 ni la da como sin puerto asignado' $true ([bool]($null -eq (Get-CheckById 'hw.noPortBound')))
+    Assert-Eq 'S100 dice que se configura en Fudo' $true ([bool]([string]$z100.recommendation -match 'Directo USB'))
+
+    # Una impresora normal sin puerto sigue yendo por el camino de siempre.
+    Reset-State
+    function Get-UsbPrintDevices {
+        @([ordered]@{ source='Win32_PnPEntity'; name='POS-80 Printer'; instanceId='USB\VID_0519&PID_0001\6&9999'
+                      portName=''; status='OK'; problem=0; deteccion='clase USB 07h (Printer)'; certeza='alta'
+                      service='usbprint'; directoUsb=$false })
+    }
+    $script:replug100b = $false
+    function Repair-BindUsbPort { param($InstanceIds) $script:replug100b = $true; @{ puertos=@(); nota='sin puerto' } }
+    Test-Layer1a-HardwareInventory
+    Assert-Eq 'S100b a una impresora normal si se le intenta asignar puerto' $true ([bool]$script:replug100b)
+    Assert-Eq 'S100b y no se la llama Directo USB' $true ([bool]($null -eq (Get-CheckById 'hw.directoUsb')))
 
     Write-Host ""
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)
@@ -9119,9 +9819,19 @@ function Install-FudoNative {
         $verNueva = [string](Get-MsiProductVersion -Path $local)
         $instAntes = Find-FudoNativeInstall
         $verAntes = ''
-        try { $verAntes = [string](Get-NativaVersionState -Install $instAntes).version } catch {}
-        $yaEstaba = ((@($instAntes.paths).Count -gt 0) -or (@($instAntes.regInfo).Count -gt 0))
-        if ($yaEstaba -and $verNueva -and $verAntes) {
+        $verAntesConfiable = $false
+        try {
+            $vsAntes = Get-NativaVersionState -Install $instAntes
+            $verAntes = [string]$vsAntes.version
+            $verAntesConfiable = [bool]$vsAntes.confiable
+        } catch {}
+        # v3.19: "ya estaba instalada" pasa a ser "el ejecutable esta en disco", y el guardarrail
+        # anti-degradacion solo corre contra una version que salio de un archivo. Antes bastaba
+        # una entrada de registro: con la pagina web agregada como aplicacion (DisplayVersion 1.0)
+        # el motor comparaba 0.0.37 contra 1.0, decidia que iba a degradar, y no instalaba la
+        # Nativa NUNCA en esa PC. El guardarrail estaba bien; el dato con el que decidia, no.
+        $yaEstaba = [bool]$instAntes.enDisco
+        if ($yaEstaba -and $verAntesConfiable -and $verNueva -and $verAntes) {
             $degradaria = $false
             try { $degradaria = ([version]$verNueva -lt [version]$verAntes) } catch { $degradaria = $false }
             if ($degradaria) {
@@ -9130,6 +9840,11 @@ function Install-FudoNative {
                 Write-Host '  Instalarlo la degradaria (ya paso en este proyecto: 0.0.36 -> 0.0.18).' -ForegroundColor Yellow
                 Write-Host ("  Conseguir el .msi de la v$($script:NativaVersionFirmada) y copiarlo al lado de este script.") -ForegroundColor Yellow
                 Write-Host ''
+                $script:Diagnostics['nativaInstall'] = [ordered]@{
+                    intento = $false; instalador = $local; versionInstalador = $verNueva
+                    quedoInstalada = $true; versionDespues = $verAntes; exitCode = $null; corriendo = $null
+                    motivo = 'no se instalo: el instalador local es mas viejo que la Nativa que ya esta en disco'
+                }
                 return @{ applied = $false; note = ("no se instalo: el instalador local (v$verNueva) es mas viejo que la instalada (v$verAntes)") }
             }
         }
@@ -9165,14 +9880,21 @@ function Install-FudoNative {
         # Verificar el EFECTO, no el codigo de retorno: es la regla del proyecto y este camino
         # no la cumplia.
         $instDespues = Find-FudoNativeInstall
-        $quedo = ((@($instDespues.paths).Count -gt 0) -or (@($instDespues.regInfo).Count -gt 0))
+        # Quedo instalada = el ejecutable esta en disco. Mirar el registro aca era justamente lo
+        # que dejaba pasar "instalador OK, Nativa ausente" cuando quedaba una entrada huerfana.
+        $quedo = [bool]$instDespues.enDisco
         $verDespues = ''
         try { $verDespues = [string](Get-NativaVersionState -Install $instDespues).version } catch {}
         $corriendo = $false
         try { $corriendo = (@(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*$FudoAppProcess*" }).Count -gt 0) } catch {}
         $script:Diagnostics['nativaInstall'] = [ordered]@{
+            intento = $true
             instalador = $local; versionInstalador = $verNueva; quedoInstalada = [bool]$quedo
             versionDespues = $verDespues; exitCode = $salida.code; corriendo = [bool]$corriendo
+            motivo = $(if ($quedo) { 'la Nativa quedo en disco' }
+                       elseif ($null -eq $salida.code) { 'no se pudo lanzar el instalador' }
+                       elseif ([int]$salida.code -ne 0) { 'el instalador termino con codigo ' + [string]$salida.code }
+                       else { 'el instalador termino bien y la Nativa no quedo en disco' })
         }
         if ($quedo) {
             Write-Host ("  App Nativa instalada" + $(if ($verDespues) { " (v$verDespues)" } else { '' }) + '.') -ForegroundColor Green
