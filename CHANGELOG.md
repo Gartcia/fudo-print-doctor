@@ -44,6 +44,16 @@ estable al día de hoy"*.
   bajar de versión**; sin instaladores no se inventa ninguno; y con `-NativeInstallerPath` el
   instalador pedido se ejecuta aunque sea anterior al instalado. **586 asserts, todos pasando.**
 
+- **Y una que encontró el CI, no el self-test local: cuatro escenarios de instalación estaban
+  leyendo el disco de verdad.** Al pasar la elección del instalador por la función nueva, mockear
+  `Find-LocalNativeInstaller` dejó de alcanzar — la elección sale de la que **escanea la PC**. En la
+  máquina de desarrollo había *diez* `.msi` de la Nativa en Descargas, así que los escenarios
+  pasaban leyendo archivos reales en vez de sus mocks; en el runner limpio se cayeron los siete
+  asserts. Ahora se mockea la fuente, y el self-test se verificó corriendo con un perfil de usuario
+  vacío para reproducir una PC sin instaladores.
+  *Segunda vez en dos versiones que aparece lo mismo: un escenario que pasa por el motivo
+  equivocado se ve exactamente igual que uno que pasa bien.*
+
 ## [3.19] - 2026-09-14
 
 De la bitácora semanal del 07/09-13/09 y, sobre todo, de tres casos que reportó un asesor en el

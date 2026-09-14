@@ -8846,6 +8846,12 @@ public class FudoFakeEndpoint {
     Reset-State
     Reset-Mocks
     function Find-LocalNativeInstaller { 'C:\kit\FudoNativa.msi' }
+    # v3.20: desde que Install-FudoNative elige con Select-LocalNativeInstaller, mockear solo
+    # Find-LocalNativeInstaller dejo de alcanzar: la eleccion sale de Get-LocalNativeInstallers,
+    # que LEE EL DISCO. En la PC de desarrollo habia diez .msi de la Nativa en Descargas, asi que
+    # estos escenarios pasaban leyendo archivos de verdad en vez de sus mocks -verde por el
+    # motivo equivocado- y se cayeron en el runner limpio de CI. Se mockea la fuente.
+    function Get-LocalNativeInstallers { @([ordered]@{ ruta='C:\kit\FudoNativa.msi'; version='0.0.37'; esMsi=$true; fecha=(Get-Date) }) }
     function Get-MsiProductVersion { param($Path) '0.0.37' }
     function Get-NativaVersionState { param($Install) [ordered]@{ version=[string](@($Install.regInfo)[0].version); firmada=$true } }
     function Invoke-NativeInstallerFile { param($Path, $ExtraArgs) 0 }
@@ -8880,6 +8886,7 @@ public class FudoFakeEndpoint {
     function Find-FudoNativeInstall { [ordered]@{ paths=@('C:\x'); regInfo=@([ordered]@{ version='0.0.37'; esPwa=$false })
                                                   exe='C:\x\fudo_native_extension.exe'; enDisco=$true } }
     function Get-NativaVersionState { param($Install) [ordered]@{ version='0.0.37'; firmada=$true; confiable=$true } }
+    function Get-LocalNativeInstallers { @([ordered]@{ ruta='C:\kit\FudoNativa.msi'; version='0.0.18'; esMsi=$true; fecha=(Get-Date) }) }
     function Get-MsiProductVersion { param($Path) '0.0.18' }
     $script:llamoInstalador93 = $false
     function Invoke-NativeInstallerFile { param($Path, $ExtraArgs) $script:llamoInstalador93 = $true; 0 }
@@ -8979,6 +8986,7 @@ public class FudoFakeEndpoint {
     # Y el instalador AHORA si se ejecuta.
     Reset-State
     function Find-LocalNativeInstaller { 'C:\kit\NATIVA FUDO.msi' }
+    function Get-LocalNativeInstallers { @([ordered]@{ ruta='C:\kit\NATIVA FUDO.msi'; version='0.0.37'; esMsi=$true; fecha=(Get-Date) }) }
     function Get-MsiProductVersion { param($Path) '0.0.37' }
     function Get-NativaVersionState { param($Install) [ordered]@{ version='1.0'; firmada=$true; confiable=$false } }
     function Add-MpPreference { param($ExclusionPath, $ExclusionProcess, $ErrorAction) }
