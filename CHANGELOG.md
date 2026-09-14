@@ -2,6 +2,48 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.20] - 2026-09-14
+
+De un caso que viene reportando un asesor desde el 03/09: *"sigo teniendo problemas con la nativa
+0.37, el antivirus sigue detectándola como amenaza y la bloquea siempre que se descarga, y a pesar
+de estar desde la carpeta de print doctor la bloquea... tengo que instalar la 0.33, que es la más
+estable al día de hoy"*.
+
+### Agregado
+
+- **El asesor elige qué versión de la App Nativa instalar.** Hasta la 3.19 el motor elegía solo —la
+  de versión más alta— y no había forma de pedirle otra. Ahora, si hay más de un instalador en la
+  PC, los lista con su versión y **elige el asesor** (Enter = la recomendada, que es la más alta
+  firmada). Con uno solo, ese; sin consola, la recomendada, igual que antes.
+
+  El motivo es concreto: **la firma de Microsoft no le dice nada a un antivirus de terceros.** La
+  0.0.37 resolvió el problema con Defender —86 corridas con 0.0.37+ y ninguna con la Nativa sin
+  instalar— pero `nativa.thirdPartyAV` sale `warn` en 32 corridas, 18 de ellas con la 0.0.37 ya
+  instalada. Son dos problemas distintos y los estábamos contando como uno.
+
+- **Bajar de versión se puede, pero nunca solo.** El guardarraíl anti-degradación que arregló la
+  3.19 sigue igual para el motor; lo que cambia es que **deja de aplicarse cuando la versión la
+  eligió una persona** viendo la lista y confirmando en pantalla, con el aviso de qué está
+  aceptando (*"esa versión es anterior a la primera firmada: Defender puede volver a ponerla en
+  cuarentena"*). Si no confirma, no se instala nada.
+  *El guardarraíl existe para que el motor no degrade solo, no para impedirle al asesor resolver el
+  caso que tiene delante.*
+
+- **Cuando no hay ningún instalador, el motor lo pide.** Antes caía en la guía de instalación
+  manual sin decir lo más simple: copiar el `.msi` al lado de `FudoPrintDoctor.cmd`. Ahora lo dice
+  primero, explica dónde más lo busca (Descargas y Escritorio) y avisa que **se pueden dejar los dos
+  `.msi`** cuando el cliente necesita una versión distinta a la vigente.
+
+- `-NativeInstallerPath` cuenta como elección explícita: apunta al archivo que se quiere instalar y
+  el guardarraíl no lo pisa. Es el camino no interactivo del mismo cambio.
+
+### Self-test
+
+- Escenario 101, seis casos: sin consola gana la firmada; con consola el asesor puede elegir la
+  más vieja; si no confirma no se instala nada; Enter deja la recomendada **y eso no habilita
+  bajar de versión**; sin instaladores no se inventa ninguno; y con `-NativeInstallerPath` el
+  instalador pedido se ejecuta aunque sea anterior al instalado. **586 asserts, todos pasando.**
+
 ## [3.19] - 2026-09-14
 
 De la bitácora semanal del 07/09-13/09 y, sobre todo, de tres casos que reportó un asesor en el

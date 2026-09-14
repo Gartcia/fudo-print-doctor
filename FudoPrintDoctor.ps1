@@ -454,7 +454,7 @@ $script:TestPrinterRx = '(?i)^FUDO-TEST-'
 # puerto tenga hardware; si el hardware se va, deja de serlo (ver Remove-OrphanOwnQueues).
 $script:OwnQueueRx   = '(?i)^FUDO-(TEST-|USB\d)'
 $script:TestDocRx    = '(?i)fudo print doctor'
-$script:SchemaVersion = '3.19'
+$script:SchemaVersion = '3.20'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -9136,6 +9136,79 @@ public class FudoFakeEndpoint {
     Assert-Eq 'S99 y no se toca el perfil equivocado' $false ([bool]$script:corrio99)
     Assert-Eq 'S99 la extension tampoco se juzga' $true ([bool]($null -eq (Get-CheckById 'fudo.extension')))
 
+    # Escenario 101: el asesor elige que version de la Nativa instalar. Sale del caso de un
+    # asesor al que el antivirus del cliente le bloquea la 0.0.37 firmada siempre, y termina
+    # instalando a mano una anterior. El motor elegia solo la mas alta y no habia forma de
+    # pedirle otra.
+    Reset-State
+    Reset-Mocks
+    function Get-LocalNativeInstallers {
+        @([ordered]@{ ruta='C:\kit\NATIVA FUDO 0.0.37.msi'; version='0.0.37'; esMsi=$true; fecha=(Get-Date) },
+          [ordered]@{ ruta='C:\kit\NATIVA FUDO 0.0.33.msi'; version='0.0.33'; esMsi=$true; fecha=(Get-Date) })
+    }
+    function Test-IsInteractiveConsole { $false }
+    $s101 = Select-LocalNativeInstaller -Instalada ''
+    Assert-Eq 'S101 sin consola elige la firmada' '0.0.37' ([string]$s101.version)
+    Assert-Eq 'S101 y no cuenta como eleccion de una persona' $false ([bool]$s101.elegidoPorPersona)
+
+    # Con consola, el asesor elige la 0.0.33 y confirma que baja de version.
+    function Test-IsInteractiveConsole { $true }
+    function Suspend-LiveStatus { }
+    $script:r101 = @('2', 's')
+    $script:i101 = 0
+    function Read-DoctorLine { param($Prompt) $v = $script:r101[$script:i101]; $script:i101++; $v }
+    $s101b = Select-LocalNativeInstaller -Instalada '0.0.37'
+    Assert-Eq 'S101b el asesor puede elegir la mas vieja' '0.0.33' ([string]$s101b.version)
+    Assert-Eq 'S101b y queda marcado que lo eligio una persona' $true ([bool]$s101b.elegidoPorPersona)
+
+    # Si no confirma, no se instala nada.
+    $script:r101 = @('2', 'n')
+    $script:i101 = 0
+    $s101c = Select-LocalNativeInstaller -Instalada '0.0.37'
+    Assert-Eq 'S101c sin confirmar no se instala nada' '' ([string]$s101c.ruta)
+    Assert-Eq 'S101c y el motivo lo dice' $true ([bool]([string]$s101c.motivo -match 'no confirmo'))
+
+    # Enter = la recomendada, y eso NO habilita bajar de version.
+    $script:r101 = @('')
+    $script:i101 = 0
+    $s101d = Select-LocalNativeInstaller -Instalada '0.0.37'
+    Assert-Eq 'S101d Enter deja la recomendada' '0.0.37' ([string]$s101d.version)
+    Assert-Eq 'S101d y sigue sin ser eleccion de una persona' $false ([bool]$s101d.elegidoPorPersona)
+
+    # Sin instaladores no se inventa nada: se pide el archivo.
+    function Get-LocalNativeInstallers { @() }
+    $s101e = Select-LocalNativeInstaller -Instalada ''
+    Assert-Eq 'S101e sin instaladores no hay ruta' '' ([string]$s101e.ruta)
+    Assert-Eq 'S101e y se explica que falta' $true ([bool]([string]$s101e.motivo -match 'no hay ningun instalador'))
+
+    # Y el guardarrail anti-degradacion no pisa lo que eligio el asesor.
+    Reset-State
+    Reset-Mocks
+    function Get-LocalNativeInstallers {
+        @([ordered]@{ ruta='C:\kit\NATIVA FUDO 0.0.33.msi'; version='0.0.33'; esMsi=$true; fecha=(Get-Date) })
+    }
+    function Test-IsInteractiveConsole { $true }
+    function Suspend-LiveStatus { }
+    function Read-DoctorLine { param($Prompt) 's' }
+    function Get-MsiProductVersion { param($Path) '0.0.33' }
+    function Find-FudoNativeInstall {
+        [ordered]@{ paths=@('C:\Users\x\AppData\Local\Fudo'); regInfo=@([ordered]@{ version='0.0.37'; esPwa=$false })
+                    exe='C:\Users\x\AppData\Local\Fudo\fudo_native_extension.exe'; enDisco=$true; soloRegistro=$false; pwa=$false }
+    }
+    function Get-NativaVersionState { param($Install) [ordered]@{ version='0.0.37'; firmada=$true; confiable=$true } }
+    function Add-MpPreference { param($ExclusionPath, $ExclusionProcess, $ErrorAction) }
+    function Get-Process { param($ErrorAction) @() }
+    function Start-Sleep { param($Seconds, $Milliseconds) }
+    $script:llamo101 = $false
+    function Invoke-NativeInstallerFile { param($Path, $ExtraArgs) $script:llamo101 = $true; 0 }
+    $NativeInstallerPath = 'C:\kit\NATIVA FUDO 0.0.33.msi'
+    function Test-Path { param($Path, $ErrorAction) $true }
+    function Resolve-Path { param($Path) [pscustomobject]@{ Path = [string]$Path } }
+    $r101f = Install-FudoNative
+    Assert-Eq 'S101f con -NativeInstallerPath se instala la que se pidio' $true ([bool]$script:llamo101)
+    Assert-Eq 'S101f y queda instalada' $true ([bool]$r101f.applied)
+    $NativeInstallerPath = ''  # no dejarlo puesto para los escenarios que siguen
+
     # Escenario 100: impresora instalada con Zadig (Directo USB). No tiene cola de Windows y no
     # la necesita: Fudo le habla directo. El motor le hacia replug por software para que Windows
     # le asignara puerto, o sea que le tocaba el dispositivo a una impresora que andaba bien.
@@ -9790,6 +9863,123 @@ function Update-FudoNativeFromLocal {
               nativaCorriendo = [bool]$Corriendo
               motivo = [string]$dec.motivo }
 }
+function Select-LocalNativeInstaller {
+    <#
+      Que instalador de la Nativa usar. Hasta la 3.19 el motor elegia solo -el de version mas
+      alta- y no habia forma de pedirle otro.
+      Hace falta porque la firma de Microsoft no le dice nada a un antivirus de TERCEROS: un
+      asesor viene reportando que con la 0.0.37 el AV del cliente la bloquea siempre y termina
+      instalando a mano una version anterior que ese cliente si aguanta. Eso hoy es trabajo
+      manual en medio de una llamada.
+      Orden de decision:
+        -NativeInstallerPath  -> ese, y cuenta como eleccion explicita de una persona
+        ninguno disponible    -> no se inventa nada: se pide el .msi
+        uno solo              -> ese
+        varios + consola      -> se listan con su version y elige el asesor (Enter = recomendada)
+        varios sin consola    -> la recomendada, igual que hasta ahora
+      La recomendada es la version mas alta que ademas este firmada; si ninguna llega a la
+      firmada, la mas alta.
+      Bajar de version NUNCA pasa solo: solo si una persona lo elige y lo confirma en pantalla.
+      Devuelve @{ ruta; version; elegidoPorPersona; motivo; candidatos }
+    #>
+    param([string]$Instalada = '')
+    $cands = @(Get-LocalNativeInstallers)
+    if ($NativeInstallerPath) {
+        $p = ''
+        try { if (Test-Path $NativeInstallerPath) { $p = [string](Resolve-Path $NativeInstallerPath).Path } } catch {}
+        if (-not $p) {
+            return @{ ruta = ''; version = ''; elegidoPorPersona = $false; candidatos = @($cands)
+                      motivo = ('la ruta indicada en -NativeInstallerPath no existe: ' + [string]$NativeInstallerPath) }
+        }
+        $vp = ''
+        try { $vp = [string](Get-MsiProductVersion -Path $p) } catch {}
+        return @{ ruta = $p; version = $vp; elegidoPorPersona = $true; candidatos = @($cands)
+                  motivo = 'instalador indicado con -NativeInstallerPath' }
+    }
+    if (@($cands).Count -eq 0) {
+        return @{ ruta = ''; version = ''; elegidoPorPersona = $false; candidatos = @()
+                  motivo = 'no hay ningun instalador de la App Nativa en esta PC' }
+    }
+    $reco = @($cands | Where-Object {
+        $v = $null
+        try { $v = [version]$_.version } catch { $v = $null }
+        ($null -ne $v) -and ($v -ge [version]$script:NativaVersionFirmada)
+    }) | Select-Object -First 1
+    if (-not $reco) { $reco = @($cands)[0] }
+
+    if (@($cands).Count -eq 1) {
+        return @{ ruta = [string]@($cands)[0].ruta; version = [string]@($cands)[0].version
+                  elegidoPorPersona = $false; candidatos = @($cands)
+                  motivo = 'es el unico instalador que hay en la PC' }
+    }
+    if (-not (Test-IsInteractiveConsole)) {
+        return @{ ruta = [string]$reco.ruta; version = [string]$reco.version
+                  elegidoPorPersona = $false; candidatos = @($cands)
+                  motivo = 'sin consola: se uso la version recomendada' }
+    }
+
+    Suspend-LiveStatus
+    Write-Host ''
+    Write-Host '  Hay mas de un instalador de la App Nativa en esta PC:' -ForegroundColor Cyan
+    $i = 0
+    foreach ($c in @($cands)) {
+        $i++
+        $etiquetas = @()
+        if ([string]$c.ruta -eq [string]$reco.ruta) { $etiquetas += 'recomendada' }
+        $vc = $null
+        try { $vc = [version]$c.version } catch {}
+        if ($null -ne $vc) {
+            try { if ($vc -lt [version]$script:NativaVersionFirmada) { $etiquetas += 'SIN firmar' } else { $etiquetas += 'firmada' } } catch {}
+        }
+        if ($Instalada -and $c.version) {
+            try { if ([version]$c.version -lt [version]$Instalada) { $etiquetas += ('mas vieja que la instalada v' + $Instalada) } } catch {}
+        }
+        Write-Host ("    $i) " + $(if ($c.version) { 'v' + [string]$c.version } else { '(no declara version)' }) +
+                    $(if (@($etiquetas).Count -gt 0) { '  [' + (@($etiquetas) -join ' / ') + ']' } else { '' }))
+        Write-Host ("       " + [string]$c.ruta) -ForegroundColor DarkGray
+    }
+    Write-Host ''
+    $ans = Read-DoctorLine -Prompt ('  Cual instalar? (numero, o Enter para la recomendada' + $(if ($reco.version) { ' v' + [string]$reco.version } else { '' }) + ')')
+    $elegido = $reco
+    $porPersona = $false
+    if ($null -ne $ans) {
+        $t = ([string]$ans).Trim()
+        if ($t) {
+            $n = 0
+            if ([int]::TryParse($t, [ref]$n) -and $n -ge 1 -and $n -le @($cands).Count) {
+                $elegido = @($cands)[$n - 1]
+                $porPersona = $true
+            } else {
+                Write-Host '  No entendi la respuesta: se usa la recomendada.' -ForegroundColor Yellow
+            }
+        }
+    }
+    # Bajar de version es una decision, no un accidente: se confirma aparte y se dice que implica.
+    if ($porPersona -and $Instalada -and $elegido.version) {
+        $baja = $false
+        try { $baja = ([version]$elegido.version -lt [version]$Instalada) } catch {}
+        if ($baja) {
+            Write-Host ''
+            Write-Host ("  OJO: vas a instalar la v" + [string]$elegido.version + " sobre la v" + [string]$Instalada + ', o sea BAJAR de version.') -ForegroundColor Yellow
+            $sinFirmar = $false
+            try { $sinFirmar = ([version]$elegido.version -lt [version]$script:NativaVersionFirmada) } catch {}
+            if ($sinFirmar) {
+                Write-Host ("  Esa version es anterior a la v" + [string]$script:NativaVersionFirmada + ', que es la primera firmada: Windows Defender puede volver a ponerla en cuarentena.') -ForegroundColor Yellow
+                Write-Host '  Tiene sentido si el antivirus de este cliente bloquea la firmada; si no, no.' -ForegroundColor Yellow
+            }
+            $ok = Read-DoctorLine -Prompt '  Seguro? (s = si / cualquier otra tecla = no)'
+            if (([string]$ok).Trim().ToLower() -ne 's') {
+                Write-Host '  No se instalo nada.' -ForegroundColor Yellow
+                return @{ ruta = ''; version = ''; elegidoPorPersona = $false; candidatos = @($cands)
+                          motivo = 'el asesor no confirmo bajar de version' }
+            }
+        }
+    }
+    return @{ ruta = [string]$elegido.ruta; version = [string]$elegido.version
+              elegidoPorPersona = [bool]$porPersona; candidatos = @($cands)
+              motivo = $(if ($porPersona) { 'lo eligio el asesor en pantalla' } else { 'se uso la version recomendada' }) }
+}
+
 function Install-FudoNative {
     <#
       Instala la App Nativa de Fudo. Antes agrega las exclusiones de antivirus, porque el bloqueo
@@ -9801,7 +9991,19 @@ function Install-FudoNative {
 
     # Preferimos un instalador que ya este en la PC: evita que el cliente tenga que descargar
     # (y que el antivirus borre la descarga a mitad de camino).
-    $local = Find-LocalNativeInstaller
+    # v3.20: cual instalar lo decide Select-LocalNativeInstaller, que le da la opcion al asesor
+    # cuando hay mas de uno. Se lee primero lo que hay instalado, porque hace falta para poder
+    # avisarle si lo que eligio baja de version.
+    $instAntes = Find-FudoNativeInstall
+    $verAntes = ''
+    $verAntesConfiable = $false
+    try {
+        $vsAntes = Get-NativaVersionState -Install $instAntes
+        $verAntes = [string]$vsAntes.version
+        $verAntesConfiable = [bool]$vsAntes.confiable
+    } catch {}
+    $eleccion = Select-LocalNativeInstaller -Instalada $(if ($verAntesConfiable) { $verAntes } else { '' })
+    $local = [string]$eleccion.ruta
     if ($local) {
         # v3.18: tres cosas estaban mal en este camino, y las tres las describio un asesor
         # ("el motor dice que instala la nativa, pero al corroborar en la version web sigue sin
@@ -9816,22 +10018,18 @@ function Install-FudoNative {
         #     que es lo que el camino de actualizacion ya hacia bien desde la 3.14.
         #  3. No se verificaba nada: solo el codigo de salida y si el proceso estaba corriendo.
         #     La reparacion se reportaba aplicada con la Nativa sin instalar. Ahora se relee.
-        $verNueva = [string](Get-MsiProductVersion -Path $local)
-        $instAntes = Find-FudoNativeInstall
-        $verAntes = ''
-        $verAntesConfiable = $false
-        try {
-            $vsAntes = Get-NativaVersionState -Install $instAntes
-            $verAntes = [string]$vsAntes.version
-            $verAntesConfiable = [bool]$vsAntes.confiable
-        } catch {}
+        $verNueva = [string]$eleccion.version
+        if (-not $verNueva) { try { $verNueva = [string](Get-MsiProductVersion -Path $local) } catch {} }
         # v3.19: "ya estaba instalada" pasa a ser "el ejecutable esta en disco", y el guardarrail
         # anti-degradacion solo corre contra una version que salio de un archivo. Antes bastaba
         # una entrada de registro: con la pagina web agregada como aplicacion (DisplayVersion 1.0)
         # el motor comparaba 0.0.37 contra 1.0, decidia que iba a degradar, y no instalaba la
         # Nativa NUNCA en esa PC. El guardarrail estaba bien; el dato con el que decidia, no.
+        # v3.20: el guardarrail deja de aplicarse cuando la version la eligio una PERSONA viendo
+        # las que hay y confirmando que baja. El guardarrail existe para que el motor no degrade
+        # solo, no para impedirle al asesor resolver el caso del antivirus de terceros.
         $yaEstaba = [bool]$instAntes.enDisco
-        if ($yaEstaba -and $verAntesConfiable -and $verNueva -and $verAntes) {
+        if ($yaEstaba -and $verAntesConfiable -and $verNueva -and $verAntes -and -not [bool]$eleccion.elegidoPorPersona) {
             $degradaria = $false
             try { $degradaria = ([version]$verNueva -lt [version]$verAntes) } catch { $degradaria = $false }
             if ($degradaria) {
@@ -9920,7 +10118,13 @@ function Install-FudoNative {
 
     if (-not $url) {
         Write-Host ''
-        Write-Host '  No hay URL de instalador configurada, asi que hay que instalarla a mano:' -ForegroundColor Yellow
+        Write-Host ('  No hay con que instalar la App Nativa: ' + [string]$eleccion.motivo + '.') -ForegroundColor Yellow
+        Write-Host '  Lo mas rapido: copiar el .msi de la App Nativa al lado de FudoPrintDoctor.cmd' -ForegroundColor Yellow
+        Write-Host '  (tambien lo busca en Descargas y en el Escritorio) y volver a correr el diagnostico.' -ForegroundColor Yellow
+        Write-Host '  Si este cliente necesita una version distinta a la vigente -por ejemplo porque su' -ForegroundColor DarkGray
+        Write-Host '  antivirus bloquea la firmada-, dejar los dos .msi: el motor te deja elegir cual.' -ForegroundColor DarkGray
+        Write-Host ''
+        Write-Host '  Si no lo tenes a mano, se instala desde la web app:' -ForegroundColor Yellow
         Write-Host '    1. Entrar a la web app de Fudo desde esta PC.'
         Write-Host '    2. Descargar la App Nativa desde el asistente de instalacion de impresoras.'
         Write-Host '    3. Si el antivirus la bloquea o la manda a cuarentena, primero correr este'
