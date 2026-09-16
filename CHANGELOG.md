@@ -2,6 +2,84 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.22] - 2026-09-16
+
+**El motor deja de ser una ventana negra.** Con `-Ui web` levanta una página en `127.0.0.1`, la
+abre en el navegador de la PC del cliente y muestra ahí lo mismo que mostraba en consola: el
+progreso por capas, las preguntas, el resultado y el menú. Sin la opción, **nada cambia**: el
+modo consola sigue siendo el default y el modo agente ni se entera.
+
+Y buscando dónde enganchar la interfaz apareció un bug viejo que estaba a la vista de todos.
+
+### Corregido
+
+- **El JSON se imprimía en pantalla en todas las corridas, aunque nadie pidiera `-Json`.**
+  Adentro de `Write-DoctorResult`, la variable con el texto serializado se llamaba `$json`.
+  PowerShell no distingue mayúsculas: ese local **tapaba al parámetro `-Json` del script** para
+  el resto de la función, así que el guard `$emitJson = [bool]$Json` evaluaba el texto
+  serializado —que nunca está vacío— en vez del switch. Al lado había un comentario explicando
+  que el problema estaba resuelto desde hacía varias versiones, y describía exactamente el
+  síntoma que seguía pasando: *"el asesor terminaba viendo el JSON entero arriba del resumen"*.
+
+  Tenía un segundo efecto que nadie había atado al primero: la copia automática del JSON en
+  `%TEMP%` **no se escribía nunca**, porque esa rama pide `-not $emitJson`. Por eso el resumen
+  tampoco mostraba la línea *"Detalle completo (JSON): &lt;ruta&gt;"*.
+
+  *Un comentario que afirma que algo está arreglado no es evidencia de que lo esté.* Verificado
+  corriendo la 3.21 publicada: sale con los delimitadores `<<<FUDO_JSON_BEGIN>>>` por stdout.
+
+- **Escenario 105 del self-test: ninguna función puede tapar un parámetro del script.** Es del
+  mismo tipo que el 76 (el que revisa que ninguna función llame a algo que no existe fuera del
+  self-test): **no se encuentra corriendo escenarios, hay que mirar el código**. Recorre el AST y
+  marca toda asignación local cuyo nombre coincida con un parámetro del script. Encontró otros
+  dos casos además del que rompía la salida (`$json` en `Get-NativeMessagingState`, `$port` en
+  `Test-IsVirtualPrinter` y en `Get-DetectedInterface`); esos tres eran inofensivos —se asignan
+  antes de leerse— pero son el mismo patrón, así que se renombraron igual.
+
+### Agregado
+
+- **`-Ui web`: la interfaz.** El motor sirve una página desde sí mismo, sólo en `127.0.0.1` y
+  con un token aleatorio por corrida. No instala nada, no sale a internet y muere con el proceso.
+  Qué muestra:
+  - **la cadena de impresión como una escalera**, con el mismo orden de capas, los mismos estados
+    y los mismos milisegundos que la consola;
+  - **las preguntas como tarjetas que no se pisan con nada**. La del papel —la única fuente de
+    verdad del motor— muestra además **el ticket dibujado al lado**, para que el asesor sepa qué
+    tiene que estar buscando. Es la corrección de diseño a la lección de la 3.10: si le
+    preguntás a un humano, la pregunta tiene que poder contestarse bien;
+  - **"lo que se tocó en esta PC"** como sección propia, con cada cambio marcado *reversible* o
+    *no se deshace*. En consola eso quedaba desparramado entre el log y el resumen;
+  - **el menú deja de ser un menú**: la acción que ejecuta una recomendación va como botón
+    dentro de esa recomendación, y el resto vive en *Opciones avanzadas*, plegado. Ahí están
+    **las diez gestiones siempre**, cada una con lo que hace —dato que el menú de consola nunca
+    dio— y las que no aplican **dicen por qué** en vez de desaparecer.
+
+- **`Test-HayHumano`, separado de `Test-IsInteractiveConsole`.** Eran la misma función
+  contestando dos preguntas distintas: *"¿hay alguien?"* y *"¿puedo pintar esta consola?"*. Con
+  la interfaz web la segunda es que no y la primera que sí. Si no se separaban, en modo web el
+  motor se creía agente y **dejaba de preguntar si salió el papel**.
+
+- **`-UiPort`, `-UiTimeoutSec` y `-UiNoOpen`.** Puerto fijo, cuánto esperar una respuesta antes
+  de darla por abandonada (15 min por defecto; al vencer se comporta como si no hubiera nadie, o
+  sea que nunca aplica por su cuenta algo que necesitaba un sí), y no abrir el navegador solo.
+
+- **`tools/Embed-Ui.ps1`.** La página vive en `ui/fpd-ui.html` y este paso la embebe en el
+  `.ps1` convirtiendo cada carácter no ASCII a entidad HTML. El motor sigue siendo **un solo
+  archivo** sin un solo byte fuera de ASCII, y el asesor sigue copiando dos archivos.
+
+### Sin cambios
+
+El contrato del JSON, los códigos de salida, la telemetría, el orden de capas y todas las
+decisiones del diagnóstico. **La interfaz es presentación: no decide nada.** Si el puerto no se
+puede abrir —sin permisos, un antivirus en el medio— el motor **avisa y sigue por consola**: la
+interfaz nunca puede ser condición para diagnosticar.
+
+### Lo que falta probar
+
+La interfaz se probó punta a punta contra el motor real, pero **contra una PC sin impresora
+térmica**: la pregunta del papel, la reconexión guiada del USB y la elección de versión de la
+Nativa se ejercitaron por HTTP, no con alguien mirando una impresora.
+
 ## [3.21] - 2026-09-15
 
 **Una corrida cerró RESUELTO en la PC de un cliente que no podía imprimir una sola comanda.** Lo

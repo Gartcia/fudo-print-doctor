@@ -73,6 +73,27 @@
 .PARAMETER NewPrinterName
     Nombre para la cola que se cree (red o USB).
 
+.PARAMETER Ui
+    Como se le muestra el diagnostico a la persona que lo esta corriendo.
+      consola - la ventana de siempre (default; nada cambia).
+      web     - el motor levanta una pagina en 127.0.0.1 y la abre en el navegador de la PC.
+                No instala nada, no sale a internet y muere con el proceso. Si el puerto no se
+                puede abrir, cae SOLO a consola: la interfaz nunca es condicion para diagnosticar.
+    El modo agente (-Json / -Quiet / salida redirigida) ignora esto: no hay a quien mostrarle nada.
+
+.PARAMETER UiPort
+    Puerto de la interfaz web. 0 (default) = uno libre que elige el sistema.
+
+.PARAMETER UiNoOpen
+    No abre el navegador solo: deja la direccion en pantalla para pegarla a mano. Sirve cuando
+    el asesor entra por escritorio remoto y prefiere abrirla el, y para probar la interfaz sin
+    que se abra una ventana encima de lo que la persona este haciendo.
+
+.PARAMETER UiTimeoutSec
+    Cuanto espera el motor una respuesta de la interfaz antes de darla por abandonada.
+    Default 900 (15 minutos). Al vencer se comporta como si no hubiera nadie: nunca aplica
+    por su cuenta algo que necesitaba un si.
+
 .PARAMETER NoMenu
     No mostrar el menu de acciones al terminar. El menu solo aparece en consola interactiva.
 
@@ -390,6 +411,11 @@ param(
     [string]$PrinterName,
     [ValidateSet('auto','USB','Red','Ambos')]
     [string]$Modo = 'auto',
+    [ValidateSet('consola','web')]
+    [string]$Ui = 'consola',
+    [int]$UiPort = 0,
+    [int]$UiTimeoutSec = 900,
+    [switch]$UiNoOpen,
     [ValidateSet('auto','USB','Ethernet')]
     [string]$Interface = 'auto',
     [string]$PrinterIp,
@@ -454,12 +480,24 @@ $script:TestPrinterRx = '(?i)^FUDO-TEST-'
 # puerto tenga hardware; si el hardware se va, deja de serlo (ver Remove-OrphanOwnQueues).
 $script:OwnQueueRx   = '(?i)^FUDO-(TEST-|USB\d)'
 $script:TestDocRx    = '(?i)fudo print doctor'
-$script:SchemaVersion = '3.21'
+$script:SchemaVersion = '3.22'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
 # Hay una linea de progreso abierta (escrita con `r, sin salto)? Ver Suspend-LiveStatus.
 $script:LiveOpen = $false
+# --- Interfaz (v3.22) -------------------------------------------------------
+# 'consola' = la ventana de siempre. 'web' = una pagina que sirve el propio motor en
+# 127.0.0.1 y abre en el navegador de la PC. La interfaz es SOLO presentacion: no decide
+# nada, no cambia un diagnostico y si no puede levantar, el motor sigue por consola.
+$script:UiModo     = 'consola'
+$script:UiState    = $null   # hashtable sincronizada que comparten el motor y el servidor
+$script:UiListener = $null
+$script:UiPs       = $null
+$script:UiRunspace = $null
+$script:UiUrl      = ''
+$script:UiSeq      = 0       # numero de evento; la pagina pide "lo que haya despues de N"
+$script:UiTimeout  = 900
 # Se corto el diagnostico porque no habia impresoras del tipo elegido y no se pidio revisar
 # las otras. Ver Confirm-ReviewOtherInterface.
 $script:AbortByMode = $false
@@ -474,6 +512,830 @@ $script:FudoExtensionUrl = 'https://chromewebstore.google.com/detail/fudo/npcjlj
 # Nombre del host de native messaging: es la clave que busca el navegador para encontrar la Nativa.
 $script:FudoNativeHostName = 'do.fu.native_extension'
 $script:MenuVacios = 0
+# El servidor de la interfaz. Corre en un runspace aparte porque el motor es de un solo hilo
+# y se bloquea a proposito en las preguntas: si el HTTP viviera en el mismo hilo, la pagina
+# se congelaria justo cuando hay que contestarle algo. Este bloque NO conoce ninguna funcion
+# del motor: solo mueve datos de la hashtable compartida.
+$script:UiServerScript = {
+    param($listener, $st)
+
+    function Send-Ui {
+        param($ctx, [string]$Cuerpo, [string]$Tipo = 'application/json; charset=utf-8', [int]$Code = 200)
+        try {
+            $bytes = [System.Text.Encoding]::UTF8.GetBytes($Cuerpo)
+            $ctx.Response.StatusCode = $Code
+            $ctx.Response.ContentType = $Tipo
+            $ctx.Response.ContentLength64 = $bytes.Length
+            # La pagina la sirve el propio proceso y muere con el: cachearla solo confunde
+            # cuando se vuelve a correr el motor.
+            $ctx.Response.Headers.Add('Cache-Control', 'no-store')
+            $ctx.Response.OutputStream.Write($bytes, 0, $bytes.Length)
+        } catch {}
+        try { $ctx.Response.OutputStream.Close() } catch {}
+        try { $ctx.Response.Close() } catch {}
+    }
+
+    while (-not $st.Cerrar) {
+        $ctx = $null
+        try { $ctx = $listener.GetContext() } catch { break }
+        if ($null -eq $ctx) { break }
+        try {
+            $ruta = [string]$ctx.Request.Url.AbsolutePath
+            $tok  = [string]$ctx.Request.QueryString['t']
+
+            if ($ruta -eq '/' -or $ruta -eq '/index.html') {
+                # La carga inicial no lleva token todavia: el token viaja en la query y se lo
+                # damos a la pagina inyectado, para que no quede en ningun archivo.
+                $html = [string]$st.Html
+                $html = $html.Replace('__FPD_TOKEN__', [string]$st.Token)
+                Send-Ui -ctx $ctx -Cuerpo $html -Tipo 'text/html; charset=utf-8'
+                continue
+            }
+
+            if ($tok -ne [string]$st.Token) {
+                Send-Ui -ctx $ctx -Cuerpo '{"error":"token"}' -Code 403
+                continue
+            }
+
+            switch ($ruta) {
+                '/eventos' {
+                    $st.UltimoPoll = Get-Date
+                    $desde = 0
+                    $null = [int]::TryParse([string]$ctx.Request.QueryString['desde'], [ref]$desde)
+                    $todos = @()
+                    try { $todos = @($st.Eventos.ToArray()) } catch { $todos = @() }
+                    $nuevos = @($todos | Where-Object { [int]$_.n -gt $desde })
+                    $ultimo = $desde
+                    if (@($nuevos).Count -gt 0) { $ultimo = [int](@($nuevos)[-1].n) }
+                    $payload = [ordered]@{
+                        fase     = [string]$st.Fase
+                        pregunta = $st.Pregunta
+                        eventos  = @($nuevos)
+                        ultimo   = $ultimo
+                    }
+                    Send-Ui -ctx $ctx -Cuerpo ($payload | ConvertTo-Json -Depth 10 -Compress)
+                }
+                '/responder' {
+                    $st.UltimoPoll = Get-Date
+                    $v = [string]$ctx.Request.QueryString['v']
+                    $st.Respuesta = $v
+                    Send-Ui -ctx $ctx -Cuerpo '{"ok":true}'
+                }
+                '/json' {
+                    Send-Ui -ctx $ctx -Cuerpo ([string]$st.Json)
+                }
+                '/salir' {
+                    $st.Viva = $false
+                    Send-Ui -ctx $ctx -Cuerpo '{"ok":true}'
+                }
+                default {
+                    Send-Ui -ctx $ctx -Cuerpo '{"error":"ruta"}' -Code 404
+                }
+            }
+        } catch {
+            try { Send-Ui -ctx $ctx -Cuerpo '{"error":"interno"}' -Code 500 } catch {}
+        }
+    }
+}
+
+# La pagina de la interfaz web. La escribe tools\Embed-Ui.ps1 desde ui\fpd-ui.html: el .ps1
+# va sin caracteres no ASCII (regla del proyecto) y el HTML lleva acentos, asi que se embebe
+# convertido a entidades. NO editar a mano: se pisa en el proximo build.
+# === UI HTML INICIO ===
+$script:UiHtml = @'
+<meta charset="utf-8">
+<title>Fudo Print Doctor</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke-linejoin='round' stroke-linecap='round'%3E%3Cpath d='M5 4.5A1.5 1.5 0 0 1 6.5 3h11A1.5 1.5 0 0 1 19 4.5v16.1l-2.8-1.8-2.8 1.8-2.8-1.8-2.8 1.8L5 18.8Z' stroke='%238b8f96' stroke-width='1.5'/%3E%3Cpath d='M7.2 12.4h2.2l1.4-3.2 2.4 5.6 1.4-2.4h2.2' stroke='%231e5fb8' stroke-width='1.9'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<style>
+:root{
+  --ground:#e9e7e2; --surface:#fffefc; --surface-2:#f4f2ee; --sunk:#edeae4;
+  --ink:#17191d; --ink-2:#4a4d53; --muted:#75736d; --line:#d7d3cb; --line-soft:#e4e0d8;
+  --ok:#1b7a49; --ok-bg:#e3f1e8; --warn:#9c6a08; --warn-bg:#f6eddb; --fail:#b8372a;
+  --fail-bg:#f8e5e2; --fixed:#1e5fb8; --fixed-bg:#e2ebf8; --idle:#8b887f; --idle-bg:#eceae5;
+  --paper:#fbf8f1; --paper-ink:#2a2622; --shadow:0 1px 2px rgba(23,25,29,.07),0 8px 24px -12px rgba(23,25,29,.18);
+  --focus:#1e5fb8;
+}
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+  --ground:#0f1113; --surface:#191c20; --surface-2:#20242a; --sunk:#141719;
+  --ink:#e8eaed; --ink-2:#b4b8be; --muted:#8b9098; --line:#2c3138; --line-soft:#242930;
+  --ok:#57c98a; --ok-bg:#16301f; --warn:#e2ac4a; --warn-bg:#332714; --fail:#f4796a;
+  --fail-bg:#3a1c18; --fixed:#77aef5; --fixed-bg:#15263c; --idle:#7d828a; --idle-bg:#1e2227;
+  --paper:#e8e3d8; --paper-ink:#2a2622; --shadow:0 1px 2px rgba(0,0,0,.4),0 10px 28px -14px rgba(0,0,0,.7);
+  --focus:#77aef5;
+}}
+:root[data-theme="dark"]{
+  --ground:#0f1113; --surface:#191c20; --surface-2:#20242a; --sunk:#141719;
+  --ink:#e8eaed; --ink-2:#b4b8be; --muted:#8b9098; --line:#2c3138; --line-soft:#242930;
+  --ok:#57c98a; --ok-bg:#16301f; --warn:#e2ac4a; --warn-bg:#332714; --fail:#f4796a;
+  --fail-bg:#3a1c18; --fixed:#77aef5; --fixed-bg:#15263c; --idle:#7d828a; --idle-bg:#1e2227;
+  --paper:#e8e3d8; --paper-ink:#2a2622; --shadow:0 1px 2px rgba(0,0,0,.4),0 10px 28px -14px rgba(0,0,0,.7);
+  --focus:#77aef5;
+}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{background:var(--ground);color:var(--ink);font-family:"IBM Plex Sans",-apple-system,Segoe UI,system-ui,sans-serif;
+  font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased}
+:focus-visible{outline:2px solid var(--focus);outline-offset:2px;border-radius:3px}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+.wrap{max-width:1060px;margin:0 auto;padding:16px;padding-block:20px 40px}
+h1,h2,h3{margin:0;text-wrap:balance;font-weight:600;letter-spacing:-.01em}
+p{margin:0}
+.mono{font-family:"IBM Plex Mono",ui-monospace,Consolas,monospace;font-variant-numeric:tabular-nums}
+
+.app{background:var(--surface);border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow);overflow:hidden}
+.titlebar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:11px 16px;background:var(--surface-2);
+  border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:center;gap:9px;margin-right:auto}
+.brand b{font-size:15px;font-weight:700;letter-spacing:-.02em}
+.ver{font-size:11px;color:var(--muted);letter-spacing:.04em}
+.mark{display:inline-flex;flex:none;color:var(--ink);transition:color .3s}
+.mark svg{display:block}
+.mark .paper{opacity:.42}
+.mark.running{color:var(--fixed)}
+.mark.running .pulse{stroke-dasharray:5 26;animation:trace 1.2s linear infinite}
+@keyframes trace{from{stroke-dashoffset:31}to{stroke-dashoffset:0}}
+.tb-meta{display:flex;gap:14px;flex-wrap:wrap;font-size:11.5px;color:var(--muted)}
+.tb-meta span b{color:var(--ink-2);font-weight:500}
+.body{padding:20px 22px 24px}
+
+.aviso{display:flex;gap:9px;align-items:baseline;padding:10px 16px;font-size:12.5px;
+  background:var(--warn-bg);color:var(--warn);border-bottom:1px solid var(--line)}
+.caido{background:var(--fail-bg);color:var(--fail)}
+
+.btn{font:inherit;font-size:13px;font-weight:500;padding:8px 14px;border-radius:6px;border:1px solid var(--line);
+  background:var(--surface);color:var(--ink);cursor:pointer;transition:background .12s,border-color .12s}
+.btn:hover{background:var(--surface-2);border-color:var(--ink-2)}
+.btn.primary{background:var(--ink);color:var(--surface);border-color:var(--ink)}
+.btn.primary:hover{opacity:.88}
+.btn.danger{border-color:var(--fail);color:var(--fail)}
+.btn.danger:hover{background:var(--fail-bg)}
+.btn.sm{font-size:12px;padding:6px 10px}
+input[type=text]{font:inherit;font-family:"IBM Plex Mono",monospace;padding:9px 11px;border:1px solid var(--line);
+  border-radius:6px;background:var(--surface);color:var(--ink);width:100%;max-width:360px}
+
+/* ---- pregunta ---- */
+.ask{border:1px solid var(--ink);border-radius:8px;background:var(--surface);box-shadow:var(--shadow);
+  padding:15px 16px;margin-bottom:16px}
+.ask.peligro{border-color:var(--fail)}
+.ask-k{font-size:10.5px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);
+  margin-bottom:6px}
+.ask.peligro .ask-k{color:var(--fail)}
+.ask h3{font-size:15.5px;margin-bottom:7px}
+.ask p{font-size:13px;color:var(--ink-2);max-width:62ch;margin-bottom:6px}
+.ask-btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.ask ul{margin:6px 0 0;padding-left:20px;font-size:12.5px;color:var(--ink-2)}
+.ticket{background:var(--paper);color:var(--paper-ink);border-radius:3px;padding:12px 14px;margin:10px 0;
+  font-family:"IBM Plex Mono",monospace;font-size:11.5px;line-height:1.55;white-space:pre;overflow-x:auto;
+  max-width:280px;box-shadow:0 2px 8px -3px rgba(0,0,0,.35);border:1px solid rgba(0,0,0,.08)}
+.count{font-family:"IBM Plex Mono",monospace;font-size:26px;font-weight:600;letter-spacing:-.02em}
+.pickrow{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.pick{flex:1 1 170px;text-align:left;border:1px solid var(--line);background:var(--surface);border-radius:7px;
+  padding:10px 12px;cursor:pointer;font:inherit;color:var(--ink)}
+.pick:hover{border-color:var(--ink-2);background:var(--surface-2)}
+.pick b{display:block;font-size:13px;font-weight:600;margin-bottom:2px}
+.pick span{font-size:11.5px;color:var(--muted);display:block;line-height:1.35}
+.inline{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+
+/* ---- corrida ---- */
+.run{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.05fr);gap:20px;align-items:start}
+@media (max-width:780px){.run{grid-template-columns:1fr}}
+.panel-t{font-size:11px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);
+  margin-bottom:9px}
+.ladder{display:flex;flex-direction:column;border:1px solid var(--line-soft);border-radius:8px;overflow:hidden}
+.rung{display:flex;align-items:center;gap:9px;padding:8px 11px;border-bottom:1px solid var(--line-soft);font-size:12.5px}
+.rung:last-child{border-bottom:0}
+.rung.now{background:var(--surface-2)}
+.rung.now .rlabel{font-weight:600}
+.rn{font-size:10.5px;color:var(--muted);width:16px;flex:none;text-align:right}
+.rlabel{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.rnote{font-size:11px;color:var(--muted);flex:none}
+.rms{font-size:10.5px;color:var(--muted);width:46px;text-align:right;flex:none}
+.chip{font-size:10.5px;font-weight:600;padding:2px 7px;border-radius:99px;flex:none;text-transform:uppercase}
+.chip.ok{background:var(--ok-bg);color:var(--ok)}
+.chip.warn,.chip.revisar{background:var(--warn-bg);color:var(--warn)}
+.chip.fail,.chip.falla{background:var(--fail-bg);color:var(--fail)}
+.chip.fixed,.chip.reparado{background:var(--fixed-bg);color:var(--fixed)}
+.chip.skip,.chip.omitido,.chip.idle,.chip.skipped{background:var(--idle-bg);color:var(--idle)}
+.spin{width:11px;height:11px;border:2px solid var(--line);border-top-color:var(--ink);border-radius:50%;
+  animation:sp .7s linear infinite;flex:none}
+@keyframes sp{to{transform:rotate(360deg)}}
+.bar{height:3px;background:var(--sunk);border-radius:2px;overflow:hidden;margin-bottom:12px}
+.bar i{display:block;height:100%;background:var(--ink);width:0;transition:width .35s ease}
+.feed{border:1px solid var(--line-soft);border-radius:8px;background:var(--sunk);padding:11px 12px;
+  min-height:180px;max-height:300px;overflow-y:auto;font-family:"IBM Plex Mono",monospace;font-size:11.5px;
+  line-height:1.65;color:var(--ink-2)}
+.feed div{white-space:pre-wrap;word-break:break-word}
+.feed .hl{color:var(--ink);font-weight:500}
+.feed .w{color:var(--warn)}
+.feed .f{color:var(--fail)}
+.touched{margin-top:16px}
+.touched ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
+.touched li{display:flex;gap:8px;align-items:flex-start;font-size:12.5px;border-left:2px solid var(--fixed);
+  padding-left:10px;color:var(--ink-2)}
+.touched li.irr{border-left-color:var(--fail)}
+.tag{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);flex:none;
+  margin-top:1px}
+.empty{font-size:12.5px;color:var(--muted);font-style:italic}
+
+/* ---- resultado ---- */
+.verdict{border-radius:9px;padding:16px 18px;margin-bottom:18px;border:1px solid}
+.verdict.ok{background:var(--ok-bg);border-color:var(--ok)}
+.verdict.no{background:var(--fail-bg);border-color:var(--fail)}
+.verdict-k{font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;margin-bottom:5px}
+.verdict.ok .verdict-k{color:var(--ok)}
+.verdict.no .verdict-k{color:var(--fail)}
+.verdict h2{font-size:19px;line-height:1.3;margin-bottom:8px;max-width:64ch}
+.verdict .meta{font-size:12px;color:var(--ink-2);display:flex;gap:16px;flex-wrap:wrap}
+.sec{margin-bottom:22px}
+.sec-t{font-size:11px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);
+  padding-bottom:6px;border-bottom:1px solid var(--line-soft);margin-bottom:11px}
+.todo{list-style:none;margin:0;padding:0;counter-reset:t;display:flex;flex-direction:column;gap:11px}
+.todo li{counter-increment:t;display:grid;grid-template-columns:22px 1fr;gap:10px;align-items:start}
+.todo li::before{content:counter(t);font-family:"IBM Plex Mono",monospace;font-size:11px;font-weight:600;
+  color:var(--surface);background:var(--ink);width:19px;height:19px;border-radius:4px;display:grid;
+  place-items:center;margin-top:1px}
+.todo b{display:block;font-size:13.5px;font-weight:600;margin-bottom:2px}
+.todo p{font-size:12.5px;color:var(--ink-2);max-width:66ch}
+.who{display:inline-block;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;
+  padding:1px 6px;border-radius:3px;background:var(--sunk);color:var(--muted);margin-left:7px;vertical-align:1px}
+.who.cliente{background:var(--warn-bg);color:var(--warn)}
+.who.asesor{background:var(--fixed-bg);color:var(--fixed)}
+.who.soporte,.who.producto{background:var(--fail-bg);color:var(--fail)}
+.art{font-size:11.5px;color:var(--muted);margin-top:3px}
+.tdo-btn{margin-top:8px;font:inherit;font-size:12px;font-weight:500;padding:6px 12px;border-radius:6px;
+  border:1px solid var(--ink-2);background:var(--surface);color:var(--ink);cursor:pointer}
+.tdo-btn:hover{background:var(--surface-2)}
+.prn{display:flex;flex-direction:column;border:1px solid var(--line-soft);border-radius:7px;overflow:hidden}
+.prow{display:flex;align-items:center;gap:10px;padding:9px 12px;background:var(--surface);
+  border-bottom:1px solid var(--line-soft);flex-wrap:wrap}
+.prow:last-child{border-bottom:0}
+.prow.target{background:var(--surface-2);box-shadow:inset 3px 0 0 var(--ink)}
+.pname{font-weight:600;font-size:13px}
+.pport{font-family:"IBM Plex Mono",monospace;font-size:11.5px;color:var(--muted)}
+.psym{flex-basis:100%;font-size:12px;color:var(--ink-2)}
+.psym ul{margin:4px 0 0;padding-left:18px}
+.hint{font-size:12.5px;color:var(--muted);max-width:66ch}
+.note{background:var(--surface-2);border:1px solid var(--line-soft);border-left:3px solid var(--ink);
+  border-radius:6px;padding:12px 14px;font-size:12.5px;color:var(--ink-2);max-width:72ch;margin-bottom:18px}
+.note b{color:var(--ink)}
+details.drawer{border:1px solid var(--line-soft);border-radius:7px;margin-top:10px;background:var(--surface)}
+details.drawer summary{padding:9px 12px;cursor:pointer;font-size:12.5px;font-weight:500;list-style:none}
+details.drawer summary::-webkit-details-marker{display:none}
+details.drawer summary::before{content:"\25B8 ";color:var(--muted)}
+details.drawer[open] summary::before{content:"\25BE "}
+.chk{width:100%;border-collapse:collapse;font-size:12px}
+.chk th{text-align:left;font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);
+  padding:6px 12px;border-bottom:1px solid var(--line-soft);font-weight:600}
+.chk td{padding:6px 12px;border-bottom:1px solid var(--line-soft);vertical-align:top}
+.chk td.id{font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--muted);white-space:nowrap}
+.tblwrap{overflow-x:auto}
+.endbar{display:flex;align-items:baseline;gap:20px;flex-wrap:wrap;border-top:1px solid var(--line);
+  margin-top:4px;padding-top:18px}
+.links{display:flex;gap:18px;flex-wrap:wrap;align-items:baseline;row-gap:8px}
+.links button{appearance:none;background:none;border:0;padding:0;font:inherit;font-size:12.5px;
+  color:var(--ink-2);cursor:pointer;text-decoration:underline;text-underline-offset:3px;
+  text-decoration-color:var(--line);white-space:nowrap}
+.links button:hover{color:var(--ink);text-decoration-color:var(--ink-2)}
+.adv{border:1px solid var(--line);border-radius:8px;background:var(--surface);margin-top:16px}
+.adv summary{padding:11px 14px;cursor:pointer;font-size:13px;font-weight:600;list-style:none;
+  display:flex;align-items:baseline;gap:9px;flex-wrap:wrap}
+.adv summary::-webkit-details-marker{display:none}
+.adv summary::before{content:"\25B8";color:var(--muted);font-weight:400}
+.adv[open] summary::before{content:"\25BE"}
+.adv summary span{font-weight:400;font-size:12px;color:var(--muted)}
+.advlist{border-top:1px solid var(--line-soft);display:flex;flex-direction:column}
+.advrow{display:flex;gap:14px;align-items:center;flex-wrap:wrap;padding:12px 14px;
+  border-bottom:1px solid var(--line-soft)}
+.advrow:last-child{border-bottom:0}
+.advrow>div{flex:1 1 300px;min-width:0}
+.advrow b{display:block;font-size:13px;font-weight:600}
+.advrow p{font-size:12px;color:var(--muted);margin-top:2px;max-width:62ch}
+.advrow.off b{color:var(--muted)}
+.advrow .why{font-size:11.5px;color:var(--muted);font-style:italic;flex:none;text-align:right}
+.foot{display:flex;gap:16px;flex-wrap:wrap;font-size:11.5px;color:var(--muted);margin-top:16px;
+  padding-top:12px;border-top:1px solid var(--line-soft)}
+.foot b{color:var(--ink-2);font-weight:500}
+pre.json{margin:0;padding:12px;font-family:"IBM Plex Mono",monospace;font-size:11px;overflow-x:auto;
+  color:var(--ink-2);line-height:1.55;max-height:420px}
+</style>
+
+<div class="wrap">
+  <div class="app">
+    <div class="titlebar">
+      <div class="brand">
+        <span class="mark" id="mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" width="23" height="23" fill="none">
+            <path class="paper" d="M5 4.5A1.5 1.5 0 0 1 6.5 3h11A1.5 1.5 0 0 1 19 4.5v16.1l-2.8-1.8-2.8 1.8-2.8-1.8-2.8 1.8L5 18.8Z"
+                  stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+            <path class="pulse" d="M7.2 12.4h2.2l1.4-3.2 2.4 5.6 1.4-2.4h2.2"
+                  stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+        </span>
+        <b>Fudo Print Doctor</b><span class="ver mono" id="tbVer"></span>
+      </div>
+      <div class="tb-meta">
+        <span>PC <b class="mono" id="tbPc">&mdash;</b></span>
+        <span>Caso <b class="mono" id="tbCaso">&mdash;</b></span>
+        <span>Revisando <b id="tbModo">&mdash;</b></span>
+      </div>
+    </div>
+
+    <div class="aviso" id="avisoVer" hidden></div>
+    <div class="aviso caido" id="avisoCaido" hidden>
+      <span id="avisoCaidoTxt">Se perdi&oacute; la conexi&oacute;n con el motor. Si cerraste la ventana negra, el diagn&oacute;stico se cort&oacute;.</span>
+    </div>
+
+    <div class="body">
+      <div id="askSlot"></div>
+
+      <section id="faseArranque">
+        <div class="note">
+          <b>Esperando al motor.</b> En unos segundos va a preguntar lo que necesita para arrancar:
+          el kit del asesor, la conversaci&oacute;n de Intercom y qu&eacute; impresora hay que mirar.
+        </div>
+      </section>
+
+      <section id="faseCorrida" hidden>
+        <div class="bar"><i id="barFill"></i></div>
+        <div class="run">
+          <div>
+            <div class="panel-t">La cadena de impresi&oacute;n, de abajo hacia arriba</div>
+            <div class="ladder" id="ladder"></div>
+          </div>
+          <div>
+            <div class="panel-t">Qu&eacute; est&aacute; haciendo ahora</div>
+            <div class="feed" id="feed"></div>
+            <div class="touched">
+              <div class="panel-t">Lo que se toc&oacute; en esta PC</div>
+              <ul id="touched"></ul>
+              <p class="empty" id="touchedEmpty">Todav&iacute;a no se modific&oacute; nada.</p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section id="faseResultado" hidden></section>
+    </div>
+  </div>
+</div>
+
+<script>
+"use strict";
+var TOKEN = "__FPD_TOKEN__";
+var desde = 0, fase = "arranque", checks = [], tocado = [], pasos = {}, total = 11;
+var claveActual = "", claveRespondida = "", resultado = null, menuPreg = null, caido = false, cerrado = false;
+
+function $(id){ return document.getElementById(id); }
+function el(t,c,x){ var n=document.createElement(t); if(c)n.className=c; if(x!=null)n.textContent=x; return n; }
+function esc(s){ return String(s==null?"":s); }
+
+/* ---------------- poll ---------------- */
+function poll(){
+  fetch("/eventos?t="+TOKEN+"&desde="+desde)
+    .then(function(r){ return r.json(); })
+    .then(function(d){
+      if(caido){ caido=false; $("avisoCaido").hidden=true; }
+      if(typeof d.ultimo==="number") desde=d.ultimo;
+      (d.eventos||[]).forEach(aplicar);
+      if(d.fase && d.fase!==fase){ fase=d.fase; pintarFase(); }
+      pregunta(d.pregunta);
+      setTimeout(poll, 350);
+    })
+    .catch(function(){
+      // Que el motor deje de contestar despues de dar el resultado es lo normal: termino y
+      // se cerro. Solo es una falla si todavia no habia resultado.
+      caido = true;
+      $("mark").classList.remove("running");
+      var a = $("avisoCaido");
+      if(cerrado || resultado){
+        a.className = "aviso";
+        $("avisoCaidoTxt").textContent =
+          "El motor termin&#243; y cerr&#243; la herramienta. Lo que ves ac&#225; queda: ya pod&#233;s cerrar esta pesta&#241;a.";
+      } else {
+        a.className = "aviso caido";
+        $("avisoCaidoTxt").textContent =
+          "Se perdi&#243; la conexi&#243;n con el motor. Si cerraste la ventana negra, el diagn&#243;stico se cort&#243;.";
+      }
+      a.hidden = false;
+      setTimeout(poll, 2000);
+    });
+}
+
+function pintarFase(){
+  $("faseArranque").hidden = (fase!=="arranque");
+  $("faseCorrida").hidden  = (fase!=="revisando");
+  $("faseResultado").hidden= (fase!=="resultado" && fase!=="fin");
+  $("mark").classList.toggle("running", fase==="revisando");
+}
+
+/* ---------------- eventos ---------------- */
+function aplicar(ev){
+  var d = ev.datos || {};
+  switch(ev.tipo){
+    case "caso":
+      $("tbCaso").textContent = esc(d.caseId) || "&#8212;";
+      $("tbPc").textContent   = esc(d.host) || "&#8212;";
+      $("tbVer").textContent  = d.version ? ("v"+d.version) : "";
+      break;
+    case "paso.inicio":
+      total = d.total || total;
+      abrirPaso(d.n, d.titulo);
+      linea("&#9484; "+esc(d.titulo), "hl");
+      break;
+    case "paso.fin":
+      cerrarPaso(d.n, d.estado, d.nota, d.ms);
+      linea("&#9492; "+String(d.estado||"").toUpperCase()+(d.nota?" &#8212; "+esc(d.nota):""),
+            /falla|error/i.test(String(d.estado))?"f":/revisar/i.test(String(d.estado))?"w":"hl");
+      break;
+    case "detalle": linea("&#9474; "+esc(d.texto)); break;
+    case "log":     linea("  "+esc(d.nivel)+": "+esc(d.texto), d.nivel==="ERROR"?"f":"w"); break;
+    case "check":   checks.push(d); break;
+    case "toque":   agregarToque(d); break;
+    case "espera":  break;
+    case "reinicio": reiniciar(); break;
+    case "resultado": resultado = d; if(d.aviso) aviso(d.aviso); pintarResultado(); break;
+    case "cerrado": cerrado = true; break;
+    case "cortado": cortado(d); break;
+  }
+}
+
+function aviso(t){ var a=$("avisoVer"); a.textContent=esc(t); a.hidden=false; }
+
+function linea(txt, cls){
+  var f=$("feed"); f.appendChild(el("div", cls||null, txt));
+  f.scrollTop = f.scrollHeight;
+  while(f.childNodes.length>400) f.removeChild(f.firstChild);
+}
+
+function abrirPaso(n, titulo){
+  var lad=$("ladder"), r=pasos[n];
+  if(!r){
+    r=el("div","rung now");
+    r.appendChild(el("div","rn mono",String(n)));
+    r.appendChild(el("div","rlabel",esc(titulo)));
+    r.appendChild(el("span","rnote"));
+    var sp=el("div","spin"); sp.setAttribute("data-slot","estado"); r.appendChild(sp);
+    r.appendChild(el("div","rms mono"));
+    lad.appendChild(r); pasos[n]=r;
+  }
+  r.className="rung now";
+}
+function cerrarPaso(n, estado, nota, ms){
+  var r=pasos[n]; if(!r) return;
+  r.className="rung";
+  r.querySelector(".rnote").textContent = esc(nota);
+  r.querySelector(".rms").textContent = (ms!=null? ms+"ms":"");
+  var viejo=r.querySelector('[data-slot="estado"]');
+  var chip=el("span","chip "+String(estado||"").replace(/\s+/g,""), String(estado||""));
+  chip.setAttribute("data-slot","estado");
+  if(viejo) r.replaceChild(chip, viejo);
+  $("barFill").style.width = Math.min(100, Math.round(n/total*100))+"%";
+}
+
+function agregarToque(d){
+  tocado.push(d);
+  var li=el("li", d.reversible===false?"irr":null);
+  li.appendChild(el("span","tag", d.reversible===false?"no se deshace":"reversible"));
+  li.appendChild(el("span",null,esc(d.texto)));
+  $("touched").appendChild(li);
+  $("touchedEmpty").hidden = true;
+}
+
+function reiniciar(){
+  checks=[]; tocado=[]; pasos={}; resultado=null; menuPreg=null;
+  $("ladder").innerHTML=""; $("feed").innerHTML=""; $("touched").innerHTML="";
+  $("touchedEmpty").hidden=false; $("barFill").style.width="0";
+  $("faseResultado").innerHTML="";
+}
+
+/* ---------------- preguntas ---------------- */
+function responder(v){
+  claveRespondida = claveActual;
+  $("askSlot").innerHTML = "";
+  fetch("/responder?t="+TOKEN+"&v="+encodeURIComponent(v)).catch(function(){});
+}
+
+function pregunta(p){
+  if(!p){ claveActual=""; if(!menuPreg) $("askSlot").innerHTML=""; return; }
+  var clave = JSON.stringify(p);
+  if(clave===claveRespondida) return;
+  if(clave===claveActual) return;
+  claveActual = clave;
+
+  // El menu no es una interrupcion: es el cierre del resultado. Va abajo, no arriba.
+  if(p.clase==="menu"){ menuPreg=p; pintarResultado(); return; }
+
+  var slot=$("askSlot"); slot.innerHTML="";
+  var box=el("div","ask"+(p.clase==="peligro"?" peligro":""));
+  box.appendChild(el("div","ask-k", p.clase==="papel"
+      ? "La pregunta que el motor no puede contestar solo" : "Hace falta que decidas"));
+  box.appendChild(el("h3",null,esc(p.titulo)));
+  if(p.texto) box.appendChild(el("p",null,esc(p.texto)));
+
+  if(p.clase==="papel"){
+    var imp = (p.extra && p.extra.impresora) ? p.extra.impresora : "";
+    box.appendChild(el("div","ticket",
+      "      FUDO PRINT DOCTOR\n" +
+      "   ---------------------------\n" +
+      "   Prueba de impresion\n" +
+      "   Impresora: " + imp + "\n" +
+      "   ---------------------------\n" +
+      "   Si estas leyendo esto,\n" +
+      "   el hardware imprime bien.\n"));
+  }
+  if(p.extra && p.extra.otras && p.extra.otras.length){
+    var u=el("ul");
+    p.extra.otras.forEach(function(o){ u.appendChild(el("li",null,esc(o))); });
+    box.appendChild(u);
+  }
+  if(p.texto2) box.appendChild(el("p",null,esc(p.texto2)));
+
+  if(p.clase==="texto"){
+    var fila=el("div","inline"); fila.style.marginTop="12px";
+    var inp=el("input"); inp.type="text"; inp.id="campoTexto";
+    if(p.extra && p.extra.placeholder) inp.placeholder=p.extra.placeholder;
+    var ok=el("button","btn primary","Continuar");
+    function enviar(){ if(inp.value.trim()) responder(inp.value.trim()); }
+    ok.addEventListener("click", enviar);
+    inp.addEventListener("keydown", function(e){ if(e.key==="Enter") enviar(); });
+    fila.appendChild(inp); fila.appendChild(ok);
+    box.appendChild(fila);
+    slot.appendChild(box);
+    inp.focus();
+    return;
+  }
+
+  if(p.clase==="modo"){
+    var row=el("div","pickrow");
+    (p.opciones||[]).forEach(function(o){
+      var b=el("button","pick");
+      b.appendChild(el("b",null,esc(o.l)));
+      if(o.detalle) b.appendChild(el("span",null,esc(o.detalle)));
+      b.addEventListener("click", function(){ responder(o.v); });
+      row.appendChild(b);
+    });
+    box.appendChild(row);
+    slot.appendChild(box);
+    var f=box.querySelector(".pick"); if(f) f.focus();
+    return;
+  }
+
+  var bs=el("div","ask-btns");
+  (p.opciones||[]).forEach(function(o){
+    var b=el("button","btn"+(o.principal?" primary":"")+(o.peligro?" danger":""), esc(o.l));
+    b.addEventListener("click", function(){ responder(o.v); });
+    bs.appendChild(b);
+  });
+  box.appendChild(bs);
+  slot.appendChild(box);
+  var pf=bs.querySelector("button"); if(pf) pf.focus();
+  box.scrollIntoView({block:"nearest", behavior:"smooth"});
+}
+
+function cortado(d){
+  fase="fin"; pintarFase();
+  var root=$("faseResultado"); root.innerHTML="";
+  var v=el("div","verdict no");
+  v.appendChild(el("div","verdict-k","Cortado"));
+  v.appendChild(el("h2",null,esc(d.titulo)));
+  v.appendChild(el("div","meta")).appendChild(el("span",null,esc(d.texto)));
+  root.appendChild(v);
+}
+
+/* ---------------- resultado ---------------- */
+function sec(t){ var s=el("section","sec"); s.appendChild(el("div","sec-t",t)); return s; }
+
+function pintarResultado(){
+  if(!resultado) return;
+  fase = (fase==="fin") ? "fin" : "resultado";
+  pintarFase();
+  var d=resultado, dg=d.diagnostico||{}, root=$("faseResultado");
+  root.innerHTML="";
+
+  var ok = !!dg.resolved;
+  var v=el("div","verdict "+(ok?"ok":"no"));
+  v.appendChild(el("div","verdict-k", ok?"Resuelto en esta PC":"No resuelto &#8212; hace falta una mano"));
+  v.appendChild(el("h2",null,esc(dg.rootCause)||"Sin causa determinada"));
+  var meta=el("div","meta");
+  if(dg.confidence) meta.appendChild(el("span",null,"Confianza: "+esc(dg.confidence)));
+  meta.appendChild(el("span",null,"Se tocaron "+tocado.length+" cosas en esta PC"));
+  if(d.modo) meta.appendChild(el("span",null,"Se revis&#243;: "+(d.modo==="Ambos"?"USB y red":"s&#243;lo "+String(d.modo).toLowerCase())));
+  v.appendChild(meta);
+  root.appendChild(v);
+
+  if(d.abortoPorModo){
+    var nn=el("div","note");
+    nn.appendChild(el("b",null,"No se revis&#243; nada. "));
+    nn.appendChild(document.createTextNode(
+      "No hay impresoras del tipo que elegiste en esta PC, y no se toc&#243; ninguna de las otras."));
+    root.appendChild(nn);
+  }
+
+  // impresora de red en otra subred
+  var pl=d.planRed;
+  if(pl && pl.hay){
+    var s=sec("La impresora est&#225; en otra red");
+    var g=el("div");
+    g.style.cssText="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px";
+    function celda(k,val){
+      var c=el("div"); c.appendChild(el("div","pport",k));
+      var b=el("div","mono"); b.textContent=esc(val);
+      b.style.cssText="font-size:15px;font-weight:600;margin-top:2px";
+      c.appendChild(b); return c;
+    }
+    g.appendChild(celda("Est&#225; en", pl.ip));
+    if(pl.ipSugerida) g.appendChild(celda("Ponerle esta IP", pl.ipSugerida));
+    if(pl.mascara)    g.appendChild(celda("M&#225;scara", pl.mascara));
+    if(pl.gateway)    g.appendChild(celda("Gateway", pl.gateway));
+    if(pl.marca)      g.appendChild(celda("Marca", pl.marca));
+    s.appendChild(g);
+    if(pl.ipSugerida){
+      var ph=el("p","hint","Esa IP se prob&#243; desde esta PC y est&#225; libre.");
+      ph.style.marginTop="10px"; s.appendChild(ph);
+    }
+    root.appendChild(s);
+  }
+
+  // que hacer ahora
+  var acc=(d.acciones||[]).filter(function(a){ return a; });
+  if(acc.length){
+    var s1=sec("Qu&#233; hacer ahora");
+    var ul=el("ul","todo");
+    acc.forEach(function(a){
+      var li=el("li"), c=el("div");
+      var b=el("b"); b.textContent=esc(a.what);
+      if(a.owner) b.appendChild(el("span","who "+esc(a.owner), esc(a.owner)));
+      c.appendChild(b);
+      if(a["do"]) c.appendChild(el("p",null,esc(a["do"])));
+      if(a.articleRef) c.appendChild(el("div","art","Art&#237;culo "+esc(a.articleRef)));
+      li.appendChild(c); ul.appendChild(li);
+    });
+    s1.appendChild(ul); root.appendChild(s1);
+  }
+
+  // impresoras
+  var colas=d.colas||[];
+  if(colas.length){
+    var s2=sec("Impresoras en esta PC");
+    var box=el("div","prn");
+    colas.forEach(function(c){
+      var r=el("div","prow"+((c.score>0)?" target":""));
+      r.appendChild(el("span","pname",esc(c.nombre)));
+      if(c.puerto) r.appendChild(el("span","pport",esc(c.puerto)));
+      var e=String(c.estado||"");
+      var cl = e==="no imprime"?"fail" : (e==="con problemas"?"warn":"ok");
+      r.appendChild(el("span","chip "+cl, e||"funcionando"));
+      if(c.sintomas && c.sintomas.length){
+        var dd=el("div","psym"), u=el("ul");
+        c.sintomas.forEach(function(x){ u.appendChild(el("li",null,esc(x))); });
+        dd.appendChild(u); r.appendChild(dd);
+      }
+      box.appendChild(r);
+    });
+    s2.appendChild(box);
+    var conn=d.conectadas||[];
+    if(conn.length){
+      var p=el("p","hint"); p.style.marginTop="10px";
+      p.textContent="Hardware conectado: "+conn.map(function(h){
+        return (h.puerto||"sin puerto")+" &#8594; "+(h.nombre||"")+(h.colaWindows?" (cola "+h.colaWindows+")":"");
+      }).join("  &#183;  ");
+      s2.appendChild(p);
+    }
+    var off=d.desconectadas||[];
+    if(off.length){
+      var p2=el("p","hint"); p2.style.marginTop="6px";
+      p2.textContent="Desconectadas: "+off.map(function(h){ return h.nombre||""; }).join(", ")+
+        " &#8212; encender la impresora y conectar el USB, preferentemente en el mismo puerto.";
+      s2.appendChild(p2);
+    }
+    root.appendChild(s2);
+  }
+
+  // lo que se toco
+  var s3=sec("Lo que se toc&#243; en esta PC");
+  if(tocado.length){
+    var u3=el("ul");
+    u3.style.cssText="list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px";
+    tocado.forEach(function(x){
+      var li=el("li");
+      li.style.cssText="display:flex;gap:8px;font-size:12.5px;border-left:2px solid "+
+        (x.reversible===false?"var(--fail)":"var(--fixed)")+";padding-left:10px;color:var(--ink-2)";
+      li.appendChild(el("span","tag", x.reversible===false?"no se deshace":"reversible"));
+      li.appendChild(el("span",null,esc(x.texto)));
+      u3.appendChild(li);
+    });
+    s3.appendChild(u3);
+  } else s3.appendChild(el("p","empty","No se modific&#243; nada en esta PC."));
+  root.appendChild(s3);
+
+  // detalle
+  var s4=sec("Detalle");
+  var dr=el("details","drawer");
+  dr.appendChild(el("summary",null,"Los "+checks.length+" chequeos, uno por uno"));
+  var tw=el("div","tblwrap"), tb=el("table","chk");
+  var th=el("thead"), trh=el("tr");
+  ["Chequeo","Id","Resultado"].forEach(function(h){ trh.appendChild(el("th",null,h)); });
+  th.appendChild(trh); tb.appendChild(th);
+  var tbody=el("tbody");
+  checks.forEach(function(c){
+    var tr=el("tr");
+    tr.appendChild(el("td",null,esc(c.nombre)));
+    var t2=el("td","id"); t2.textContent=esc(c.id); tr.appendChild(t2);
+    var t3=el("td"); t3.appendChild(el("span","chip "+esc(c.estado), esc(c.estado))); tr.appendChild(t3);
+    tbody.appendChild(tr);
+  });
+  tb.appendChild(tbody); tw.appendChild(tb); dr.appendChild(tw); s4.appendChild(dr);
+
+  var dj=el("details","drawer");
+  dj.appendChild(el("summary",null,"El JSON que le queda al agente"));
+  var pre=el("pre","json mono","cargando&#8230;");
+  dj.appendChild(pre);
+  dj.addEventListener("toggle", function(){
+    if(!dj.open || dj.dataset.cargado) return;
+    dj.dataset.cargado="1";
+    fetch("/json?t="+TOKEN).then(function(r){ return r.text(); })
+      .then(function(t){ pre.textContent=t; })
+      .catch(function(){ pre.textContent="No se pudo leer el JSON."; });
+  });
+  s4.appendChild(dj);
+  root.appendChild(s4);
+
+  // resumen de siempre, por si alguien lo quiere pegar en el caso
+  if(d.resumen){
+    var dt=el("details","drawer");
+    dt.appendChild(el("summary",null,"El resumen en texto (para pegar en Intercom)"));
+    dt.appendChild(el("pre","json mono", d.resumen));
+    root.appendChild(dt);
+  }
+
+  // acciones finales: vienen del menu del motor
+  if(menuPreg) root.appendChild(barraAcciones(menuPreg));
+
+  var f=el("div","foot");
+  function tag(t){ var s=el("span"); s.appendChild(el("b",null,"&#183;  "));
+    s.appendChild(document.createTextNode(t)); return s; }
+  if(d.telemetria){
+    f.appendChild(tag(d.telemetria.enviada ? "Reporte enviado al panel de telemetr&#237;a"
+                                           : "Telemetr&#237;a: "+esc(d.telemetria.detalle)));
+  }
+  if(d.jsonPath) f.appendChild(tag("JSON en "+esc(d.jsonPath)));
+  root.appendChild(f);
+}
+
+function barraAcciones(p){
+  var cont=el("div");
+  var disp={}; (p.opciones||[]).forEach(function(o){ disp[o.v]=o.l; });
+
+  var a=el("div","endbar");
+  if(disp.R){
+    var main=el("button","btn primary","Volver a revisar todo");
+    main.addEventListener("click", function(){ responder("R"); });
+    a.appendChild(main);
+  }
+  var links=el("div","links");
+  var cerrar=el("button",null,"Cerrar");
+  cerrar.addEventListener("click", function(){ responder("S"); });
+  links.appendChild(cerrar);
+  a.appendChild(links);
+  cont.appendChild(a);
+
+  var cat=(p.extra && p.extra.catalogo) ? p.extra.catalogo : [];
+  if(cat.length){
+    var adv=el("details","adv");
+    var sm=el("summary");
+    sm.appendChild(document.createTextNode("Opciones avanzadas"));
+    sm.appendChild(el("span",null,"gestiones puntuales sin volver a revisar todo"));
+    adv.appendChild(sm);
+    var list=el("div","advlist");
+    cat.forEach(function(o){
+      var row=el("div","advrow"+(o.disponible?"":" off"));
+      var dd=el("div");
+      dd.appendChild(el("b",null,esc(o.l)));
+      if(o.detalle) dd.appendChild(el("p",null,esc(o.detalle)));
+      row.appendChild(dd);
+      if(o.disponible){
+        var b=el("button","btn sm"+(o.v==="L"?" danger":""), o.v==="L"?"Limpiarla":"Hacerlo");
+        b.addEventListener("click", function(){ responder(o.v); });
+        row.appendChild(b);
+      } else {
+        row.appendChild(el("span","why", esc(o.motivo)||"no corresponde ahora"));
+      }
+      list.appendChild(row);
+    });
+    adv.appendChild(list);
+    cont.appendChild(adv);
+  }
+  return cont;
+}
+
+pintarFase();
+poll();
+</script>
+'@
+# === UI HTML FIN ===
 # Distribucion: repo publico. VERSION es un archivo de una linea con la version publicada.
 $script:RepoUrl    = 'https://github.com/Gartcia/fudo-print-doctor'
 $script:RawBase    = 'https://raw.githubusercontent.com/Gartcia/fudo-print-doctor/main'
@@ -530,6 +1392,207 @@ $script:PosBrands = @('Bixolon','Epson','Citizen','Hasar','Sam4s','3nStar','XPri
     'Nictom','Kretz','OCOM','Barpos','Solpos','Jaltech','Sprt','Sewoo','TM-T','TM20','RPT008','SerForce',
     'Ser force','Star Micronics','Zebra','Custom','Posiflex')
 
+# ---------------------------------------------------------------------------
+# INTERFAZ WEB LOCAL
+# Todo lo de abajo es presentacion. El contrato es de una sola direccion: el motor
+# EMPUJA eventos y, cuando necesita una decision, PIDE una respuesta y se bloquea
+# esperandola igual que se bloquea en Read-Host. Si no hay interfaz, todo esto es
+# un no-op y el motor se comporta exactamente como en la 3.21.
+# ---------------------------------------------------------------------------
+function Test-UiViva {
+    <#
+      La pagina sigue del otro lado? Se responde por el ultimo poll: si el navegador se
+      cerro, el motor no puede quedarse esperando para siempre una respuesta que no va a
+      llegar. Antes del primer poll se asume viva (la pagina todavia esta cargando).
+    #>
+    if ($null -eq $script:UiState) { return $false }
+    if (-not [bool]$script:UiState.Viva) { return $false }
+    $ult = $script:UiState.UltimoPoll
+    if ($null -eq $ult) { return $true }
+    return ((((Get-Date) - $ult).TotalSeconds) -lt 45)
+}
+
+function Test-UiWeb {
+    <# Hay una interfaz web levantada y viva para esta corrida? #>
+    if ($script:UiModo -ne 'web') { return $false }
+    return (Test-UiViva)
+}
+
+function Test-HayHumano {
+    <#
+      Hay alguien que pueda contestar una pregunta?
+      OJO: NO es lo mismo que Test-IsInteractiveConsole, que contesta algo mas chico
+      ('puedo pintar ESTA consola'). Con la interfaz web la consola no se pinta y sin
+      embargo hay una persona del otro lado. Separar las dos preguntas es lo que permite
+      que las cuatro decisiones humanas del motor existan igual en los dos modos; si se
+      mezclan, en modo web el motor se cree agente y deja de preguntar si salio el papel,
+      que es su unica fuente de verdad.
+    #>
+    if (Test-UiWeb) { return $true }
+    return (Test-IsInteractiveConsole)
+}
+
+function Push-UiEvent {
+    <# Agrega un evento a la cola que lee la pagina. Nunca puede tirar el run. #>
+    param([string]$Tipo, $Datos = $null)
+    if (-not (Test-UiWeb)) { return }
+    try {
+        $script:UiSeq = [int]$script:UiSeq + 1
+        [void]$script:UiState.Eventos.Add([ordered]@{
+            n = $script:UiSeq; tipo = $Tipo; ts = (Get-Date).ToString('o'); datos = $Datos })
+    } catch {}
+}
+
+function Set-UiFase {
+    <# En que esta la corrida: arranque | revisando | resultado | fin. #>
+    param([string]$Fase)
+    if (-not (Test-UiWeb)) { return }
+    try { $script:UiState.Fase = $Fase } catch {}
+}
+
+function Request-UiAnswer {
+    <#
+      Publica una pregunta y se bloquea hasta que la persona contesta, igual que Read-Host.
+      Devuelve el valor elegido, o $null si nadie contesto (timeout o navegador cerrado).
+      $null NO es 'no': quien llama tiene que tratarlo como 'no se pudo preguntar', que es
+      exactamente lo que ya hace en modo agente.
+    #>
+    param([string]$Id, [string]$Titulo, [string]$Texto = '', [string]$Texto2 = '',
+          $Opciones = @(), [string]$Clase = 'confirm', $Extra = $null, [int]$TimeoutSec = 0)
+    if (-not (Test-UiWeb)) { return $null }
+    if ($TimeoutSec -le 0) { $TimeoutSec = [int]$script:UiTimeout }
+
+    $p = [ordered]@{
+        id = $Id; titulo = $Titulo; texto = $Texto; texto2 = $Texto2
+        clase = $Clase; opciones = @($Opciones); extra = $Extra
+    }
+    try {
+        $script:UiState.Respuesta = $null
+        $script:UiState.Pregunta  = $p
+    } catch { return $null }
+    Push-UiEvent -Tipo 'pregunta' -Datos $p
+
+    $fin = (Get-Date).AddSeconds($TimeoutSec)
+    $resp = $null
+    while ((Get-Date) -lt $fin) {
+        Start-Sleep -Milliseconds 200
+        try { $resp = $script:UiState.Respuesta } catch { $resp = $null }
+        if ($null -ne $resp) { break }
+        if (-not (Test-UiViva)) { break }
+    }
+    try {
+        $script:UiState.Pregunta  = $null
+        $script:UiState.Respuesta = $null
+    } catch {}
+    if ($null -eq $resp) {
+        Write-DoctorLog -Level 'WARN' -Message ("Nadie contesto '" + $Id + "' en la interfaz: se sigue como si no hubiera humano.")
+        Push-UiEvent -Tipo 'pregunta.vencida' -Datos @{ id = $Id }
+        return $null
+    }
+    Push-UiEvent -Tipo 'pregunta.respondida' -Datos @{ id = $Id; valor = [string]$resp }
+    return [string]$resp
+}
+
+function Get-FreeTcpPort {
+    <# Un puerto libre que elige el sistema, para no chocar con nada del cliente. #>
+    $l = $null
+    try {
+        $l = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+        $l.Start()
+        $p = ([System.Net.IPEndPoint]$l.LocalEndpoint).Port
+        $l.Stop()
+        return [int]$p
+    } catch { return 0 }
+}
+
+function Start-DoctorUi {
+    <#
+      Levanta la pagina local y la abre en el navegador de la PC.
+      Decisiones y por que:
+        - Escucha SOLO en 127.0.0.1. Nada de esto sale de la maquina.
+        - Token aleatorio por corrida: cualquier otra cosa que corra en la PC y adivine el
+          puerto igual no puede leer el diagnostico ni contestar por el asesor.
+        - Si no levanta, se cae a consola y se sigue. La interfaz no puede ser condicion
+          para diagnosticar: el motor corre en la PC de un cliente que ya tiene un problema.
+      Devuelve $true si quedo andando.
+    #>
+    param([int]$Puerto = 0)
+    if ($script:UiModo -ne 'web') { return $false }
+
+    $estado = [hashtable]::Synchronized(@{})
+    $estado.Eventos    = [System.Collections.ArrayList]::Synchronized((New-Object System.Collections.ArrayList))
+    $estado.Pregunta   = $null
+    $estado.Respuesta  = $null
+    $estado.UltimoPoll = $null
+    $estado.Viva       = $true
+    $estado.Cerrar     = $false
+    $estado.Fase       = 'arranque'
+    $estado.Json       = ''
+    $estado.Token      = ([guid]::NewGuid()).ToString('N')
+    $estado.Html       = [string]$script:UiHtml
+    $script:UiState    = $estado
+
+    if ($Puerto -le 0) { $Puerto = Get-FreeTcpPort }
+    if ($Puerto -le 0) {
+        Write-DoctorLog -Level 'WARN' -Message 'No se pudo reservar un puerto para la interfaz web; sigue por consola.'
+        $script:UiModo = 'consola'; $script:UiState = $null
+        return $false
+    }
+
+    $listener = New-Object System.Net.HttpListener
+    $listener.Prefixes.Add(('http://127.0.0.1:' + [string]$Puerto + '/'))
+    try {
+        $listener.Start()
+    } catch {
+        # Tipico sin permisos de administrador. No es un error del diagnostico.
+        Write-DoctorLog -Level 'WARN' -Message ('No se pudo abrir la interfaz web (' + $_.Exception.Message + '); sigue por consola.')
+        $script:UiModo = 'consola'; $script:UiState = $null
+        return $false
+    }
+    $script:UiListener = $listener
+
+    try {
+        $rs = [runspacefactory]::CreateRunspace()
+        $rs.ApartmentState = 'MTA'
+        $rs.ThreadOptions  = 'ReuseThread'
+        $rs.Open()
+        $ps = [powershell]::Create()
+        $ps.Runspace = $rs
+        [void]$ps.AddScript($script:UiServerScript)
+        [void]$ps.AddArgument($listener)
+        [void]$ps.AddArgument($estado)
+        [void]$ps.BeginInvoke()
+        $script:UiRunspace = $rs
+        $script:UiPs = $ps
+    } catch {
+        Write-DoctorLog -Level 'WARN' -Message ('No se pudo arrancar el servidor de la interfaz (' + $_.Exception.Message + '); sigue por consola.')
+        try { $listener.Stop() } catch {}
+        $script:UiModo = 'consola'; $script:UiState = $null
+        return $false
+    }
+
+    $script:UiUrl = 'http://127.0.0.1:' + [string]$Puerto + '/?t=' + [string]$estado.Token
+    if (-not $UiNoOpen) {
+        try { $null = Start-Process -FilePath $script:UiUrl } catch {
+            Write-DoctorLog -Level 'WARN' -Message 'No se pudo abrir el navegador solo; hay que pegar la direccion a mano.'
+        }
+    }
+    return $true
+}
+
+function Stop-DoctorUi {
+    <#
+      Cierra la interfaz. Va en el finally del motor: una corrida que explota tampoco puede
+      dejar un puerto escuchando en la PC del cliente.
+    #>
+    if ($null -eq $script:UiState -and $null -eq $script:UiListener) { return }
+    try { if ($script:UiState) { $script:UiState.Cerrar = $true } } catch {}
+    try { if ($script:UiListener) { $script:UiListener.Stop(); $script:UiListener.Close() } } catch {}
+    try { if ($script:UiPs) { $script:UiPs.Dispose() } } catch {}
+    try { if ($script:UiRunspace) { $script:UiRunspace.Close(); $script:UiRunspace.Dispose() } } catch {}
+    $script:UiListener = $null; $script:UiPs = $null; $script:UiRunspace = $null
+}
+
 function Write-DoctorLog {
     param([string]$Level, [string]$Message)
     $entry = [ordered]@{
@@ -538,6 +1601,7 @@ function Write-DoctorLog {
         message = $Message
     }
     [void]$script:Log.Add($entry)
+    if ($Level -in @('WARN','ERROR')) { Push-UiEvent -Tipo 'log' -Datos @{ nivel = $Level; texto = $Message } }
     # A stderr: stdout queda reservado exclusivamente para el JSON (contrato con el agente).
     if ($VerbosePreference -eq 'Continue' -or $Level -in @('WARN','ERROR')) {
         # Un WARN/ERROR puede caer en cualquier momento, incluso en medio de una etapa: si la
@@ -584,6 +1648,14 @@ function Add-Check {
         recommendation     = $Recommendation
     }
     [void]$script:Checks.Add($check)
+    Push-UiEvent -Tipo 'check' -Datos @{ id = $Id; capa = $Layer; nombre = $Name; estado = $Status
+                                         recomendacion = $Recommendation }
+    # 'Lo que se toco en esta PC': se alimenta del texto humano de la reparacion, no del id
+    # interno, y viaja con si se puede deshacer o no. Es la seccion que en consola quedaba
+    # desparramada entre el log y el resumen.
+    if ($ActionTaken) {
+        Push-UiEvent -Tipo 'toque' -Datos @{ texto = $ActionTaken; reversible = $Reversible }
+    }
     Write-DoctorLog -Level 'INFO' -Message ("[L{0}] {1} => {2}{3}" -f $Layer, $Name, $Status, $(if($ActionTaken){" | $ActionTaken"}else{""}))
     # NO emitir al pipeline: los checks se acumulan en $script:Checks.
 }
@@ -640,6 +1712,7 @@ function Write-StepDetail {
     param([string]$Text)
     if (-not $script:StepLabel) { return }
     Write-LiveStatus ("$($script:StepLabel) - $Text")
+    Push-UiEvent -Tipo 'detalle' -Datos @{ texto = $Text }
 }
 
 function Set-StepNote {
@@ -746,6 +1819,7 @@ function Invoke-Step {
         $script:StepNote  = ''
         $script:StepLabel = ("[{0}/{1}] {2}" -f $script:StepIndex, $script:StepTotal, $title)
         Write-LiveStatus ($script:StepLabel + '...')
+        Push-UiEvent -Tipo 'paso.inicio' -Datos @{ n = $script:StepIndex; total = $script:StepTotal; titulo = $title }
     }
 
     try {
@@ -763,6 +1837,8 @@ function Invoke-Step {
             $dots = '.' * [Math]::Max(3, 44 - $script:StepLabel.Length)
             $extra = $(if ($script:StepNote) { " ($($script:StepNote))" } else { '' })
             Complete-LiveStatus ("$($script:StepLabel) $dots $estado$extra  ${ms}ms") $color
+            Push-UiEvent -Tipo 'paso.fin' -Datos @{ n = $script:StepIndex; estado = $estado
+                                                    nota = [string]$script:StepNote; ms = $ms }
             $script:StepLabel = ''
         }
         return $result
@@ -779,6 +1855,8 @@ function Invoke-Step {
         if ($title) {
             $dots = '.' * [Math]::Max(3, 44 - $script:StepLabel.Length)
             Complete-LiveStatus ("$($script:StepLabel) $dots error interno") 'Red'
+            Push-UiEvent -Tipo 'paso.fin' -Datos @{ n = $script:StepIndex; estado = 'error interno'
+                                                    nota = ''; ms = 0 }
             $script:StepLabel = ''
         }
         return $null
@@ -891,6 +1969,21 @@ function Resolve-RunMode {
       'auto' = preguntar si hay un humano; en modo agente equivale a 'Ambos' (historico).
     #>
     if ($Modo -ne 'auto') { return $Modo }
+    if (Test-UiWeb) {
+        $r = Request-UiAnswer -Id 'modo' -Clase 'modo' `
+            -Titulo 'Que impresora hay que revisar?' `
+            -Texto ('Si elegis mal, el diagnostico puede terminar hablando de una impresora que no ' +
+                    'es la que falla. Nace de un caso real: un cliente con dos impresoras de red ' +
+                    'sanas recibia como diagnostico "ninguna impresora fisica conectada".') `
+            -Texto2 'Si no sabes, elegi las dos.' `
+            -Opciones @(
+                @{ v = 'USB';   l = 'USB';     detalle = 'La impresora esta enchufada a esta PC con un cable' },
+                @{ v = 'Red';   l = 'Red';     detalle = 'La impresora tiene IP propia (cable de red o wifi)' },
+                @{ v = 'Ambos'; l = 'Las dos'; detalle = 'Revisar todo lo que haya'; principal = $true })
+        if ($r -eq 'USB') { return 'USB' }
+        if ($r -eq 'Red') { return 'Red' }
+        return 'Ambos'
+    }
     if (-not (Test-IsInteractiveConsole)) { return 'Ambos' }
 
     Write-Host ''
@@ -925,7 +2018,21 @@ function Confirm-ReviewOtherInterface {
     #>
     param([string]$Modo, $Otras)
     $lista = @($Otras)
-    if (-not (Test-IsInteractiveConsole)) { return $false }
+    if (-not (Test-HayHumano)) { return $false }
+    if (Test-UiWeb) {
+        $queSonUi = $(if ($Modo -eq 'Red') { 'por USB' } else { 'de red' })
+        $r = Request-UiAnswer -Id 'otraInterfaz' -Clase 'confirm' `
+            -Titulo ('No hay ninguna impresora ' + $(if ($Modo -eq 'Red') { 'de red' } else { 'por USB' }) + ' instalada en esta PC') `
+            -Texto ('Elegiste revisar ' + $(if ($Modo -eq 'Red') { 'la red' } else { 'el USB' }) +
+                    ', asi que no se toco ninguna de las otras. El motor no solo diagnostica: ' +
+                    'repara e imprime, y sacar papel de una impresora que nadie pidio es peor ' +
+                    'que no revisar nada.') `
+            -Extra @{ otras = @($lista); queSon = $queSonUi } `
+            -Opciones @(
+                @{ v = 'si'; l = ('Revisa las ' + $queSonUi + ' igual') },
+                @{ v = 'no'; l = 'No, terminar aca'; principal = $true })
+        return ($r -eq 'si')
+    }
     Suspend-LiveStatus
     $queSon = $(if ($Modo -eq 'Red') { 'por USB' } else { 'de red' })
     Write-Host ''
@@ -987,7 +2094,26 @@ function Confirm-PaperCameOut {
       Por eso, si hay consola, se pregunta. Devuelve $true / $false / $null (no se pudo).
     #>
     param([string]$Printer)
-    if (-not (Test-IsInteractiveConsole)) { return $null }
+    if (-not (Test-HayHumano)) { return $null }
+    if (Test-UiWeb) {
+        # La leccion de la 3.10: si le preguntas a un humano, la pregunta tiene que poder
+        # contestarse bien. Por eso la interfaz manda tambien QUE tiene que estar mirando.
+        $r = Request-UiAnswer -Id 'papel' -Clase 'papel' `
+            -Titulo ("Mira la impresora: salio el ticket de prueba de '" + $Printer + "'?") `
+            -Texto ('Es la unica pregunta que el motor no puede contestar solo. Windows da el ' +
+                    'trabajo por impreso apenas la impresora acepta los bytes, aunque no haya ' +
+                    'papel, la tapa este abierta o el rollo puesto al reves.') `
+            -Texto2 ('El ticket sale con avance de papel antes del corte, asi que tiene que asomar ' +
+                     'fuera de la impresora. Si ves papel en blanco, el rollo esta al reves.') `
+            -Extra @{ impresora = $Printer } `
+            -Opciones @(
+                @{ v = 'si';   l = 'Salio, lo tengo en la mano'; principal = $true },
+                @{ v = 'no';   l = 'No salio nada' },
+                @{ v = 'nose'; l = 'No la puedo ver ahora' })
+        if ($r -eq 'si') { return $true }
+        if ($r -eq 'no') { return $false }
+        return $null
+    }
     Suspend-LiveStatus
     Write-Host ''
     Write-Host ("  Mira la impresora: salio el ticket de prueba de '" + $Printer + "'?") -ForegroundColor Cyan
@@ -1061,7 +2187,17 @@ function Confirm-Irreversible {
     param([string]$Description, [string]$Impact = '')
     if ($SkipIrreversible) { return $false }
     if ($script:BoundParams -and $script:BoundParams.ContainsKey('AllowQueuePurge')) { return [bool]$AllowQueuePurge }
-    if (-not (Test-IsInteractiveConsole)) { return $false }
+    if (-not (Test-HayHumano)) { return $false }
+    if (Test-UiWeb) {
+        $r = Request-UiAnswer -Id 'irreversible' -Clase 'peligro' `
+            -Titulo $Description `
+            -Texto 'Es la unica accion del motor que no se puede deshacer.' `
+            -Texto2 $Impact `
+            -Opciones @(
+                @{ v = 'si'; l = 'Aplicarlo igual'; peligro = $true },
+                @{ v = 'no'; l = 'No tocar nada'; principal = $true })
+        return ($r -eq 'si')
+    }
 
     Suspend-LiveStatus
     [Console]::Error.WriteLine('')
@@ -1530,14 +2666,16 @@ function Get-NativeMessagingState {
         [ordered]@{ nav = 'Chromium'; ruta = ('HKCU:\Software\Chromium\NativeMessagingHosts\' + $script:FudoNativeHostName) }
     )
     foreach ($c in $claves) {
-        $json = ''
-        try { $json = [string](Get-ItemProperty -Path ([string]$c.ruta) -ErrorAction SilentlyContinue).'(default)' } catch {}
-        if (-not $json) { $out.pendientes += ([string]$c.nav + ': sin clave de registro'); continue }
+        # $rutaManifest y no $json: es la RUTA al manifest, y ademas $Json es un parametro del
+        # script (ver escenario 105 del self-test).
+        $rutaManifest = ''
+        try { $rutaManifest = [string](Get-ItemProperty -Path ([string]$c.ruta) -ErrorAction SilentlyContinue).'(default)' } catch {}
+        if (-not $rutaManifest) { $out.pendientes += ([string]$c.nav + ': sin clave de registro'); continue }
         $existe = $false
-        try { $existe = [bool](Test-Path $json) } catch {}
+        try { $existe = [bool](Test-Path $rutaManifest) } catch {}
         if (-not $existe) { $out.pendientes += ([string]$c.nav + ': la clave apunta a un manifest que no existe'); continue }
         $out.navegadores += [string]$c.nav
-        if (-not $out.manifest) { $out.manifest = [string]$json }
+        if (-not $out.manifest) { $out.manifest = [string]$rutaManifest }
     }
     # Firefox: manifest suelto, sin registro.
     try {
@@ -2298,13 +3436,13 @@ function Get-DriverPlan {
 function Test-IsVirtualPrinter {
     <# Devuelve @{ isVirtual = $true/$false; reason = '...' } #>
     param($P)
-    $name = ''; $drv = ''; $port = ''
+    $name = ''; $drv = ''; $puerto = ''
     try { $name = [string]$P.Name } catch {}
     try { $drv  = [string]$P.DriverName } catch {}
-    try { $port = [string]$P.PortName } catch {}
+    try { $puerto = [string]$P.PortName } catch {}
     foreach ($pat in $script:VirtualNamePatterns)   { if ($name -match $pat) { return @{ isVirtual = $true; reason = "nombre coincide con impresora virtual ($pat)" } } }
     foreach ($pat in $script:VirtualDriverPatterns) { if ($drv  -match $pat) { return @{ isVirtual = $true; reason = "driver virtual ($drv)" } } }
-    foreach ($pat in $script:VirtualPortPatterns)   { if ($port -match $pat) { return @{ isVirtual = $true; reason = "puerto no fisico ($port)" } } }
+    foreach ($pat in $script:VirtualPortPatterns)   { if ($puerto -match $pat) { return @{ isVirtual = $true; reason = "puerto no fisico ($puerto)" } } }
     return @{ isVirtual = $false; reason = '' }
 }
 
@@ -3664,6 +4802,9 @@ function Wait-ForPrinterReconnect {
     while (((Get-Date) - $t0).TotalSeconds -lt $TimeoutSec) {
         $restante = [int]($TimeoutSec - ((Get-Date) - $t0).TotalSeconds)
         Write-LiveStatus ("Esperando que desconectes y vuelvas a conectar el USB de la impresora... ${restante}s")
+        Push-UiEvent -Tipo 'espera' -Datos @{ id = 'usb'; restante = $restante
+            titulo = 'Desenchufa y volve a enchufar el cable USB de la impresora'
+            texto  = 'En cuanto Windows la vea, el motor detecta en que puerto aparecio y sigue solo.' }
         Start-Sleep -Seconds 3
 
         $script:PresentIds = $null
@@ -3701,6 +4842,19 @@ function Invoke-ReconnectFlow {
     $quiere = $false
     if ($script:ForceWaitReconnect) { $quiere = $true }
     elseif ($script:BoundParams -and $script:BoundParams.ContainsKey('WaitReconnect')) { $quiere = [bool]$WaitReconnect }
+    elseif (Test-UiWeb) {
+        $rRe = Request-UiAnswer -Id 'reconectar' -Clase 'confirm' `
+            -Titulo 'Desenchufa y volve a enchufar el cable USB de la impresora' `
+            -Texto ("La cola '" + [string]$Printer.Name + "' apunta a " + [string]$Printer.PortName +
+                    ', donde no hay ningun dispositivo conectado. Si la enchufas ahora, el motor ' +
+                    'detecta en que puerto aparecio y sigue la reparacion solo.') `
+            -Texto2 ('Preferentemente en el mismo puerto de siempre. Si no entra, cualquiera sirve: ' +
+                     'el motor reengancha la cola al puerto nuevo.') `
+            -Opciones @(
+                @{ v = 'si'; l = 'Listo, la voy a enchufar ahora'; principal = $true },
+                @{ v = 'no'; l = 'No puedo ahora, segui sin esto' })
+        $quiere = ($rRe -eq 'si')
+    }
     elseif (Test-IsInteractiveConsole) {
         Suspend-LiveStatus
         [Console]::Error.WriteLine('')
@@ -4243,13 +5397,16 @@ function Get-DetectedInterface {
     param($Printer)
     if ($Interface -ne 'auto') { return $Interface }
     if ($PrinterIp) { return 'Ethernet' }
-    $port = ''
-    if ($Printer) { try { $port = [string]$Printer.PortName } catch {} }
-    if ($port -like 'USB*' -or $port -like 'LPT*' -or $port -like '*USB*') { return 'USB' }
-    if ($port -match '^\d{1,3}(\.\d{1,3}){3}' -or $port -like 'IP_*' -or $port -like '*9100*') { return 'Ethernet' }
+    # $puertoCola y no $port: $Port es un parametro del script (el TCP 9100) y PowerShell no
+    # distingue mayusculas. Aca no hacia dano porque se asigna antes de leerse, pero es el
+    # mismo patron que rompio la salida del JSON. Ver el escenario 105 del self-test.
+    $puertoCola = ''
+    if ($Printer) { try { $puertoCola = [string]$Printer.PortName } catch {} }
+    if ($puertoCola -like 'USB*' -or $puertoCola -like 'LPT*' -or $puertoCola -like '*USB*') { return 'USB' }
+    if ($puertoCola -match '^\d{1,3}(\.\d{1,3}){3}' -or $puertoCola -like 'IP_*' -or $puertoCola -like '*9100*') { return 'Ethernet' }
     # WSD: la cola es de red aunque no tenga IP en el nombre del puerto (Windows la descubrio
     # sola por la red). Tratarla como USB hacia que la capa 3 dijera 'Puerto USB OK'.
-    if ($port -match '(?i)^WSD-' -or $port -match '(?i)^\{?[0-9a-f]{8}-[0-9a-f]{4}-') { return 'WSD' }
+    if ($puertoCola -match '(?i)^WSD-' -or $puertoCola -match '(?i)^\{?[0-9a-f]{8}-[0-9a-f]{4}-') { return 'WSD' }
     return 'USB'
 }
 
@@ -4697,7 +5854,21 @@ function Confirm-NetProbe {
     #>
     param([string]$Prefijo, [string]$Motivo)
     if ($script:BoundParams -and $script:BoundParams.ContainsKey('AllowNetProbe')) { return [bool]$AllowNetProbe }
-    if (-not (Test-IsInteractiveConsole)) { return $false }
+    if (-not (Test-HayHumano)) { return $false }
+    if (Test-UiWeb) {
+        $r = Request-UiAnswer -Id 'netprobe' -Clase 'confirm' `
+            -Titulo 'Le agrego una IP temporal a esta PC para poder ver la impresora?' `
+            -Texto ('Puede haber una impresora de red en la subred ' + $Prefijo + '.0/24, distinta ' +
+                    'a la de esta PC. Para verla, el motor le agrega una segunda direccion a la ' +
+                    'placa de red y la saca al terminar.') `
+            -Texto2 ('La PC NO pierde internet ni la conexion remota: conserva su IP y suma una. ' +
+                     'Es lo unico que el motor toca de la red del cliente, y se retira siempre.' +
+                     $(if ($Motivo) { ' Por que: ' + $Motivo } else { '' })) `
+            -Opciones @(
+                @{ v = 'si'; l = 'Agregala y revisa esa subred'; principal = $true },
+                @{ v = 'no'; l = 'No tocar la red' })
+        return ($r -eq 'si')
+    }
 
     Suspend-LiveStatus
     [Console]::Error.WriteLine('')
@@ -6409,6 +7580,24 @@ function Resolve-CaseIdObligatorio {
     param([string]$Actual)
     $id = Test-CaseIdValido -Texto $Actual
     if ($id) { return $id }
+    if (Test-UiWeb) {
+        for ($iUi = 1; $iUi -le 5; $iUi++) {
+            $rCaso = Request-UiAnswer -Id 'caso' -Clase 'texto' `
+                -Titulo 'Conversacion de Intercom' `
+                -Texto ('Pega la conversacion o los 15 digitos. Es obligatorio: sin esto la ' +
+                        'corrida no se puede cruzar con el caso del cliente.') `
+                -Texto2 $(if ($iUi -gt 1) { 'Eso no parece un ID de conversacion: hacen falta 15 digitos.' } else { '' }) `
+                -Extra @{ placeholder = '215475776099648  o la URL de la conversacion' }
+            if ($null -eq $rCaso) { break }
+            $idUi = Test-CaseIdValido -Texto $rCaso
+            if ($idUi) { return $idUi }
+        }
+        Push-UiEvent -Tipo 'cortado' -Datos @{
+            titulo = 'Sin ID de conversacion no se puede correr el diagnostico'
+            texto  = 'Buscalo en la URL de la conversacion de Intercom y volve a abrir FudoPrintDoctor.' }
+        Start-Sleep -Seconds 3
+        exit 6
+    }
     if (-not (Test-IsInteractiveConsole)) {
         [Console]::Error.WriteLine('')
         [Console]::Error.WriteLine('  FALTA EL ID DE CONVERSACION.')
@@ -6740,6 +7929,38 @@ function Invoke-SelfTest {
         }
     }
     Assert-Eq 'S76 ninguna funcion llama a algo que no existe fuera del self-test' '' ((@($huerfanas76) | Sort-Object -Unique) -join '; ')
+
+    # Escenario 105 (v3.22): ninguna funcion puede ASIGNAR una variable que se llame igual que un
+    # parametro del script. PowerShell no distingue mayusculas, asi que ese local tapa al
+    # parametro para el resto de la funcion.
+    # De donde sale: adentro de Write-DoctorResult, '$json = $Obj | ConvertTo-Json' tapaba al
+    # switch -Json. El guard '$emitJson = [bool]$Json' evaluaba el texto serializado (nunca
+    # vacio) en vez del switch, asi que el JSON entero se imprimia en pantalla en TODAS las
+    # corridas y la copia automatica en Temp no se escribia nunca. Estuvo asi varias versiones
+    # con un comentario al lado afirmando que estaba resuelto.
+    # Como S76: esto NO se encuentra corriendo escenarios, hay que mirar el codigo.
+    $sfn77 = @($todas76 | Where-Object { [string]$_.Name -eq 'Invoke-SelfTest' }) | Select-Object -First 1
+    $ini77 = -1; $fin77 = -1
+    if ($sfn77) { $ini77 = [int]$sfn77.Extent.StartOffset; $fin77 = [int]$sfn77.Extent.EndOffset }
+    $params77 = @($ast76.ParamBlock.Parameters | ForEach-Object { [string]$_.Name.VariablePath.UserPath })
+    $esAsig77 = { param($x) $x -is [System.Management.Automation.Language.AssignmentStatementAst] }
+    $choques77 = @()
+    foreach ($fn77 in @($todas76 | Where-Object { [int]$_.Extent.StartOffset -lt $ini77 -or [int]$_.Extent.StartOffset -ge $fin77 })) {
+        # Un parametro PROPIO que se llame igual no es un accidente: es la funcion recibiendo
+        # ese dato. Lo que se persigue es el local que aparece por descuido.
+        $propios77 = @()
+        if ($fn77.Body.ParamBlock) {
+            $propios77 = @($fn77.Body.ParamBlock.Parameters | ForEach-Object { [string]$_.Name.VariablePath.UserPath })
+        }
+        foreach ($a77 in @($fn77.Body.FindAll($esAsig77, $true))) {
+            if ($a77.Left -isnot [System.Management.Automation.Language.VariableExpressionAst]) { continue }
+            $nom77 = [string]$a77.Left.VariablePath.UserPath
+            if ($nom77 -match ':') { continue }   # $script:algo tiene scope explicito
+            if (@($propios77) -contains $nom77) { continue }
+            if (@($params77) -contains $nom77) { $choques77 += ([string]$fn77.Name + ' -> $' + $nom77) }
+        }
+    }
+    Assert-Eq 'S105 ninguna funcion tapa un parametro del script' '' ((@($choques77) | Sort-Object -Unique) -join '; ')
 
     function Get-CheckById { param([string]$Id) return (@($script:Checks | Where-Object { $_.id -eq $Id }) | Select-Object -First 1) }
 
@@ -9519,6 +10740,51 @@ function Get-MenuOptions {
     return @($ops)
 }
 
+function Get-MenuCatalogo {
+    <#
+      Todo lo que el motor sabe hacer sobre la PC, con lo que hace cada cosa y -cuando no
+      corresponde- por que no.
+      Por que existe: Get-MenuOptions arma el menu SOLO con las opciones que aplican, asi que
+      en consola una gestion que no corresponde simplemente no esta, y el asesor no puede
+      distinguir 'no hace falta' de 'se rompio algo'. La interfaz las muestra todas: las que
+      aplican con su boton, las que no con el motivo. El texto de 'que hace' tampoco existia
+      en ningun lado: el menu de consola muestra el titulo pelado.
+      El motivo se resuelve arriba, cruzando con lo que devolvio Get-MenuOptions.
+    #>
+    return @(
+        [ordered]@{ k = 'T'; t = 'Imprimir un ticket de prueba'
+                    d = 'Manda un ESC/POS directo al hardware, salteando Fudo y el driver. Es la forma de separar un problema de impresora de uno de configuracion.'
+                    na = '' }
+        [ordered]@{ k = 'L'; t = 'Limpiar la cola de impresion'
+                    d = 'Descarta los trabajos pendientes. Es la unica accion del motor que no se puede deshacer.'
+                    na = 'no hay trabajos pendientes en ninguna cola' }
+        [ordered]@{ k = 'U'; t = 'Esperar la reconexion del USB'
+                    d = 'Espera a que desenchufes y vuelvas a enchufar el cable, detecta en que puerto aparecio la impresora y reengancha la cola sola.'
+                    na = 'no hay ninguna impresora desconectada' }
+        [ordered]@{ k = 'I'; t = 'Instalar la impresora conectada'
+                    d = 'Cuando hay hardware conectado sin cola en Windows: instala el driver generico de texto y crea la cola.'
+                    na = 'no hay hardware conectado sin cola en Windows' }
+        [ordered]@{ k = 'N'; t = 'Buscar impresoras en la red'
+                    d = 'Barre la red buscando algo que conteste en el puerto 9100 y saca la marca de la MAC.'
+                    na = '' }
+        [ordered]@{ k = 'P'; t = 'Instalar una impresora de red'
+                    d = 'Crea la cola de Windows apuntando a la IP de alguna de las que se encontraron.'
+                    na = 'todavia no se encontro ninguna impresora en la red' }
+        [ordered]@{ k = 'F'; t = 'Instalar o reparar la App Nativa'
+                    d = 'La saca de la cuarentena del antivirus, instala la version firmada y registra el host nativo para Chrome.'
+                    na = 'la App Nativa esta bien' }
+        [ordered]@{ k = 'A'; t = 'Actualizar el motor'
+                    d = 'Baja la ultima version publicada. El motor avisa cuando hay una, pero nunca se actualiza solo.'
+                    na = 'el motor esta en la ultima version' }
+        [ordered]@{ k = 'D'; t = 'Ver el detalle de los chequeos'
+                    d = 'La lista completa de lo que se reviso, con el resultado de cada cosa.'
+                    na = '' }
+        [ordered]@{ k = 'J'; t = 'Guardar el JSON en otra carpeta'
+                    d = 'El JSON ya se escribe solo en Temp. Esto lo copia a donde quieras para adjuntarlo al caso.'
+                    na = '' }
+    )
+}
+
 function Resolve-MenuChoice {
     <#
       Decide que hacer con lo que escribio el asesor. Separado de la lectura para poder
@@ -9535,6 +10801,23 @@ function Resolve-MenuChoice {
 
 function Show-DoctorMenu {
     $ops = @(Get-MenuOptions)
+    if (Test-UiWeb) {
+        # Las mismas opciones y las mismas condiciones que en consola: Get-MenuOptions sigue
+        # siendo quien decide cuales aplican. La interfaz solo las dibuja.
+        $opsUi = @()
+        foreach ($o in $ops) { $opsUi += @{ v = [string]$o.k; l = [string]$o.t } }
+        $dispUi = @($ops | ForEach-Object { [string]$_.k })
+        $catUi = @()
+        foreach ($c in @(Get-MenuCatalogo)) {
+            $hayUi = [bool](@($dispUi) -contains [string]$c.k)
+            $catUi += @{ v = [string]$c.k; l = [string]$c.t; detalle = [string]$c.d
+                         disponible = $hayUi; motivo = $(if ($hayUi) { '' } else { [string]$c.na }) }
+        }
+        $rUi = Request-UiAnswer -Id 'menu' -Clase 'menu' -Extra @{ catalogo = @($catUi) } `
+            -Titulo 'Que queres hacer ahora?' -Opciones $opsUi
+        if ($null -eq $rUi) { return 'S' }
+        return (Resolve-MenuChoice -Raw $rUi -Keys @($ops | ForEach-Object { [string]$_.k }))
+    }
     Write-Host ''
     Write-Host '  ==============================================================' -ForegroundColor DarkGray
     Write-Host '   QUE QUERES HACER AHORA' -ForegroundColor Cyan
@@ -9909,7 +11192,21 @@ function Confirm-NativaKit {
     param($Kit)
     if ($NoNativaKitCheck) { $script:NativaKitOmitido = $true; return $true }
     if ($Kit -and [bool]$Kit.listo) { return $true }
-    if (-not (Test-IsInteractiveConsole)) { return $true }
+    if (-not (Test-HayHumano)) { return $true }
+    if (Test-UiWeb) {
+        $rKit = Request-UiAnswer -Id 'kit' -Clase 'confirm' `
+            -Titulo ('Falta el instalador de la App Nativa firmada (v' + $script:NativaVersionFirmada + ')') `
+            -Texto ([string]$Kit.motivo + '.') `
+            -Texto2 ('Sin ese archivo, si este cliente tiene una version vieja de la App Nativa el ' +
+                     'motor NO puede actualizarla y el antivirus se la va a volver a comer. ' +
+                     'Conviene tenerlo siempre junto a los dos archivos que copias a la PC del ' +
+                     'cliente: se arregla una vez y sirve para todos los casos.') `
+            -Opciones @(
+                @{ v = 'no'; l = 'Cortar y buscar el .msi'; principal = $true },
+                @{ v = 'si'; l = 'Seguir igual (queda registrado)' })
+        if ($null -eq $rKit) { return $true }
+        return ($rKit -eq 'si')
+    }
 
     Suspend-LiveStatus
     [Console]::Error.WriteLine('')
@@ -10130,6 +11427,49 @@ function Select-LocalNativeInstaller {
 
     Suspend-LiveStatus
     Write-Host ''
+    if (Test-UiWeb) {
+        # Las mismas etiquetas que en consola (recomendada / firmada / SIN firmar / mas vieja
+        # que la instalada), pero como opciones elegibles en vez de un numero a escribir.
+        $opsN = @()
+        foreach ($c in @($cands)) {
+            $etq = @()
+            if ([string]$c.ruta -eq [string]$reco.ruta) { $etq += 'recomendada' }
+            $vcN = $null
+            try { $vcN = [version]$c.version } catch {}
+            if ($null -ne $vcN) {
+                try { if ($vcN -lt [version]$script:NativaVersionFirmada) { $etq += 'SIN firmar' } else { $etq += 'firmada' } } catch {}
+            }
+            if ($Instalada -and $c.version) {
+                try { if ([version]$c.version -lt [version]$Instalada) { $etq += ('mas vieja que la instalada v' + $Instalada) } } catch {}
+            }
+            $opsN += @{
+                v = [string]$c.ruta
+                l = $(if ($c.version) { 'v' + [string]$c.version } else { '(no declara version)' }) +
+                    $(if (@($etq).Count -gt 0) { '  [' + (@($etq) -join ' / ') + ']' } else { '' })
+                detalle = [string]$c.ruta
+                principal = ([string]$c.ruta -eq [string]$reco.ruta)
+            }
+        }
+        $rN = Request-UiAnswer -Id 'nativaVersion' -Clase 'modo' `
+            -Titulo 'Cual version de la App Nativa instalo?' `
+            -Texto ('Hay mas de un instalador en esta PC. Desde la v' + $script:NativaVersionFirmada +
+                    ' la Nativa esta firmada: el antivirus deja de bloquearla y no hace falta ' +
+                    'ninguna exclusion.') `
+            -Texto2 ('Bajar de version tiene sentido solo si el antivirus de este cliente bloquea ' +
+                     'la firmada. Si no, no.') `
+            -Opciones $opsN
+        if ($rN) {
+            $elegidoN = @($cands | Where-Object { [string]$_.ruta -eq [string]$rN }) | Select-Object -First 1
+            if ($elegidoN) {
+                return @{ ruta = [string]$elegidoN.ruta; version = [string]$elegidoN.version
+                          elegidoPorPersona = ([string]$elegidoN.ruta -ne [string]$reco.ruta)
+                          candidatos = @($cands); motivo = 'lo eligio el asesor en la interfaz' }
+            }
+        }
+        return @{ ruta = [string]$reco.ruta; version = [string]$reco.version
+                  elegidoPorPersona = $false; candidatos = @($cands)
+                  motivo = 'se uso la recomendada' }
+    }
     Write-Host '  Hay mas de un instalador de la App Nativa en esta PC:' -ForegroundColor Cyan
     $i = 0
     foreach ($c in @($cands)) {
@@ -10771,15 +12111,22 @@ function Write-DoctorResult {
         }
     } catch {}
 
-    $json = $null
+    # OJO con el nombre de esta variable. Se llamaba $json, y PowerShell no distingue
+    # mayusculas: adentro de esta funcion tapaba al parametro -Json del script, asi que el
+    # guard de abajo ('$emitJson = [bool]$Json') terminaba evaluando el TEXTO serializado -que
+    # nunca esta vacio- en vez del switch. Consecuencia: el JSON entero se imprimia en pantalla
+    # en TODAS las corridas, aunque nadie pidiera -Json, y encima la copia automatica en Temp
+    # nunca se escribia porque esa rama pide -not $emitJson. El comentario de mas abajo decia
+    # que el problema estaba resuelto desde hacia varias versiones; no lo estaba.
+    $jsonTexto = $null
     try {
-        $json = $Obj | ConvertTo-Json -Depth 12
+        $jsonTexto = $Obj | ConvertTo-Json -Depth 12
     } catch {
-        $json = '{"schemaVersion":"' + $script:SchemaVersion + '","status":"engine_error","error":{"message":"No se pudo serializar el resultado a JSON: ' + (([string]$_.Exception.Message) -replace '"','\"') + '"}}'
+        $jsonTexto = '{"schemaVersion":"' + $script:SchemaVersion + '","status":"engine_error","error":{"message":"No se pudo serializar el resultado a JSON: ' + (([string]$_.Exception.Message) -replace '"','\"') + '"}}'
     }
     if ($JsonOut) {
         try {
-            $json | Out-File -FilePath $JsonOut -Encoding UTF8
+            $jsonTexto | Out-File -FilePath $JsonOut -Encoding UTF8
             [Console]::Error.WriteLine("Resultado JSON escrito en: $JsonOut")
         } catch {
             [Console]::Error.WriteLine("No se pudo escribir '$JsonOut': $($_.Exception.Message)")
@@ -10793,14 +12140,40 @@ function Write-DoctorResult {
     if (-not $emitJson -and -not $JsonOut) {
         try {
             $auto = Join-Path $env:TEMP ("FudoPrintDoctor-" + (Get-Date).ToString('yyyyMMdd-HHmmss') + ".json")
-            $json | Out-File -FilePath $auto -Encoding UTF8
+            $jsonTexto | Out-File -FilePath $auto -Encoding UTF8
             $script:AutoJsonPath = $auto
         } catch {}
     }
 
+    # La interfaz recibe el resultado completo de una: el resumen humano que ya arma
+    # Build-HumanSummary, las acciones priorizadas y el JSON. No se recalcula nada aca.
+    if (Test-UiWeb) {
+        try { $script:UiState.Json = [string]$jsonTexto } catch {}
+        Set-UiFase 'resultado'
+        $resumenUi = ''
+        try { $resumenUi = [string]$Obj.humanSummary } catch {}
+        $dondeUi = $(if ($JsonOut) { $JsonOut } elseif ($script:AutoJsonPath) { $script:AutoJsonPath } else { '' })
+        Push-UiEvent -Tipo 'resultado' -Datos @{
+            status      = [string]$Obj.status
+            resumen     = $resumenUi
+            diagnostico = $Obj.diagnosis
+            acciones    = @($Obj.nextActions)
+            llegada     = $Obj.llegada
+            telemetria  = $script:TelemetryStatus
+            jsonPath    = $dondeUi
+            modo        = [string]$script:RunMode
+            aviso       = [string]$script:UpdateNote
+            abortoPorModo = [bool]$script:AbortByMode
+            colas         = $(if ($script:Diagnostics.Contains('colas')) { @($script:Diagnostics['colas']) } else { @() })
+            conectadas    = $(if ($script:Diagnostics.Contains('printersConnected')) { @($script:Diagnostics['printersConnected']) } else { @() })
+            desconectadas = $(if ($script:Diagnostics.Contains('impresorasDesconectadas')) { @($script:Diagnostics['impresorasDesconectadas']) } else { @() })
+            planRed       = $(if ($script:Diagnostics.Contains('planRedImpresora')) { $script:Diagnostics['planRedImpresora'] } else { $null })
+        }
+    }
+
     if ($emitJson) {
         Write-Output $script:JsonBegin
-        Write-Output $json
+        Write-Output $jsonTexto
         Write-Output $script:JsonEnd
     }
 
@@ -10876,6 +12249,22 @@ try {
     # el cliente -lo que importa es si el asesor puede resolverlo cuando aparezca- y se pregunta
     # antes que el ID del caso, para no hacerle pegar la conversacion de Intercom y recien
     # despues mandarlo a buscar un archivo.
+    # La interfaz se levanta antes de las compuertas, para que el kit y el ID de conversacion
+    # se pregunten ahi y no en dos lugares distintos. En modo agente no se levanta: no hay a
+    # quien mostrarle nada, y el contrato del JSON no cambia.
+    $script:UiTimeout = [int]$UiTimeoutSec
+    if ($Ui -eq 'web' -and -not $Quiet -and -not $Json) {
+        $script:UiModo = 'web'
+        if (Start-DoctorUi -Puerto $UiPort) {
+            [Console]::Error.WriteLine('')
+            [Console]::Error.WriteLine('  La interfaz se abrio en el navegador de esta PC:')
+            [Console]::Error.WriteLine('    ' + $script:UiUrl)
+            [Console]::Error.WriteLine('  Si no se abrio sola, pega esa direccion. Esta ventana puede quedar de fondo,')
+            [Console]::Error.WriteLine('  pero NO hay que cerrarla: el diagnostico corre aca.')
+            [Console]::Error.WriteLine('')
+        }
+    }
+
     if (Test-VersionBloqueada) { exit 5 }
     $script:NativaKit = Test-NativaKitReady
     if (-not (Confirm-NativaKit -Kit $script:NativaKit)) {
@@ -10885,12 +12274,17 @@ try {
         exit 7
     }
     $CaseId = Resolve-CaseIdObligatorio -Actual $CaseId
+    Push-UiEvent -Tipo 'caso' -Datos @{ caseId = $CaseId; host = $env:COMPUTERNAME; version = $script:SchemaVersion }
+    Set-UiFase 'revisando'
 
     $final = Invoke-FudoPrintDoctor
     Write-DoctorResult -Obj $final
 
     # Menu de acciones: permite volver a revisar o corregir sin cerrar y reabrir la app.
-    if (-not $NoMenu -and (Test-IsInteractiveConsole)) {
+    # Test-HayHumano y no Test-IsInteractiveConsole: con la interfaz web la salida de esta
+    # ventana esta redirigida y no hay consola que pintar, pero hay una persona del otro lado
+    # esperando para elegir. Con la condicion vieja el menu no aparecia nunca en modo web.
+    if (-not $NoMenu -and (Test-HayHumano)) {
         while ($true) {
             $op = Show-DoctorMenu
             if ($op -eq 'S') { break }
@@ -10909,11 +12303,22 @@ try {
             $script:MenuVacios = 0
             $volverACorrer = Invoke-MenuAction -Op $op
             if ($volverACorrer) {
+                Push-UiEvent -Tipo 'reinicio' -Datos @{}
+                Set-UiFase 'revisando'
                 Reset-RunState
                 $final = Invoke-FudoPrintDoctor
                 Write-DoctorResult -Obj $final
             }
         }
+    }
+
+    # La pagina muere con el proceso. Un respiro para que el ultimo estado llegue al navegador
+    # antes de que se caiga el servidor: si no, el asesor ve 'se perdio la conexion' en vez de
+    # 'listo'.
+    if (Test-UiWeb) {
+        Push-UiEvent -Tipo 'cerrado' -Datos @{}
+        Set-UiFase 'fin'
+        Start-Sleep -Milliseconds 1200
     }
 
     if (@($script:Errors).Count -gt 0)                                   { exit 3 }
@@ -11009,6 +12414,10 @@ try {
     Write-DoctorResult -Obj $err
     exit 3
 } finally {
+    # La interfaz se cierra siempre, tambien si el motor aborto: dejar un puerto escuchando en
+    # la PC de un cliente seria peor que no haber revisado nada.
+    try { Set-UiFase 'fin' } catch {}
+    try { Stop-DoctorUi } catch {}
     # La IP secundaria que se agrego para poder ver una impresora de otra subred se saca SIEMPRE,
     # tambien si el motor aborto: dejarle una direccion de mas a la placa del cliente seria peor
     # que no haber revisado nada. Va en finally justamente porque los caminos de salida son
