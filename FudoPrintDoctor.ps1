@@ -454,7 +454,7 @@ $script:TestPrinterRx = '(?i)^FUDO-TEST-'
 # puerto tenga hardware; si el hardware se va, deja de serlo (ver Remove-OrphanOwnQueues).
 $script:OwnQueueRx   = '(?i)^FUDO-(TEST-|USB\d)'
 $script:TestDocRx    = '(?i)fudo print doctor'
-$script:SchemaVersion = '3.20'
+$script:SchemaVersion = '3.21'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -1890,8 +1890,17 @@ function Test-Layer0b-NativeApp {
             Start-Sleep -Milliseconds 800
             try {
                 $reCheck = Find-FudoNativeInstall
-                $volvio = ((@($reCheck.paths).Count -gt 0) -or (@($reCheck.regInfo).Count -gt 0))
-                try { $verDespues = [string](@($reCheck.regInfo)[0].version) } catch {}
+                # v3.21: aca quedo el criterio VIEJO -carpeta o entrada de registro- cuando la
+                # 3.19 lo cambio en todos lados por "el ejecutable esta en disco". Y como este
+                # camino ademas CORRIGE el hallazgo de la capa 0b.1, el criterio flojo le ganaba
+                # al estricto: la carpeta %LOCALAPPDATA%\Fudo sigue existiendo despues de que el
+                # antivirus se lleva el .exe -quedan los dos manifests y node_printer.node- asi
+                # que 'volvio' daba $true con la Nativa borrada. Resultado en la PC de un cliente:
+                # "App Nativa restaurada de la cuarentena", capa 0b en "reparado", cero fallas,
+                # el ticket de prueba salio y el caso cerro RESUELTO -con Fudo sin poder imprimir
+                # una sola comanda-. Lo reportaron tres asesores el mismo dia, con video.
+                $volvio = [bool]$reCheck.enDisco
+                try { $verDespues = [string](@(@($reCheck.regInfo) | Where-Object { -not $_.esPwa })[0].version) } catch {}
             } catch {}
         }
         $degradada = Test-NativaDegradada -Antes $verAntes -Despues $verDespues
@@ -1970,11 +1979,39 @@ function Test-Layer0b-NativeApp {
                              'este cliente, la solucion de fondo es actualizarla a la version firmada.')
     }
 
-    # 0b.3 Antivirus de terceros (Avast, etc.): no scriptable -> guiado/escalar
+    # 0b.3 Antivirus de terceros (Avast, etc.). El motor solo sabe tocar Defender
+    # (Add-MpPreference): con un AV de terceros no puede excluir nada, asi que lo unico util que
+    # puede hacer es decir QUE hay que hacer y EN QUE ORDEN.
+    #
+    # v3.21, dos cambios, los dos de casos reales de la misma semana:
+    #  1. Era candidato a causa raiz cuando la Nativa no estaba CORRIENDO, y no correr es el
+    #     estado normal con Fudo cerrado -lo dice el codigo de al lado desde la 3.9-. Resultado:
+    #     32 corridas con este check en warn, 8 dandolo como causa y 4 de esas escalando. Ahora
+    #     es candidato solo cuando la Nativa no esta EN DISCO, que es cuando hay algo real que
+    #     explicar.
+    #  2. El texto no decia que excluir ni en que orden. Un asesor describio el flujo que si le
+    #     funciona -"desinstalo nativa, entro a printdoctor, instalo, despues de eso anado
+    #     extension en avast, quedo ok"-, y el orden importa: si se reinstala antes de excluir,
+    #     el antivirus se la vuelve a llevar y volvemos al principio.
     if (@($av.thirdParty).Count -gt 0) {
-        Add-Check -Id 'nativa.thirdPartyAV' -Layer 0 -Name 'Antivirus de terceros presente' -Status 'warn' -RootCauseCandidate (-not $procRunning) -Plane 'hardware' `
-            -Evidence @{ products = $av.thirdParty } -Reversible $true `
-            -Recommendation "Detectado $($av.thirdParty -join ', '). Puede poner la Nativa en cuarentena. Requiere accion guiada en el AV (excluir/restaurar), no automatizable de forma segura."
+        $avNombres = (@($av.thirdParty) -join ', ')
+        $carpetaFudo = [string]$install.carpeta
+        if (-not $carpetaFudo) { try { $carpetaFudo = @(Get-FudoDataDirs)[0] } catch {} }
+        Add-Check -Id 'nativa.thirdPartyAV' -Layer 0 `
+            -Name $(if (-not $installed) { "Antivirus de terceros ($avNombres) y la App Nativa no esta en disco" }
+                    else                 { "Antivirus de terceros presente ($avNombres)" }) `
+            -Status 'warn' -RootCauseCandidate (-not $installed) -Plane 'hardware' `
+            -Evidence @{ products = $av.thirdParty; nativaEnDisco = [bool]$installed; carpeta = $carpetaFudo } -Reversible $true `
+            -Recommendation $(if (-not $installed) {
+                    "Esta PC tiene $avNombres y el archivo de la App Nativa no esta. El motor NO puede tocar la configuracion de un antivirus que no sea Windows Defender, asi que esto va a mano y el ORDEN importa: " +
+                    "1) agregar la exclusion en $avNombres para la carpeta " + $(if ($carpetaFudo) { $carpetaFudo } else { '%LOCALAPPDATA%\Fudo' }) + " (y para el archivo fudo_native_extension.exe); " +
+                    "2) recien despues reinstalar la App Nativa -el motor puede hacerlo desde el menu-; " +
+                    "3) volver a correr el diagnostico para confirmar que el archivo siguio estando. " +
+                    "Si se reinstala antes de excluir, el antivirus se la vuelve a llevar y no se avanza. " +
+                    "Si con la version vigente se repite, instalar una version anterior que ese antivirus si acepte (el motor deja elegir cual si dejas los dos .msi en la carpeta)."
+                } else {
+                    "Detectado $avNombres. La App Nativa esta en disco, asi que hoy no la esta bloqueando. Si este cliente se queda sin la Nativa mas adelante, hay que excluirla a mano en $avNombres (la firma digital de la Nativa no le dice nada a un antivirus de terceros): el motor solo puede configurar exclusiones en Windows Defender."
+                })
     }
 
     # 0b.4 Los dos eslabones que faltaban entre "la Nativa esta instalada" y "Fudo imprime".
@@ -8421,7 +8458,7 @@ public class FudoFakeEndpoint {
     function Find-LocalNativeInstaller { 'C:\Users\test\Desktop\FudoNativa.msi' }
     function Get-MsiProductVersion { param($Path) '0.0.27' }
     function Find-FudoNativeInstall { [ordered]@{ found = $true; paths = @() } }
-    function Invoke-NativeInstallerFile { param($Path, $ExtraArgs) 1603 }
+    function Invoke-NativeInstallerFile { param($Path, $ExtraArgs, $Reparar) 1603 }
     function Get-NativaVersionState { param($Install) [ordered]@{ version = '0.0.18'; firmada = $false } }
     function Start-Sleep { param($Seconds) }
     $u78 = Update-FudoNativeFromLocal -Instalada '0.0.18' -Corriendo $true
@@ -8435,7 +8472,7 @@ public class FudoFakeEndpoint {
 
     # El instalador dice que anduvo y la version no cambia: tampoco puede pasar por exito.
     Reset-State
-    function Invoke-NativeInstallerFile { param($Path, $ExtraArgs) 0 }
+    function Invoke-NativeInstallerFile { param($Path, $ExtraArgs, $Reparar) 0 }
     $u78b = Update-FudoNativeFromLocal -Instalada '0.0.18' -Corriendo $true
     Assert-Eq 'S78b sin cambio de version no es exito' $false ([bool]$u78b.subio)
     Assert-Eq 'S78b y el motivo apunta a la Nativa en uso' $true ([bool]([string]$u78b.porQueNo -match 'corriendo'))
@@ -8854,7 +8891,7 @@ public class FudoFakeEndpoint {
     function Get-LocalNativeInstallers { @([ordered]@{ ruta='C:\kit\FudoNativa.msi'; version='0.0.37'; esMsi=$true; fecha=(Get-Date) }) }
     function Get-MsiProductVersion { param($Path) '0.0.37' }
     function Get-NativaVersionState { param($Install) [ordered]@{ version=[string](@($Install.regInfo)[0].version); firmada=$true } }
-    function Invoke-NativeInstallerFile { param($Path, $ExtraArgs) 0 }
+    function Invoke-NativeInstallerFile { param($Path, $ExtraArgs, $Reparar) 0 }
     function Add-MpPreference { param($ExclusionPath, $ExclusionProcess, $ErrorAction) }
     function Get-Process { param($ErrorAction) @() }
     function Start-Sleep { param($Seconds, $Milliseconds) }
@@ -8889,7 +8926,7 @@ public class FudoFakeEndpoint {
     function Get-LocalNativeInstallers { @([ordered]@{ ruta='C:\kit\FudoNativa.msi'; version='0.0.18'; esMsi=$true; fecha=(Get-Date) }) }
     function Get-MsiProductVersion { param($Path) '0.0.18' }
     $script:llamoInstalador93 = $false
-    function Invoke-NativeInstallerFile { param($Path, $ExtraArgs) $script:llamoInstalador93 = $true; 0 }
+    function Invoke-NativeInstallerFile { param($Path, $ExtraArgs, $Reparar) $script:llamoInstalador93 = $true; 0 }
     $r93c = Install-FudoNative
     Assert-Eq 'S93c no degrada la Nativa instalada' $false ([bool]$r93c.applied)
     Assert-Eq 'S93c y ni siquiera corre el instalador' $false ([bool]$script:llamoInstalador93)
@@ -8995,7 +9032,7 @@ public class FudoFakeEndpoint {
     function Find-FudoNativeInstall { [ordered]@{ paths=@(); regInfo=@([ordered]@{ name='Fudo'; version='1.0'; esPwa=$true })
                                                   exe=''; enDisco=$false; soloRegistro=$false; pwa=$true } }
     $script:llamoInstalador96 = $false
-    function Invoke-NativeInstallerFile { param($Path, $ExtraArgs) $script:llamoInstalador96 = $true; 0 }
+    function Invoke-NativeInstallerFile { param($Path, $ExtraArgs, $Reparar) $script:llamoInstalador96 = $true; 0 }
     $r96 = Install-FudoNative
     Assert-Eq 'S96 con la PWA instalada el instalador SI se ejecuta' $true ([bool]$script:llamoInstalador96)
     Assert-Eq 'S96 y sin archivos no se declara instalada' $false ([bool]$r96.applied)
@@ -9144,6 +9181,156 @@ public class FudoFakeEndpoint {
     Assert-Eq 'S99 y no se toca el perfil equivocado' $false ([bool]$script:corrio99)
     Assert-Eq 'S99 la extension tampoco se juzga' $true ([bool]($null -eq (Get-CheckById 'fudo.extension')))
 
+    # Escenario 104: el antivirus de terceros. Era causa raiz cuando la Nativa no estaba
+    # CORRIENDO -que con Fudo cerrado es lo normal-, asi que escalaba casos de gratis: 8 corridas
+    # dandolo como causa, 4 de ellas sigue_fallando. Y el texto no decia que excluir ni en que
+    # orden, que es lo unico que el motor puede aportar con un AV que no sabe tocar.
+    Reset-State
+    Reset-Mocks
+    function Get-AntivirusState {
+        [ordered]@{ defender = $null; thirdParty = @('Avast Antivirus'); realTime = $null; fudoThreats = @() }
+    }
+    function Get-NativaVersionState { param($Install) [ordered]@{ version='0.0.37'; firmada=$true; confiable=$true } }
+    function Get-Process { param($ErrorAction) @() }
+    function Get-SesionInteractiva { [ordered]@{ usuarioMotor='ana'; usuarioSesion='ana'; otroPerfil=$false } }
+    function Get-NativeMessagingState {
+        [ordered]@{ registrado=$true; navegadores=@('Chrome'); manifest='m.json'
+                    exeDelManifest='C:\Users\x\AppData\Local\Fudo\fudo_native_extension.exe'; exeExiste=$true
+                    extensionIds=@('npcjljaedonmjndbliillcmkhidejhmb'); pendientes=@() }
+    }
+    function Get-FudoExtensionState { param($Ids) [ordered]@{ instalada=$true; ids=@($Ids); encontrada='npcjljaedonmjndbliillcmkhidejhmb'
+                                                              navegador='Chrome'; perfil='Default'; perfilesVistos=1 } }
+    # Nativa EN DISCO y apagada: con Fudo cerrado es lo normal, no es causa de nada.
+    function Find-FudoNativeInstall {
+        [ordered]@{ paths=@('C:\Users\x\AppData\Local\Fudo'); regInfo=@([ordered]@{ version='0.0.37'; esPwa=$false })
+                    exe='C:\Users\x\AppData\Local\Fudo\fudo_native_extension.exe'; manifests=@()
+                    carpeta='C:\Users\x\AppData\Local\Fudo'; enDisco=$true; soloRegistro=$false; pwa=$false }
+    }
+    Test-Layer0b-NativeApp
+    $a104 = Get-CheckById 'nativa.thirdPartyAV'
+    Assert-Eq 'S104 con la Nativa en disco el AV no es causa raiz' $false ([bool]$a104.rootCauseCandidate)
+
+    # Sin la Nativa en disco si lo es, y el texto tiene que decir que hacer y en que orden.
+    Reset-State
+    function Find-FudoNativeInstall {
+        [ordered]@{ paths=@('C:\Users\x\AppData\Local\Fudo'); regInfo=@([ordered]@{ version='0.0.37'; esPwa=$false })
+                    exe=''; manifests=@(); carpeta='C:\Users\x\AppData\Local\Fudo'
+                    enDisco=$false; soloRegistro=$true; pwa=$false }
+    }
+    function Get-LocalRunHistory { [ordered]@{ ultimaCausa='' } }
+    Test-Layer0b-NativeApp
+    $a104b = Get-CheckById 'nativa.thirdPartyAV'
+    Assert-Eq 'S104b sin la Nativa en disco el AV si es causa raiz' $true ([bool]$a104b.rootCauseCandidate)
+    Assert-Eq 'S104b nombra el antivirus' $true ([bool]([string]$a104b.name -match 'Avast'))
+    Assert-Eq 'S104b dice que carpeta excluir' $true ([bool]([string]$a104b.recommendation -match 'AppData\\Local\\Fudo'))
+    Assert-Eq 'S104b y que la exclusion va ANTES de reinstalar' $true ([bool]([string]$a104b.recommendation -match 'antes de excluir'))
+
+    # Escenario 103: reinstalar cuando Windows tiene el producto anotado y los archivos no estan.
+    # Sin modo reparacion, 'msiexec /i' ve el producto presente y se va con codigo 0 sin escribir
+    # nada: el motor decia que instalaba y el .exe seguia sin aparecer.
+    Reset-State
+    Reset-Mocks
+    function Get-LocalNativeInstallers { @([ordered]@{ ruta='C:\kit\NATIVA FUDO.msi'; version='0.0.37'; esMsi=$true; fecha=(Get-Date) }) }
+    function Get-MsiProductVersion { param($Path) '0.0.37' }
+    function Add-MpPreference { param($ExclusionPath, $ExclusionProcess, $ErrorAction) }
+    function Get-Process { param($ErrorAction) @() }
+    function Start-Sleep { param($Seconds, $Milliseconds) }
+    $script:reparo103 = $null
+    function Invoke-NativeInstallerFile { param($Path, $ExtraArgs, $Reparar) $script:reparo103 = [bool]$Reparar; 0 }
+    $script:n103 = 0
+    function Find-FudoNativeInstall {
+        $script:n103++
+        $hay = ($script:n103 -gt 1)
+        [ordered]@{ paths=@('C:\Users\x\AppData\Local\Fudo'); regInfo=@([ordered]@{ name='Fudo'; version='0.0.37'; esPwa=$false })
+                    exe=$(if ($hay) { 'C:\Users\x\AppData\Local\Fudo\fudo_native_extension.exe' } else { '' })
+                    manifests=@(); carpeta='C:\Users\x\AppData\Local\Fudo'
+                    enDisco=$hay; soloRegistro=(-not $hay); pwa=$false }
+    }
+    function Get-NativaVersionState { param($Install) [ordered]@{ version='0.0.37'; firmada=$true; confiable=[bool]$Install.enDisco } }
+    $r103 = Install-FudoNative
+    Assert-Eq 'S103 con el producto anotado y sin archivos, se repara' $true ([bool]$script:reparo103)
+    Assert-Eq 'S103 y la instalacion queda verificada' $true ([bool]$r103.applied)
+
+    # Si no habia nada instalado, es una instalacion normal, no una reparacion.
+    Reset-State
+    $script:reparo103b = $null
+    function Invoke-NativeInstallerFile { param($Path, $ExtraArgs, $Reparar) $script:reparo103b = [bool]$Reparar; 0 }
+    $script:n103b = 0
+    function Find-FudoNativeInstall {
+        $script:n103b++
+        $hay = ($script:n103b -gt 1)
+        [ordered]@{ paths=@(); regInfo=@()
+                    exe=$(if ($hay) { 'C:\Users\x\AppData\Local\Fudo\fudo_native_extension.exe' } else { '' })
+                    manifests=@(); carpeta=''; enDisco=$hay; soloRegistro=$false; pwa=$false }
+    }
+    $r103b = Install-FudoNative
+    Assert-Eq 'S103b sin producto anotado no se repara, se instala' $false ([bool]$script:reparo103b)
+    Assert-Eq 'S103b y tambien queda verificada' $true ([bool]$r103b.applied)
+
+    # Escenario 102: restaurar de cuarentena y que el .exe NO vuelva no es una reparacion.
+    # El caso real (tres asesores el mismo dia, con video): el antivirus se lleva
+    # fudo_native_extension.exe y deja la carpeta con los dos manifests y node_printer.node. El
+    # motor restauraba, miraba "hay carpeta o entrada de registro" -el criterio que la 3.19 ya
+    # habia reemplazado en el resto del motor- y daba la Nativa por restaurada. Peor: corregia
+    # el hallazgo correcto de la capa 0b.1, asi que el caso cerraba RESUELTO con Fudo sin poder
+    # imprimir.
+    Reset-State
+    Reset-Mocks
+    function Get-AntivirusState {
+        [ordered]@{ defender = [ordered]@{ amRunning=$true; realTimeProtection=$true; antivirusEnabled=$true }
+                    thirdParty = @(); realTime = $true
+                    fudoThreats = @([ordered]@{ id='2147735503'; resources='file:_C:\Users\x\AppData\Local\Fudo\fudo_native_extension.exe'
+                                                action='0'; remediada=$false; statusId=$null; detectada='2026-09-14' }) }
+    }
+    # La carpeta sigue existiendo (manifests + node_printer.node) y la entrada de registro tambien:
+    # eso es exactamente lo que enganaba al chequeo viejo.
+    function Find-FudoNativeInstall {
+        [ordered]@{ paths=@('C:\Users\x\AppData\Local\Fudo'); regInfo=@([ordered]@{ name='Fudo'; version='0.0.37'; esPwa=$false })
+                    exe=''; manifests=@('do.fu.native_extension_chrome.json','do.fu.native_extension_firefox.json')
+                    carpeta='C:\Users\x\AppData\Local\Fudo'; enDisco=$false; soloRegistro=$true; pwa=$false }
+    }
+    function Get-NativaVersionState { param($Install) [ordered]@{ version='0.0.37'; firmada=$true; confiable=$false } }
+    function Get-Process { param($ErrorAction) @() }
+    function Start-Sleep { param($Seconds, $Milliseconds) }
+    function Get-ChildItem { param($Path, $Recurse, $Filter, $ErrorAction, $Directory, $File) @() }
+    function Get-Item { param($Path, $ErrorAction) $null }
+    function Add-MpPreference { param($ExclusionPath, $ExclusionProcess, $ErrorAction) }
+    function Get-LocalRunHistory { [ordered]@{ ultimaCausa='' } }
+    Test-Layer0b-NativeApp
+    $q102 = Get-CheckById 'nativa.defenderQuarantine'
+    Assert-Eq 'S102 restaurar sin que vuelva el .exe no es reparado' $true ([bool]([string]$q102.status -ne 'fixed'))
+    Assert-Eq 'S102 y el nombre dice que sigue sin aparecer' $true ([bool]([string]$q102.name -match 'sigue sin aparecer'))
+    $i102 = Get-CheckById 'nativa.installed'
+    Assert-Eq 'S102 el hallazgo de la Nativa ausente NO se corrige' 'fail' ([string]$i102.status)
+    Assert-Eq 'S102 y sigue siendo causa raiz' $true ([bool]$i102.rootCauseCandidate)
+    $d102 = Resolve-Diagnosis
+    Assert-Eq 'S102 con la Nativa borrada el caso no cierra' $false ([bool]$d102.resolved)
+
+    # Y si el .exe SI vuelve con la restauracion, la reparacion cuenta. Ojo: tiene que volver
+    # despues de restaurar. Si estuviera en disco desde el principio no habria nada que
+    # restaurar, que es lo que arreglo la 3.12.
+    Reset-State
+    $script:n102 = 0
+    function Find-FudoNativeInstall {
+        $script:n102++
+        $hay = ($script:n102 -gt 1)
+        [ordered]@{ paths=@('C:\Users\x\AppData\Local\Fudo'); regInfo=@([ordered]@{ name='Fudo'; version='0.0.37'; esPwa=$false })
+                    exe=$(if ($hay) { 'C:\Users\x\AppData\Local\Fudo\fudo_native_extension.exe' } else { '' })
+                    manifests=@(); carpeta='C:\Users\x\AppData\Local\Fudo'
+                    enDisco=$hay; soloRegistro=(-not $hay); pwa=$false }
+    }
+    function Get-SesionInteractiva { [ordered]@{ usuarioMotor='ana'; usuarioSesion='ana'; otroPerfil=$false } }
+    function Get-NativeMessagingState {
+        [ordered]@{ registrado=$true; navegadores=@('Chrome'); manifest='m.json'
+                    exeDelManifest='C:\Users\x\AppData\Local\Fudo\fudo_native_extension.exe'; exeExiste=$true
+                    extensionIds=@('npcjljaedonmjndbliillcmkhidejhmb'); pendientes=@() }
+    }
+    function Get-FudoExtensionState { param($Ids) [ordered]@{ instalada=$true; ids=@($Ids); encontrada='npcjljaedonmjndbliillcmkhidejhmb'
+                                                              navegador='Chrome'; perfil='Default'; perfilesVistos=1 } }
+    Test-Layer0b-NativeApp
+    Assert-Eq 'S102b si el .exe vuelve, la restauracion si cuenta' 'fixed' ([string](Get-CheckById 'nativa.defenderQuarantine').status)
+    Assert-Eq 'S102b y el hallazgo de la capa 0b.1 queda corregido' 'fixed' ([string](Get-CheckById 'nativa.installed').status)
+
     # Escenario 101: el asesor elige que version de la Nativa instalar. Sale del caso de un
     # asesor al que el antivirus del cliente le bloquea la 0.0.37 firmada siempre, y termina
     # instalando a mano una anterior. El motor elegia solo la mas alta y no habia forma de
@@ -9208,7 +9395,7 @@ public class FudoFakeEndpoint {
     function Get-Process { param($ErrorAction) @() }
     function Start-Sleep { param($Seconds, $Milliseconds) }
     $script:llamo101 = $false
-    function Invoke-NativeInstallerFile { param($Path, $ExtraArgs) $script:llamo101 = $true; 0 }
+    function Invoke-NativeInstallerFile { param($Path, $ExtraArgs, $Reparar) $script:llamo101 = $true; 0 }
     $NativeInstallerPath = 'C:\kit\NATIVA FUDO 0.0.33.msi'
     function Test-Path { param($Path, $ErrorAction) $true }
     function Resolve-Path { param($Path) [pscustomobject]@{ Path = [string]$Path } }
@@ -9799,13 +9986,28 @@ function Invoke-NativeInstallerFile {
       Ejecuta el instalador de la Nativa. Un .msi NO se ejecuta directo: va por msiexec, y en
       silencio, para no dejar un asistente abierto en la PC del cliente.
       Devuelve el codigo de salida, o $null si no se pudo lanzar.
+
+      v3.21, -Reparar: cuando el antivirus se lleva los archivos, Windows sigue teniendo el
+      producto ANOTADO como instalado. En ese estado 'msiexec /i' no hace nada -ve el producto
+      presente y se va con codigo 0-, asi que el motor "instalaba" y el .exe seguia sin estar.
+      Un asesor lo describio exacto: "al colocar para que instale la nativa te daba todo ok,
+      pero el fudo_native_extension.exe seguia sin estar". Para ese caso va '/fa', que reescribe
+      todos los archivos del producto instalado. Si /fa no aplica (el producto no esta
+      registrado, 1605/1614) se cae a /i, que es el camino normal.
     #>
-    param([string]$Path, [string]$ExtraArgs = '')
+    param([string]$Path, [string]$ExtraArgs = '', $Reparar = $false)
     if (-not $Path) { return $null }
     try {
         if ($Path -match '(?i)\.msi$') {
-            $msiArgs = '/i "' + (Resolve-Path $Path).Path + '" /qn /norestart'
-            if ($ExtraArgs) { $msiArgs = $msiArgs + ' ' + $ExtraArgs }
+            $ruta = (Resolve-Path $Path).Path
+            $sufijo = ' /qn /norestart' + $(if ($ExtraArgs) { ' ' + $ExtraArgs } else { '' })
+            if ([bool]$Reparar) {
+                $pr = Start-Process -FilePath 'msiexec.exe' -ArgumentList ('/fa "' + $ruta + '"' + $sufijo) -PassThru -Wait -ErrorAction Stop
+                $code = [int]$pr.ExitCode
+                # 1605/1614: ese producto no esta instalado, asi que no habia nada que reparar.
+                if ($code -ne 1605 -and $code -ne 1614) { return $code }
+            }
+            $msiArgs = '/i "' + $ruta + '"' + $sufijo
             $pr = Start-Process -FilePath 'msiexec.exe' -ArgumentList $msiArgs -PassThru -Wait -ErrorAction Stop
             return [int]$pr.ExitCode
         }
@@ -10076,8 +10278,10 @@ function Install-FudoNative {
                     try { Add-MpPreference -ExclusionProcess "$FudoAppProcess*.exe" -ErrorAction SilentlyContinue } catch {}
                     try { Add-MpPreference -ExclusionPath $local -ErrorAction SilentlyContinue } catch {}
                 }
-                Write-StepDetail 'ejecutando el instalador local'
-                $code = Invoke-NativeInstallerFile -Path $local -ExtraArgs $NativeInstallerArgs
+                # Si Windows tiene el producto anotado y los archivos no estan, hay que REPARAR:
+                # una instalacion normal sobre un producto ya registrado no reescribe nada.
+                Write-StepDetail $(if ([bool]$instAntes.soloRegistro) { 'reinstalando la App Nativa (figura instalada pero falta el archivo)' } else { 'ejecutando el instalador local' })
+                $code = Invoke-NativeInstallerFile -Path $local -ExtraArgs $NativeInstallerArgs -Reparar ([bool]$instAntes.soloRegistro)
                 $salida.code = $code
                 $notas += $(if ($null -eq $code) { 'no se pudo lanzar el instalador' } else { "el instalador termino con codigo $code" })
                 Start-Sleep -Seconds 3

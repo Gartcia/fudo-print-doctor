@@ -2,6 +2,70 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.21] - 2026-09-15
+
+**Una corrida cerró RESUELTO en la PC de un cliente que no podía imprimir una sola comanda.** Lo
+reportaron tres asesores el mismo día —uno con video— y es una regresión que introdujo la 3.19.
+
+### Corregido
+
+- **La restauración de cuarentena se verificaba con el criterio que la 3.19 había reemplazado.**
+  La 3.19 cambió "la Nativa está instalada" por *el ejecutable está en disco*, en todo el motor
+  menos en un lugar: la re-lectura posterior a restaurar de la cuarentena de Defender, que seguía
+  preguntando *"¿hay carpeta o entrada de registro?"*. Y ese lugar es justamente el que **corrige
+  el hallazgo de la capa 0b.1**, así que el criterio flojo le ganaba al estricto.
+
+  En el caso real: el antivirus se lleva `fudo_native_extension.exe` y deja la carpeta con los dos
+  manifests y `node_printer.node`. El motor restauraba, veía la carpeta, daba la Nativa por
+  restaurada, **pisaba el hallazgo correcto** de que no estaba, la capa 0b salía *"reparado"*, no
+  quedaba ninguna falla, el ticket de prueba salía —el hardware estaba perfecto— y el caso cerraba
+  **RESUELTO**. En la pantalla de Fudo la impresora seguía en *Desconocido*.
+
+  *Es el falso positivo más caro desde el launcher que decía RESUELTO sin correr, y del mismo tipo:
+  una verificación que mira el dato equivocado vale menos que no verificar, porque además tapa el
+  diagnóstico que estaba bien.*
+
+- **Reinstalar la Nativa sobre un producto que Windows tiene anotado no hacía nada.** Cuando el
+  antivirus borra los archivos, el producto sigue registrado como instalado; en ese estado
+  `msiexec /i` ve el producto presente, no reescribe nada y termina con código 0. Un asesor lo
+  describió exacto: *"al colocar para que instale la nativa te daba todo ok, pero el
+  fudo_native_extension.exe seguía sin estar"*. Ahora, cuando el producto figura instalado y los
+  archivos no están, el motor **repara** (`msiexec /fa`, que reescribe los archivos del producto);
+  si ese producto no estaba registrado de verdad, se cae solo a la instalación normal.
+  Es lo que hasta ahora obligaba a desinstalar a mano antes de reinstalar.
+
+- **El antivirus de terceros ahora dice qué hacer, y en qué orden.** El motor sólo sabe configurar
+  exclusiones en Windows Defender: con Avast (o cualquier otro) no puede tocar nada, así que lo único
+  útil que puede aportar es la indicación exacta. Ahora nombra el antivirus, **la carpeta concreta a
+  excluir** y el orden — *excluir primero, reinstalar después*, porque al revés el antivirus se la
+  vuelve a llevar y no se avanza. Sale del flujo que describió un asesor: *"desinstalo nativa, entro
+  a printdoctor, instalo, después de eso añado extensión en avast, quedó ok"*.
+- **Y ese check dejó de escalar casos de gratis.** Era candidato a causa raíz cuando la Nativa no
+  estaba *corriendo* — y con Fudo cerrado no correr es el estado normal, como el propio motor
+  documenta desde la 3.9. Aparecía en 32 corridas, daba la causa en 8 y 4 de ésas escalaban. Ahora
+  sólo es candidato cuando la Nativa **no está en disco**, que es cuando hay algo real que explicar.
+
+### Self-test
+
+- Escenario 102: restaurar de cuarentena **sin** que el ejecutable vuelva no es una reparación, no
+  corrige el hallazgo de la Nativa ausente, y el caso **no cierra**. Con el ejecutable de vuelta, sí.
+- Escenario 103: producto anotado sin archivos ⇒ se repara; nada instalado ⇒ se instala.
+- Escenario 104: con la Nativa en disco el antivirus de terceros no es causa raíz; sin ella sí, y
+  el texto tiene que nombrar el antivirus, la carpeta a excluir y el orden.
+- **602 asserts, todos pasando**, verificados también con un perfil de usuario vacío.
+
+### Lo que esto deja abierto
+
+- **La premisa de la 0.0.37 no se sostiene en campo.** Tres asesores reportan que Defender la sigue
+  detectando y borrando *estando firmada*, y que la 0.0.33 es la que aguanta. El motor ya deja
+  elegir versión (3.20), pero la exclusión que agrega no está impidiendo que se la vuelvan a llevar:
+  falta verificar que la exclusión quede aplicada y volver a mirar el archivo unos segundos después,
+  porque hoy se verifica el efecto **antes** de que el antivirus lo deshaga.
+- **Los asesores con el launcher viejo siguen viendo RESUELTO sin que el motor corra.** El
+  `.cmd` no se actualiza solo a propósito (lleva la URL de telemetría), así que el arreglo del
+  09/09 no les llegó: se ve una PC con Windows 7 donde el `.ps1` ni siquiera parsea y el launcher
+  igual escribe RESUELTO.
+
 ## [3.20] - 2026-09-14
 
 De un caso que viene reportando un asesor desde el 03/09: *"sigo teniendo problemas con la nativa
