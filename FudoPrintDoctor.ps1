@@ -497,6 +497,11 @@ $script:UiPs       = $null
 $script:UiRunspace = $null
 $script:UiUrl      = ''
 $script:UiSeq      = 0       # numero de evento; la pagina pide "lo que haya despues de N"
+$script:UiPregSeq  = 0       # numero de PREGUNTA; ver Request-UiAnswer
+# Lo que dejo la ultima gestion del menu. Las ramas de Invoke-MenuAction informan con
+# Write-Host, que en modo web no lo ve nadie: sin esto, el asesor toca una opcion y no pasa
+# nada en pantalla, aunque la gestion haya corrido.
+$script:UltimaAccionNota = ''
 $script:UiTimeout  = 900
 # Se corto el diagnostico porque no habia impresoras del tipo elegido y no se pidio revisar
 # las otras. Ver Confirm-ReviewOtherInterface.
@@ -598,742 +603,483 @@ $script:UiServerScript = {
     }
 }
 
-# La pagina de la interfaz web. La escribe tools\Embed-Ui.ps1 desde ui\fpd-ui.html: el .ps1
-# va sin caracteres no ASCII (regla del proyecto) y el HTML lleva acentos, asi que se embebe
-# convertido a entidades. NO editar a mano: se pisa en el proximo build.
+# La pagina de la interfaz web. La escribe tools\Embed-Ui.ps1 desde ui\fpd-ui.html.
+# Va en BASE64 y no como texto. El .ps1 no puede llevar un solo caracter fuera de ASCII
+# (regla del proyecto) y la pagina tiene acentos. El primer intento los convirtio a entidades
+# HTML: funcionan en el marcado, pero NO adentro de una cadena de JavaScript, asi que el
+# asesor veia 'No se modific&#243; nada' escrito tal cual en pantalla -y los caracteres de
+# dibujo del panel de progreso salian igual de rotos. Base64 es ASCII puro y no toca el
+# contenido. NO editar a mano: se pisa en el proximo build.
 # === UI HTML INICIO ===
-$script:UiHtml = @'
-<meta charset="utf-8">
-<title>Fudo Print Doctor</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke-linejoin='round' stroke-linecap='round'%3E%3Cpath d='M5 4.5A1.5 1.5 0 0 1 6.5 3h11A1.5 1.5 0 0 1 19 4.5v16.1l-2.8-1.8-2.8 1.8-2.8-1.8-2.8 1.8L5 18.8Z' stroke='%238b8f96' stroke-width='1.5'/%3E%3Cpath d='M7.2 12.4h2.2l1.4-3.2 2.4 5.6 1.4-2.4h2.2' stroke='%231e5fb8' stroke-width='1.9'/%3E%3C/svg%3E">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
-<style>
-:root{
-  --ground:#e9e7e2; --surface:#fffefc; --surface-2:#f4f2ee; --sunk:#edeae4;
-  --ink:#17191d; --ink-2:#4a4d53; --muted:#75736d; --line:#d7d3cb; --line-soft:#e4e0d8;
-  --ok:#1b7a49; --ok-bg:#e3f1e8; --warn:#9c6a08; --warn-bg:#f6eddb; --fail:#b8372a;
-  --fail-bg:#f8e5e2; --fixed:#1e5fb8; --fixed-bg:#e2ebf8; --idle:#8b887f; --idle-bg:#eceae5;
-  --paper:#fbf8f1; --paper-ink:#2a2622; --shadow:0 1px 2px rgba(23,25,29,.07),0 8px 24px -12px rgba(23,25,29,.18);
-  --focus:#1e5fb8;
-}
-@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
-  --ground:#0f1113; --surface:#191c20; --surface-2:#20242a; --sunk:#141719;
-  --ink:#e8eaed; --ink-2:#b4b8be; --muted:#8b9098; --line:#2c3138; --line-soft:#242930;
-  --ok:#57c98a; --ok-bg:#16301f; --warn:#e2ac4a; --warn-bg:#332714; --fail:#f4796a;
-  --fail-bg:#3a1c18; --fixed:#77aef5; --fixed-bg:#15263c; --idle:#7d828a; --idle-bg:#1e2227;
-  --paper:#e8e3d8; --paper-ink:#2a2622; --shadow:0 1px 2px rgba(0,0,0,.4),0 10px 28px -14px rgba(0,0,0,.7);
-  --focus:#77aef5;
-}}
-:root[data-theme="dark"]{
-  --ground:#0f1113; --surface:#191c20; --surface-2:#20242a; --sunk:#141719;
-  --ink:#e8eaed; --ink-2:#b4b8be; --muted:#8b9098; --line:#2c3138; --line-soft:#242930;
-  --ok:#57c98a; --ok-bg:#16301f; --warn:#e2ac4a; --warn-bg:#332714; --fail:#f4796a;
-  --fail-bg:#3a1c18; --fixed:#77aef5; --fixed-bg:#15263c; --idle:#7d828a; --idle-bg:#1e2227;
-  --paper:#e8e3d8; --paper-ink:#2a2622; --shadow:0 1px 2px rgba(0,0,0,.4),0 10px 28px -14px rgba(0,0,0,.7);
-  --focus:#77aef5;
-}
-*{box-sizing:border-box}
-[hidden]{display:none!important}
-body{background:var(--ground);color:var(--ink);font-family:"IBM Plex Sans",-apple-system,Segoe UI,system-ui,sans-serif;
-  font-size:14px;line-height:1.5;-webkit-font-smoothing:antialiased}
-:focus-visible{outline:2px solid var(--focus);outline-offset:2px;border-radius:3px}
-@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
-.wrap{max-width:1060px;margin:0 auto;padding:16px;padding-block:20px 40px}
-h1,h2,h3{margin:0;text-wrap:balance;font-weight:600;letter-spacing:-.01em}
-p{margin:0}
-.mono{font-family:"IBM Plex Mono",ui-monospace,Consolas,monospace;font-variant-numeric:tabular-nums}
-
-.app{background:var(--surface);border:1px solid var(--line);border-radius:10px;box-shadow:var(--shadow);overflow:hidden}
-.titlebar{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:11px 16px;background:var(--surface-2);
-  border-bottom:1px solid var(--line)}
-.brand{display:flex;align-items:center;gap:9px;margin-right:auto}
-.brand b{font-size:15px;font-weight:700;letter-spacing:-.02em}
-.ver{font-size:11px;color:var(--muted);letter-spacing:.04em}
-.mark{display:inline-flex;flex:none;color:var(--ink);transition:color .3s}
-.mark svg{display:block}
-.mark .paper{opacity:.42}
-.mark.running{color:var(--fixed)}
-.mark.running .pulse{stroke-dasharray:5 26;animation:trace 1.2s linear infinite}
-@keyframes trace{from{stroke-dashoffset:31}to{stroke-dashoffset:0}}
-.tb-meta{display:flex;gap:14px;flex-wrap:wrap;font-size:11.5px;color:var(--muted)}
-.tb-meta span b{color:var(--ink-2);font-weight:500}
-.body{padding:20px 22px 24px}
-
-.aviso{display:flex;gap:9px;align-items:baseline;padding:10px 16px;font-size:12.5px;
-  background:var(--warn-bg);color:var(--warn);border-bottom:1px solid var(--line)}
-.caido{background:var(--fail-bg);color:var(--fail)}
-
-.btn{font:inherit;font-size:13px;font-weight:500;padding:8px 14px;border-radius:6px;border:1px solid var(--line);
-  background:var(--surface);color:var(--ink);cursor:pointer;transition:background .12s,border-color .12s}
-.btn:hover{background:var(--surface-2);border-color:var(--ink-2)}
-.btn.primary{background:var(--ink);color:var(--surface);border-color:var(--ink)}
-.btn.primary:hover{opacity:.88}
-.btn.danger{border-color:var(--fail);color:var(--fail)}
-.btn.danger:hover{background:var(--fail-bg)}
-.btn.sm{font-size:12px;padding:6px 10px}
-input[type=text]{font:inherit;font-family:"IBM Plex Mono",monospace;padding:9px 11px;border:1px solid var(--line);
-  border-radius:6px;background:var(--surface);color:var(--ink);width:100%;max-width:360px}
-
-/* ---- pregunta ---- */
-.ask{border:1px solid var(--ink);border-radius:8px;background:var(--surface);box-shadow:var(--shadow);
-  padding:15px 16px;margin-bottom:16px}
-.ask.peligro{border-color:var(--fail)}
-.ask-k{font-size:10.5px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);
-  margin-bottom:6px}
-.ask.peligro .ask-k{color:var(--fail)}
-.ask h3{font-size:15.5px;margin-bottom:7px}
-.ask p{font-size:13px;color:var(--ink-2);max-width:62ch;margin-bottom:6px}
-.ask-btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
-.ask ul{margin:6px 0 0;padding-left:20px;font-size:12.5px;color:var(--ink-2)}
-.ticket{background:var(--paper);color:var(--paper-ink);border-radius:3px;padding:12px 14px;margin:10px 0;
-  font-family:"IBM Plex Mono",monospace;font-size:11.5px;line-height:1.55;white-space:pre;overflow-x:auto;
-  max-width:280px;box-shadow:0 2px 8px -3px rgba(0,0,0,.35);border:1px solid rgba(0,0,0,.08)}
-.count{font-family:"IBM Plex Mono",monospace;font-size:26px;font-weight:600;letter-spacing:-.02em}
-.pickrow{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
-.pick{flex:1 1 170px;text-align:left;border:1px solid var(--line);background:var(--surface);border-radius:7px;
-  padding:10px 12px;cursor:pointer;font:inherit;color:var(--ink)}
-.pick:hover{border-color:var(--ink-2);background:var(--surface-2)}
-.pick b{display:block;font-size:13px;font-weight:600;margin-bottom:2px}
-.pick span{font-size:11.5px;color:var(--muted);display:block;line-height:1.35}
-.inline{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
-
-/* ---- corrida ---- */
-.run{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1.05fr);gap:20px;align-items:start}
-@media (max-width:780px){.run{grid-template-columns:1fr}}
-.panel-t{font-size:11px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);
-  margin-bottom:9px}
-.ladder{display:flex;flex-direction:column;border:1px solid var(--line-soft);border-radius:8px;overflow:hidden}
-.rung{display:flex;align-items:center;gap:9px;padding:8px 11px;border-bottom:1px solid var(--line-soft);font-size:12.5px}
-.rung:last-child{border-bottom:0}
-.rung.now{background:var(--surface-2)}
-.rung.now .rlabel{font-weight:600}
-.rn{font-size:10.5px;color:var(--muted);width:16px;flex:none;text-align:right}
-.rlabel{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.rnote{font-size:11px;color:var(--muted);flex:none}
-.rms{font-size:10.5px;color:var(--muted);width:46px;text-align:right;flex:none}
-.chip{font-size:10.5px;font-weight:600;padding:2px 7px;border-radius:99px;flex:none;text-transform:uppercase}
-.chip.ok{background:var(--ok-bg);color:var(--ok)}
-.chip.warn,.chip.revisar{background:var(--warn-bg);color:var(--warn)}
-.chip.fail,.chip.falla{background:var(--fail-bg);color:var(--fail)}
-.chip.fixed,.chip.reparado{background:var(--fixed-bg);color:var(--fixed)}
-.chip.skip,.chip.omitido,.chip.idle,.chip.skipped{background:var(--idle-bg);color:var(--idle)}
-.spin{width:11px;height:11px;border:2px solid var(--line);border-top-color:var(--ink);border-radius:50%;
-  animation:sp .7s linear infinite;flex:none}
-@keyframes sp{to{transform:rotate(360deg)}}
-.bar{height:3px;background:var(--sunk);border-radius:2px;overflow:hidden;margin-bottom:12px}
-.bar i{display:block;height:100%;background:var(--ink);width:0;transition:width .35s ease}
-.feed{border:1px solid var(--line-soft);border-radius:8px;background:var(--sunk);padding:11px 12px;
-  min-height:180px;max-height:300px;overflow-y:auto;font-family:"IBM Plex Mono",monospace;font-size:11.5px;
-  line-height:1.65;color:var(--ink-2)}
-.feed div{white-space:pre-wrap;word-break:break-word}
-.feed .hl{color:var(--ink);font-weight:500}
-.feed .w{color:var(--warn)}
-.feed .f{color:var(--fail)}
-.touched{margin-top:16px}
-.touched ul{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px}
-.touched li{display:flex;gap:8px;align-items:flex-start;font-size:12.5px;border-left:2px solid var(--fixed);
-  padding-left:10px;color:var(--ink-2)}
-.touched li.irr{border-left-color:var(--fail)}
-.tag{font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);flex:none;
-  margin-top:1px}
-.empty{font-size:12.5px;color:var(--muted);font-style:italic}
-
-/* ---- resultado ---- */
-.verdict{border-radius:9px;padding:16px 18px;margin-bottom:18px;border:1px solid}
-.verdict.ok{background:var(--ok-bg);border-color:var(--ok)}
-.verdict.no{background:var(--fail-bg);border-color:var(--fail)}
-.verdict-k{font-size:11px;font-weight:700;letter-spacing:.1em;text-transform:uppercase;margin-bottom:5px}
-.verdict.ok .verdict-k{color:var(--ok)}
-.verdict.no .verdict-k{color:var(--fail)}
-.verdict h2{font-size:19px;line-height:1.3;margin-bottom:8px;max-width:64ch}
-.verdict .meta{font-size:12px;color:var(--ink-2);display:flex;gap:16px;flex-wrap:wrap}
-.sec{margin-bottom:22px}
-.sec-t{font-size:11px;font-weight:600;letter-spacing:.09em;text-transform:uppercase;color:var(--muted);
-  padding-bottom:6px;border-bottom:1px solid var(--line-soft);margin-bottom:11px}
-.todo{list-style:none;margin:0;padding:0;counter-reset:t;display:flex;flex-direction:column;gap:11px}
-.todo li{counter-increment:t;display:grid;grid-template-columns:22px 1fr;gap:10px;align-items:start}
-.todo li::before{content:counter(t);font-family:"IBM Plex Mono",monospace;font-size:11px;font-weight:600;
-  color:var(--surface);background:var(--ink);width:19px;height:19px;border-radius:4px;display:grid;
-  place-items:center;margin-top:1px}
-.todo b{display:block;font-size:13.5px;font-weight:600;margin-bottom:2px}
-.todo p{font-size:12.5px;color:var(--ink-2);max-width:66ch}
-.who{display:inline-block;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:.05em;
-  padding:1px 6px;border-radius:3px;background:var(--sunk);color:var(--muted);margin-left:7px;vertical-align:1px}
-.who.cliente{background:var(--warn-bg);color:var(--warn)}
-.who.asesor{background:var(--fixed-bg);color:var(--fixed)}
-.who.soporte,.who.producto{background:var(--fail-bg);color:var(--fail)}
-.art{font-size:11.5px;color:var(--muted);margin-top:3px}
-.tdo-btn{margin-top:8px;font:inherit;font-size:12px;font-weight:500;padding:6px 12px;border-radius:6px;
-  border:1px solid var(--ink-2);background:var(--surface);color:var(--ink);cursor:pointer}
-.tdo-btn:hover{background:var(--surface-2)}
-.prn{display:flex;flex-direction:column;border:1px solid var(--line-soft);border-radius:7px;overflow:hidden}
-.prow{display:flex;align-items:center;gap:10px;padding:9px 12px;background:var(--surface);
-  border-bottom:1px solid var(--line-soft);flex-wrap:wrap}
-.prow:last-child{border-bottom:0}
-.prow.target{background:var(--surface-2);box-shadow:inset 3px 0 0 var(--ink)}
-.pname{font-weight:600;font-size:13px}
-.pport{font-family:"IBM Plex Mono",monospace;font-size:11.5px;color:var(--muted)}
-.psym{flex-basis:100%;font-size:12px;color:var(--ink-2)}
-.psym ul{margin:4px 0 0;padding-left:18px}
-.hint{font-size:12.5px;color:var(--muted);max-width:66ch}
-.note{background:var(--surface-2);border:1px solid var(--line-soft);border-left:3px solid var(--ink);
-  border-radius:6px;padding:12px 14px;font-size:12.5px;color:var(--ink-2);max-width:72ch;margin-bottom:18px}
-.note b{color:var(--ink)}
-details.drawer{border:1px solid var(--line-soft);border-radius:7px;margin-top:10px;background:var(--surface)}
-details.drawer summary{padding:9px 12px;cursor:pointer;font-size:12.5px;font-weight:500;list-style:none}
-details.drawer summary::-webkit-details-marker{display:none}
-details.drawer summary::before{content:"\25B8 ";color:var(--muted)}
-details.drawer[open] summary::before{content:"\25BE "}
-.chk{width:100%;border-collapse:collapse;font-size:12px}
-.chk th{text-align:left;font-size:10.5px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);
-  padding:6px 12px;border-bottom:1px solid var(--line-soft);font-weight:600}
-.chk td{padding:6px 12px;border-bottom:1px solid var(--line-soft);vertical-align:top}
-.chk td.id{font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--muted);white-space:nowrap}
-.tblwrap{overflow-x:auto}
-.endbar{display:flex;align-items:baseline;gap:20px;flex-wrap:wrap;border-top:1px solid var(--line);
-  margin-top:4px;padding-top:18px}
-.links{display:flex;gap:18px;flex-wrap:wrap;align-items:baseline;row-gap:8px}
-.links button{appearance:none;background:none;border:0;padding:0;font:inherit;font-size:12.5px;
-  color:var(--ink-2);cursor:pointer;text-decoration:underline;text-underline-offset:3px;
-  text-decoration-color:var(--line);white-space:nowrap}
-.links button:hover{color:var(--ink);text-decoration-color:var(--ink-2)}
-.adv{border:1px solid var(--line);border-radius:8px;background:var(--surface);margin-top:16px}
-.adv summary{padding:11px 14px;cursor:pointer;font-size:13px;font-weight:600;list-style:none;
-  display:flex;align-items:baseline;gap:9px;flex-wrap:wrap}
-.adv summary::-webkit-details-marker{display:none}
-.adv summary::before{content:"\25B8";color:var(--muted);font-weight:400}
-.adv[open] summary::before{content:"\25BE"}
-.adv summary span{font-weight:400;font-size:12px;color:var(--muted)}
-.advlist{border-top:1px solid var(--line-soft);display:flex;flex-direction:column}
-.advrow{display:flex;gap:14px;align-items:center;flex-wrap:wrap;padding:12px 14px;
-  border-bottom:1px solid var(--line-soft)}
-.advrow:last-child{border-bottom:0}
-.advrow>div{flex:1 1 300px;min-width:0}
-.advrow b{display:block;font-size:13px;font-weight:600}
-.advrow p{font-size:12px;color:var(--muted);margin-top:2px;max-width:62ch}
-.advrow.off b{color:var(--muted)}
-.advrow .why{font-size:11.5px;color:var(--muted);font-style:italic;flex:none;text-align:right}
-.foot{display:flex;gap:16px;flex-wrap:wrap;font-size:11.5px;color:var(--muted);margin-top:16px;
-  padding-top:12px;border-top:1px solid var(--line-soft)}
-.foot b{color:var(--ink-2);font-weight:500}
-pre.json{margin:0;padding:12px;font-family:"IBM Plex Mono",monospace;font-size:11px;overflow-x:auto;
-  color:var(--ink-2);line-height:1.55;max-height:420px}
-</style>
-
-<div class="wrap">
-  <div class="app">
-    <div class="titlebar">
-      <div class="brand">
-        <span class="mark" id="mark" aria-hidden="true">
-          <svg viewBox="0 0 24 24" width="23" height="23" fill="none">
-            <path class="paper" d="M5 4.5A1.5 1.5 0 0 1 6.5 3h11A1.5 1.5 0 0 1 19 4.5v16.1l-2.8-1.8-2.8 1.8-2.8-1.8-2.8 1.8L5 18.8Z"
-                  stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
-            <path class="pulse" d="M7.2 12.4h2.2l1.4-3.2 2.4 5.6 1.4-2.4h2.2"
-                  stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
-          </svg>
-        </span>
-        <b>Fudo Print Doctor</b><span class="ver mono" id="tbVer"></span>
-      </div>
-      <div class="tb-meta">
-        <span>PC <b class="mono" id="tbPc">&mdash;</b></span>
-        <span>Caso <b class="mono" id="tbCaso">&mdash;</b></span>
-        <span>Revisando <b id="tbModo">&mdash;</b></span>
-      </div>
-    </div>
-
-    <div class="aviso" id="avisoVer" hidden></div>
-    <div class="aviso caido" id="avisoCaido" hidden>
-      <span id="avisoCaidoTxt">Se perdi&oacute; la conexi&oacute;n con el motor. Si cerraste la ventana negra, el diagn&oacute;stico se cort&oacute;.</span>
-    </div>
-
-    <div class="body">
-      <div id="askSlot"></div>
-
-      <section id="faseArranque">
-        <div class="note">
-          <b>Esperando al motor.</b> En unos segundos va a preguntar lo que necesita para arrancar:
-          el kit del asesor, la conversaci&oacute;n de Intercom y qu&eacute; impresora hay que mirar.
-        </div>
-      </section>
-
-      <section id="faseCorrida" hidden>
-        <div class="bar"><i id="barFill"></i></div>
-        <div class="run">
-          <div>
-            <div class="panel-t">La cadena de impresi&oacute;n, de abajo hacia arriba</div>
-            <div class="ladder" id="ladder"></div>
-          </div>
-          <div>
-            <div class="panel-t">Qu&eacute; est&aacute; haciendo ahora</div>
-            <div class="feed" id="feed"></div>
-            <div class="touched">
-              <div class="panel-t">Lo que se toc&oacute; en esta PC</div>
-              <ul id="touched"></ul>
-              <p class="empty" id="touchedEmpty">Todav&iacute;a no se modific&oacute; nada.</p>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <section id="faseResultado" hidden></section>
-    </div>
-  </div>
-</div>
-
-<script>
-"use strict";
-var TOKEN = "__FPD_TOKEN__";
-var desde = 0, fase = "arranque", checks = [], tocado = [], pasos = {}, total = 11;
-var claveActual = "", claveRespondida = "", resultado = null, menuPreg = null, caido = false, cerrado = false;
-
-function $(id){ return document.getElementById(id); }
-function el(t,c,x){ var n=document.createElement(t); if(c)n.className=c; if(x!=null)n.textContent=x; return n; }
-function esc(s){ return String(s==null?"":s); }
-
-/* ---------------- poll ---------------- */
-function poll(){
-  fetch("/eventos?t="+TOKEN+"&desde="+desde)
-    .then(function(r){ return r.json(); })
-    .then(function(d){
-      if(caido){ caido=false; $("avisoCaido").hidden=true; }
-      if(typeof d.ultimo==="number") desde=d.ultimo;
-      (d.eventos||[]).forEach(aplicar);
-      if(d.fase && d.fase!==fase){ fase=d.fase; pintarFase(); }
-      pregunta(d.pregunta);
-      setTimeout(poll, 350);
-    })
-    .catch(function(){
-      // Que el motor deje de contestar despues de dar el resultado es lo normal: termino y
-      // se cerro. Solo es una falla si todavia no habia resultado.
-      caido = true;
-      $("mark").classList.remove("running");
-      var a = $("avisoCaido");
-      if(cerrado || resultado){
-        a.className = "aviso";
-        $("avisoCaidoTxt").textContent =
-          "El motor termin&#243; y cerr&#243; la herramienta. Lo que ves ac&#225; queda: ya pod&#233;s cerrar esta pesta&#241;a.";
-      } else {
-        a.className = "aviso caido";
-        $("avisoCaidoTxt").textContent =
-          "Se perdi&#243; la conexi&#243;n con el motor. Si cerraste la ventana negra, el diagn&#243;stico se cort&#243;.";
-      }
-      a.hidden = false;
-      setTimeout(poll, 2000);
-    });
-}
-
-function pintarFase(){
-  $("faseArranque").hidden = (fase!=="arranque");
-  $("faseCorrida").hidden  = (fase!=="revisando");
-  $("faseResultado").hidden= (fase!=="resultado" && fase!=="fin");
-  $("mark").classList.toggle("running", fase==="revisando");
-}
-
-/* ---------------- eventos ---------------- */
-function aplicar(ev){
-  var d = ev.datos || {};
-  switch(ev.tipo){
-    case "caso":
-      $("tbCaso").textContent = esc(d.caseId) || "&#8212;";
-      $("tbPc").textContent   = esc(d.host) || "&#8212;";
-      $("tbVer").textContent  = d.version ? ("v"+d.version) : "";
-      break;
-    case "paso.inicio":
-      total = d.total || total;
-      abrirPaso(d.n, d.titulo);
-      linea("&#9484; "+esc(d.titulo), "hl");
-      break;
-    case "paso.fin":
-      cerrarPaso(d.n, d.estado, d.nota, d.ms);
-      linea("&#9492; "+String(d.estado||"").toUpperCase()+(d.nota?" &#8212; "+esc(d.nota):""),
-            /falla|error/i.test(String(d.estado))?"f":/revisar/i.test(String(d.estado))?"w":"hl");
-      break;
-    case "detalle": linea("&#9474; "+esc(d.texto)); break;
-    case "log":     linea("  "+esc(d.nivel)+": "+esc(d.texto), d.nivel==="ERROR"?"f":"w"); break;
-    case "check":   checks.push(d); break;
-    case "toque":   agregarToque(d); break;
-    case "espera":  break;
-    case "reinicio": reiniciar(); break;
-    case "resultado": resultado = d; if(d.aviso) aviso(d.aviso); pintarResultado(); break;
-    case "cerrado": cerrado = true; break;
-    case "cortado": cortado(d); break;
-  }
-}
-
-function aviso(t){ var a=$("avisoVer"); a.textContent=esc(t); a.hidden=false; }
-
-function linea(txt, cls){
-  var f=$("feed"); f.appendChild(el("div", cls||null, txt));
-  f.scrollTop = f.scrollHeight;
-  while(f.childNodes.length>400) f.removeChild(f.firstChild);
-}
-
-function abrirPaso(n, titulo){
-  var lad=$("ladder"), r=pasos[n];
-  if(!r){
-    r=el("div","rung now");
-    r.appendChild(el("div","rn mono",String(n)));
-    r.appendChild(el("div","rlabel",esc(titulo)));
-    r.appendChild(el("span","rnote"));
-    var sp=el("div","spin"); sp.setAttribute("data-slot","estado"); r.appendChild(sp);
-    r.appendChild(el("div","rms mono"));
-    lad.appendChild(r); pasos[n]=r;
-  }
-  r.className="rung now";
-}
-function cerrarPaso(n, estado, nota, ms){
-  var r=pasos[n]; if(!r) return;
-  r.className="rung";
-  r.querySelector(".rnote").textContent = esc(nota);
-  r.querySelector(".rms").textContent = (ms!=null? ms+"ms":"");
-  var viejo=r.querySelector('[data-slot="estado"]');
-  var chip=el("span","chip "+String(estado||"").replace(/\s+/g,""), String(estado||""));
-  chip.setAttribute("data-slot","estado");
-  if(viejo) r.replaceChild(chip, viejo);
-  $("barFill").style.width = Math.min(100, Math.round(n/total*100))+"%";
-}
-
-function agregarToque(d){
-  tocado.push(d);
-  var li=el("li", d.reversible===false?"irr":null);
-  li.appendChild(el("span","tag", d.reversible===false?"no se deshace":"reversible"));
-  li.appendChild(el("span",null,esc(d.texto)));
-  $("touched").appendChild(li);
-  $("touchedEmpty").hidden = true;
-}
-
-function reiniciar(){
-  checks=[]; tocado=[]; pasos={}; resultado=null; menuPreg=null;
-  $("ladder").innerHTML=""; $("feed").innerHTML=""; $("touched").innerHTML="";
-  $("touchedEmpty").hidden=false; $("barFill").style.width="0";
-  $("faseResultado").innerHTML="";
-}
-
-/* ---------------- preguntas ---------------- */
-function responder(v){
-  claveRespondida = claveActual;
-  $("askSlot").innerHTML = "";
-  fetch("/responder?t="+TOKEN+"&v="+encodeURIComponent(v)).catch(function(){});
-}
-
-function pregunta(p){
-  if(!p){ claveActual=""; if(!menuPreg) $("askSlot").innerHTML=""; return; }
-  var clave = JSON.stringify(p);
-  if(clave===claveRespondida) return;
-  if(clave===claveActual) return;
-  claveActual = clave;
-
-  // El menu no es una interrupcion: es el cierre del resultado. Va abajo, no arriba.
-  if(p.clase==="menu"){ menuPreg=p; pintarResultado(); return; }
-
-  var slot=$("askSlot"); slot.innerHTML="";
-  var box=el("div","ask"+(p.clase==="peligro"?" peligro":""));
-  box.appendChild(el("div","ask-k", p.clase==="papel"
-      ? "La pregunta que el motor no puede contestar solo" : "Hace falta que decidas"));
-  box.appendChild(el("h3",null,esc(p.titulo)));
-  if(p.texto) box.appendChild(el("p",null,esc(p.texto)));
-
-  if(p.clase==="papel"){
-    var imp = (p.extra && p.extra.impresora) ? p.extra.impresora : "";
-    box.appendChild(el("div","ticket",
-      "      FUDO PRINT DOCTOR\n" +
-      "   ---------------------------\n" +
-      "   Prueba de impresion\n" +
-      "   Impresora: " + imp + "\n" +
-      "   ---------------------------\n" +
-      "   Si estas leyendo esto,\n" +
-      "   el hardware imprime bien.\n"));
-  }
-  if(p.extra && p.extra.otras && p.extra.otras.length){
-    var u=el("ul");
-    p.extra.otras.forEach(function(o){ u.appendChild(el("li",null,esc(o))); });
-    box.appendChild(u);
-  }
-  if(p.texto2) box.appendChild(el("p",null,esc(p.texto2)));
-
-  if(p.clase==="texto"){
-    var fila=el("div","inline"); fila.style.marginTop="12px";
-    var inp=el("input"); inp.type="text"; inp.id="campoTexto";
-    if(p.extra && p.extra.placeholder) inp.placeholder=p.extra.placeholder;
-    var ok=el("button","btn primary","Continuar");
-    function enviar(){ if(inp.value.trim()) responder(inp.value.trim()); }
-    ok.addEventListener("click", enviar);
-    inp.addEventListener("keydown", function(e){ if(e.key==="Enter") enviar(); });
-    fila.appendChild(inp); fila.appendChild(ok);
-    box.appendChild(fila);
-    slot.appendChild(box);
-    inp.focus();
-    return;
-  }
-
-  if(p.clase==="modo"){
-    var row=el("div","pickrow");
-    (p.opciones||[]).forEach(function(o){
-      var b=el("button","pick");
-      b.appendChild(el("b",null,esc(o.l)));
-      if(o.detalle) b.appendChild(el("span",null,esc(o.detalle)));
-      b.addEventListener("click", function(){ responder(o.v); });
-      row.appendChild(b);
-    });
-    box.appendChild(row);
-    slot.appendChild(box);
-    var f=box.querySelector(".pick"); if(f) f.focus();
-    return;
-  }
-
-  var bs=el("div","ask-btns");
-  (p.opciones||[]).forEach(function(o){
-    var b=el("button","btn"+(o.principal?" primary":"")+(o.peligro?" danger":""), esc(o.l));
-    b.addEventListener("click", function(){ responder(o.v); });
-    bs.appendChild(b);
-  });
-  box.appendChild(bs);
-  slot.appendChild(box);
-  var pf=bs.querySelector("button"); if(pf) pf.focus();
-  box.scrollIntoView({block:"nearest", behavior:"smooth"});
-}
-
-function cortado(d){
-  fase="fin"; pintarFase();
-  var root=$("faseResultado"); root.innerHTML="";
-  var v=el("div","verdict no");
-  v.appendChild(el("div","verdict-k","Cortado"));
-  v.appendChild(el("h2",null,esc(d.titulo)));
-  v.appendChild(el("div","meta")).appendChild(el("span",null,esc(d.texto)));
-  root.appendChild(v);
-}
-
-/* ---------------- resultado ---------------- */
-function sec(t){ var s=el("section","sec"); s.appendChild(el("div","sec-t",t)); return s; }
-
-function pintarResultado(){
-  if(!resultado) return;
-  fase = (fase==="fin") ? "fin" : "resultado";
-  pintarFase();
-  var d=resultado, dg=d.diagnostico||{}, root=$("faseResultado");
-  root.innerHTML="";
-
-  var ok = !!dg.resolved;
-  var v=el("div","verdict "+(ok?"ok":"no"));
-  v.appendChild(el("div","verdict-k", ok?"Resuelto en esta PC":"No resuelto &#8212; hace falta una mano"));
-  v.appendChild(el("h2",null,esc(dg.rootCause)||"Sin causa determinada"));
-  var meta=el("div","meta");
-  if(dg.confidence) meta.appendChild(el("span",null,"Confianza: "+esc(dg.confidence)));
-  meta.appendChild(el("span",null,"Se tocaron "+tocado.length+" cosas en esta PC"));
-  if(d.modo) meta.appendChild(el("span",null,"Se revis&#243;: "+(d.modo==="Ambos"?"USB y red":"s&#243;lo "+String(d.modo).toLowerCase())));
-  v.appendChild(meta);
-  root.appendChild(v);
-
-  if(d.abortoPorModo){
-    var nn=el("div","note");
-    nn.appendChild(el("b",null,"No se revis&#243; nada. "));
-    nn.appendChild(document.createTextNode(
-      "No hay impresoras del tipo que elegiste en esta PC, y no se toc&#243; ninguna de las otras."));
-    root.appendChild(nn);
-  }
-
-  // impresora de red en otra subred
-  var pl=d.planRed;
-  if(pl && pl.hay){
-    var s=sec("La impresora est&#225; en otra red");
-    var g=el("div");
-    g.style.cssText="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px";
-    function celda(k,val){
-      var c=el("div"); c.appendChild(el("div","pport",k));
-      var b=el("div","mono"); b.textContent=esc(val);
-      b.style.cssText="font-size:15px;font-weight:600;margin-top:2px";
-      c.appendChild(b); return c;
-    }
-    g.appendChild(celda("Est&#225; en", pl.ip));
-    if(pl.ipSugerida) g.appendChild(celda("Ponerle esta IP", pl.ipSugerida));
-    if(pl.mascara)    g.appendChild(celda("M&#225;scara", pl.mascara));
-    if(pl.gateway)    g.appendChild(celda("Gateway", pl.gateway));
-    if(pl.marca)      g.appendChild(celda("Marca", pl.marca));
-    s.appendChild(g);
-    if(pl.ipSugerida){
-      var ph=el("p","hint","Esa IP se prob&#243; desde esta PC y est&#225; libre.");
-      ph.style.marginTop="10px"; s.appendChild(ph);
-    }
-    root.appendChild(s);
-  }
-
-  // que hacer ahora
-  var acc=(d.acciones||[]).filter(function(a){ return a; });
-  if(acc.length){
-    var s1=sec("Qu&#233; hacer ahora");
-    var ul=el("ul","todo");
-    acc.forEach(function(a){
-      var li=el("li"), c=el("div");
-      var b=el("b"); b.textContent=esc(a.what);
-      if(a.owner) b.appendChild(el("span","who "+esc(a.owner), esc(a.owner)));
-      c.appendChild(b);
-      if(a["do"]) c.appendChild(el("p",null,esc(a["do"])));
-      if(a.articleRef) c.appendChild(el("div","art","Art&#237;culo "+esc(a.articleRef)));
-      li.appendChild(c); ul.appendChild(li);
-    });
-    s1.appendChild(ul); root.appendChild(s1);
-  }
-
-  // impresoras
-  var colas=d.colas||[];
-  if(colas.length){
-    var s2=sec("Impresoras en esta PC");
-    var box=el("div","prn");
-    colas.forEach(function(c){
-      var r=el("div","prow"+((c.score>0)?" target":""));
-      r.appendChild(el("span","pname",esc(c.nombre)));
-      if(c.puerto) r.appendChild(el("span","pport",esc(c.puerto)));
-      var e=String(c.estado||"");
-      var cl = e==="no imprime"?"fail" : (e==="con problemas"?"warn":"ok");
-      r.appendChild(el("span","chip "+cl, e||"funcionando"));
-      if(c.sintomas && c.sintomas.length){
-        var dd=el("div","psym"), u=el("ul");
-        c.sintomas.forEach(function(x){ u.appendChild(el("li",null,esc(x))); });
-        dd.appendChild(u); r.appendChild(dd);
-      }
-      box.appendChild(r);
-    });
-    s2.appendChild(box);
-    var conn=d.conectadas||[];
-    if(conn.length){
-      var p=el("p","hint"); p.style.marginTop="10px";
-      p.textContent="Hardware conectado: "+conn.map(function(h){
-        return (h.puerto||"sin puerto")+" &#8594; "+(h.nombre||"")+(h.colaWindows?" (cola "+h.colaWindows+")":"");
-      }).join("  &#183;  ");
-      s2.appendChild(p);
-    }
-    var off=d.desconectadas||[];
-    if(off.length){
-      var p2=el("p","hint"); p2.style.marginTop="6px";
-      p2.textContent="Desconectadas: "+off.map(function(h){ return h.nombre||""; }).join(", ")+
-        " &#8212; encender la impresora y conectar el USB, preferentemente en el mismo puerto.";
-      s2.appendChild(p2);
-    }
-    root.appendChild(s2);
-  }
-
-  // lo que se toco
-  var s3=sec("Lo que se toc&#243; en esta PC");
-  if(tocado.length){
-    var u3=el("ul");
-    u3.style.cssText="list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px";
-    tocado.forEach(function(x){
-      var li=el("li");
-      li.style.cssText="display:flex;gap:8px;font-size:12.5px;border-left:2px solid "+
-        (x.reversible===false?"var(--fail)":"var(--fixed)")+";padding-left:10px;color:var(--ink-2)";
-      li.appendChild(el("span","tag", x.reversible===false?"no se deshace":"reversible"));
-      li.appendChild(el("span",null,esc(x.texto)));
-      u3.appendChild(li);
-    });
-    s3.appendChild(u3);
-  } else s3.appendChild(el("p","empty","No se modific&#243; nada en esta PC."));
-  root.appendChild(s3);
-
-  // detalle
-  var s4=sec("Detalle");
-  var dr=el("details","drawer");
-  dr.appendChild(el("summary",null,"Los "+checks.length+" chequeos, uno por uno"));
-  var tw=el("div","tblwrap"), tb=el("table","chk");
-  var th=el("thead"), trh=el("tr");
-  ["Chequeo","Id","Resultado"].forEach(function(h){ trh.appendChild(el("th",null,h)); });
-  th.appendChild(trh); tb.appendChild(th);
-  var tbody=el("tbody");
-  checks.forEach(function(c){
-    var tr=el("tr");
-    tr.appendChild(el("td",null,esc(c.nombre)));
-    var t2=el("td","id"); t2.textContent=esc(c.id); tr.appendChild(t2);
-    var t3=el("td"); t3.appendChild(el("span","chip "+esc(c.estado), esc(c.estado))); tr.appendChild(t3);
-    tbody.appendChild(tr);
-  });
-  tb.appendChild(tbody); tw.appendChild(tb); dr.appendChild(tw); s4.appendChild(dr);
-
-  var dj=el("details","drawer");
-  dj.appendChild(el("summary",null,"El JSON que le queda al agente"));
-  var pre=el("pre","json mono","cargando&#8230;");
-  dj.appendChild(pre);
-  dj.addEventListener("toggle", function(){
-    if(!dj.open || dj.dataset.cargado) return;
-    dj.dataset.cargado="1";
-    fetch("/json?t="+TOKEN).then(function(r){ return r.text(); })
-      .then(function(t){ pre.textContent=t; })
-      .catch(function(){ pre.textContent="No se pudo leer el JSON."; });
-  });
-  s4.appendChild(dj);
-  root.appendChild(s4);
-
-  // resumen de siempre, por si alguien lo quiere pegar en el caso
-  if(d.resumen){
-    var dt=el("details","drawer");
-    dt.appendChild(el("summary",null,"El resumen en texto (para pegar en Intercom)"));
-    dt.appendChild(el("pre","json mono", d.resumen));
-    root.appendChild(dt);
-  }
-
-  // acciones finales: vienen del menu del motor
-  if(menuPreg) root.appendChild(barraAcciones(menuPreg));
-
-  var f=el("div","foot");
-  function tag(t){ var s=el("span"); s.appendChild(el("b",null,"&#183;  "));
-    s.appendChild(document.createTextNode(t)); return s; }
-  if(d.telemetria){
-    f.appendChild(tag(d.telemetria.enviada ? "Reporte enviado al panel de telemetr&#237;a"
-                                           : "Telemetr&#237;a: "+esc(d.telemetria.detalle)));
-  }
-  if(d.jsonPath) f.appendChild(tag("JSON en "+esc(d.jsonPath)));
-  root.appendChild(f);
-}
-
-function barraAcciones(p){
-  var cont=el("div");
-  var disp={}; (p.opciones||[]).forEach(function(o){ disp[o.v]=o.l; });
-
-  var a=el("div","endbar");
-  if(disp.R){
-    var main=el("button","btn primary","Volver a revisar todo");
-    main.addEventListener("click", function(){ responder("R"); });
-    a.appendChild(main);
-  }
-  var links=el("div","links");
-  var cerrar=el("button",null,"Cerrar");
-  cerrar.addEventListener("click", function(){ responder("S"); });
-  links.appendChild(cerrar);
-  a.appendChild(links);
-  cont.appendChild(a);
-
-  var cat=(p.extra && p.extra.catalogo) ? p.extra.catalogo : [];
-  if(cat.length){
-    var adv=el("details","adv");
-    var sm=el("summary");
-    sm.appendChild(document.createTextNode("Opciones avanzadas"));
-    sm.appendChild(el("span",null,"gestiones puntuales sin volver a revisar todo"));
-    adv.appendChild(sm);
-    var list=el("div","advlist");
-    cat.forEach(function(o){
-      var row=el("div","advrow"+(o.disponible?"":" off"));
-      var dd=el("div");
-      dd.appendChild(el("b",null,esc(o.l)));
-      if(o.detalle) dd.appendChild(el("p",null,esc(o.detalle)));
-      row.appendChild(dd);
-      if(o.disponible){
-        var b=el("button","btn sm"+(o.v==="L"?" danger":""), o.v==="L"?"Limpiarla":"Hacerlo");
-        b.addEventListener("click", function(){ responder(o.v); });
-        row.appendChild(b);
-      } else {
-        row.appendChild(el("span","why", esc(o.motivo)||"no corresponde ahora"));
-      }
-      list.appendChild(row);
-    });
-    adv.appendChild(list);
-    cont.appendChild(adv);
-  }
-  return cont;
-}
-
-pintarFase();
-poll();
-</script>
+$script:UiHtmlB64 = @'
+PG1ldGEgY2hhcnNldD0idXRmLTgiPgo8dGl0bGU+RnVkbyBQcmludCBEb2N0b3I8L3RpdGxlPgo8bGluayByZWw9Imljb24iIGhyZWY9ImRhdGE6aW1hZ2Uv
+c3ZnK3htbCwlM0NzdmcgeG1sbnM9J2h0dHA6Ly93d3cudzMub3JnLzIwMDAvc3ZnJyB2aWV3Qm94PScwIDAgMjQgMjQnIGZpbGw9J25vbmUnIHN0cm9rZS1s
+aW5lam9pbj0ncm91bmQnIHN0cm9rZS1saW5lY2FwPSdyb3VuZCclM0UlM0NwYXRoIGQ9J001IDQuNUExLjUgMS41IDAgMCAxIDYuNSAzaDExQTEuNSAxLjUg
+MCAwIDEgMTkgNC41djE2LjFsLTIuOC0xLjgtMi44IDEuOC0yLjgtMS44LTIuOCAxLjhMNSAxOC44Wicgc3Ryb2tlPSclMjM4YjhmOTYnIHN0cm9rZS13aWR0
+aD0nMS41Jy8lM0UlM0NwYXRoIGQ9J003LjIgMTIuNGgyLjJsMS40LTMuMiAyLjQgNS42IDEuNC0yLjRoMi4yJyBzdHJva2U9JyUyMzFlNWZiOCcgc3Ryb2tl
+LXdpZHRoPScxLjknLyUzRSUzQy9zdmclM0UiPgo8bGluayByZWw9InByZWNvbm5lY3QiIGhyZWY9Imh0dHBzOi8vZm9udHMuZ29vZ2xlYXBpcy5jb20iPgo8
+bGluayByZWw9InByZWNvbm5lY3QiIGhyZWY9Imh0dHBzOi8vZm9udHMuZ3N0YXRpYy5jb20iIGNyb3Nzb3JpZ2luPgo8bGluayByZWw9InN0eWxlc2hlZXQi
+IGhyZWY9Imh0dHBzOi8vZm9udHMuZ29vZ2xlYXBpcy5jb20vY3NzMj9mYW1pbHk9SUJNK1BsZXgrTW9ubzp3Z2h0QDQwMDs1MDA7NjAwJmZhbWlseT1JQk0r
+UGxleCtTYW5zOndnaHRANDAwOzUwMDs2MDA7NzAwJmRpc3BsYXk9c3dhcCI+CjxzdHlsZT4KOnJvb3R7CiAgLS1ncm91bmQ6I2U5ZTdlMjsgLS1zdXJmYWNl
+OiNmZmZlZmM7IC0tc3VyZmFjZS0yOiNmNGYyZWU7IC0tc3VuazojZWRlYWU0OwogIC0taW5rOiMxNzE5MWQ7IC0taW5rLTI6IzRhNGQ1MzsgLS1tdXRlZDoj
+NzU3MzZkOyAtLWxpbmU6I2Q3ZDNjYjsgLS1saW5lLXNvZnQ6I2U0ZTBkODsKICAtLW9rOiMxYjdhNDk7IC0tb2stYmc6I2UzZjFlODsgLS13YXJuOiM5YzZh
+MDg7IC0td2Fybi1iZzojZjZlZGRiOyAtLWZhaWw6I2I4MzcyYTsKICAtLWZhaWwtYmc6I2Y4ZTVlMjsgLS1maXhlZDojMWU1ZmI4OyAtLWZpeGVkLWJnOiNl
+MmViZjg7IC0taWRsZTojOGI4ODdmOyAtLWlkbGUtYmc6I2VjZWFlNTsKICAtLXBhcGVyOiNmYmY4ZjE7IC0tcGFwZXItaW5rOiMyYTI2MjI7IC0tc2hhZG93
+OjAgMXB4IDJweCByZ2JhKDIzLDI1LDI5LC4wNyksMCA4cHggMjRweCAtMTJweCByZ2JhKDIzLDI1LDI5LC4xOCk7CiAgLS1mb2N1czojMWU1ZmI4Owp9CkBt
+ZWRpYSAocHJlZmVycy1jb2xvci1zY2hlbWU6ZGFyayl7OnJvb3Q6bm90KFtkYXRhLXRoZW1lPSJsaWdodCJdKXsKICAtLWdyb3VuZDojMGYxMTEzOyAtLXN1
+cmZhY2U6IzE5MWMyMDsgLS1zdXJmYWNlLTI6IzIwMjQyYTsgLS1zdW5rOiMxNDE3MTk7CiAgLS1pbms6I2U4ZWFlZDsgLS1pbmstMjojYjRiOGJlOyAtLW11
+dGVkOiM4YjkwOTg7IC0tbGluZTojMmMzMTM4OyAtLWxpbmUtc29mdDojMjQyOTMwOwogIC0tb2s6IzU3Yzk4YTsgLS1vay1iZzojMTYzMDFmOyAtLXdhcm46
+I2UyYWM0YTsgLS13YXJuLWJnOiMzMzI3MTQ7IC0tZmFpbDojZjQ3OTZhOwogIC0tZmFpbC1iZzojM2ExYzE4OyAtLWZpeGVkOiM3N2FlZjU7IC0tZml4ZWQt
+Ymc6IzE1MjYzYzsgLS1pZGxlOiM3ZDgyOGE7IC0taWRsZS1iZzojMWUyMjI3OwogIC0tcGFwZXI6I2U4ZTNkODsgLS1wYXBlci1pbms6IzJhMjYyMjsgLS1z
+aGFkb3c6MCAxcHggMnB4IHJnYmEoMCwwLDAsLjQpLDAgMTBweCAyOHB4IC0xNHB4IHJnYmEoMCwwLDAsLjcpOwogIC0tZm9jdXM6Izc3YWVmNTsKfX0KOnJv
+b3RbZGF0YS10aGVtZT0iZGFyayJdewogIC0tZ3JvdW5kOiMwZjExMTM7IC0tc3VyZmFjZTojMTkxYzIwOyAtLXN1cmZhY2UtMjojMjAyNDJhOyAtLXN1bms6
+IzE0MTcxOTsKICAtLWluazojZThlYWVkOyAtLWluay0yOiNiNGI4YmU7IC0tbXV0ZWQ6IzhiOTA5ODsgLS1saW5lOiMyYzMxMzg7IC0tbGluZS1zb2Z0OiMy
+NDI5MzA7CiAgLS1vazojNTdjOThhOyAtLW9rLWJnOiMxNjMwMWY7IC0td2FybjojZTJhYzRhOyAtLXdhcm4tYmc6IzMzMjcxNDsgLS1mYWlsOiNmNDc5NmE7
+CiAgLS1mYWlsLWJnOiMzYTFjMTg7IC0tZml4ZWQ6Izc3YWVmNTsgLS1maXhlZC1iZzojMTUyNjNjOyAtLWlkbGU6IzdkODI4YTsgLS1pZGxlLWJnOiMxZTIy
+Mjc7CiAgLS1wYXBlcjojZThlM2Q4OyAtLXBhcGVyLWluazojMmEyNjIyOyAtLXNoYWRvdzowIDFweCAycHggcmdiYSgwLDAsMCwuNCksMCAxMHB4IDI4cHgg
+LTE0cHggcmdiYSgwLDAsMCwuNyk7CiAgLS1mb2N1czojNzdhZWY1Owp9Cip7Ym94LXNpemluZzpib3JkZXItYm94fQpbaGlkZGVuXXtkaXNwbGF5Om5vbmUh
+aW1wb3J0YW50fQpib2R5e2JhY2tncm91bmQ6dmFyKC0tZ3JvdW5kKTtjb2xvcjp2YXIoLS1pbmspO2ZvbnQtZmFtaWx5OiJJQk0gUGxleCBTYW5zIiwtYXBw
+bGUtc3lzdGVtLFNlZ29lIFVJLHN5c3RlbS11aSxzYW5zLXNlcmlmOwogIGZvbnQtc2l6ZToxNHB4O2xpbmUtaGVpZ2h0OjEuNTstd2Via2l0LWZvbnQtc21v
+b3RoaW5nOmFudGlhbGlhc2VkfQo6Zm9jdXMtdmlzaWJsZXtvdXRsaW5lOjJweCBzb2xpZCB2YXIoLS1mb2N1cyk7b3V0bGluZS1vZmZzZXQ6MnB4O2JvcmRl
+ci1yYWRpdXM6M3B4fQpAbWVkaWEgKHByZWZlcnMtcmVkdWNlZC1tb3Rpb246cmVkdWNlKXsqe2FuaW1hdGlvbjpub25lIWltcG9ydGFudDt0cmFuc2l0aW9u
+Om5vbmUhaW1wb3J0YW50fX0KLndyYXB7bWF4LXdpZHRoOjEwNjBweDttYXJnaW46MCBhdXRvO3BhZGRpbmc6MTZweDtwYWRkaW5nLWJsb2NrOjIwcHggNDBw
+eH0KaDEsaDIsaDN7bWFyZ2luOjA7dGV4dC13cmFwOmJhbGFuY2U7Zm9udC13ZWlnaHQ6NjAwO2xldHRlci1zcGFjaW5nOi0uMDFlbX0KcHttYXJnaW46MH0K
+Lm1vbm97Zm9udC1mYW1pbHk6IklCTSBQbGV4IE1vbm8iLHVpLW1vbm9zcGFjZSxDb25zb2xhcyxtb25vc3BhY2U7Zm9udC12YXJpYW50LW51bWVyaWM6dGFi
+dWxhci1udW1zfQoKLmFwcHtiYWNrZ3JvdW5kOnZhcigtLXN1cmZhY2UpO2JvcmRlcjoxcHggc29saWQgdmFyKC0tbGluZSk7Ym9yZGVyLXJhZGl1czoxMHB4
+O2JveC1zaGFkb3c6dmFyKC0tc2hhZG93KTtvdmVyZmxvdzpoaWRkZW59Ci50aXRsZWJhcntkaXNwbGF5OmZsZXg7YWxpZ24taXRlbXM6Y2VudGVyO2dhcDox
+MnB4O2ZsZXgtd3JhcDp3cmFwO3BhZGRpbmc6MTFweCAxNnB4O2JhY2tncm91bmQ6dmFyKC0tc3VyZmFjZS0yKTsKICBib3JkZXItYm90dG9tOjFweCBzb2xp
+ZCB2YXIoLS1saW5lKX0KLmJyYW5ke2Rpc3BsYXk6ZmxleDthbGlnbi1pdGVtczpjZW50ZXI7Z2FwOjlweDttYXJnaW4tcmlnaHQ6YXV0b30KLmJyYW5kIGJ7
+Zm9udC1zaXplOjE1cHg7Zm9udC13ZWlnaHQ6NzAwO2xldHRlci1zcGFjaW5nOi0uMDJlbX0KLnZlcntmb250LXNpemU6MTFweDtjb2xvcjp2YXIoLS1tdXRl
+ZCk7bGV0dGVyLXNwYWNpbmc6LjA0ZW19Ci5tYXJre2Rpc3BsYXk6aW5saW5lLWZsZXg7ZmxleDpub25lO2NvbG9yOnZhcigtLWluayk7dHJhbnNpdGlvbjpj
+b2xvciAuM3N9Ci5tYXJrIHN2Z3tkaXNwbGF5OmJsb2NrfQoubWFyayAucGFwZXJ7b3BhY2l0eTouNDJ9Ci5tYXJrLnJ1bm5pbmd7Y29sb3I6dmFyKC0tZml4
+ZWQpfQoubWFyay5ydW5uaW5nIC5wdWxzZXtzdHJva2UtZGFzaGFycmF5OjUgMjY7YW5pbWF0aW9uOnRyYWNlIDEuMnMgbGluZWFyIGluZmluaXRlfQpAa2V5
+ZnJhbWVzIHRyYWNle2Zyb217c3Ryb2tlLWRhc2hvZmZzZXQ6MzF9dG97c3Ryb2tlLWRhc2hvZmZzZXQ6MH19Ci50Yi1tZXRhe2Rpc3BsYXk6ZmxleDtnYXA6
+MTRweDtmbGV4LXdyYXA6d3JhcDtmb250LXNpemU6MTEuNXB4O2NvbG9yOnZhcigtLW11dGVkKX0KLnRiLW1ldGEgc3BhbiBie2NvbG9yOnZhcigtLWluay0y
+KTtmb250LXdlaWdodDo1MDB9Ci5ib2R5e3BhZGRpbmc6MjBweCAyMnB4IDI0cHh9CgouYXZpc297ZGlzcGxheTpmbGV4O2dhcDo5cHg7YWxpZ24taXRlbXM6
+YmFzZWxpbmU7cGFkZGluZzoxMHB4IDE2cHg7Zm9udC1zaXplOjEyLjVweDsKICBiYWNrZ3JvdW5kOnZhcigtLXdhcm4tYmcpO2NvbG9yOnZhcigtLXdhcm4p
+O2JvcmRlci1ib3R0b206MXB4IHNvbGlkIHZhcigtLWxpbmUpfQouY2FpZG97YmFja2dyb3VuZDp2YXIoLS1mYWlsLWJnKTtjb2xvcjp2YXIoLS1mYWlsKX0K
+Ci5idG57Zm9udDppbmhlcml0O2ZvbnQtc2l6ZToxM3B4O2ZvbnQtd2VpZ2h0OjUwMDtwYWRkaW5nOjhweCAxNHB4O2JvcmRlci1yYWRpdXM6NnB4O2JvcmRl
+cjoxcHggc29saWQgdmFyKC0tbGluZSk7CiAgYmFja2dyb3VuZDp2YXIoLS1zdXJmYWNlKTtjb2xvcjp2YXIoLS1pbmspO2N1cnNvcjpwb2ludGVyO3RyYW5z
+aXRpb246YmFja2dyb3VuZCAuMTJzLGJvcmRlci1jb2xvciAuMTJzfQouYnRuOmhvdmVye2JhY2tncm91bmQ6dmFyKC0tc3VyZmFjZS0yKTtib3JkZXItY29s
+b3I6dmFyKC0taW5rLTIpfQouYnRuLnByaW1hcnl7YmFja2dyb3VuZDp2YXIoLS1pbmspO2NvbG9yOnZhcigtLXN1cmZhY2UpO2JvcmRlci1jb2xvcjp2YXIo
+LS1pbmspfQouYnRuLnByaW1hcnk6aG92ZXJ7b3BhY2l0eTouODh9Ci5idG4uZGFuZ2Vye2JvcmRlci1jb2xvcjp2YXIoLS1mYWlsKTtjb2xvcjp2YXIoLS1m
+YWlsKX0KLmJ0bi5kYW5nZXI6aG92ZXJ7YmFja2dyb3VuZDp2YXIoLS1mYWlsLWJnKX0KLmJ0bi5zbXtmb250LXNpemU6MTJweDtwYWRkaW5nOjZweCAxMHB4
+fQppbnB1dFt0eXBlPXRleHRde2ZvbnQ6aW5oZXJpdDtmb250LWZhbWlseToiSUJNIFBsZXggTW9ubyIsbW9ub3NwYWNlO3BhZGRpbmc6OXB4IDExcHg7Ym9y
+ZGVyOjFweCBzb2xpZCB2YXIoLS1saW5lKTsKICBib3JkZXItcmFkaXVzOjZweDtiYWNrZ3JvdW5kOnZhcigtLXN1cmZhY2UpO2NvbG9yOnZhcigtLWluayk7
+d2lkdGg6MTAwJTttYXgtd2lkdGg6MzYwcHh9CgovKiAtLS0tIHByZWd1bnRhIC0tLS0gKi8KLmFza3tib3JkZXI6MXB4IHNvbGlkIHZhcigtLWluayk7Ym9y
+ZGVyLXJhZGl1czo4cHg7YmFja2dyb3VuZDp2YXIoLS1zdXJmYWNlKTtib3gtc2hhZG93OnZhcigtLXNoYWRvdyk7CiAgcGFkZGluZzoxNXB4IDE2cHg7bWFy
+Z2luLWJvdHRvbToxNnB4fQouYXNrLnBlbGlncm97Ym9yZGVyLWNvbG9yOnZhcigtLWZhaWwpfQouYXNrLWt7Zm9udC1zaXplOjEwLjVweDtmb250LXdlaWdo
+dDo2MDA7bGV0dGVyLXNwYWNpbmc6LjA5ZW07dGV4dC10cmFuc2Zvcm06dXBwZXJjYXNlO2NvbG9yOnZhcigtLW11dGVkKTsKICBtYXJnaW4tYm90dG9tOjZw
+eH0KLmFzay5wZWxpZ3JvIC5hc2sta3tjb2xvcjp2YXIoLS1mYWlsKX0KLmFzayBoM3tmb250LXNpemU6MTUuNXB4O21hcmdpbi1ib3R0b206N3B4fQouYXNr
+IHB7Zm9udC1zaXplOjEzcHg7Y29sb3I6dmFyKC0taW5rLTIpO21heC13aWR0aDo2MmNoO21hcmdpbi1ib3R0b206NnB4fQouYXNrLWJ0bnN7ZGlzcGxheTpm
+bGV4O2dhcDo4cHg7ZmxleC13cmFwOndyYXA7bWFyZ2luLXRvcDoxMnB4fQouc29sb2FzZXNvcntkaXNwbGF5OmlubGluZS1ibG9jaztmb250LXNpemU6OS41
+cHg7Zm9udC13ZWlnaHQ6NzAwO2xldHRlci1zcGFjaW5nOi4wOGVtOwogIHRleHQtdHJhbnNmb3JtOnVwcGVyY2FzZTtwYWRkaW5nOjJweCA3cHg7Ym9yZGVy
+LXJhZGl1czozcHg7YmFja2dyb3VuZDp2YXIoLS1zdW5rKTsKICBjb2xvcjp2YXIoLS1tdXRlZCk7bWFyZ2luLWJvdHRvbTo4cHh9Ci5zdWJ0aXR1bG97Zm9u
+dC1zaXplOjExLjVweDtjb2xvcjp2YXIoLS1tdXRlZCk7bWFyZ2luLWxlZnQ6MnB4fQouZ2VzdHtib3JkZXI6MXB4IHNvbGlkIHZhcigtLWxpbmUpO2JvcmRl
+ci1sZWZ0OjNweCBzb2xpZCB2YXIoLS1maXhlZCk7Ym9yZGVyLXJhZGl1czo4cHg7CiAgYmFja2dyb3VuZDp2YXIoLS1zdXJmYWNlLTIpO3BhZGRpbmc6MTJw
+eCAxNHB4O21hcmdpbi1ib3R0b206MTZweH0KLmdlc3QgYntkaXNwbGF5OmJsb2NrO2ZvbnQtc2l6ZToxMy41cHg7Zm9udC13ZWlnaHQ6NjAwO21hcmdpbi1i
+b3R0b206M3B4fQouZ2VzdCBwe2ZvbnQtc2l6ZToxMi41cHg7Y29sb3I6dmFyKC0taW5rLTIpO21heC13aWR0aDo2MmNoO21hcmdpbi10b3A6M3B4fQouZ2Vz
+dCAuY3VlbnRhe2ZvbnQtZmFtaWx5OiJJQk0gUGxleCBNb25vIixtb25vc3BhY2U7Zm9udC1zaXplOjIycHg7Zm9udC13ZWlnaHQ6NjAwO21hcmdpbi10b3A6
+NnB4OwogIGRpc3BsYXk6YmxvY2s7bGV0dGVyLXNwYWNpbmc6LS4wMmVtfQouZ2VzdC5lc3BlcmF7Ym9yZGVyLWxlZnQtY29sb3I6dmFyKC0td2Fybil9Ci5h
+c2tlcnJ7ZGlzcGxheTpmbGV4O2dhcDo4cHg7YWxpZ24taXRlbXM6ZmxleC1zdGFydDttYXJnaW4tdG9wOjEycHg7cGFkZGluZzo5cHggMTFweDtib3JkZXIt
+cmFkaXVzOjZweDsKICBiYWNrZ3JvdW5kOnZhcigtLWZhaWwtYmcpO2NvbG9yOnZhcigtLWZhaWwpO2ZvbnQtc2l6ZToxMi41cHg7Zm9udC13ZWlnaHQ6NTAw
+O21heC13aWR0aDo2MmNofQouYXNrZXJyOjpiZWZvcmV7Y29udGVudDoiISI7ZmxleDpub25lO3dpZHRoOjE2cHg7aGVpZ2h0OjE2cHg7Ym9yZGVyLXJhZGl1
+czo1MCU7YmFja2dyb3VuZDp2YXIoLS1mYWlsKTsKICBjb2xvcjp2YXIoLS1zdXJmYWNlKTtmb250LXNpemU6MTFweDtmb250LXdlaWdodDo3MDA7ZGlzcGxh
+eTpncmlkO3BsYWNlLWl0ZW1zOmNlbnRlcjttYXJnaW4tdG9wOjFweH0KLmFzayB1bHttYXJnaW46NnB4IDAgMDtwYWRkaW5nLWxlZnQ6MjBweDtmb250LXNp
+emU6MTIuNXB4O2NvbG9yOnZhcigtLWluay0yKX0KLnRpY2tldHtiYWNrZ3JvdW5kOnZhcigtLXBhcGVyKTtjb2xvcjp2YXIoLS1wYXBlci1pbmspO2JvcmRl
+ci1yYWRpdXM6M3B4O3BhZGRpbmc6MTJweCAxNHB4O21hcmdpbjoxMHB4IDA7CiAgZm9udC1mYW1pbHk6IklCTSBQbGV4IE1vbm8iLG1vbm9zcGFjZTtmb250
+LXNpemU6MTEuNXB4O2xpbmUtaGVpZ2h0OjEuNTU7d2hpdGUtc3BhY2U6cHJlO292ZXJmbG93LXg6YXV0bzsKICBtYXgtd2lkdGg6MjgwcHg7Ym94LXNoYWRv
+dzowIDJweCA4cHggLTNweCByZ2JhKDAsMCwwLC4zNSk7Ym9yZGVyOjFweCBzb2xpZCByZ2JhKDAsMCwwLC4wOCl9Ci5jb3VudHtmb250LWZhbWlseToiSUJN
+IFBsZXggTW9ubyIsbW9ub3NwYWNlO2ZvbnQtc2l6ZToyNnB4O2ZvbnQtd2VpZ2h0OjYwMDtsZXR0ZXItc3BhY2luZzotLjAyZW19Ci5waWNrcm93e2Rpc3Bs
+YXk6ZmxleDtnYXA6OHB4O2ZsZXgtd3JhcDp3cmFwO21hcmdpbi10b3A6MTJweH0KLnBpY2t7ZmxleDoxIDEgMTcwcHg7dGV4dC1hbGlnbjpsZWZ0O2JvcmRl
+cjoxcHggc29saWQgdmFyKC0tbGluZSk7YmFja2dyb3VuZDp2YXIoLS1zdXJmYWNlKTtib3JkZXItcmFkaXVzOjdweDsKICBwYWRkaW5nOjEwcHggMTJweDtj
+dXJzb3I6cG9pbnRlcjtmb250OmluaGVyaXQ7Y29sb3I6dmFyKC0taW5rKX0KLnBpY2s6aG92ZXJ7Ym9yZGVyLWNvbG9yOnZhcigtLWluay0yKTtiYWNrZ3Jv
+dW5kOnZhcigtLXN1cmZhY2UtMil9Ci5waWNrIGJ7ZGlzcGxheTpibG9jaztmb250LXNpemU6MTNweDtmb250LXdlaWdodDo2MDA7bWFyZ2luLWJvdHRvbToy
+cHh9Ci5waWNrIHNwYW57Zm9udC1zaXplOjExLjVweDtjb2xvcjp2YXIoLS1tdXRlZCk7ZGlzcGxheTpibG9jaztsaW5lLWhlaWdodDoxLjM1fQouaW5saW5l
+e2Rpc3BsYXk6ZmxleDtnYXA6OHB4O2FsaWduLWl0ZW1zOmNlbnRlcjtmbGV4LXdyYXA6d3JhcH0KCi8qIC0tLS0gY29ycmlkYSAtLS0tICovCi5ydW57ZGlz
+cGxheTpncmlkO2dyaWQtdGVtcGxhdGUtY29sdW1uczptaW5tYXgoMCwxZnIpIG1pbm1heCgwLDEuMDVmcik7Z2FwOjIwcHg7YWxpZ24taXRlbXM6c3RhcnR9
+CkBtZWRpYSAobWF4LXdpZHRoOjc4MHB4KXsucnVue2dyaWQtdGVtcGxhdGUtY29sdW1uczoxZnJ9fQoucGFuZWwtdHtmb250LXNpemU6MTFweDtmb250LXdl
+aWdodDo2MDA7bGV0dGVyLXNwYWNpbmc6LjA5ZW07dGV4dC10cmFuc2Zvcm06dXBwZXJjYXNlO2NvbG9yOnZhcigtLW11dGVkKTsKICBtYXJnaW4tYm90dG9t
+OjlweH0KLmxhZGRlcntkaXNwbGF5OmZsZXg7ZmxleC1kaXJlY3Rpb246Y29sdW1uO2JvcmRlcjoxcHggc29saWQgdmFyKC0tbGluZS1zb2Z0KTtib3JkZXIt
+cmFkaXVzOjhweDtvdmVyZmxvdzpoaWRkZW59Ci5ydW5ne2Rpc3BsYXk6ZmxleDthbGlnbi1pdGVtczpjZW50ZXI7Z2FwOjlweDtwYWRkaW5nOjhweCAxMXB4
+O2JvcmRlci1ib3R0b206MXB4IHNvbGlkIHZhcigtLWxpbmUtc29mdCk7Zm9udC1zaXplOjEyLjVweH0KLnJ1bmc6bGFzdC1jaGlsZHtib3JkZXItYm90dG9t
+OjB9Ci5ydW5nLm5vd3tiYWNrZ3JvdW5kOnZhcigtLXN1cmZhY2UtMil9Ci5ydW5nLm5vdyAucmxhYmVse2ZvbnQtd2VpZ2h0OjYwMH0KLnJue2ZvbnQtc2l6
+ZToxMC41cHg7Y29sb3I6dmFyKC0tbXV0ZWQpO3dpZHRoOjE2cHg7ZmxleDpub25lO3RleHQtYWxpZ246cmlnaHR9Ci5ybGFiZWx7ZmxleDoxO21pbi13aWR0
+aDowO292ZXJmbG93OmhpZGRlbjt0ZXh0LW92ZXJmbG93OmVsbGlwc2lzO3doaXRlLXNwYWNlOm5vd3JhcH0KLnJub3Rle2ZvbnQtc2l6ZToxMXB4O2NvbG9y
+OnZhcigtLW11dGVkKTtmbGV4Om5vbmV9Ci5ybXN7Zm9udC1zaXplOjEwLjVweDtjb2xvcjp2YXIoLS1tdXRlZCk7d2lkdGg6NDZweDt0ZXh0LWFsaWduOnJp
+Z2h0O2ZsZXg6bm9uZX0KLmNoaXB7Zm9udC1zaXplOjEwLjVweDtmb250LXdlaWdodDo2MDA7cGFkZGluZzoycHggN3B4O2JvcmRlci1yYWRpdXM6OTlweDtm
+bGV4Om5vbmU7dGV4dC10cmFuc2Zvcm06dXBwZXJjYXNlfQouY2hpcC5va3tiYWNrZ3JvdW5kOnZhcigtLW9rLWJnKTtjb2xvcjp2YXIoLS1vayl9Ci5jaGlw
+Lndhcm4sLmNoaXAucmV2aXNhcntiYWNrZ3JvdW5kOnZhcigtLXdhcm4tYmcpO2NvbG9yOnZhcigtLXdhcm4pfQouY2hpcC5mYWlsLC5jaGlwLmZhbGxhe2Jh
+Y2tncm91bmQ6dmFyKC0tZmFpbC1iZyk7Y29sb3I6dmFyKC0tZmFpbCl9Ci5jaGlwLmZpeGVkLC5jaGlwLnJlcGFyYWRve2JhY2tncm91bmQ6dmFyKC0tZml4
+ZWQtYmcpO2NvbG9yOnZhcigtLWZpeGVkKX0KLmNoaXAuc2tpcCwuY2hpcC5vbWl0aWRvLC5jaGlwLmlkbGUsLmNoaXAuc2tpcHBlZHtiYWNrZ3JvdW5kOnZh
+cigtLWlkbGUtYmcpO2NvbG9yOnZhcigtLWlkbGUpfQouc3Bpbnt3aWR0aDoxMXB4O2hlaWdodDoxMXB4O2JvcmRlcjoycHggc29saWQgdmFyKC0tbGluZSk7
+Ym9yZGVyLXRvcC1jb2xvcjp2YXIoLS1pbmspO2JvcmRlci1yYWRpdXM6NTAlOwogIGFuaW1hdGlvbjpzcCAuN3MgbGluZWFyIGluZmluaXRlO2ZsZXg6bm9u
+ZX0KQGtleWZyYW1lcyBzcHt0b3t0cmFuc2Zvcm06cm90YXRlKDM2MGRlZyl9fQouYmFye2hlaWdodDozcHg7YmFja2dyb3VuZDp2YXIoLS1zdW5rKTtib3Jk
+ZXItcmFkaXVzOjJweDtvdmVyZmxvdzpoaWRkZW47bWFyZ2luLWJvdHRvbToxMnB4fQouYmFyIGl7ZGlzcGxheTpibG9jaztoZWlnaHQ6MTAwJTtiYWNrZ3Jv
+dW5kOnZhcigtLWluayk7d2lkdGg6MDt0cmFuc2l0aW9uOndpZHRoIC4zNXMgZWFzZX0KLmZlZWR7Ym9yZGVyOjFweCBzb2xpZCB2YXIoLS1saW5lLXNvZnQp
+O2JvcmRlci1yYWRpdXM6OHB4O2JhY2tncm91bmQ6dmFyKC0tc3Vuayk7cGFkZGluZzoxMXB4IDEycHg7CiAgbWluLWhlaWdodDoxODBweDttYXgtaGVpZ2h0
+OjMwMHB4O292ZXJmbG93LXk6YXV0bztmb250LWZhbWlseToiSUJNIFBsZXggTW9ubyIsbW9ub3NwYWNlO2ZvbnQtc2l6ZToxMS41cHg7CiAgbGluZS1oZWln
+aHQ6MS42NTtjb2xvcjp2YXIoLS1pbmstMil9Ci5mZWVkIGRpdnt3aGl0ZS1zcGFjZTpwcmUtd3JhcDt3b3JkLWJyZWFrOmJyZWFrLXdvcmR9Ci5mZWVkIC5o
+bHtjb2xvcjp2YXIoLS1pbmspO2ZvbnQtd2VpZ2h0OjUwMH0KLmZlZWQgLnd7Y29sb3I6dmFyKC0td2Fybil9Ci5mZWVkIC5me2NvbG9yOnZhcigtLWZhaWwp
+fQoudG91Y2hlZHttYXJnaW4tdG9wOjE2cHh9Ci50b3VjaGVkIHVse2xpc3Qtc3R5bGU6bm9uZTttYXJnaW46MDtwYWRkaW5nOjA7ZGlzcGxheTpmbGV4O2Zs
+ZXgtZGlyZWN0aW9uOmNvbHVtbjtnYXA6NnB4fQoudG91Y2hlZCBsaXtkaXNwbGF5OmZsZXg7Z2FwOjhweDthbGlnbi1pdGVtczpmbGV4LXN0YXJ0O2ZvbnQt
+c2l6ZToxMi41cHg7Ym9yZGVyLWxlZnQ6MnB4IHNvbGlkIHZhcigtLWZpeGVkKTsKICBwYWRkaW5nLWxlZnQ6MTBweDtjb2xvcjp2YXIoLS1pbmstMil9Ci50
+b3VjaGVkIGxpLmlycntib3JkZXItbGVmdC1jb2xvcjp2YXIoLS1mYWlsKX0KLnRhZ3tmb250LXNpemU6MTBweDtmb250LXdlaWdodDo2MDA7dGV4dC10cmFu
+c2Zvcm06dXBwZXJjYXNlO2xldHRlci1zcGFjaW5nOi4wNGVtO2NvbG9yOnZhcigtLW11dGVkKTtmbGV4Om5vbmU7CiAgbWFyZ2luLXRvcDoxcHh9Ci5lbXB0
+eXtmb250LXNpemU6MTIuNXB4O2NvbG9yOnZhcigtLW11dGVkKTtmb250LXN0eWxlOml0YWxpY30KCi8qIC0tLS0gcmVzdWx0YWRvIC0tLS0gKi8KLnZlcmRp
+Y3R7Ym9yZGVyLXJhZGl1czo5cHg7cGFkZGluZzoxNnB4IDE4cHg7bWFyZ2luLWJvdHRvbToxOHB4O2JvcmRlcjoxcHggc29saWR9Ci52ZXJkaWN0Lm9re2Jh
+Y2tncm91bmQ6dmFyKC0tb2stYmcpO2JvcmRlci1jb2xvcjp2YXIoLS1vayl9Ci52ZXJkaWN0Lm5ve2JhY2tncm91bmQ6dmFyKC0tZmFpbC1iZyk7Ym9yZGVy
+LWNvbG9yOnZhcigtLWZhaWwpfQoudmVyZGljdC1re2ZvbnQtc2l6ZToxMXB4O2ZvbnQtd2VpZ2h0OjcwMDtsZXR0ZXItc3BhY2luZzouMWVtO3RleHQtdHJh
+bnNmb3JtOnVwcGVyY2FzZTttYXJnaW4tYm90dG9tOjVweH0KLnZlcmRpY3Qub2sgLnZlcmRpY3Qta3tjb2xvcjp2YXIoLS1vayl9Ci52ZXJkaWN0Lm5vIC52
+ZXJkaWN0LWt7Y29sb3I6dmFyKC0tZmFpbCl9Ci52ZXJkaWN0IGgye2ZvbnQtc2l6ZToxOXB4O2xpbmUtaGVpZ2h0OjEuMzttYXJnaW4tYm90dG9tOjhweDtt
+YXgtd2lkdGg6NjRjaH0KLnZlcmRpY3QgLm1ldGF7Zm9udC1zaXplOjEycHg7Y29sb3I6dmFyKC0taW5rLTIpO2Rpc3BsYXk6ZmxleDtnYXA6MTZweDtmbGV4
+LXdyYXA6d3JhcH0KLnNlY3ttYXJnaW4tYm90dG9tOjIycHh9Ci5zZWMtdHtmb250LXNpemU6MTFweDtmb250LXdlaWdodDo2MDA7bGV0dGVyLXNwYWNpbmc6
+LjA5ZW07dGV4dC10cmFuc2Zvcm06dXBwZXJjYXNlO2NvbG9yOnZhcigtLW11dGVkKTsKICBwYWRkaW5nLWJvdHRvbTo2cHg7Ym9yZGVyLWJvdHRvbToxcHgg
+c29saWQgdmFyKC0tbGluZS1zb2Z0KTttYXJnaW4tYm90dG9tOjExcHh9Ci50b2Rve2xpc3Qtc3R5bGU6bm9uZTttYXJnaW46MDtwYWRkaW5nOjA7Y291bnRl
+ci1yZXNldDp0O2Rpc3BsYXk6ZmxleDtmbGV4LWRpcmVjdGlvbjpjb2x1bW47Z2FwOjExcHh9Ci50b2RvIGxpe2NvdW50ZXItaW5jcmVtZW50OnQ7ZGlzcGxh
+eTpncmlkO2dyaWQtdGVtcGxhdGUtY29sdW1uczoyMnB4IDFmcjtnYXA6MTBweDthbGlnbi1pdGVtczpzdGFydH0KLnRvZG8gbGk6OmJlZm9yZXtjb250ZW50
+OmNvdW50ZXIodCk7Zm9udC1mYW1pbHk6IklCTSBQbGV4IE1vbm8iLG1vbm9zcGFjZTtmb250LXNpemU6MTFweDtmb250LXdlaWdodDo2MDA7CiAgY29sb3I6
+dmFyKC0tc3VyZmFjZSk7YmFja2dyb3VuZDp2YXIoLS1pbmspO3dpZHRoOjE5cHg7aGVpZ2h0OjE5cHg7Ym9yZGVyLXJhZGl1czo0cHg7ZGlzcGxheTpncmlk
+OwogIHBsYWNlLWl0ZW1zOmNlbnRlcjttYXJnaW4tdG9wOjFweH0KLnRvZG8gYntkaXNwbGF5OmJsb2NrO2ZvbnQtc2l6ZToxMy41cHg7Zm9udC13ZWlnaHQ6
+NjAwO21hcmdpbi1ib3R0b206MnB4fQoudG9kbyBwe2ZvbnQtc2l6ZToxMi41cHg7Y29sb3I6dmFyKC0taW5rLTIpO21heC13aWR0aDo2NmNofQoud2hve2Rp
+c3BsYXk6aW5saW5lLWJsb2NrO2ZvbnQtc2l6ZToxMHB4O2ZvbnQtd2VpZ2h0OjYwMDt0ZXh0LXRyYW5zZm9ybTp1cHBlcmNhc2U7bGV0dGVyLXNwYWNpbmc6
+LjA1ZW07CiAgcGFkZGluZzoxcHggNnB4O2JvcmRlci1yYWRpdXM6M3B4O2JhY2tncm91bmQ6dmFyKC0tc3Vuayk7Y29sb3I6dmFyKC0tbXV0ZWQpO21hcmdp
+bi1sZWZ0OjdweDt2ZXJ0aWNhbC1hbGlnbjoxcHh9Ci53aG8uY2xpZW50ZXtiYWNrZ3JvdW5kOnZhcigtLXdhcm4tYmcpO2NvbG9yOnZhcigtLXdhcm4pfQou
+d2hvLmFzZXNvcntiYWNrZ3JvdW5kOnZhcigtLWZpeGVkLWJnKTtjb2xvcjp2YXIoLS1maXhlZCl9Ci53aG8uc29wb3J0ZSwud2hvLnByb2R1Y3Rve2JhY2tn
+cm91bmQ6dmFyKC0tZmFpbC1iZyk7Y29sb3I6dmFyKC0tZmFpbCl9Ci5hcnR7Zm9udC1zaXplOjExLjVweDtjb2xvcjp2YXIoLS1tdXRlZCk7bWFyZ2luLXRv
+cDozcHh9CmRldGFpbHMudGVjbmljb3ttYXJnaW4tdG9wOjdweH0KZGV0YWlscy50ZWNuaWNvIHN1bW1hcnl7Zm9udC1zaXplOjExLjVweDtjb2xvcjp2YXIo
+LS1tdXRlZCk7Y3Vyc29yOnBvaW50ZXI7bGlzdC1zdHlsZTpub25lOwogIHRleHQtZGVjb3JhdGlvbjp1bmRlcmxpbmU7dGV4dC11bmRlcmxpbmUtb2Zmc2V0
+OjNweDt0ZXh0LWRlY29yYXRpb24tY29sb3I6dmFyKC0tbGluZSl9CmRldGFpbHMudGVjbmljbyBzdW1tYXJ5Ojotd2Via2l0LWRldGFpbHMtbWFya2Vye2Rp
+c3BsYXk6bm9uZX0KZGV0YWlscy50ZWNuaWNvIHN1bW1hcnk6aG92ZXJ7Y29sb3I6dmFyKC0taW5rLTIpfQpkZXRhaWxzLnRlY25pY28gcHtmb250LXNpemU6
+MTJweDtjb2xvcjp2YXIoLS1tdXRlZCk7bWFyZ2luLXRvcDo1cHg7cGFkZGluZy1sZWZ0OjEwcHg7CiAgYm9yZGVyLWxlZnQ6MnB4IHNvbGlkIHZhcigtLWxp
+bmUpO21heC13aWR0aDo2NmNofQoudGRvLWJ0bnttYXJnaW4tdG9wOjhweDtmb250OmluaGVyaXQ7Zm9udC1zaXplOjEycHg7Zm9udC13ZWlnaHQ6NTAwO3Bh
+ZGRpbmc6NnB4IDEycHg7Ym9yZGVyLXJhZGl1czo2cHg7CiAgYm9yZGVyOjFweCBzb2xpZCB2YXIoLS1pbmstMik7YmFja2dyb3VuZDp2YXIoLS1zdXJmYWNl
+KTtjb2xvcjp2YXIoLS1pbmspO2N1cnNvcjpwb2ludGVyfQoudGRvLWJ0bjpob3ZlcntiYWNrZ3JvdW5kOnZhcigtLXN1cmZhY2UtMil9Ci5wcm57ZGlzcGxh
+eTpmbGV4O2ZsZXgtZGlyZWN0aW9uOmNvbHVtbjtib3JkZXI6MXB4IHNvbGlkIHZhcigtLWxpbmUtc29mdCk7Ym9yZGVyLXJhZGl1czo3cHg7b3ZlcmZsb3c6
+aGlkZGVufQoucHJvd3tkaXNwbGF5OmZsZXg7YWxpZ24taXRlbXM6Y2VudGVyO2dhcDoxMHB4O3BhZGRpbmc6OXB4IDEycHg7YmFja2dyb3VuZDp2YXIoLS1z
+dXJmYWNlKTsKICBib3JkZXItYm90dG9tOjFweCBzb2xpZCB2YXIoLS1saW5lLXNvZnQpO2ZsZXgtd3JhcDp3cmFwfQoucHJvdzpsYXN0LWNoaWxke2JvcmRl
+ci1ib3R0b206MH0KLnByb3cudGFyZ2V0e2JhY2tncm91bmQ6dmFyKC0tc3VyZmFjZS0yKTtib3gtc2hhZG93Omluc2V0IDNweCAwIDAgdmFyKC0taW5rKX0K
+LnBuYW1le2ZvbnQtd2VpZ2h0OjYwMDtmb250LXNpemU6MTNweH0KLnBwb3J0e2ZvbnQtZmFtaWx5OiJJQk0gUGxleCBNb25vIixtb25vc3BhY2U7Zm9udC1z
+aXplOjExLjVweDtjb2xvcjp2YXIoLS1tdXRlZCl9Ci5wc3lte2ZsZXgtYmFzaXM6MTAwJTtmb250LXNpemU6MTJweDtjb2xvcjp2YXIoLS1pbmstMil9Ci5w
+c3ltIHVse21hcmdpbjo0cHggMCAwO3BhZGRpbmctbGVmdDoxOHB4fQouaGludHtmb250LXNpemU6MTIuNXB4O2NvbG9yOnZhcigtLW11dGVkKTttYXgtd2lk
+dGg6NjZjaH0KLm5vdGV7YmFja2dyb3VuZDp2YXIoLS1zdXJmYWNlLTIpO2JvcmRlcjoxcHggc29saWQgdmFyKC0tbGluZS1zb2Z0KTtib3JkZXItbGVmdDoz
+cHggc29saWQgdmFyKC0taW5rKTsKICBib3JkZXItcmFkaXVzOjZweDtwYWRkaW5nOjEycHggMTRweDtmb250LXNpemU6MTIuNXB4O2NvbG9yOnZhcigtLWlu
+ay0yKTttYXgtd2lkdGg6NzJjaDttYXJnaW4tYm90dG9tOjE4cHh9Ci5ub3RlIGJ7Y29sb3I6dmFyKC0taW5rKX0KZGV0YWlscy5kcmF3ZXJ7Ym9yZGVyOjFw
+eCBzb2xpZCB2YXIoLS1saW5lLXNvZnQpO2JvcmRlci1yYWRpdXM6N3B4O21hcmdpbi10b3A6MTBweDtiYWNrZ3JvdW5kOnZhcigtLXN1cmZhY2UpfQpkZXRh
+aWxzLmRyYXdlciBzdW1tYXJ5e3BhZGRpbmc6OXB4IDEycHg7Y3Vyc29yOnBvaW50ZXI7Zm9udC1zaXplOjEyLjVweDtmb250LXdlaWdodDo1MDA7bGlzdC1z
+dHlsZTpub25lfQpkZXRhaWxzLmRyYXdlciBzdW1tYXJ5Ojotd2Via2l0LWRldGFpbHMtbWFya2Vye2Rpc3BsYXk6bm9uZX0KZGV0YWlscy5kcmF3ZXIgc3Vt
+bWFyeTo6YmVmb3Jle2NvbnRlbnQ6IlwyNUI4ICI7Y29sb3I6dmFyKC0tbXV0ZWQpfQpkZXRhaWxzLmRyYXdlcltvcGVuXSBzdW1tYXJ5OjpiZWZvcmV7Y29u
+dGVudDoiXDI1QkUgIn0KLmNoa3t3aWR0aDoxMDAlO2JvcmRlci1jb2xsYXBzZTpjb2xsYXBzZTtmb250LXNpemU6MTJweH0KLmNoayB0aHt0ZXh0LWFsaWdu
+OmxlZnQ7Zm9udC1zaXplOjEwLjVweDt0ZXh0LXRyYW5zZm9ybTp1cHBlcmNhc2U7bGV0dGVyLXNwYWNpbmc6LjA2ZW07Y29sb3I6dmFyKC0tbXV0ZWQpOwog
+IHBhZGRpbmc6NnB4IDEycHg7Ym9yZGVyLWJvdHRvbToxcHggc29saWQgdmFyKC0tbGluZS1zb2Z0KTtmb250LXdlaWdodDo2MDB9Ci5jaGsgdGR7cGFkZGlu
+Zzo2cHggMTJweDtib3JkZXItYm90dG9tOjFweCBzb2xpZCB2YXIoLS1saW5lLXNvZnQpO3ZlcnRpY2FsLWFsaWduOnRvcH0KLmNoayB0ZC5pZHtmb250LWZh
+bWlseToiSUJNIFBsZXggTW9ubyIsbW9ub3NwYWNlO2ZvbnQtc2l6ZToxMXB4O2NvbG9yOnZhcigtLW11dGVkKTt3aGl0ZS1zcGFjZTpub3dyYXB9Ci50Ymx3
+cmFwe292ZXJmbG93LXg6YXV0b30KLmVuZGJhcntkaXNwbGF5OmZsZXg7YWxpZ24taXRlbXM6YmFzZWxpbmU7Z2FwOjIwcHg7ZmxleC13cmFwOndyYXA7Ym9y
+ZGVyLXRvcDoxcHggc29saWQgdmFyKC0tbGluZSk7CiAgbWFyZ2luLXRvcDo0cHg7cGFkZGluZy10b3A6MThweH0KLmxpbmtze2Rpc3BsYXk6ZmxleDtnYXA6
+MThweDtmbGV4LXdyYXA6d3JhcDthbGlnbi1pdGVtczpiYXNlbGluZTtyb3ctZ2FwOjhweH0KLmxpbmtzIGJ1dHRvbnthcHBlYXJhbmNlOm5vbmU7YmFja2dy
+b3VuZDpub25lO2JvcmRlcjowO3BhZGRpbmc6MDtmb250OmluaGVyaXQ7Zm9udC1zaXplOjEyLjVweDsKICBjb2xvcjp2YXIoLS1pbmstMik7Y3Vyc29yOnBv
+aW50ZXI7dGV4dC1kZWNvcmF0aW9uOnVuZGVybGluZTt0ZXh0LXVuZGVybGluZS1vZmZzZXQ6M3B4OwogIHRleHQtZGVjb3JhdGlvbi1jb2xvcjp2YXIoLS1s
+aW5lKTt3aGl0ZS1zcGFjZTpub3dyYXB9Ci5saW5rcyBidXR0b246aG92ZXJ7Y29sb3I6dmFyKC0taW5rKTt0ZXh0LWRlY29yYXRpb24tY29sb3I6dmFyKC0t
+aW5rLTIpfQouYWR2e2JvcmRlcjoxcHggc29saWQgdmFyKC0tbGluZSk7Ym9yZGVyLXJhZGl1czo4cHg7YmFja2dyb3VuZDp2YXIoLS1zdXJmYWNlKTttYXJn
+aW4tdG9wOjE2cHh9Ci5hZHYgc3VtbWFyeXtwYWRkaW5nOjExcHggMTRweDtjdXJzb3I6cG9pbnRlcjtmb250LXNpemU6MTNweDtmb250LXdlaWdodDo2MDA7
+bGlzdC1zdHlsZTpub25lOwogIGRpc3BsYXk6ZmxleDthbGlnbi1pdGVtczpiYXNlbGluZTtnYXA6OXB4O2ZsZXgtd3JhcDp3cmFwfQouYWR2IHN1bW1hcnk6
+Oi13ZWJraXQtZGV0YWlscy1tYXJrZXJ7ZGlzcGxheTpub25lfQouYWR2IHN1bW1hcnk6OmJlZm9yZXtjb250ZW50OiJcMjVCOCI7Y29sb3I6dmFyKC0tbXV0
+ZWQpO2ZvbnQtd2VpZ2h0OjQwMH0KLmFkdltvcGVuXSBzdW1tYXJ5OjpiZWZvcmV7Y29udGVudDoiXDI1QkUifQouYWR2IHN1bW1hcnkgc3Bhbntmb250LXdl
+aWdodDo0MDA7Zm9udC1zaXplOjEycHg7Y29sb3I6dmFyKC0tbXV0ZWQpfQouYWR2bGlzdHtib3JkZXItdG9wOjFweCBzb2xpZCB2YXIoLS1saW5lLXNvZnQp
+O2Rpc3BsYXk6ZmxleDtmbGV4LWRpcmVjdGlvbjpjb2x1bW59Ci5hZHZyb3d7ZGlzcGxheTpmbGV4O2dhcDoxNHB4O2FsaWduLWl0ZW1zOmNlbnRlcjtmbGV4
+LXdyYXA6d3JhcDtwYWRkaW5nOjEycHggMTRweDsKICBib3JkZXItYm90dG9tOjFweCBzb2xpZCB2YXIoLS1saW5lLXNvZnQpfQouYWR2cm93Omxhc3QtY2hp
+bGR7Ym9yZGVyLWJvdHRvbTowfQouYWR2cm93PmRpdntmbGV4OjEgMSAzMDBweDttaW4td2lkdGg6MH0KLmFkdnJvdyBie2Rpc3BsYXk6YmxvY2s7Zm9udC1z
+aXplOjEzcHg7Zm9udC13ZWlnaHQ6NjAwfQouYWR2cm93IHB7Zm9udC1zaXplOjEycHg7Y29sb3I6dmFyKC0tbXV0ZWQpO21hcmdpbi10b3A6MnB4O21heC13
+aWR0aDo2MmNofQouYWR2cm93Lm9mZiBie2NvbG9yOnZhcigtLW11dGVkKX0KLmFkdnJvdyAud2h5e2ZvbnQtc2l6ZToxMS41cHg7Y29sb3I6dmFyKC0tbXV0
+ZWQpO2ZvbnQtc3R5bGU6aXRhbGljO2ZsZXg6bm9uZTt0ZXh0LWFsaWduOnJpZ2h0fQouZm9vdHtkaXNwbGF5OmZsZXg7Z2FwOjE2cHg7ZmxleC13cmFwOndy
+YXA7Zm9udC1zaXplOjExLjVweDtjb2xvcjp2YXIoLS1tdXRlZCk7bWFyZ2luLXRvcDoxNnB4OwogIHBhZGRpbmctdG9wOjEycHg7Ym9yZGVyLXRvcDoxcHgg
+c29saWQgdmFyKC0tbGluZS1zb2Z0KX0KLmZvb3QgYntjb2xvcjp2YXIoLS1pbmstMik7Zm9udC13ZWlnaHQ6NTAwfQpwcmUuanNvbnttYXJnaW46MDtwYWRk
+aW5nOjEycHg7Zm9udC1mYW1pbHk6IklCTSBQbGV4IE1vbm8iLG1vbm9zcGFjZTtmb250LXNpemU6MTFweDtvdmVyZmxvdy14OmF1dG87CiAgY29sb3I6dmFy
+KC0taW5rLTIpO2xpbmUtaGVpZ2h0OjEuNTU7bWF4LWhlaWdodDo0MjBweH0KPC9zdHlsZT4KCjxkaXYgY2xhc3M9IndyYXAiPgogIDxkaXYgY2xhc3M9ImFw
+cCI+CiAgICA8ZGl2IGNsYXNzPSJ0aXRsZWJhciI+CiAgICAgIDxkaXYgY2xhc3M9ImJyYW5kIj4KICAgICAgICA8c3BhbiBjbGFzcz0ibWFyayIgaWQ9Im1h
+cmsiIGFyaWEtaGlkZGVuPSJ0cnVlIj4KICAgICAgICAgIDxzdmcgdmlld0JveD0iMCAwIDI0IDI0IiB3aWR0aD0iMjMiIGhlaWdodD0iMjMiIGZpbGw9Im5v
+bmUiPgogICAgICAgICAgICA8cGF0aCBjbGFzcz0icGFwZXIiIGQ9Ik01IDQuNUExLjUgMS41IDAgMCAxIDYuNSAzaDExQTEuNSAxLjUgMCAwIDEgMTkgNC41
+djE2LjFsLTIuOC0xLjgtMi44IDEuOC0yLjgtMS44LTIuOCAxLjhMNSAxOC44WiIKICAgICAgICAgICAgICAgICAgc3Ryb2tlPSJjdXJyZW50Q29sb3IiIHN0
+cm9rZS13aWR0aD0iMS41IiBzdHJva2UtbGluZWpvaW49InJvdW5kIi8+CiAgICAgICAgICAgIDxwYXRoIGNsYXNzPSJwdWxzZSIgZD0iTTcuMiAxMi40aDIu
+MmwxLjQtMy4yIDIuNCA1LjYgMS40LTIuNGgyLjIiCiAgICAgICAgICAgICAgICAgIHN0cm9rZT0iY3VycmVudENvbG9yIiBzdHJva2Utd2lkdGg9IjEuOCIg
+c3Ryb2tlLWxpbmVjYXA9InJvdW5kIiBzdHJva2UtbGluZWpvaW49InJvdW5kIi8+CiAgICAgICAgICA8L3N2Zz4KICAgICAgICA8L3NwYW4+CiAgICAgICAg
+PGI+RnVkbyBQcmludCBEb2N0b3I8L2I+PHNwYW4gY2xhc3M9InN1YnRpdHVsbyI+cmV2aXNpJm9hY3V0ZTtuIGRlIGxhIGltcHJlc29yYTwvc3Bhbj48c3Bh
+biBjbGFzcz0idmVyIG1vbm8iIGlkPSJ0YlZlciI+PC9zcGFuPgogICAgICA8L2Rpdj4KICAgICAgPGRpdiBjbGFzcz0idGItbWV0YSI+CiAgICAgICAgPHNw
+YW4+RXF1aXBvIDxiIGNsYXNzPSJtb25vIiBpZD0idGJQYyI+Jm1kYXNoOzwvYj48L3NwYW4+CiAgICAgICAgPHNwYW4+Q2FzbyA8YiBjbGFzcz0ibW9ubyIg
+aWQ9InRiQ2FzbyI+Jm1kYXNoOzwvYj48L3NwYW4+CiAgICAgICAgPHNwYW4+UmV2aXNhbmRvIDxiIGlkPSJ0Yk1vZG8iPiZtZGFzaDs8L2I+PC9zcGFuPgog
+ICAgICA8L2Rpdj4KICAgIDwvZGl2PgoKICAgIDxkaXYgY2xhc3M9ImF2aXNvIiBpZD0iYXZpc29WZXIiIGhpZGRlbj48L2Rpdj4KICAgIDxkaXYgY2xhc3M9
+ImF2aXNvIiBpZD0iYXZpc29EcnkiIGhpZGRlbj4KICAgICAgPHNwYW4+TW9kbyByZXZpc2kmb2FjdXRlO246IGVzdGFtb3MgPGI+bWlyYW5kbyBzaW4gY2Ft
+YmlhciBuYWRhPC9iPiBlbiBlc3RhIGNvbXB1dGFkb3JhLgogICAgICBMYXMgYWNjaW9uZXMgcXVlIHJlcGFyYW4gdmFuIGEgYXZpc2FyIHF1ZSBubyBhcGxp
+Y2Fyb24gY2FtYmlvcy48L3NwYW4+CiAgICA8L2Rpdj4KICAgIDxkaXYgY2xhc3M9ImF2aXNvIGNhaWRvIiBpZD0iYXZpc29DYWlkbyIgaGlkZGVuPgogICAg
+ICA8c3BhbiBpZD0iYXZpc29DYWlkb1R4dCI+U2UgY29ydCZvYWN1dGU7IGxhIGNvbmV4aSZvYWN1dGU7biBjb24gbGEgcmV2aXNpJm9hY3V0ZTtuLjwvc3Bh
+bj4KICAgIDwvZGl2PgoKICAgIDxkaXYgY2xhc3M9ImJvZHkiPgogICAgICA8ZGl2IGlkPSJhc2tTbG90Ij48L2Rpdj4KICAgICAgPGRpdiBpZD0iZ2VzdGlv
+blNsb3QiPjwvZGl2PgoKICAgICAgPHNlY3Rpb24gaWQ9ImZhc2VBcnJhbnF1ZSI+CiAgICAgICAgPGRpdiBjbGFzcz0ibm90ZSIgaWQ9ImVzcGVyYW5kb01v
+dG9yIj4KICAgICAgICAgIDxiPlByZXBhcmFuZG8gbGEgcmV2aXNpJm9hY3V0ZTtuLjwvYj4gRW4gdW5vcyBzZWd1bmRvcyB2YW1vcyBhIG5lY2VzaXRhciB1
+biBwYXIgZGUgZGF0b3MKICAgICAgICAgIHBhcmEgZW1wZXphciBhIHJldmlzYXIgbGEgaW1wcmVzb3JhIGRlIGVzdGUgbG9jYWwuCiAgICAgICAgPC9kaXY+
+CiAgICAgIDwvc2VjdGlvbj4KCiAgICAgIDxzZWN0aW9uIGlkPSJmYXNlQ29ycmlkYSIgaGlkZGVuPgogICAgICAgIDxkaXYgY2xhc3M9Im5vdGUiIGlkPSJt
+b3Rpdm9SZWluaWNpbyIgaGlkZGVuPjwvZGl2PgogICAgICAgIDxkaXYgY2xhc3M9ImJhciI+PGkgaWQ9ImJhckZpbGwiPjwvaT48L2Rpdj4KICAgICAgICA8
+ZGl2IGNsYXNzPSJydW4iPgogICAgICAgICAgPGRpdj4KICAgICAgICAgICAgPGRpdiBjbGFzcz0icGFuZWwtdCI+UXUmZWFjdXRlOyBlc3RhbW9zIHJldmlz
+YW5kbzwvZGl2PgogICAgICAgICAgICA8ZGl2IGNsYXNzPSJsYWRkZXIiIGlkPSJsYWRkZXIiPjwvZGl2PgogICAgICAgICAgPC9kaXY+CiAgICAgICAgICA8
+ZGl2PgogICAgICAgICAgICA8ZGl2IGNsYXNzPSJwYW5lbC10Ij5FbiBxdSZlYWN1dGU7IGFuZGEgYWhvcmE8L2Rpdj4KICAgICAgICAgICAgPGRpdiBjbGFz
+cz0iZmVlZCIgaWQ9ImZlZWQiPjwvZGl2PgogICAgICAgICAgICA8ZGl2IGNsYXNzPSJ0b3VjaGVkIj4KICAgICAgICAgICAgICA8ZGl2IGNsYXNzPSJwYW5l
+bC10Ij5RdSZlYWN1dGU7IGNhbWJpYW1vcyBlbiBlc3RhIGNvbXB1dGFkb3JhPC9kaXY+CiAgICAgICAgICAgICAgPHVsIGlkPSJ0b3VjaGVkIj48L3VsPgog
+ICAgICAgICAgICAgIDxwIGNsYXNzPSJlbXB0eSIgaWQ9InRvdWNoZWRFbXB0eSI+VG9kYXYmaWFjdXRlO2Egbm8gY2FtYmlhbW9zIG5hZGEuPC9wPgogICAg
+ICAgICAgICA8L2Rpdj4KICAgICAgICAgIDwvZGl2PgogICAgICAgIDwvZGl2PgogICAgICA8L3NlY3Rpb24+CgogICAgICA8c2VjdGlvbiBpZD0iZmFzZVJl
+c3VsdGFkbyIgaGlkZGVuPjwvc2VjdGlvbj4KICAgIDwvZGl2PgogIDwvZGl2Pgo8L2Rpdj4KCjxzY3JpcHQ+CiJ1c2Ugc3RyaWN0IjsKdmFyIFRPS0VOID0g
+Il9fRlBEX1RPS0VOX18iOwp2YXIgZGVzZGUgPSAwLCBmYXNlID0gImFycmFucXVlIiwgY2hlY2tzID0gW10sIHRvY2FkbyA9IFtdLCBwYXNvcyA9IHt9LCB0
+b3RhbCA9IDExOwp2YXIgY2xhdmVBY3R1YWwgPSAiIiwgY2xhdmVSZXNwb25kaWRhID0gIiIsIHJlc3VsdGFkbyA9IG51bGwsIG1lbnVQcmVnID0gbnVsbCwg
+Y2FpZG8gPSBmYWxzZSwgY2VycmFkbyA9IGZhbHNlOwp2YXIgZHJ5UnVuID0gZmFsc2U7CgpmdW5jdGlvbiAkKGlkKXsgcmV0dXJuIGRvY3VtZW50LmdldEVs
+ZW1lbnRCeUlkKGlkKTsgfQpmdW5jdGlvbiBlbCh0LGMseCl7IHZhciBuPWRvY3VtZW50LmNyZWF0ZUVsZW1lbnQodCk7IGlmKGMpbi5jbGFzc05hbWU9Yzsg
+aWYoeCE9bnVsbCluLnRleHRDb250ZW50PXg7IHJldHVybiBuOyB9CmZ1bmN0aW9uIGVzYyhzKXsgcmV0dXJuIFN0cmluZyhzPT1udWxsPyIiOnMpOyB9Cgov
+KiAtLS0tLS0tLS0tLS0tLS0tIHBvbGwgLS0tLS0tLS0tLS0tLS0tLSAqLwpmdW5jdGlvbiBwb2xsKCl7CiAgZmV0Y2goIi9ldmVudG9zP3Q9IitUT0tFTisi
+JmRlc2RlPSIrZGVzZGUpCiAgICAudGhlbihmdW5jdGlvbihyKXsgcmV0dXJuIHIuanNvbigpOyB9KQogICAgLnRoZW4oZnVuY3Rpb24oZCl7CiAgICAgIGlm
+KGNhaWRvKXsgY2FpZG89ZmFsc2U7ICQoImF2aXNvQ2FpZG8iKS5oaWRkZW49dHJ1ZTsgfQogICAgICBpZih0eXBlb2YgZC51bHRpbW89PT0ibnVtYmVyIikg
+ZGVzZGU9ZC51bHRpbW87CiAgICAgIChkLmV2ZW50b3N8fFtdKS5mb3JFYWNoKGFwbGljYXIpOwogICAgICBpZihkLmZhc2UgJiYgZC5mYXNlIT09ZmFzZSl7
+IGZhc2U9ZC5mYXNlOyBwaW50YXJGYXNlKCk7IH0KICAgICAgcHJlZ3VudGEoZC5wcmVndW50YSk7CiAgICAgIHNldFRpbWVvdXQocG9sbCwgMzUwKTsKICAg
+IH0pCiAgICAuY2F0Y2goZnVuY3Rpb24oKXsKICAgICAgLy8gUXVlIGVsIG1vdG9yIGRlamUgZGUgY29udGVzdGFyIGRlc3B1ZXMgZGUgZGFyIGVsIHJlc3Vs
+dGFkbyBlcyBsbyBub3JtYWw6IHRlcm1pbm8geQogICAgICAvLyBzZSBjZXJyby4gU29sbyBlcyB1bmEgZmFsbGEgc2kgdG9kYXZpYSBubyBoYWJpYSByZXN1
+bHRhZG8uCiAgICAgIGNhaWRvID0gdHJ1ZTsKICAgICAgJCgibWFyayIpLmNsYXNzTGlzdC5yZW1vdmUoInJ1bm5pbmciKTsKICAgICAgdmFyIGEgPSAkKCJh
+dmlzb0NhaWRvIik7CiAgICAgIGlmKGNlcnJhZG8gfHwgcmVzdWx0YWRvKXsKICAgICAgICBhLmNsYXNzTmFtZSA9ICJhdmlzbyI7CiAgICAgICAgJCgiYXZp
+c29DYWlkb1R4dCIpLnRleHRDb250ZW50ID0KICAgICAgICAgICJMYSByZXZpc2lcdTAwZjNuIHRlcm1pblx1MDBmMy4gTG8gcXVlIHZlcyBhY1x1MDBlMSBx
+dWVkYTogeWEgc2UgcHVlZGUgY2VycmFyIGVzdGEgcGVzdGFcdTAwZjFhLiI7CiAgICAgIH0gZWxzZSB7CiAgICAgICAgYS5jbGFzc05hbWUgPSAiYXZpc28g
+Y2FpZG8iOwogICAgICAgICQoImF2aXNvQ2FpZG9UeHQiKS50ZXh0Q29udGVudCA9CiAgICAgICAgICAiU2UgY29ydFx1MDBmMyBsYSBjb25leGlcdTAwZjNu
+IGNvbiBsYSByZXZpc2lcdTAwZjNuLiBTaSBzZSBjZXJyXHUwMGYzIGxhIHZlbnRhbmEgZGUgbGEgaGVycmFtaWVudGEsIGhheSBxdWUgdm9sdmVyIGEgZW1w
+ZXphci4iOwogICAgICB9CiAgICAgIGEuaGlkZGVuID0gZmFsc2U7CiAgICAgIHNldFRpbWVvdXQocG9sbCwgMjAwMCk7CiAgICB9KTsKfQoKZnVuY3Rpb24g
+cGludGFyRmFzZSgpewogICQoImZhc2VBcnJhbnF1ZSIpLmhpZGRlbiA9IChmYXNlIT09ImFycmFucXVlIik7CiAgJCgiZmFzZUNvcnJpZGEiKS5oaWRkZW4g
+ID0gKGZhc2UhPT0icmV2aXNhbmRvIik7CiAgJCgiZmFzZVJlc3VsdGFkbyIpLmhpZGRlbj0gKGZhc2UhPT0icmVzdWx0YWRvIiAmJiBmYXNlIT09ImZpbiIp
+OwogICQoIm1hcmsiKS5jbGFzc0xpc3QudG9nZ2xlKCJydW5uaW5nIiwgZmFzZT09PSJyZXZpc2FuZG8iKTsKfQoKLyogLS0tLS0tLS0tLS0tLS0tLSBldmVu
+dG9zIC0tLS0tLS0tLS0tLS0tLS0gKi8KZnVuY3Rpb24gYXBsaWNhcihldil7CiAgdmFyIGQgPSBldi5kYXRvcyB8fCB7fTsKICBzd2l0Y2goZXYudGlwbyl7
+CiAgICBjYXNlICJjYXNvIjoKICAgICAgJCgidGJDYXNvIikudGV4dENvbnRlbnQgPSBlc2MoZC5jYXNlSWQpIHx8ICLigJQiOwogICAgICAkKCJ0YlBjIiku
+dGV4dENvbnRlbnQgICA9IGVzYyhkLmhvc3QpIHx8ICLigJQiOwogICAgICAkKCJ0YlZlciIpLnRleHRDb250ZW50ICA9IGQudmVyc2lvbiA/ICgidiIrZC52
+ZXJzaW9uKSA6ICIiOwogICAgICBkcnlSdW4gPSAhIWQuZHJ5UnVuOwogICAgICAkKCJhdmlzb0RyeSIpLmhpZGRlbiA9ICFkcnlSdW47CiAgICAgIGJyZWFr
+OwogICAgY2FzZSAicGFzby5pbmljaW8iOgogICAgICB0b3RhbCA9IGQudG90YWwgfHwgdG90YWw7CiAgICAgIGFicmlyUGFzbyhkLm4sIGQudGl0dWxvKTsK
+ICAgICAgbGluZWEoIuKUjCAiK2VzYyhkLnRpdHVsbyksICJobCIpOwogICAgICBicmVhazsKICAgIGNhc2UgInBhc28uZmluIjoKICAgICAgY2VycmFyUGFz
+byhkLm4sIGQuZXN0YWRvLCBkLm5vdGEsIGQubXMpOwogICAgICBsaW5lYSgi4pSUICIrU3RyaW5nKGQuZXN0YWRvfHwiIikudG9VcHBlckNhc2UoKSsoZC5u
+b3RhPyIg4oCUICIrZXNjKGQubm90YSk6IiIpLAogICAgICAgICAgICAvZmFsbGF8ZXJyb3IvaS50ZXN0KFN0cmluZyhkLmVzdGFkbykpPyJmIjovcmV2aXNh
+ci9pLnRlc3QoU3RyaW5nKGQuZXN0YWRvKSk/InciOiJobCIpOwogICAgICBicmVhazsKICAgIGNhc2UgImRldGFsbGUiOiBsaW5lYSgi4pSCICIrZXNjKGQu
+dGV4dG8pKTsgYnJlYWs7CiAgICBjYXNlICJsb2ciOiAgICAgbGluZWEoIiAgIitlc2MoZC5uaXZlbCkrIjogIitlc2MoZC50ZXh0byksIGQubml2ZWw9PT0i
+RVJST1IiPyJmIjoidyIpOyBicmVhazsKICAgIGNhc2UgImNoZWNrIjogICBjaGVja3MucHVzaChkKTsgYnJlYWs7CiAgICBjYXNlICJ0b3F1ZSI6ICAgYWdy
+ZWdhclRvcXVlKGQpOyBicmVhazsKICAgIGNhc2UgImVzcGVyYSI6ICBlc3BlcmEoZCk7IGJyZWFrOwogICAgY2FzZSAiZ2VzdGlvbi5pbmljaW8iOiBnZXN0
+aW9uSW5pY2lvKGQpOyBicmVhazsKICAgIGNhc2UgImdlc3Rpb24uZmluIjogICAgZ2VzdGlvbkZpbihkKTsgYnJlYWs7CiAgICBjYXNlICJyZWluaWNpbyI6
+IHJlaW5pY2lhcihkLm1vdGl2byk7IGJyZWFrOwogICAgY2FzZSAicmVzdWx0YWRvIjogcmVzdWx0YWRvID0gZDsgaWYoZC5hdmlzbykgYXZpc28oZC5hdmlz
+byk7IHBpbnRhclJlc3VsdGFkbygpOyBicmVhazsKICAgIGNhc2UgImNlcnJhZG8iOiBjZXJyYWRvID0gdHJ1ZTsgYnJlYWs7CiAgICBjYXNlICJjb3J0YWRv
+IjogY29ydGFkbyhkKTsgYnJlYWs7CiAgfQp9CgpmdW5jdGlvbiBhdmlzbyh0KXsgdmFyIGE9JCgiYXZpc29WZXIiKTsgYS50ZXh0Q29udGVudD1lc2ModCk7
+IGEuaGlkZGVuPWZhbHNlOyB9CgpmdW5jdGlvbiBsaW5lYSh0eHQsIGNscyl7CiAgdmFyIGY9JCgiZmVlZCIpOyBmLmFwcGVuZENoaWxkKGVsKCJkaXYiLCBj
+bHN8fG51bGwsIHR4dCkpOwogIGYuc2Nyb2xsVG9wID0gZi5zY3JvbGxIZWlnaHQ7CiAgd2hpbGUoZi5jaGlsZE5vZGVzLmxlbmd0aD40MDApIGYucmVtb3Zl
+Q2hpbGQoZi5maXJzdENoaWxkKTsKfQoKZnVuY3Rpb24gYWJyaXJQYXNvKG4sIHRpdHVsbyl7CiAgdmFyIGxhZD0kKCJsYWRkZXIiKSwgcj1wYXNvc1tuXTsK
+ICBpZighcil7CiAgICByPWVsKCJkaXYiLCJydW5nIG5vdyIpOwogICAgci5hcHBlbmRDaGlsZChlbCgiZGl2Iiwicm4gbW9ubyIsU3RyaW5nKG4pKSk7CiAg
+ICByLmFwcGVuZENoaWxkKGVsKCJkaXYiLCJybGFiZWwiLGVzYyh0aXR1bG8pKSk7CiAgICByLmFwcGVuZENoaWxkKGVsKCJzcGFuIiwicm5vdGUiKSk7CiAg
+ICB2YXIgc3A9ZWwoImRpdiIsInNwaW4iKTsgc3Auc2V0QXR0cmlidXRlKCJkYXRhLXNsb3QiLCJlc3RhZG8iKTsgci5hcHBlbmRDaGlsZChzcCk7CiAgICBy
+LmFwcGVuZENoaWxkKGVsKCJkaXYiLCJybXMgbW9ubyIpKTsKICAgIGxhZC5hcHBlbmRDaGlsZChyKTsgcGFzb3Nbbl09cjsKICB9CiAgci5jbGFzc05hbWU9
+InJ1bmcgbm93IjsKfQpmdW5jdGlvbiBjZXJyYXJQYXNvKG4sIGVzdGFkbywgbm90YSwgbXMpewogIHZhciByPXBhc29zW25dOyBpZighcikgcmV0dXJuOwog
+IHIuY2xhc3NOYW1lPSJydW5nIjsKICByLnF1ZXJ5U2VsZWN0b3IoIi5ybm90ZSIpLnRleHRDb250ZW50ID0gZXNjKG5vdGEpOwogIHIucXVlcnlTZWxlY3Rv
+cigiLnJtcyIpLnRleHRDb250ZW50ID0gKG1zIT1udWxsPyBtcysibXMiOiIiKTsKICB2YXIgdmllam89ci5xdWVyeVNlbGVjdG9yKCdbZGF0YS1zbG90PSJl
+c3RhZG8iXScpOwogIHZhciBjaGlwPWVsKCJzcGFuIiwiY2hpcCAiK1N0cmluZyhlc3RhZG98fCIiKS5yZXBsYWNlKC9ccysvZywiIiksIFN0cmluZyhlc3Rh
+ZG98fCIiKSk7CiAgY2hpcC5zZXRBdHRyaWJ1dGUoImRhdGEtc2xvdCIsImVzdGFkbyIpOwogIGlmKHZpZWpvKSByLnJlcGxhY2VDaGlsZChjaGlwLCB2aWVq
+byk7CiAgJCgiYmFyRmlsbCIpLnN0eWxlLndpZHRoID0gTWF0aC5taW4oMTAwLCBNYXRoLnJvdW5kKG4vdG90YWwqMTAwKSkrIiUiOwp9CgpmdW5jdGlvbiBh
+Z3JlZ2FyVG9xdWUoZCl7CiAgdG9jYWRvLnB1c2goZCk7CiAgdmFyIGxpPWVsKCJsaSIsIGQucmV2ZXJzaWJsZT09PWZhbHNlPyJpcnIiOm51bGwpOwogIGxp
+LmFwcGVuZENoaWxkKGVsKCJzcGFuIiwidGFnIiwgZC5yZXZlcnNpYmxlPT09ZmFsc2U/Im5vIHNlIGRlc2hhY2UiOiJyZXZlcnNpYmxlIikpOwogIGxpLmFw
+cGVuZENoaWxkKGVsKCJzcGFuIixudWxsLGVzYyhkLnRleHRvKSkpOwogICQoInRvdWNoZWQiKS5hcHBlbmRDaGlsZChsaSk7CiAgJCgidG91Y2hlZEVtcHR5
+IikuaGlkZGVuID0gdHJ1ZTsKfQoKZnVuY3Rpb24gZ2VzdGlvblNsb3QoKXsgcmV0dXJuICQoImdlc3Rpb25TbG90Iik7IH0KCmZ1bmN0aW9uIGVzcGVyYShk
+KXsKICAvLyBMYSBjdWVudGEgcmVncmVzaXZhIGRlIGxhIHJlY29uZXhpb24gZGVsIFVTQi4gU2luIGVzdG8gZWwgbW90b3IgZXNwZXJhYmEgaGFzdGEgZG9z
+IG1pbnV0b3MKICAvLyBtb3N0cmFuZG8gZWwgY29udGFkb3IgZW4gdW5hIGNvbnNvbGEgcXVlIGVuIG1vZG8gd2ViIG5hZGllIGVzdGEgbWlyYW5kby4KICB2
+YXIgZyA9IGdlc3Rpb25TbG90KCk7CiAgdmFyIGJveCA9IGcucXVlcnlTZWxlY3RvcignW2RhdGEtZXNwZXJhPSIxIl0nKTsKICBpZighYm94KXsKICAgIGcu
+aW5uZXJIVE1MID0gIiI7CiAgICBib3ggPSBlbCgiZGl2IiwiZ2VzdCBlc3BlcmEiKTsKICAgIGJveC5zZXRBdHRyaWJ1dGUoImRhdGEtZXNwZXJhIiwiMSIp
+OwogICAgYm94LmFwcGVuZENoaWxkKGVsKCJiIixudWxsLGVzYyhkLnRpdHVsbyl8fCJFc3BlcmFuZG8iKSk7CiAgICBpZihkLnRleHRvKSBib3guYXBwZW5k
+Q2hpbGQoZWwoInAiLG51bGwsZXNjKGQudGV4dG8pKSk7CiAgICBib3guYXBwZW5kQ2hpbGQoZWwoInNwYW4iLCJjdWVudGEiLCIiKSk7CiAgICBnLmFwcGVu
+ZENoaWxkKGJveCk7CiAgfQogIHZhciBzZWcgPSBNYXRoLm1heCgwLCBwYXJzZUludChkLnJlc3RhbnRlLDEwKXx8MCk7CiAgYm94LnF1ZXJ5U2VsZWN0b3Io
+Ii5jdWVudGEiKS50ZXh0Q29udGVudCA9CiAgICBTdHJpbmcoTWF0aC5mbG9vcihzZWcvNjApKSArICI6IiArICgiMCIrKHNlZyU2MCkpLnNsaWNlKC0yKTsK
+fQoKZnVuY3Rpb24gZ2VzdGlvbkluaWNpbyhkKXsKICB2YXIgZyA9IGdlc3Rpb25TbG90KCk7IGcuaW5uZXJIVE1MID0gIiI7CiAgdmFyIGJveCA9IGVsKCJk
+aXYiLCJnZXN0Iik7CiAgYm94LmFwcGVuZENoaWxkKGVsKCJiIixudWxsLCJIYWNpZW5kbzogIitlc2MoZC50aXR1bG8pKSk7CiAgaWYoZC5kcnlSdW4pewog
+ICAgYm94LmFwcGVuZENoaWxkKGVsKCJwIixudWxsLAogICAgICAiRXN0YW1vcyBlbiBtb2RvIHJldmlzaVx1MDBmM24sIGFzXHUwMGVkIHF1ZSBlc3RvIG5v
+IHZhIGEgY2FtYmlhciBuYWRhLiIpKTsKICB9CiAgZy5hcHBlbmRDaGlsZChib3gpOwp9CgpmdW5jdGlvbiBnZXN0aW9uRmluKGQpewogIHZhciBnID0gZ2Vz
+dGlvblNsb3QoKTsgZy5pbm5lckhUTUwgPSAiIjsKICB2YXIgYm94ID0gZWwoImRpdiIsImdlc3QiKTsKICBib3guYXBwZW5kQ2hpbGQoZWwoImIiLG51bGws
+ZXNjKGQudGl0dWxvKSkpOwogIGJveC5hcHBlbmRDaGlsZChlbCgicCIsbnVsbCwgZXNjKGQubm90YSkgfHwKICAgIChkLnZ1ZWx2ZUFSZXZpc2FyID8gIlRl
+cm1pblx1MDBmMy4gUmV2aXNhbmRvIGRlIG51ZXZvIHBhcmEgdmVyIGNcdTAwZjNtbyBxdWVkXHUwMGYzLiIKICAgICAgICAgICAgICAgICAgICAgIDogIlRl
+cm1pblx1MDBmMyBzaW4gbm92ZWRhZGVzLiIpKSk7CiAgZy5hcHBlbmRDaGlsZChib3gpOwp9CgpmdW5jdGlvbiByZWluaWNpYXIobW90aXZvKXsKICAvLyBW
+YXJpYXMgZ2VzdGlvbmVzIHRlcm1pbmFuIGVuICJ2b2x2ZXIgYSBkaWFnbm9zdGljYXIiOiByZXBhcmFyIG5vIGVzIHJlc29sdmVyLCBoYXkgcXVlCiAgLy8g
+dm9sdmVyIGEgbWVkaXIuIFNpbiBkZWNpcmxvLCBsYSBwYWdpbmEgc2UgdmFjaWEgZGUgZ29scGUgeSBwYXJlY2UgcXVlIHZvbHZpbyBhbCBwcmluY2lwaW8u
+CiAgdmFyIG1yPSQoIm1vdGl2b1JlaW5pY2lvIik7CiAgaWYobW90aXZvKXsgbXIudGV4dENvbnRlbnQ9bW90aXZvOyBtci5oaWRkZW49ZmFsc2U7IH0gZWxz
+ZSB7IG1yLmhpZGRlbj10cnVlOyB9CiAgZ2VzdGlvblNsb3QoKS5pbm5lckhUTUw9IiI7CiAgY2hlY2tzPVtdOyB0b2NhZG89W107IHBhc29zPXt9OyByZXN1
+bHRhZG89bnVsbDsgbWVudVByZWc9bnVsbDsKICAkKCJsYWRkZXIiKS5pbm5lckhUTUw9IiI7ICQoImZlZWQiKS5pbm5lckhUTUw9IiI7ICQoInRvdWNoZWQi
+KS5pbm5lckhUTUw9IiI7CiAgJCgidG91Y2hlZEVtcHR5IikuaGlkZGVuPWZhbHNlOyAkKCJiYXJGaWxsIikuc3R5bGUud2lkdGg9IjAiOwogICQoImZhc2VS
+ZXN1bHRhZG8iKS5pbm5lckhUTUw9IiI7Cn0KCi8qIC0tLS0tLS0tLS0tLS0tLS0gcHJlZ3VudGFzIC0tLS0tLS0tLS0tLS0tLS0gKi8KZnVuY3Rpb24gcmVz
+cG9uZGVyKHYpewogIGNsYXZlUmVzcG9uZGlkYSA9IGNsYXZlQWN0dWFsOwogICQoImFza1Nsb3QiKS5pbm5lckhUTUwgPSAiIjsKICBmZXRjaCgiL3Jlc3Bv
+bmRlcj90PSIrVE9LRU4rIiZ2PSIrZW5jb2RlVVJJQ29tcG9uZW50KHYpKS5jYXRjaChmdW5jdGlvbigpe30pOwp9CgpmdW5jdGlvbiBwcmVndW50YShwKXsK
+ICAvLyBFbCBjYXJ0ZWwgZGUgJ2VzcGVyYW5kbyBhbCBtb3RvcicgZXMgdW4gcGxhY2Vob2xkZXI6IGN1YW5kbyB5YSBoYXkgdW5hIHByZWd1bnRhIGVuCiAg
+Ly8gcGFudGFsbGEsIHJlcGV0aXIgcXVlIGVsIG1vdG9yIHZhIGEgcHJlZ3VudGFyIGFsZ28gc29icmEgeSBjb25mdW5kZS4KICB2YXIgZW0gPSAkKCJlc3Bl
+cmFuZG9Nb3RvciIpOyBpZihlbSkgZW0uaGlkZGVuID0gISFwOwogIGlmKCFwKXsgY2xhdmVBY3R1YWw9IiI7IGlmKCFtZW51UHJlZykgJCgiYXNrU2xvdCIp
+LmlubmVySFRNTD0iIjsgcmV0dXJuOyB9CiAgdmFyIGNsYXZlID0gSlNPTi5zdHJpbmdpZnkocCk7CiAgaWYoY2xhdmU9PT1jbGF2ZVJlc3BvbmRpZGEpIHJl
+dHVybjsKICBpZihjbGF2ZT09PWNsYXZlQWN0dWFsKSByZXR1cm47CiAgY2xhdmVBY3R1YWwgPSBjbGF2ZTsKCiAgLy8gRWwgbWVudSBubyBlcyB1bmEgaW50
+ZXJydXBjaW9uOiBlcyBlbCBjaWVycmUgZGVsIHJlc3VsdGFkby4gVmEgYWJham8sIG5vIGFycmliYS4KICBpZihwLmNsYXNlPT09Im1lbnUiKXsgbWVudVBy
+ZWc9cDsgcGludGFyUmVzdWx0YWRvKCk7IHJldHVybjsgfQoKICB2YXIgc2xvdD0kKCJhc2tTbG90Iik7IHNsb3QuaW5uZXJIVE1MPSIiOwogIGdlc3Rpb25T
+bG90KCkuaW5uZXJIVE1MPSIiOwogIHZhciBib3g9ZWwoImRpdiIsImFzayIrKHAuY2xhc2U9PT0icGVsaWdybyI/IiBwZWxpZ3JvIjoiIikpOwogIC8vIFRy
+YW1pdGUgaW50ZXJubyBkZWwgYXNlc29yOiBzZSBtYXJjYSBwYXJhIHF1ZSBlbCBjbGllbnRlIHF1ZSBlc3RhIG1pcmFuZG8gZW50aWVuZGEgcXVlCiAgLy8g
+bm8gbGUgZXN0YW4gcGlkaWVuZG8gbmFkYSBhIGVsLgogIGlmKHAuc29sb0FzZXNvcikgYm94LmFwcGVuZENoaWxkKGVsKCJkaXYiLCJzb2xvYXNlc29yIiwi
+UGFzbyBkZWwgYXNlc29yIikpOwogIGJveC5hcHBlbmRDaGlsZChlbCgiZGl2IiwiYXNrLWsiLCBwLmNsYXNlPT09InBhcGVsIgogICAgICA/ICJMYSBwcmVn
+dW50YSBxdWUgZWwgbW90b3Igbm8gcHVlZGUgY29udGVzdGFyIHNvbG8iIDogIkhhY2UgZmFsdGEgcXVlIGRlY2lkYXMiKSk7CiAgYm94LmFwcGVuZENoaWxk
+KGVsKCJoMyIsbnVsbCxlc2MocC50aXR1bG8pKSk7CiAgaWYocC50ZXh0bykgYm94LmFwcGVuZENoaWxkKGVsKCJwIixudWxsLGVzYyhwLnRleHRvKSkpOwoK
+ICBpZihwLmNsYXNlPT09InBhcGVsIil7CiAgICB2YXIgaW1wID0gKHAuZXh0cmEgJiYgcC5leHRyYS5pbXByZXNvcmEpID8gcC5leHRyYS5pbXByZXNvcmEg
+OiAiIjsKICAgIGJveC5hcHBlbmRDaGlsZChlbCgiZGl2IiwidGlja2V0IiwKICAgICAgIiAgICAgIEZVRE8gUFJJTlQgRE9DVE9SXG4iICsKICAgICAgIiAg
+IC0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLVxuIiArCiAgICAgICIgICBQcnVlYmEgZGUgaW1wcmVzaW9uXG4iICsKICAgICAgIiAgIEltcHJlc29yYTog
+IiArIGltcCArICJcbiIgKwogICAgICAiICAgLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tLS0tXG4iICsKICAgICAgIiAgIFNpIGVzdGFzIGxleWVuZG8gZXN0
+byxcbiIgKwogICAgICAiICAgZWwgaGFyZHdhcmUgaW1wcmltZSBiaWVuLlxuIikpOwogIH0KICBpZihwLmV4dHJhICYmIHAuZXh0cmEub3RyYXMgJiYgcC5l
+eHRyYS5vdHJhcy5sZW5ndGgpewogICAgdmFyIHU9ZWwoInVsIik7CiAgICBwLmV4dHJhLm90cmFzLmZvckVhY2goZnVuY3Rpb24obyl7IHUuYXBwZW5kQ2hp
+bGQoZWwoImxpIixudWxsLGVzYyhvKSkpOyB9KTsKICAgIGJveC5hcHBlbmRDaGlsZCh1KTsKICB9CiAgaWYocC50ZXh0bzIpIGJveC5hcHBlbmRDaGlsZChl
+bCgicCIsbnVsbCxlc2MocC50ZXh0bzIpKSk7CiAgLy8gRWwgZXJyb3IgdmEgY29tbyBlcnJvcjogcm9qbywgY29uIG1hcmNhLCB5IHBlZ2FkbyBhbCBjb250
+cm9sIHF1ZSBoYXkgcXVlIGNvcnJlZ2lyLgogIGlmKHAuZXJyb3IpIGJveC5hcHBlbmRDaGlsZChlbCgiZGl2IiwiYXNrZXJyIixlc2MocC5lcnJvcikpKTsK
+CiAgaWYocC5jbGFzZT09PSJ0ZXh0byIpewogICAgdmFyIGZpbGE9ZWwoImRpdiIsImlubGluZSIpOyBmaWxhLnN0eWxlLm1hcmdpblRvcD0iMTJweCI7CiAg
+ICB2YXIgaW5wPWVsKCJpbnB1dCIpOyBpbnAudHlwZT0idGV4dCI7IGlucC5pZD0iY2FtcG9UZXh0byI7CiAgICBpZihwLmV4dHJhICYmIHAuZXh0cmEucGxh
+Y2Vob2xkZXIpIGlucC5wbGFjZWhvbGRlcj1wLmV4dHJhLnBsYWNlaG9sZGVyOwogICAgdmFyIG9rPWVsKCJidXR0b24iLCJidG4gcHJpbWFyeSIsIkNvbnRp
+bnVhciIpOwogICAgZnVuY3Rpb24gZW52aWFyKCl7IGlmKGlucC52YWx1ZS50cmltKCkpIHJlc3BvbmRlcihpbnAudmFsdWUudHJpbSgpKTsgfQogICAgb2su
+YWRkRXZlbnRMaXN0ZW5lcigiY2xpY2siLCBlbnZpYXIpOwogICAgaW5wLmFkZEV2ZW50TGlzdGVuZXIoImtleWRvd24iLCBmdW5jdGlvbihlKXsgaWYoZS5r
+ZXk9PT0iRW50ZXIiKSBlbnZpYXIoKTsgfSk7CiAgICBmaWxhLmFwcGVuZENoaWxkKGlucCk7IGZpbGEuYXBwZW5kQ2hpbGQob2spOwogICAgYm94LmFwcGVu
+ZENoaWxkKGZpbGEpOwogICAgc2xvdC5hcHBlbmRDaGlsZChib3gpOwogICAgaW5wLmZvY3VzKCk7CiAgICByZXR1cm47CiAgfQoKICBpZihwLmNsYXNlPT09
+Im1vZG8iKXsKICAgIHZhciByb3c9ZWwoImRpdiIsInBpY2tyb3ciKTsKICAgIChwLm9wY2lvbmVzfHxbXSkuZm9yRWFjaChmdW5jdGlvbihvKXsKICAgICAg
+dmFyIGI9ZWwoImJ1dHRvbiIsInBpY2siKTsKICAgICAgYi5hcHBlbmRDaGlsZChlbCgiYiIsbnVsbCxlc2Moby5sKSkpOwogICAgICBpZihvLmRldGFsbGUp
+IGIuYXBwZW5kQ2hpbGQoZWwoInNwYW4iLG51bGwsZXNjKG8uZGV0YWxsZSkpKTsKICAgICAgYi5hZGRFdmVudExpc3RlbmVyKCJjbGljayIsIGZ1bmN0aW9u
+KCl7IHJlc3BvbmRlcihvLnYpOyB9KTsKICAgICAgcm93LmFwcGVuZENoaWxkKGIpOwogICAgfSk7CiAgICBib3guYXBwZW5kQ2hpbGQocm93KTsKICAgIHNs
+b3QuYXBwZW5kQ2hpbGQoYm94KTsKICAgIHZhciBmPWJveC5xdWVyeVNlbGVjdG9yKCIucGljayIpOyBpZihmKSBmLmZvY3VzKCk7CiAgICByZXR1cm47CiAg
+fQoKICB2YXIgYnM9ZWwoImRpdiIsImFzay1idG5zIik7CiAgKHAub3BjaW9uZXN8fFtdKS5mb3JFYWNoKGZ1bmN0aW9uKG8pewogICAgdmFyIGI9ZWwoImJ1
+dHRvbiIsImJ0biIrKG8ucHJpbmNpcGFsPyIgcHJpbWFyeSI6IiIpKyhvLnBlbGlncm8/IiBkYW5nZXIiOiIiKSwgZXNjKG8ubCkpOwogICAgYi5hZGRFdmVu
+dExpc3RlbmVyKCJjbGljayIsIGZ1bmN0aW9uKCl7IHJlc3BvbmRlcihvLnYpOyB9KTsKICAgIGJzLmFwcGVuZENoaWxkKGIpOwogIH0pOwogIGJveC5hcHBl
+bmRDaGlsZChicyk7CiAgc2xvdC5hcHBlbmRDaGlsZChib3gpOwogIHZhciBwZj1icy5xdWVyeVNlbGVjdG9yKCJidXR0b24iKTsgaWYocGYpIHBmLmZvY3Vz
+KCk7CiAgYm94LnNjcm9sbEludG9WaWV3KHtibG9jazoibmVhcmVzdCIsIGJlaGF2aW9yOiJzbW9vdGgifSk7Cn0KCmZ1bmN0aW9uIGNvcnRhZG8oZCl7CiAg
+Ly8gRWwgbW90b3IgZGVjaWRpbyB0ZXJtaW5hci4gTm8gZXMgdW5hIGNhaWRhOiBjdWFuZG8gZGVqZSBkZSBjb250ZXN0YXIsIGVsIGF2aXNvIHRpZW5lIHF1
+ZQogIC8vIHNlciBlbCB0cmFucXVpbG8geSBubyBlbCByb2pvIGRlICdzZSBwZXJkaW8gbGEgY29uZXhpb24nLgogIGNlcnJhZG8gPSB0cnVlOwogIGZhc2U9
+ImZpbiI7IHBpbnRhckZhc2UoKTsKICB2YXIgcm9vdD0kKCJmYXNlUmVzdWx0YWRvIik7IHJvb3QuaW5uZXJIVE1MPSIiOwogIHZhciB2PWVsKCJkaXYiLCJ2
+ZXJkaWN0IG5vIik7CiAgdi5hcHBlbmRDaGlsZChlbCgiZGl2IiwidmVyZGljdC1rIiwiQ29ydGFkbyIpKTsKICB2LmFwcGVuZENoaWxkKGVsKCJoMiIsbnVs
+bCxlc2MoZC50aXR1bG8pKSk7CiAgdi5hcHBlbmRDaGlsZChlbCgiZGl2IiwibWV0YSIpKS5hcHBlbmRDaGlsZChlbCgic3BhbiIsbnVsbCxlc2MoZC50ZXh0
+bykpKTsKICByb290LmFwcGVuZENoaWxkKHYpOwp9CgovKiAtLS0tLS0tLS0tLS0tLS0tIHJlc3VsdGFkbyAtLS0tLS0tLS0tLS0tLS0tICovCnZhciBRVUlF
+TiA9IHsgY2xpZW50ZToiZW4gZWwgbG9jYWwiLCBhc2Vzb3I6ImxvIGhhY2Ugc29wb3J0ZSIsCiAgICAgICAgICAgICAgc29wb3J0ZToiZXF1aXBvIEZ1ZG8i
+LCBwcm9kdWN0bzoiZXF1aXBvIEZ1ZG8iIH07CgpmdW5jdGlvbiBzZWModCl7IHZhciBzPWVsKCJzZWN0aW9uIiwic2VjIik7IHMuYXBwZW5kQ2hpbGQoZWwo
+ImRpdiIsInNlYy10Iix0KSk7IHJldHVybiBzOyB9CgpmdW5jdGlvbiBwaW50YXJSZXN1bHRhZG8oKXsKICBpZighcmVzdWx0YWRvKSByZXR1cm47CiAgZmFz
+ZSA9IChmYXNlPT09ImZpbiIpID8gImZpbiIgOiAicmVzdWx0YWRvIjsKICBwaW50YXJGYXNlKCk7CiAgdmFyIGQ9cmVzdWx0YWRvLCBkZz1kLmRpYWdub3N0
+aWNvfHx7fSwgcm9vdD0kKCJmYXNlUmVzdWx0YWRvIik7CiAgcm9vdC5pbm5lckhUTUw9IiI7CgogIHZhciBvayA9ICEhZGcucmVzb2x2ZWQ7CiAgdmFyIHY9
+ZWwoImRpdiIsInZlcmRpY3QgIisob2s/Im9rIjoibm8iKSk7CiAgdi5hcHBlbmRDaGlsZChlbCgiZGl2IiwidmVyZGljdC1rIiwgb2sgPyAiTGlzdG86IGxh
+IGltcHJlc29yYSBxdWVkXHUwMGYzIGZ1bmNpb25hbmRvIiA6ICJUb2Rhdlx1MDBlZGEgbm8gaW1wcmltZTogZmFsdGEgcmVzb2x2ZXIgZXN0byIpKTsKICB2
+LmFwcGVuZENoaWxkKGVsKCJoMiIsbnVsbCxlc2MoZGcucm9vdENhdXNlKXx8IlNpbiBjYXVzYSBkZXRlcm1pbmFkYSIpKTsKICB2YXIgbWV0YT1lbCgiZGl2
+IiwibWV0YSIpOwogIGlmKGRnLmNvbmZpZGVuY2UpIG1ldGEuYXBwZW5kQ2hpbGQoZWwoInNwYW4iLG51bGwsIkNvbmZpYW56YTogIitlc2MoZGcuY29uZmlk
+ZW5jZSkpKTsKICBtZXRhLmFwcGVuZENoaWxkKGVsKCJzcGFuIixudWxsLCB0b2NhZG8ubGVuZ3RoPT09MSA/ICJDYW1iaWFtb3MgMSBjb3NhIGVuIGVzdGEg
+Y29tcHV0YWRvcmEiIDogKCJDYW1iaWFtb3MgIit0b2NhZG8ubGVuZ3RoKyIgY29zYXMgZW4gZXN0YSBjb21wdXRhZG9yYSIpKSk7CiAgaWYoZC5tb2RvKSBt
+ZXRhLmFwcGVuZENoaWxkKGVsKCJzcGFuIixudWxsLCJSZXZpc2Ftb3M6ICIrKGQubW9kbz09PSJBbWJvcyI/IlVTQiB5IHJlZCI6InNcdTAwZjNsbyAiK1N0
+cmluZyhkLm1vZG8pLnRvTG93ZXJDYXNlKCkpKSk7CiAgdi5hcHBlbmRDaGlsZChtZXRhKTsKICByb290LmFwcGVuZENoaWxkKHYpOwoKICBpZihkLmFib3J0
+b1Bvck1vZG8pewogICAgdmFyIG5uPWVsKCJkaXYiLCJub3RlIik7CiAgICBubi5hcHBlbmRDaGlsZChlbCgiYiIsbnVsbCwiTm8gc2UgcmV2aXPDsyBuYWRh
+LiAiKSk7CiAgICBubi5hcHBlbmRDaGlsZChkb2N1bWVudC5jcmVhdGVUZXh0Tm9kZSgKICAgICAgIk5vIGhheSBpbXByZXNvcmFzIGRlbCB0aXBvIHF1ZSBl
+bGVnaXN0ZSBlbiBlc3RhIFBDLCB5IG5vIHNlIHRvY8OzIG5pbmd1bmEgZGUgbGFzIG90cmFzLiIpKTsKICAgIHJvb3QuYXBwZW5kQ2hpbGQobm4pOwogIH0K
+CiAgLy8gaW1wcmVzb3JhIGRlIHJlZCBlbiBvdHJhIHN1YnJlZAogIHZhciBwbD1kLnBsYW5SZWQ7CiAgaWYocGwgJiYgcGwuaGF5KXsKICAgIHZhciBzPXNl
+YygiTGEgaW1wcmVzb3JhIGVzdMOhIGVuIG90cmEgcmVkIik7CiAgICB2YXIgZz1lbCgiZGl2Iik7CiAgICBnLnN0eWxlLmNzc1RleHQ9ImRpc3BsYXk6Z3Jp
+ZDtncmlkLXRlbXBsYXRlLWNvbHVtbnM6cmVwZWF0KGF1dG8tZml0LG1pbm1heCgxNTBweCwxZnIpKTtnYXA6MTJweCI7CiAgICBmdW5jdGlvbiBjZWxkYShr
+LHZhbCl7CiAgICAgIHZhciBjPWVsKCJkaXYiKTsgYy5hcHBlbmRDaGlsZChlbCgiZGl2IiwicHBvcnQiLGspKTsKICAgICAgdmFyIGI9ZWwoImRpdiIsIm1v
+bm8iKTsgYi50ZXh0Q29udGVudD1lc2ModmFsKTsKICAgICAgYi5zdHlsZS5jc3NUZXh0PSJmb250LXNpemU6MTVweDtmb250LXdlaWdodDo2MDA7bWFyZ2lu
+LXRvcDoycHgiOwogICAgICBjLmFwcGVuZENoaWxkKGIpOyByZXR1cm4gYzsKICAgIH0KICAgIGcuYXBwZW5kQ2hpbGQoY2VsZGEoIkVzdMOhIGVuIiwgcGwu
+aXApKTsKICAgIGlmKHBsLmlwU3VnZXJpZGEpIGcuYXBwZW5kQ2hpbGQoY2VsZGEoIlBvbmVybGUgZXN0YSBJUCIsIHBsLmlwU3VnZXJpZGEpKTsKICAgIGlm
+KHBsLm1hc2NhcmEpICAgIGcuYXBwZW5kQ2hpbGQoY2VsZGEoIk3DoXNjYXJhIiwgcGwubWFzY2FyYSkpOwogICAgaWYocGwuZ2F0ZXdheSkgICAgZy5hcHBl
+bmRDaGlsZChjZWxkYSgiR2F0ZXdheSIsIHBsLmdhdGV3YXkpKTsKICAgIGlmKHBsLm1hcmNhKSAgICAgIGcuYXBwZW5kQ2hpbGQoY2VsZGEoIk1hcmNhIiwg
+cGwubWFyY2EpKTsKICAgIHMuYXBwZW5kQ2hpbGQoZyk7CiAgICBpZihwbC5pcFN1Z2VyaWRhKXsKICAgICAgdmFyIHBoPWVsKCJwIiwiaGludCIsIkVzYSBJ
+UCBzZSBwcm9iw7MgZGVzZGUgZXN0YSBQQyB5IGVzdMOhIGxpYnJlLiIpOwogICAgICBwaC5zdHlsZS5tYXJnaW5Ub3A9IjEwcHgiOyBzLmFwcGVuZENoaWxk
+KHBoKTsKICAgIH0KICAgIHJvb3QuYXBwZW5kQ2hpbGQocyk7CiAgfQoKICAvLyBxdWUgaGFjZXIgYWhvcmEKICAvLyBhY2Npb25lc1RvcCB2aWVuZSBjb2xh
+cHNhZGEgcG9yIGVsIG1vdG9yIGNvbiBsYSBtaXNtYSByZWdsYSBkZWwgcmVzdW1lbiBkZSBjb25zb2xhLgogIHZhciBhY2M9KGQuYWNjaW9uZXNUb3AgJiYg
+ZC5hY2Npb25lc1RvcC5sZW5ndGggPyBkLmFjY2lvbmVzVG9wIDogKGQuYWNjaW9uZXN8fFtdKSkKICAgICAgICAgICAgLmZpbHRlcihmdW5jdGlvbihhKXsg
+cmV0dXJuIGE7IH0pOwogIGlmKGFjYy5sZW5ndGgpewogICAgdmFyIHMxPXNlYygiUXXDqSBoYWNlciBhaG9yYSIpOwogICAgdmFyIHVsPWVsKCJ1bCIsInRv
+ZG8iKTsKICAgIC8vIExhcyBwcmltZXJhcyB0cmVzIGEgbGEgdmlzdGEgeSBlbCByZXN0byBwbGVnYWRvOiBlbCBtaXNtbyBjb3J0ZSBxdWUgaGFjZSBlbCBy
+ZXN1bWVuIGRlCiAgICAvLyBjb25zb2xhLiBEaWV6IHJlbmdsb25lcyBkZSBnb2xwZSBubyBzZSBsZWVuLCBzZSBzYWx0ZWFuLgogICAgdmFyIFZJU0lCTEVT
+PTM7CiAgICB2YXIgdWxNYXM9bnVsbDsKICAgIGFjYy5mb3JFYWNoKGZ1bmN0aW9uKGEsaWR4KXsKICAgICAgdmFyIGxpPWVsKCJsaSIpLCBjPWVsKCJkaXYi
+KTsKICAgICAgLy8gJ2xvY2FsJyBlcyBlbCBtaXNtbyBoYWxsYXpnbyBjb250YWRvIHBhcmEgbGEgcGVyc29uYSBkZWwgbG9jYWwuIFNpIG5vIGVzdGEsIHNl
+CiAgICAgIC8vIG11ZXN0cmEgZWwgdGV4dG8gZGVsIG1vdG9yLCBxdWUgZXN0YSBlc2NyaXRvIHBhcmEgZWwgYXNlc29yLgogICAgICB2YXIgbG9jID0gYS5s
+b2NhbDsKICAgICAgdmFyIGI9ZWwoImIiKTsgYi50ZXh0Q29udGVudCA9IChsb2MgJiYgbG9jLnRpdHVsbykgPyBsb2MudGl0dWxvIDogKGVzYyhhLndoYXQp
+IHx8IGVzYyhhLnRleHQpKTsKICAgICAgLy8gJ2NsaWVudGUnIHkgJ2FzZXNvcicgc29uIGV0aXF1ZXRhcyBpbnRlcm5hcyBkZWwgbW90b3IuIEVuIHBhbnRh
+bGxhIHNlIGRpY2UgcXVpZW4gbG8gaGFjZS4KICAgICAgaWYoYS5vd25lcikgYi5hcHBlbmRDaGlsZChlbCgic3BhbiIsIndobyAiK2VzYyhhLm93bmVyKSwg
+UVVJRU5bYS5vd25lcl0gfHwgZXNjKGEub3duZXIpKSk7CiAgICAgIGMuYXBwZW5kQ2hpbGQoYik7CiAgICAgIHZhciB0ZWNuaWNvID0gYVsiZG8iXSB8fCBh
+LnRleHQ7CiAgICAgIHZhciBkZXRhbGxlID0gKGxvYyAmJiBsb2MudGV4dG8pID8gbG9jLnRleHRvIDogdGVjbmljbzsKICAgICAgaWYoZGV0YWxsZSkgYy5h
+cHBlbmRDaGlsZChlbCgicCIsbnVsbCxlc2MoZGV0YWxsZSkpKTsKICAgICAgLy8gRWwgdGV4dG8gZGVsIG1vdG9yIG5vIHNlIHBpZXJkZTogcXVlZGEgYSB1
+biBjbGljLCBwYXJhIGVsIGFzZXNvci4KICAgICAgaWYobG9jICYmIHRlY25pY28pewogICAgICAgIHZhciBkdGVjID0gZWwoImRldGFpbHMiLCJ0ZWNuaWNv
+Iik7CiAgICAgICAgZHRlYy5hcHBlbmRDaGlsZChlbCgic3VtbWFyeSIsbnVsbCwiVmVyIGVsIGRldGFsbGUgdMOpY25pY28iKSk7CiAgICAgICAgZHRlYy5h
+cHBlbmRDaGlsZChlbCgicCIsbnVsbCxlc2ModGVjbmljbykpKTsKICAgICAgICBjLmFwcGVuZENoaWxkKGR0ZWMpOwogICAgICB9CiAgICAgIHZhciBhcnRp
+ID0gYS5hcnRpY2xlUmVmIHx8IGEucmVmOwogICAgICBpZihhcnRpKSBjLmFwcGVuZENoaWxkKGVsKCJkaXYiLCJhcnQiLCJBcnTDrWN1bG8gIitlc2MoYXJ0
+aSkpKTsKICAgICAgLy8gU2kgZWwgbW90b3IgcHVlZGUgZWplY3V0YXIgZXN0YSByZWNvbWVuZGFjaW9uIHkgbGEgZ2VzdGlvbiBlc3RhIGRpc3BvbmlibGUg
+YWhvcmEsIGVsCiAgICAgIC8vIGJvdG9uIHZhIGFjYSB5IG5vIGVuIHVuYSBib3RvbmVyYSBhcGFydGU6IGVzIGxhIG1pc21hIGNvc2EgZGljaGEgdW5hIHNv
+bGEgdmV6LgogICAgICB2YXIgZ2VzdCA9IChkLmdlc3Rpb25lcyB8fCB7fSlbYS5jaGVja0lkXTsKICAgICAgaWYoZ2VzdCAmJiBtZW51UHJlZyl7CiAgICAg
+ICAgdmFyIGhheSA9IChtZW51UHJlZy5vcGNpb25lc3x8W10pLnNvbWUoZnVuY3Rpb24obyl7IHJldHVybiBvLnYgPT09IGdlc3Q7IH0pOwogICAgICAgIGlm
+KGhheSl7CiAgICAgICAgICB2YXIgYnQgPSBlbCgiYnV0dG9uIiwidGRvLWJ0biIsIGRyeVJ1biA/ICJIYWNlcmxvIChubyB2YSBhIGNhbWJpYXIgbmFkYSki
+IDogIkhhY2VybG8gYWhvcmEiKTsKICAgICAgICAgIGJ0LmFkZEV2ZW50TGlzdGVuZXIoImNsaWNrIiwgZnVuY3Rpb24oKXsgcmVzcG9uZGVyKGdlc3QpOyB9
+KTsKICAgICAgICAgIGMuYXBwZW5kQ2hpbGQoYnQpOwogICAgICAgIH0KICAgICAgfQogICAgICBsaS5hcHBlbmRDaGlsZChjKTsKICAgICAgaWYoaWR4IDwg
+VklTSUJMRVMpeyB1bC5hcHBlbmRDaGlsZChsaSk7IH0KICAgICAgZWxzZSB7CiAgICAgICAgaWYoIXVsTWFzKXsgdWxNYXMgPSBlbCgidWwiLCJ0b2RvIik7
+IHVsTWFzLnN0eWxlLm1hcmdpblRvcD0iMTFweCI7IH0KICAgICAgICB1bE1hcy5hcHBlbmRDaGlsZChsaSk7CiAgICAgIH0KICAgIH0pOwogICAgczEuYXBw
+ZW5kQ2hpbGQodWwpOwogICAgaWYodWxNYXMpewogICAgICB2YXIgZG1hcyA9IGVsKCJkZXRhaWxzIiwiZHJhd2VyIik7CiAgICAgIGRtYXMuYXBwZW5kQ2hp
+bGQoZWwoInN1bW1hcnkiLG51bGwsIlZlciBsYXMgb3RyYXMgIisoYWNjLmxlbmd0aC1WSVNJQkxFUykrIiBjb3NhcyBwYXJhIHJldmlzYXIiKSk7CiAgICAg
+IHZhciBjb250ID0gZWwoImRpdiIpOyBjb250LnN0eWxlLnBhZGRpbmc9IjRweCAxNHB4IDE0cHgiOwogICAgICBjb250LmFwcGVuZENoaWxkKHVsTWFzKTsK
+ICAgICAgZG1hcy5hcHBlbmRDaGlsZChjb250KTsKICAgICAgczEuYXBwZW5kQ2hpbGQoZG1hcyk7CiAgICB9CiAgICByb290LmFwcGVuZENoaWxkKHMxKTsK
+ICB9CgogIC8vIGltcHJlc29yYXMKICB2YXIgY29sYXM9ZC5jb2xhc3x8W107CiAgaWYoY29sYXMubGVuZ3RoKXsKICAgIHZhciBzMj1zZWMoIkltcHJlc29y
+YXMgZGUgZXN0ZSBsb2NhbCIpOwogICAgdmFyIGJveD1lbCgiZGl2IiwicHJuIik7CiAgICBjb2xhcy5mb3JFYWNoKGZ1bmN0aW9uKGMpewogICAgICB2YXIg
+cj1lbCgiZGl2IiwicHJvdyIrKChjLnNjb3JlPjApPyIgdGFyZ2V0IjoiIikpOwogICAgICByLmFwcGVuZENoaWxkKGVsKCJzcGFuIiwicG5hbWUiLGVzYyhj
+Lm5vbWJyZSkpKTsKICAgICAgaWYoYy5wdWVydG8pIHIuYXBwZW5kQ2hpbGQoZWwoInNwYW4iLCJwcG9ydCIsZXNjKGMucHVlcnRvKSkpOwogICAgICB2YXIg
+ZT1TdHJpbmcoYy5lc3RhZG98fCIiKTsKICAgICAgdmFyIGNsID0gZT09PSJubyBpbXByaW1lIj8iZmFpbCIgOiAoZT09PSJjb24gcHJvYmxlbWFzIj8id2Fy
+biI6Im9rIik7CiAgICAgIHIuYXBwZW5kQ2hpbGQoZWwoInNwYW4iLCJjaGlwICIrY2wsIGV8fCJmdW5jaW9uYW5kbyIpKTsKICAgICAgaWYoYy5zaW50b21h
+cyAmJiBjLnNpbnRvbWFzLmxlbmd0aCl7CiAgICAgICAgdmFyIGRkPWVsKCJkaXYiLCJwc3ltIiksIHU9ZWwoInVsIik7CiAgICAgICAgYy5zaW50b21hcy5m
+b3JFYWNoKGZ1bmN0aW9uKHgpeyB1LmFwcGVuZENoaWxkKGVsKCJsaSIsbnVsbCxlc2MoeCkpKTsgfSk7CiAgICAgICAgZGQuYXBwZW5kQ2hpbGQodSk7IHIu
+YXBwZW5kQ2hpbGQoZGQpOwogICAgICB9CiAgICAgIGJveC5hcHBlbmRDaGlsZChyKTsKICAgIH0pOwogICAgczIuYXBwZW5kQ2hpbGQoYm94KTsKICAgIHZh
+ciBjb25uPWQuY29uZWN0YWRhc3x8W107CiAgICBpZihjb25uLmxlbmd0aCl7CiAgICAgIHZhciBwPWVsKCJwIiwiaGludCIpOyBwLnN0eWxlLm1hcmdpblRv
+cD0iMTBweCI7CiAgICAgIHAudGV4dENvbnRlbnQ9IkNvbmVjdGFkYXMgYWhvcmE6ICIrY29ubi5tYXAoZnVuY3Rpb24oaCl7CiAgICAgICAgcmV0dXJuICho
+LnB1ZXJ0b3x8InNpbiBwdWVydG8iKSsiIOKGkiAiKyhoLm5vbWJyZXx8IiIpKyhoLmNvbGFXaW5kb3dzPyIgKGNvbGEgIitoLmNvbGFXaW5kb3dzKyIpIjoi
+Iik7CiAgICAgIH0pLmpvaW4oIiAgwrcgICIpOwogICAgICBzMi5hcHBlbmRDaGlsZChwKTsKICAgIH0KICAgIHZhciBvZmY9ZC5kZXNjb25lY3RhZGFzfHxb
+XTsKICAgIGlmKG9mZi5sZW5ndGgpewogICAgICB2YXIgcDI9ZWwoInAiLCJoaW50Iik7IHAyLnN0eWxlLm1hcmdpblRvcD0iNnB4IjsKICAgICAgcDIudGV4
+dENvbnRlbnQ9IlNpbiBjb25leGlcdTAwZjNuOiAiK29mZi5tYXAoZnVuY3Rpb24oaCl7IHJldHVybiBoLm5vbWJyZXx8IiI7IH0pLmpvaW4oIiwgIikrCiAg
+ICAgICAgIiBcdTIwMTQgaGF5IHF1ZSBlbmNlbmRlcmxhcyB5IGVuY2h1ZmFyIGVsIGNhYmxlIFVTQiwgbWVqb3IgZW4gZWwgbWlzbW8gbHVnYXIgZGUgc2ll
+bXByZS4iOwogICAgICBzMi5hcHBlbmRDaGlsZChwMik7CiAgICB9CiAgICByb290LmFwcGVuZENoaWxkKHMyKTsKICB9CgogIC8vIGxvIHF1ZSBzZSB0b2Nv
+CiAgdmFyIHMzPXNlYygiUXVcdTAwZTkgY2FtYmlhbW9zIGVuIGVzdGEgY29tcHV0YWRvcmEiKTsKICBpZih0b2NhZG8ubGVuZ3RoKXsKICAgIHZhciB1Mz1l
+bCgidWwiKTsKICAgIHUzLnN0eWxlLmNzc1RleHQ9Imxpc3Qtc3R5bGU6bm9uZTttYXJnaW46MDtwYWRkaW5nOjA7ZGlzcGxheTpmbGV4O2ZsZXgtZGlyZWN0
+aW9uOmNvbHVtbjtnYXA6NnB4IjsKICAgIHRvY2Fkby5mb3JFYWNoKGZ1bmN0aW9uKHgpewogICAgICB2YXIgbGk9ZWwoImxpIik7CiAgICAgIGxpLnN0eWxl
+LmNzc1RleHQ9ImRpc3BsYXk6ZmxleDtnYXA6OHB4O2ZvbnQtc2l6ZToxMi41cHg7Ym9yZGVyLWxlZnQ6MnB4IHNvbGlkICIrCiAgICAgICAgKHgucmV2ZXJz
+aWJsZT09PWZhbHNlPyJ2YXIoLS1mYWlsKSI6InZhcigtLWZpeGVkKSIpKyI7cGFkZGluZy1sZWZ0OjEwcHg7Y29sb3I6dmFyKC0taW5rLTIpIjsKICAgICAg
+bGkuYXBwZW5kQ2hpbGQoZWwoInNwYW4iLCJ0YWciLCB4LnJldmVyc2libGU9PT1mYWxzZT8ibm8gc2UgZGVzaGFjZSI6InJldmVyc2libGUiKSk7CiAgICAg
+IGxpLmFwcGVuZENoaWxkKGVsKCJzcGFuIixudWxsLGVzYyh4LnRleHRvKSkpOwogICAgICB1My5hcHBlbmRDaGlsZChsaSk7CiAgICB9KTsKICAgIHMzLmFw
+cGVuZENoaWxkKHUzKTsKICB9IGVsc2UgczMuYXBwZW5kQ2hpbGQoZWwoInAiLCJlbXB0eSIsIk5vIGNhbWJpYW1vcyBuYWRhIGVuIGVzdGEgY29tcHV0YWRv
+cmEuIikpOwogIHJvb3QuYXBwZW5kQ2hpbGQoczMpOwoKICAvLyBkZXRhbGxlCiAgdmFyIHM0PXNlYygiRGV0YWxsZSB0XHUwMGU5Y25pY28iKTsKICB2YXIg
+YXZpc29UZWM9ZWwoInAiLCJoaW50Iik7CiAgYXZpc29UZWMuc3R5bGUuY3NzVGV4dD0ibWFyZ2luOi00cHggMCAxMXB4IjsKICBhdmlzb1RlYy50ZXh0Q29u
+dGVudD0iRXN0byBlcyBwYXJhIHNvcG9ydGU6IGVsIGRldGFsbGUgY29tcGxldG8gZGUgbG8gcXVlIHNlIHJldmlzXHUwMGYzLiI7CiAgczQuYXBwZW5kQ2hp
+bGQoYXZpc29UZWMpOwogIHZhciBkcj1lbCgiZGV0YWlscyIsImRyYXdlciIpOwogIGRyLmFwcGVuZENoaWxkKGVsKCJzdW1tYXJ5IixudWxsLCJMb3MgIitj
+aGVja3MubGVuZ3RoKyIgY29udHJvbGVzLCB1bm8gcG9yIHVubyIpKTsKICB2YXIgdHc9ZWwoImRpdiIsInRibHdyYXAiKSwgdGI9ZWwoInRhYmxlIiwiY2hr
+Iik7CiAgdmFyIHRoPWVsKCJ0aGVhZCIpLCB0cmg9ZWwoInRyIik7CiAgWyJDb250cm9sIiwiSWQiLCJSZXN1bHRhZG8iXS5mb3JFYWNoKGZ1bmN0aW9uKGgp
+eyB0cmguYXBwZW5kQ2hpbGQoZWwoInRoIixudWxsLGgpKTsgfSk7CiAgdGguYXBwZW5kQ2hpbGQodHJoKTsgdGIuYXBwZW5kQ2hpbGQodGgpOwogIHZhciB0
+Ym9keT1lbCgidGJvZHkiKTsKICBjaGVja3MuZm9yRWFjaChmdW5jdGlvbihjKXsKICAgIHZhciB0cj1lbCgidHIiKTsKICAgIHRyLmFwcGVuZENoaWxkKGVs
+KCJ0ZCIsbnVsbCxlc2MoYy5ub21icmUpKSk7CiAgICB2YXIgdDI9ZWwoInRkIiwiaWQiKTsgdDIudGV4dENvbnRlbnQ9ZXNjKGMuaWQpOyB0ci5hcHBlbmRD
+aGlsZCh0Mik7CiAgICB2YXIgdDM9ZWwoInRkIik7IHQzLmFwcGVuZENoaWxkKGVsKCJzcGFuIiwiY2hpcCAiK2VzYyhjLmVzdGFkbyksIGVzYyhjLmVzdGFk
+bykpKTsgdHIuYXBwZW5kQ2hpbGQodDMpOwogICAgdGJvZHkuYXBwZW5kQ2hpbGQodHIpOwogIH0pOwogIHRiLmFwcGVuZENoaWxkKHRib2R5KTsgdHcuYXBw
+ZW5kQ2hpbGQodGIpOyBkci5hcHBlbmRDaGlsZCh0dyk7IHM0LmFwcGVuZENoaWxkKGRyKTsKCiAgdmFyIGRqPWVsKCJkZXRhaWxzIiwiZHJhd2VyIik7CiAg
+ZGouYXBwZW5kQ2hpbGQoZWwoInN1bW1hcnkiLG51bGwsIkRhdG9zIHRcdTAwZTljbmljb3MgZGUgbGEgcmV2aXNpXHUwMGYzbiAoSlNPTikiKSk7CiAgdmFy
+IHByZT1lbCgicHJlIiwianNvbiBtb25vIiwiY2FyZ2FuZG/igKYiKTsKICBkai5hcHBlbmRDaGlsZChwcmUpOwogIGRqLmFkZEV2ZW50TGlzdGVuZXIoInRv
+Z2dsZSIsIGZ1bmN0aW9uKCl7CiAgICBpZighZGoub3BlbiB8fCBkai5kYXRhc2V0LmNhcmdhZG8pIHJldHVybjsKICAgIGRqLmRhdGFzZXQuY2FyZ2Fkbz0i
+MSI7CiAgICBmZXRjaCgiL2pzb24/dD0iK1RPS0VOKS50aGVuKGZ1bmN0aW9uKHIpeyByZXR1cm4gci50ZXh0KCk7IH0pCiAgICAgIC50aGVuKGZ1bmN0aW9u
+KHQpeyBwcmUudGV4dENvbnRlbnQ9dDsgfSkKICAgICAgLmNhdGNoKGZ1bmN0aW9uKCl7IHByZS50ZXh0Q29udGVudD0iTm8gc2UgcHVkbyBsZWVyIGVsIEpT
+T04uIjsgfSk7CiAgfSk7CiAgczQuYXBwZW5kQ2hpbGQoZGopOwogIHJvb3QuYXBwZW5kQ2hpbGQoczQpOwoKICAvLyByZXN1bWVuIGRlIHNpZW1wcmUsIHBv
+ciBzaSBhbGd1aWVuIGxvIHF1aWVyZSBwZWdhciBlbiBlbCBjYXNvCiAgaWYoZC5yZXN1bWVuKXsKICAgIHZhciBkdD1lbCgiZGV0YWlscyIsImRyYXdlciIp
+OwogICAgZHQuYXBwZW5kQ2hpbGQoZWwoInN1bW1hcnkiLG51bGwsIlJlc3VtZW4gZW4gdGV4dG8sIHBhcmEgYWRqdW50YXIgYWwgY2FzbyIpKTsKICAgIGR0
+LmFwcGVuZENoaWxkKGVsKCJwcmUiLCJqc29uIG1vbm8iLCBkLnJlc3VtZW4pKTsKICAgIHJvb3QuYXBwZW5kQ2hpbGQoZHQpOwogIH0KCiAgLy8gYWNjaW9u
+ZXMgZmluYWxlczogdmllbmVuIGRlbCBtZW51IGRlbCBtb3RvcgogIGlmKG1lbnVQcmVnKSByb290LmFwcGVuZENoaWxkKGJhcnJhQWNjaW9uZXMobWVudVBy
+ZWcpKTsKCiAgdmFyIGY9ZWwoImRpdiIsImZvb3QiKTsKICBmdW5jdGlvbiB0YWcodCl7IHZhciBzPWVsKCJzcGFuIik7IHMuYXBwZW5kQ2hpbGQoZWwoImIi
+LG51bGwsIsK3ICAiKSk7CiAgICBzLmFwcGVuZENoaWxkKGRvY3VtZW50LmNyZWF0ZVRleHROb2RlKHQpKTsgcmV0dXJuIHM7IH0KICBpZihkLnRlbGVtZXRy
+aWEpewogICAgZi5hcHBlbmRDaGlsZCh0YWcoZC50ZWxlbWV0cmlhLmVudmlhZGEgPyAiUmVwb3J0ZSBlbnZpYWRvIGFsIHBhbmVsIGRlIHRlbGVtZXRyw61h
+IgogICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgOiAiVGVsZW1ldHLDrWE6ICIrZXNjKGQudGVsZW1ldHJpYS5kZXRhbGxlKSkp
+OwogIH0KICBpZihkLmpzb25QYXRoKSBmLmFwcGVuZENoaWxkKHRhZygiSlNPTiBlbiAiK2VzYyhkLmpzb25QYXRoKSkpOwogIHJvb3QuYXBwZW5kQ2hpbGQo
+Zik7Cn0KCmZ1bmN0aW9uIGJhcnJhQWNjaW9uZXMocCl7CiAgdmFyIGNvbnQ9ZWwoImRpdiIpOwogIHZhciBkaXNwPXt9OyAocC5vcGNpb25lc3x8W10pLmZv
+ckVhY2goZnVuY3Rpb24obyl7IGRpc3Bbby52XT1vLmw7IH0pOwoKICB2YXIgYT1lbCgiZGl2IiwiZW5kYmFyIik7CiAgaWYoZGlzcC5SKXsKICAgIHZhciBt
+YWluPWVsKCJidXR0b24iLCJidG4gcHJpbWFyeSIsIlJldmlzYXIgdG9kbyBkZSBudWV2byIpOwogICAgbWFpbi5hZGRFdmVudExpc3RlbmVyKCJjbGljayIs
+IGZ1bmN0aW9uKCl7IHJlc3BvbmRlcigiUiIpOyB9KTsKICAgIGEuYXBwZW5kQ2hpbGQobWFpbik7CiAgfQogIHZhciBsaW5rcz1lbCgiZGl2IiwibGlua3Mi
+KTsKICB2YXIgY2VycmFyPWVsKCJidXR0b24iLG51bGwsIkNlcnJhciIpOwogIGNlcnJhci5hZGRFdmVudExpc3RlbmVyKCJjbGljayIsIGZ1bmN0aW9uKCl7
+IHJlc3BvbmRlcigiUyIpOyB9KTsKICBsaW5rcy5hcHBlbmRDaGlsZChjZXJyYXIpOwogIGEuYXBwZW5kQ2hpbGQobGlua3MpOwogIGNvbnQuYXBwZW5kQ2hp
+bGQoYSk7CgogIHZhciBjYXQ9KHAuZXh0cmEgJiYgcC5leHRyYS5jYXRhbG9nbykgPyBwLmV4dHJhLmNhdGFsb2dvIDogW107CiAgaWYoY2F0Lmxlbmd0aCl7
+CiAgICB2YXIgYWR2PWVsKCJkZXRhaWxzIiwiYWR2Iik7CiAgICB2YXIgc209ZWwoInN1bW1hcnkiKTsKICAgIHNtLmFwcGVuZENoaWxkKGRvY3VtZW50LmNy
+ZWF0ZVRleHROb2RlKCJIZXJyYW1pZW50YXMgZGUgc29wb3J0ZSIpKTsKICAgIHNtLmFwcGVuZENoaWxkKGVsKCJzcGFuIixudWxsLCJhY2Npb25lcyBwdW50
+dWFsZXMsIHNpbiB2b2x2ZXIgYSByZXZpc2FyIHRvZG8iKSk7CiAgICBhZHYuYXBwZW5kQ2hpbGQoc20pOwogICAgdmFyIGxpc3Q9ZWwoImRpdiIsImFkdmxp
+c3QiKTsKICAgIGNhdC5mb3JFYWNoKGZ1bmN0aW9uKG8pewogICAgICB2YXIgcm93PWVsKCJkaXYiLCJhZHZyb3ciKyhvLmRpc3BvbmlibGU/IiI6IiBvZmYi
+KSk7CiAgICAgIHZhciBkZD1lbCgiZGl2Iik7CiAgICAgIGRkLmFwcGVuZENoaWxkKGVsKCJiIixudWxsLGVzYyhvLmwpKSk7CiAgICAgIGlmKG8uZGV0YWxs
+ZSkgZGQuYXBwZW5kQ2hpbGQoZWwoInAiLG51bGwsZXNjKG8uZGV0YWxsZSkpKTsKICAgICAgcm93LmFwcGVuZENoaWxkKGRkKTsKICAgICAgaWYoby5kaXNw
+b25pYmxlKXsKICAgICAgICB2YXIgYj1lbCgiYnV0dG9uIiwiYnRuIHNtIisoby52PT09IkwiPyIgZGFuZ2VyIjoiIiksIG8udj09PSJMIj8iTGltcGlhcmxh
+IjoiSGFjZXJsbyIpOwogICAgICAgIGIuYWRkRXZlbnRMaXN0ZW5lcigiY2xpY2siLCBmdW5jdGlvbigpeyByZXNwb25kZXIoby52KTsgfSk7CiAgICAgICAg
+cm93LmFwcGVuZENoaWxkKGIpOwogICAgICB9IGVsc2UgewogICAgICAgIHJvdy5hcHBlbmRDaGlsZChlbCgic3BhbiIsIndoeSIsIGVzYyhvLm1vdGl2byl8
+fCJubyBjb3JyZXNwb25kZSBhaG9yYSIpKTsKICAgICAgfQogICAgICBsaXN0LmFwcGVuZENoaWxkKHJvdyk7CiAgICB9KTsKICAgIGFkdi5hcHBlbmRDaGls
+ZChsaXN0KTsKICAgIGNvbnQuYXBwZW5kQ2hpbGQoYWR2KTsKICB9CiAgcmV0dXJuIGNvbnQ7Cn0KCnBpbnRhckZhc2UoKTsKcG9sbCgpOwo8L3NjcmlwdD4K
 '@
 # === UI HTML FIN ===
 # Distribucion: repo publico. VERSION es un archivo de una linea con la version publicada.
@@ -1399,6 +1145,18 @@ $script:PosBrands = @('Bixolon','Epson','Citizen','Hasar','Sam4s','3nStar','XPri
 # esperandola igual que se bloquea en Read-Host. Si no hay interfaz, todo esto es
 # un no-op y el motor se comporta exactamente como en la 3.21.
 # ---------------------------------------------------------------------------
+function Get-UiHtml {
+    <# La pagina embebida, decodificada. Ver el comentario del bloque UI HTML. #>
+    if (-not $script:UiHtmlB64) { return '' }
+    try {
+        $limpio = ([string]$script:UiHtmlB64) -replace '\s', ''
+        return [System.Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($limpio))
+    } catch {
+        Write-DoctorLog -Level 'WARN' -Message ('No se pudo decodificar la interfaz embebida: ' + $_.Exception.Message)
+        return ''
+    }
+}
+
 function Test-UiViva {
     <#
       La pagina sigue del otro lado? Se responde por el ultimo poll: si el navegador se
@@ -1458,12 +1216,29 @@ function Request-UiAnswer {
       exactamente lo que ya hace en modo agente.
     #>
     param([string]$Id, [string]$Titulo, [string]$Texto = '', [string]$Texto2 = '',
-          $Opciones = @(), [string]$Clase = 'confirm', $Extra = $null, [int]$TimeoutSec = 0)
+          $Opciones = @(), [string]$Clase = 'confirm', $Extra = $null, [int]$TimeoutSec = 0,
+          [string]$ErrorPrevio = '', [switch]$SoloAsesor)
     if (-not (Test-UiWeb)) { return $null }
     if ($TimeoutSec -le 0) { $TimeoutSec = [int]$script:UiTimeout }
 
+    # 'seq' hace que dos preguntas consecutivas NUNCA sean identicas.
+    # De donde sale: el ID de conversacion se pide hasta cinco veces, y a partir del segundo
+    # intento el texto es siempre el mismo ('hacen falta 15 digitos'). La pagina decidia si una
+    # pregunta era nueva comparando su contenido, asi que el tercer intento salia igual al
+    # segundo, lo tomaba por ya contestado y no dibujaba nada: el motor seguia esperando y
+    # desde afuera parecia colgado. Lo mismo pasaba al reimprimir el ticket dos veces seguidas.
+    $script:UiPregSeq = [int]$script:UiPregSeq + 1
+    # 'error' viaja aparte del texto descriptivo a proposito. Mezclado adentro de texto2 se
+    # dibujaba como un parrafo gris identico a la descripcion de arriba: el asesor reintentaba
+    # y desde afuera parecia que la pagina se recargaba sola sin decir nada.
     $p = [ordered]@{
+        seq = $script:UiPregSeq
         id = $Id; titulo = $Titulo; texto = $Texto; texto2 = $Texto2
+        error = $ErrorPrevio
+        # La pantalla la mira tambien el cliente. Las preguntas que son tramite interno
+        # -el kit del asesor, el numero de caso- se marcan para que se vean como lo que son
+        # y el cliente no crea que le estan pidiendo algo a el.
+        soloAsesor = [bool]$SoloAsesor
         clase = $Clase; opciones = @($Opciones); extra = $Extra
     }
     try {
@@ -1529,8 +1304,14 @@ function Start-DoctorUi {
     $estado.Fase       = 'arranque'
     $estado.Json       = ''
     $estado.Token      = ([guid]::NewGuid()).ToString('N')
-    $estado.Html       = [string]$script:UiHtml
+    $estado.Html       = [string](Get-UiHtml)
     $script:UiState    = $estado
+
+    if (-not $estado.Html) {
+        Write-DoctorLog -Level 'WARN' -Message 'La interfaz no esta embebida en esta copia del motor; sigue por consola.'
+        $script:UiModo = 'consola'; $script:UiState = $null
+        return $false
+    }
 
     if ($Puerto -le 0) { $Puerto = Get-FreeTcpPort }
     if ($Puerto -le 0) {
@@ -1971,15 +1752,14 @@ function Resolve-RunMode {
     if ($Modo -ne 'auto') { return $Modo }
     if (Test-UiWeb) {
         $r = Request-UiAnswer -Id 'modo' -Clase 'modo' `
-            -Titulo 'Que impresora hay que revisar?' `
-            -Texto ('Si elegis mal, el diagnostico puede terminar hablando de una impresora que no ' +
-                    'es la que falla. Nace de un caso real: un cliente con dos impresoras de red ' +
-                    'sanas recibia como diagnostico "ninguna impresora fisica conectada".') `
-            -Texto2 'Si no sabes, elegi las dos.' `
+            -Titulo 'Como esta conectada la impresora que no anda?' `
+            -Texto ('Es para mirar la impresora correcta: si hay varias, revisar la que no ' +
+                    'corresponde lleva a un diagnostico que no tiene nada que ver.') `
+            -Texto2 'Si no estas seguro, elegi "las dos" y revisamos todo.' `
             -Opciones @(
-                @{ v = 'USB';   l = 'USB';     detalle = 'La impresora esta enchufada a esta PC con un cable' },
-                @{ v = 'Red';   l = 'Red';     detalle = 'La impresora tiene IP propia (cable de red o wifi)' },
-                @{ v = 'Ambos'; l = 'Las dos'; detalle = 'Revisar todo lo que haya'; principal = $true })
+                @{ v = 'USB';   l = 'Con un cable a esta computadora'; detalle = 'El cable USB va de la impresora a este equipo' },
+                @{ v = 'Red';   l = 'Por la red';                      detalle = 'La impresora tiene su propia IP, por cable de red o wifi' },
+                @{ v = 'Ambos'; l = 'No se / las dos';                 detalle = 'Revisamos todo lo que haya conectado'; principal = $true })
         if ($r -eq 'USB') { return 'USB' }
         if ($r -eq 'Red') { return 'Red' }
         return 'Ambos'
@@ -2022,11 +1802,10 @@ function Confirm-ReviewOtherInterface {
     if (Test-UiWeb) {
         $queSonUi = $(if ($Modo -eq 'Red') { 'por USB' } else { 'de red' })
         $r = Request-UiAnswer -Id 'otraInterfaz' -Clase 'confirm' `
-            -Titulo ('No hay ninguna impresora ' + $(if ($Modo -eq 'Red') { 'de red' } else { 'por USB' }) + ' instalada en esta PC') `
-            -Texto ('Elegiste revisar ' + $(if ($Modo -eq 'Red') { 'la red' } else { 'el USB' }) +
-                    ', asi que no se toco ninguna de las otras. El motor no solo diagnostica: ' +
-                    'repara e imprime, y sacar papel de una impresora que nadie pidio es peor ' +
-                    'que no revisar nada.') `
+            -Titulo ('No hay ninguna impresora ' + $(if ($Modo -eq 'Red') { 'de red' } else { 'por USB' }) + ' instalada en esta computadora') `
+            -Texto ('Como elegimos revisar ' + $(if ($Modo -eq 'Red') { 'la red' } else { 'el USB' }) +
+                    ', no tocamos ninguna de las otras. Revisar tambien repara e imprime, y sacar ' +
+                    'papel de una impresora que nadie pidio es peor que no revisar nada.') `
             -Extra @{ otras = @($lista); queSon = $queSonUi } `
             -Opciones @(
                 @{ v = 'si'; l = ('Revisa las ' + $queSonUi + ' igual') },
@@ -2100,9 +1879,9 @@ function Confirm-PaperCameOut {
         # contestarse bien. Por eso la interfaz manda tambien QUE tiene que estar mirando.
         $r = Request-UiAnswer -Id 'papel' -Clase 'papel' `
             -Titulo ("Mira la impresora: salio el ticket de prueba de '" + $Printer + "'?") `
-            -Texto ('Es la unica pregunta que el motor no puede contestar solo. Windows da el ' +
-                    'trabajo por impreso apenas la impresora acepta los bytes, aunque no haya ' +
-                    'papel, la tapa este abierta o el rollo puesto al reves.') `
+            -Texto ('Es la unica cosa que no podemos ver desde la computadora. Windows da el ' +
+                    'trabajo por impreso apenas la impresora lo acepta, aunque despues no haya ' +
+                    'salido papel: rollo terminado, tapa mal cerrada o el rollo puesto al reves.') `
             -Texto2 ('El ticket sale con avance de papel antes del corte, asi que tiene que asomar ' +
                      'fuera de la impresora. Si ves papel en blanco, el rollo esta al reves.') `
             -Extra @{ impresora = $Printer } `
@@ -2191,7 +1970,8 @@ function Confirm-Irreversible {
     if (Test-UiWeb) {
         $r = Request-UiAnswer -Id 'irreversible' -Clase 'peligro' `
             -Titulo $Description `
-            -Texto 'Es la unica accion del motor que no se puede deshacer.' `
+            -Texto ('Es lo unico que hacemos que no se puede deshacer, por eso preguntamos ' +
+                    'antes.') `
             -Texto2 $Impact `
             -Opciones @(
                 @{ v = 'si'; l = 'Aplicarlo igual'; peligro = $true },
@@ -5857,15 +5637,16 @@ function Confirm-NetProbe {
     if (-not (Test-HayHumano)) { return $false }
     if (Test-UiWeb) {
         $r = Request-UiAnswer -Id 'netprobe' -Clase 'confirm' `
-            -Titulo 'Le agrego una IP temporal a esta PC para poder ver la impresora?' `
-            -Texto ('Puede haber una impresora de red en la subred ' + $Prefijo + '.0/24, distinta ' +
-                    'a la de esta PC. Para verla, el motor le agrega una segunda direccion a la ' +
-                    'placa de red y la saca al terminar.') `
-            -Texto2 ('La PC NO pierde internet ni la conexion remota: conserva su IP y suma una. ' +
-                     'Es lo unico que el motor toca de la red del cliente, y se retira siempre.' +
-                     $(if ($Motivo) { ' Por que: ' + $Motivo } else { '' })) `
+            -Titulo 'Podemos darle una direccion de red temporal a esta computadora?' `
+            -Texto ('Parece haber una impresora en otra red (la ' + $Prefijo + '.0/24) distinta a ' +
+                    'la de este equipo. Para poder verla necesitamos agregarle una segunda ' +
+                    'direccion a la placa de red, y la sacamos apenas terminamos.') `
+            -Texto2 ('La computadora NO pierde internet ni la conexion remota: conserva la que ' +
+                     'tiene y suma una. Es lo unico que tocamos de la red, y se retira siempre, ' +
+                     'incluso si algo falla.' +
+                     $(if ($Motivo) { ' Motivo: ' + $Motivo } else { '' })) `
             -Opciones @(
-                @{ v = 'si'; l = 'Agregala y revisa esa subred'; principal = $true },
+                @{ v = 'si'; l = 'Si, agregala y revisa'; principal = $true },
                 @{ v = 'no'; l = 'No tocar la red' })
         return ($r -eq 'si')
     }
@@ -7136,16 +6917,20 @@ function Get-ShortActions {
     $rest = @($acts | Where-Object { -not ([string]$_.checkId).StartsWith('fudo.') })
     $list = @()
     foreach ($a in $rest) {
-        $list += [ordered]@{ owner = [string]$a.owner; text = [string]$a.do; ref = [string]$a.articleRef }
+        $list += [ordered]@{ owner = [string]$a.owner; text = [string]$a.do; ref = [string]$a.articleRef
+                             checkId = [string]$a.checkId; what = [string]$a.what }
     }
     if (@($fudo).Count -ge 2) {
         $list += [ordered]@{
             owner = 'asesor'
             text  = 'Verificar en la web app de Fudo: impresora registrada con la interfaz correcta, cocina/area asignada a la impresora, categorias con cocina, y salas tildadas si el local usa salas.'
             ref   = 'https://soporte.fu.do/es/articles/11730815'
+            checkId = 'fudo.varios'
+            what  = ('Revisar la configuracion de Fudo (' + @($fudo).Count + ' cosas)')
         }
     } elseif (@($fudo).Count -eq 1) {
-        $list += [ordered]@{ owner = 'asesor'; text = [string]@($fudo)[0].do; ref = [string]@($fudo)[0].articleRef }
+        $list += [ordered]@{ owner = 'asesor'; text = [string]@($fudo)[0].do; ref = [string]@($fudo)[0].articleRef
+                             checkId = [string]@($fudo)[0].checkId; what = [string]@($fudo)[0].what }
     }
     return [ordered]@{ shown = @($list | Select-Object -First $Max); total = @($list).Count }
 }
@@ -7582,12 +7367,15 @@ function Resolve-CaseIdObligatorio {
     if ($id) { return $id }
     if (Test-UiWeb) {
         for ($iUi = 1; $iUi -le 5; $iUi++) {
-            $rCaso = Request-UiAnswer -Id 'caso' -Clase 'texto' `
-                -Titulo 'Conversacion de Intercom' `
-                -Texto ('Pega la conversacion o los 15 digitos. Es obligatorio: sin esto la ' +
-                        'corrida no se puede cruzar con el caso del cliente.') `
-                -Texto2 $(if ($iUi -gt 1) { 'Eso no parece un ID de conversacion: hacen falta 15 digitos.' } else { '' }) `
-                -Extra @{ placeholder = '215475776099648  o la URL de la conversacion' }
+            $rCaso = Request-UiAnswer -Id 'caso' -Clase 'texto' -SoloAsesor `
+                -Titulo 'Numero del caso de soporte' `
+                -Texto ('Son los 15 digitos de la conversacion, o la direccion completa. Sirve ' +
+                        'para dejar esta revision guardada junto al caso.') `
+                -ErrorPrevio $(if ($iUi -gt 1) {
+                    'Eso no parece un numero de caso: hacen falta 15 digitos. Intento ' +
+                    [string]$iUi + ' de 5; despues de eso la revision se corta.'
+                } else { '' }) `
+                -Extra @{ placeholder = '215475776099648  o la direccion de la conversacion' }
             if ($null -eq $rCaso) { break }
             $idUi = Test-CaseIdValido -Texto $rCaso
             if ($idUi) { return $idUi }
@@ -7961,6 +7749,27 @@ function Invoke-SelfTest {
         }
     }
     Assert-Eq 'S105 ninguna funcion tapa un parametro del script' '' ((@($choques77) | Sort-Object -Unique) -join '; ')
+
+    # Escenario 106 (v3.22): cada clave de $script:TextosLocal tiene que ser un chequeo que el
+    # motor realmente emite. Es una tabla paralela al codigo: si alguien renombra un check, el
+    # texto para el local deja de aparecer y NADIE se entera -la interfaz cae al texto tecnico
+    # sin avisar, que es exactamente el tipo de falla silenciosa que ya costo caro en este
+    # proyecto. Los ids sintetizados en Get-NextActions y en Get-ShortActions no salen de un
+    # Add-Check, asi que van declarados aca.
+    $sinteticos106 = @('conn.net.ip','fudo.varios','none')
+    $reales106 = @()
+    foreach ($mt106 in [regex]::Matches((Get-Content $PSCommandPath -Raw), "Add-Check\s+-Id\s+'([a-zA-Z0-9._]+)'")) {
+        $reales106 += [string]$mt106.Groups[1].Value
+    }
+    $reales106 = @(@($reales106) + @($sinteticos106) | Sort-Object -Unique)
+    $huerfanos106 = @()
+    foreach ($k106 in @($script:TextosLocal.Keys)) {
+        if (@($reales106) -notcontains [string]$k106) { $huerfanos106 += [string]$k106 }
+    }
+    Assert-Eq 'S106 los textos para el local apuntan a chequeos que existen' '' ((@($huerfanos106) | Sort-Object) -join '; ')
+    Assert-Eq 'S106 un chequeo conocido tiene su version para el local' 'La impresora esta configurada pero ahora no responde' ([string](Get-TextoParaElLocal -CheckId 'hw.disconnected').t)
+    Assert-Eq 'S106 uno que no esta en la tabla no inventa nada' $true ($null -eq (Get-TextoParaElLocal -CheckId 'no.existe.este.check'))
+    Assert-Eq 'S106 sin id tampoco' $true ($null -eq (Get-TextoParaElLocal -CheckId ''))
 
     function Get-CheckById { param([string]$Id) return (@($script:Checks | Where-Object { $_.id -eq $Id }) | Select-Object -First 1) }
 
@@ -10740,6 +10549,146 @@ function Get-MenuOptions {
     return @($ops)
 }
 
+# ---------------------------------------------------------------------------
+# EL MISMO HALLAZGO, CONTADO PARA EL LOCAL
+# La pantalla de la interfaz la mira el cliente mientras el asesor la usa. El texto que el
+# motor ya tiene ('recommendation') esta escrito para el asesor y viaja al JSON, a la consola
+# y a la telemetria: es el contrato con el agente y no se toca.
+#
+# POR QUE UNA TABLA Y NO UN SEGUNDO -Recommendation EN CADA Add-Check: las recomendaciones
+# estan escritas en ~80 lugares del motor. Duplicar el texto ahi seria duplicar el
+# mantenimiento de lo que ya cuesta mantener, y garantizar que las dos versiones se
+# desincronicen. Aca vive SOLO la version para el local, indexada por el id del chequeo.
+#
+# Lo que no esta en la tabla no muestra version para el local, y la interfaz cae al texto
+# tecnico. Es a proposito: mejor que el cliente lea algo tecnico a que lea una traduccion
+# inventada que dice otra cosa. El escenario 106 del self-test verifica que cada clave de
+# aca sea un chequeo que el motor realmente puede emitir.
+# ---------------------------------------------------------------------------
+$script:TextosLocal = @{
+    'env.admin' = @{
+        t = 'Estamos revisando sin permisos de administrador'
+        d = 'Se puede diagnosticar igual, pero algunas reparaciones necesitan permisos. Si hace falta, volvemos a abrir la herramienta como administrador.' }
+    'env.spooler' = @{
+        t = 'El servicio de impresion de Windows estaba detenido'
+        d = 'Es el que recibe todo lo que se manda a imprimir. Con el servicio parado, ninguna impresora de esta computadora funciona.' }
+    'nativa.installed' = @{
+        t = 'Falta la aplicacion que conecta Fudo con la impresora'
+        d = 'Fudo corre en el navegador y necesita esta aplicacion para poder mandarle las comandas a Windows. Sin ella, la impresora puede estar perfecta y nunca recibir nada.' }
+    'nativa.defenderQuarantine' = @{
+        t = 'El antivirus se llevo la aplicacion de Fudo'
+        d = 'Windows Defender la puso en cuarentena por error. La recuperamos y volvemos a instalarla; la version nueva esta firmada y el antivirus ya no la toca.' }
+    'nativa.sinFirmar' = @{
+        t = 'La aplicacion de Fudo esta desactualizada'
+        d = 'Las versiones viejas no estan firmadas y algunos antivirus las borran solas. Actualizarla evita que el problema vuelva.' }
+    'nativa.thirdPartyAV' = @{
+        t = 'El antivirus de esta computadora puede estar bloqueando a Fudo'
+        d = 'No es Windows Defender, asi que no lo podemos configurar desde aca. Hay que agregar la carpeta de Fudo a las excepciones del antivirus, y recien despues reinstalar.' }
+    'nativa.hostRegistrado' = @{
+        t = 'El navegador no encuentra la aplicacion de Fudo'
+        d = 'Estan las dos cosas instaladas pero no se ven entre si. Lo corregimos y despues hay que cerrar y volver a abrir Fudo en el navegador.' }
+    'fudo.extension' = @{
+        t = 'Falta la extension de Fudo en el navegador'
+        d = 'Es la que conecta la pagina de Fudo con la impresora. Se instala desde la tienda de Chrome y despues hay que reabrir Fudo.' }
+    'hw.deviceConnected' = @{
+        t = 'Windows no ve ninguna impresora conectada'
+        d = 'Revisar que la impresora este encendida (luz fija, no titilando), que el cable USB este firme de los dos lados y, si esta en un hub o alargue, probar enchufandola directo a la computadora.' }
+    'hw.disconnected' = @{
+        t = 'La impresora esta configurada pero ahora no responde'
+        d = 'Windows la tiene anotada de antes, pero en este momento no la encuentra. Suele ser que quedo apagada, que el cable se aflojo o que se cambio de puerto USB.' }
+    'hw.notInstalled' = @{
+        t = 'La impresora esta conectada pero Windows no la tiene instalada'
+        d = 'El equipo la ve enchufada pero le falta el programa que la maneja. Lo instalamos nosotros.' }
+    'hw.noPortBound' = @{
+        t = 'La impresora esta conectada pero Windows no le asigno lugar'
+        d = 'Pasa cuando se enchufa en un puerto nuevo. La reconectamos por software para que Windows la registre bien.' }
+    'hw.driverMissing' = @{
+        t = 'Falta el programa que maneja la impresora'
+        d = 'Instalamos el generico de texto, que es el que usan las comanderas termicas.' }
+    'hw.testprint' = @{
+        t = 'El ticket de prueba no salio'
+        d = 'Le mandamos un ticket directo a la impresora y no aparecio papel. Revisar que quede rollo, que el rollo este puesto con el lado brillante para arriba y que la tapa cierre bien.' }
+    'printer.exists' = @{
+        t = 'No hay ninguna impresora real instalada en esta computadora'
+        d = 'Solo figuran impresoras virtuales, que guardan archivos en vez de imprimir. Primero hay que conectar la comandera; despues la instalamos y la registramos en Fudo.' }
+    'printer.paused' = @{
+        t = 'La impresora estaba en pausa'
+        d = 'Alguien la pauso desde Windows, o Windows la pauso solo despues de un error. Todo lo que Fudo mandaba se quedaba esperando.' }
+    'printer.offline' = @{
+        t = 'La impresora figuraba sin conexion'
+        d = 'Windows la habia marcado como no disponible y por eso no le mandaba nada, aunque estuviera enchufada.' }
+    'printer.disconnected' = @{
+        t = 'La impresora no esta conectada'
+        d = 'Hay que encenderla y enchufar el cable USB, preferentemente en el mismo lugar donde estaba antes.' }
+    'printer.multiple' = @{
+        t = 'Hay mas de una impresora y puede estar fallando la que no miramos'
+        d = 'Si la que no imprime es otra, conviene volver a revisar eligiendo esa.' }
+    'queue.health' = @{
+        t = 'Hay comandas viejas trabadas esperando'
+        d = 'Cuando un trabajo se traba, todo lo que viene atras se apila y no sale nada. Hay que descartar esos trabajos viejos para destapar la cola.' }
+    'queue.otherBacklog' = @{
+        t = 'Otra impresora tiene comandas acumuladas'
+        d = 'No es la que estamos revisando, pero conviene mirarla: si a esa tampoco le sale nada, el problema puede ser el mismo.' }
+    'conn.portMismatch' = @{
+        t = 'La impresora cambio de puerto USB'
+        d = 'Windows la sigue buscando donde estaba antes. La reapuntamos al lugar donde esta ahora.' }
+    'conn.net' = @{
+        t = 'No llegamos a la impresora de red'
+        d = 'La impresora tiene su propia direccion y esta computadora no logra alcanzarla. Revisar que este encendida y conectada al mismo router que el equipo.' }
+    'conn.otherSubnet' = @{
+        t = 'La impresora quedo en otra red'
+        d = 'Tiene una direccion que no pertenece a la red de este local, asi que las comandas se mandan a un lugar al que no se llega. Hay que cambiarle la direccion a la impresora.' }
+    'conn.net.ip' = @{
+        t = 'Encontramos una impresora en la red'
+        d = 'Responde y esta lista para usarse. Hay que cargar su direccion en la configuracion de Fudo.' }
+    'fudo.printerRegistered' = @{
+        t = 'Falta revisar que la impresora este cargada en Fudo'
+        d = 'La impresora puede funcionar perfecto en Windows y aun asi no recibir comandas, si en Fudo no esta dada de alta.' }
+    'fudo.printerKitchen' = @{
+        t = 'Falta revisar a que cocina o area apunta la impresora'
+        d = 'Si el area no apunta a esta impresora, las comandas salen por otra o no salen.' }
+    'fudo.varios' = @{
+        t = 'Falta revisar la configuracion en Fudo'
+        d = 'La impresora anda; lo que queda por mirar esta del lado de Fudo: que este dada de alta, que la cocina o area apunte a ella, que las categorias tengan cocina y que las salas esten tildadas si el local usa salas.' }
+    'none' = @{
+        t = 'No encontramos nada roto en esta computadora'
+        d = 'Todo lo que depende de Windows esta bien. Lo que queda por revisar es la configuracion dentro de Fudo.' }
+}
+
+function Get-TextoParaElLocal {
+    <# El texto en castellano llano de un hallazgo, o $null si no hay. Ver la tabla de arriba. #>
+    param([string]$CheckId)
+    $id = [string]$CheckId
+    if (-not $id) { return $null }
+    if ($script:TextosLocal.ContainsKey($id)) { return $script:TextosLocal[$id] }
+    return $null
+}
+
+function Get-AccionSugerida {
+    <#
+      Que gestion del menu ejecutaria esta recomendacion, si es que alguna.
+      Existe para que el asesor no tenga que traducir 'que hacer' a 'que boton': en consola esa
+      traduccion la hacia a ojo entre la lista de acciones y el menu de letras.
+      Devuelve '' cuando la recomendacion la tiene que hacer una persona -cambiar un cable,
+      tocar la configuracion de Fudo, excluir en un antivirus que no es Defender-. Prometer un
+      boton para algo que el motor no puede hacer seria peor que no ofrecer nada.
+    #>
+    param([string]$CheckId)
+    $id = [string]$CheckId
+    if (-not $id) { return '' }
+    # El antivirus de terceros queda afuera a proposito: el motor no puede tocar Avast ni ESET,
+    # ahi lo unico util es la indicacion escrita.
+    if ($id -eq 'nativa.thirdPartyAV')                                   { return '' }
+    if ($id -like 'nativa.*')                                            { return 'F' }
+    if ($id -in @('printer.disconnected','hw.disconnected'))             { return 'U' }
+    if ($id -in @('queue.health','queue.otherBacklog','queue.rebotePurga')) { return 'L' }
+    if ($id -in @('hw.notInstalled','hw.noPortBound','hw.driverMissing')) { return 'I' }
+    if ($id -in @('conn.net','conn.otherSubnet'))                        { return 'N' }
+    if ($id -eq 'hw.testprint')                                          { return 'T' }
+    if ($id -eq 'engine.updateAvailable')                                { return 'A' }
+    return ''
+}
+
 function Get-MenuCatalogo {
     <#
       Todo lo que el motor sabe hacer sobre la PC, con lo que hace cada cosa y -cuando no
@@ -10814,7 +10763,7 @@ function Show-DoctorMenu {
                          disponible = $hayUi; motivo = $(if ($hayUi) { '' } else { [string]$c.na }) }
         }
         $rUi = Request-UiAnswer -Id 'menu' -Clase 'menu' -Extra @{ catalogo = @($catUi) } `
-            -Titulo 'Que queres hacer ahora?' -Opciones $opsUi
+            -Titulo 'Que hacemos ahora?' -Opciones $opsUi
         if ($null -eq $rUi) { return 'S' }
         return (Resolve-MenuChoice -Raw $rUi -Keys @($ops | ForEach-Object { [string]$_.k }))
     }
@@ -10859,13 +10808,19 @@ function Invoke-MenuAction {
                 $f = Invoke-ReconnectFlow -Printer $pr
                 Write-Host ''
                 Write-Host ('  ' + $(if ($f.recovered) { 'Recuperada: ' } else { 'Sin exito: ' }) + [string]$f.note) -ForegroundColor $(if ($f.recovered) { 'Green' } else { 'Yellow' })
+                $script:UltimaAccionNota = $(if ($f.recovered) { 'Recuperada: ' } else { 'Sin exito: ' }) + [string]$f.note
             } else {
                 Write-Host ''
                 Write-Host '  Desenchufa y volve a enchufar el USB de la impresora (encendida)...' -ForegroundColor Cyan
                 $puerto = Wait-ForPrinterReconnect -TimeoutSec $ReconnectTimeoutSec
                 Write-Host ''
-                if ($puerto) { Write-Host ("  Aparecio una impresora en " + $puerto) -ForegroundColor Green }
-                else { Write-Host '  No se detecto ninguna impresora nueva.' -ForegroundColor Yellow }
+                if ($puerto) {
+                    Write-Host ("  Aparecio una impresora en " + $puerto) -ForegroundColor Green
+                    $script:UltimaAccionNota = 'Aparecio una impresora en ' + $puerto
+                } else {
+                    Write-Host '  No se detecto ninguna impresora nueva.' -ForegroundColor Yellow
+                    $script:UltimaAccionNota = 'No se detecto ninguna impresora nueva.'
+                }
             }
             $script:ForceWaitReconnect = $false
             return $true
@@ -11194,16 +11149,15 @@ function Confirm-NativaKit {
     if ($Kit -and [bool]$Kit.listo) { return $true }
     if (-not (Test-HayHumano)) { return $true }
     if (Test-UiWeb) {
-        $rKit = Request-UiAnswer -Id 'kit' -Clase 'confirm' `
-            -Titulo ('Falta el instalador de la App Nativa firmada (v' + $script:NativaVersionFirmada + ')') `
+        $rKit = Request-UiAnswer -Id 'kit' -Clase 'confirm' -SoloAsesor `
+            -Titulo 'Falta el instalador de la App Nativa en esta carpeta' `
             -Texto ([string]$Kit.motivo + '.') `
-            -Texto2 ('Sin ese archivo, si este cliente tiene una version vieja de la App Nativa el ' +
-                     'motor NO puede actualizarla y el antivirus se la va a volver a comer. ' +
-                     'Conviene tenerlo siempre junto a los dos archivos que copias a la PC del ' +
-                     'cliente: se arregla una vez y sirve para todos los casos.') `
+            -Texto2 ('Sin ese archivo, si esta computadora tiene una version vieja de la App Nativa ' +
+                     'no se la puede actualizar durante la revision. Se puede seguir igual: la ' +
+                     'impresora puede estar fallando por algo que no tiene nada que ver.') `
             -Opciones @(
-                @{ v = 'no'; l = 'Cortar y buscar el .msi'; principal = $true },
-                @{ v = 'si'; l = 'Seguir igual (queda registrado)' })
+                @{ v = 'no'; l = 'Cortar y buscar el instalador'; principal = $true },
+                @{ v = 'si'; l = 'Seguir igual' })
         if ($null -eq $rKit) { return $true }
         return ($rKit -eq 'si')
     }
@@ -11450,8 +11404,8 @@ function Select-LocalNativeInstaller {
                 principal = ([string]$c.ruta -eq [string]$reco.ruta)
             }
         }
-        $rN = Request-UiAnswer -Id 'nativaVersion' -Clase 'modo' `
-            -Titulo 'Cual version de la App Nativa instalo?' `
+        $rN = Request-UiAnswer -Id 'nativaVersion' -Clase 'modo' -SoloAsesor `
+            -Titulo 'Cual version de la App Nativa instalamos?' `
             -Texto ('Hay mas de un instalador en esta PC. Desde la v' + $script:NativaVersionFirmada +
                     ' la Nativa esta firmada: el antivirus deja de bloquearla y no hace falta ' +
                     'ninguna exclusion.') `
@@ -12148,6 +12102,59 @@ function Write-DoctorResult {
     # La interfaz recibe el resultado completo de una: el resumen humano que ya arma
     # Build-HumanSummary, las acciones priorizadas y el JSON. No se recalcula nada aca.
     if (Test-UiWeb) {
+        # Que gestion del menu resuelve cada recomendacion, como mapa checkId -> letra.
+        # Va aparte y NO adentro de nextActions: el primer intento copiaba cada accion para
+        # agregarle el campo, y una entrada nula tiraba la copia entera. El resultado salia
+        # como engine_error, o sea que un adorno de la interfaz se llevaba puesto el
+        # diagnostico. La interfaz no puede romper lo que ya funciona: si esto falla, se
+        # manda vacio y lo unico que pasa es que no hay botones.
+        # OJO: nextActions vive adentro de diagnosis, NO en la raiz del resultado.
+        # ($diag['nextActions'] = @(Get-NextActions ...) en Invoke-FudoPrintDoctor.) Leerlo de
+        # la raiz daba $null, y @($null) es un array de UN elemento nulo: la interfaz recibia
+        # 'acciones: [null]' y no dibujaba la seccion 'Que hacer ahora' -la parte mas util del
+        # resultado- sin que nada avisara. La raiz SI lo tiene en el camino de engine_error,
+        # asi que se prueban los dos.
+        $accionesUi = @()
+        try {
+            if ($Obj.diagnosis -and $Obj.diagnosis.nextActions) { $accionesUi = @($Obj.diagnosis.nextActions) }
+            elseif ($Obj.nextActions) { $accionesUi = @($Obj.nextActions) }
+        } catch {}
+        $accionesUi = @($accionesUi | Where-Object { $null -ne $_ })
+
+        # La lista corta usa Get-ShortActions, que es la MISMA regla del resumen de consola:
+        # los cuatro chequeos genericos de config de Fudo se colapsan en una linea sola. Sin
+        # esto la interfaz mostraba diez renglones, cuatro de ellos la misma recomendacion
+        # partida en pedazos.
+        $accionesTopUi = @()
+        try {
+            if ($Obj.diagnosis) {
+                $cortoUi = Get-ShortActions -Diag $Obj.diagnosis -Max 99
+                foreach ($itUi in @($cortoUi.shown)) {
+                    if ($null -eq $itUi) { continue }
+                    $locUi = Get-TextoParaElLocal -CheckId ([string]$itUi.checkId)
+                    if ($locUi) { $itUi['local'] = [ordered]@{ titulo = [string]$locUi.t; texto = [string]$locUi.d } }
+                    $accionesTopUi += $itUi
+                }
+            }
+        } catch {
+            Write-DoctorLog -Level 'WARN' -Message ('No se pudo armar la lista corta de acciones: ' + $_.Exception.Message)
+        }
+
+        $gestionesUi = [ordered]@{}
+        try {
+            foreach ($aUi in @($accionesUi)) {
+                if ($null -eq $aUi) { continue }
+                $cidUi = ''
+                try { $cidUi = [string]$aUi.checkId } catch {}
+                if (-not $cidUi) { continue }
+                if ($gestionesUi.Contains($cidUi)) { continue }
+                $gUi = [string](Get-AccionSugerida -CheckId $cidUi)
+                if ($gUi) { $gestionesUi[$cidUi] = $gUi }
+            }
+        } catch {
+            Write-DoctorLog -Level 'WARN' -Message ('No se pudo mapear las gestiones sugeridas: ' + $_.Exception.Message)
+        }
+
         try { $script:UiState.Json = [string]$jsonTexto } catch {}
         Set-UiFase 'resultado'
         $resumenUi = ''
@@ -12157,7 +12164,9 @@ function Write-DoctorResult {
             status      = [string]$Obj.status
             resumen     = $resumenUi
             diagnostico = $Obj.diagnosis
-            acciones    = @($Obj.nextActions)
+            acciones    = @($accionesUi)
+            accionesTop = $accionesTopUi
+            gestiones   = $gestionesUi
             llegada     = $Obj.llegada
             telemetria  = $script:TelemetryStatus
             jsonPath    = $dondeUi
@@ -12274,7 +12283,11 @@ try {
         exit 7
     }
     $CaseId = Resolve-CaseIdObligatorio -Actual $CaseId
-    Push-UiEvent -Tipo 'caso' -Datos @{ caseId = $CaseId; host = $env:COMPUTERNAME; version = $script:SchemaVersion }
+    # dryRun viaja a la interfaz: en modo diagnostico las gestiones del menu no aplican nada,
+    # y si no se dice, el asesor toca 'esperar la reconexion del USB' y parece que se colgo.
+    Push-UiEvent -Tipo 'caso' -Datos @{ caseId = $CaseId; host = $env:COMPUTERNAME
+                                        version = $script:SchemaVersion
+                                        dryRun = [bool]$DryRun; autoFix = [bool]$AutoFix }
     Set-UiFase 'revisando'
 
     $final = Invoke-FudoPrintDoctor
@@ -12301,9 +12314,32 @@ try {
                 continue
             }
             $script:MenuVacios = 0
+            $script:UltimaAccionNota = ''
+            $etiquetaUi = ''
+            foreach ($oUi in @(Get-MenuOptions)) { if ([string]$oUi.k -eq [string]$op) { $etiquetaUi = [string]$oUi.t } }
+            Push-UiEvent -Tipo 'gestion.inicio' -Datos @{ op = $op; titulo = $etiquetaUi
+                                                          dryRun = [bool]$DryRun }
             $volverACorrer = Invoke-MenuAction -Op $op
+            Push-UiEvent -Tipo 'gestion.fin' -Datos @{ op = $op; titulo = $etiquetaUi
+                                                       nota = [string]$script:UltimaAccionNota
+                                                       vuelveARevisar = [bool]$volverACorrer }
             if ($volverACorrer) {
-                Push-UiEvent -Tipo 'reinicio' -Datos @{}
+                # Varias gestiones terminan en 'volver a diagnosticar', porque reparar no es
+                # resolver: hay que volver a medir para saber si quedo bien. En consola eso se
+                # ve porque la pantalla sigue scrolleando; en la interfaz la pagina se vacia de
+                # golpe y parece que volvio al principio. Por eso viaja el motivo.
+                $notaUi = [string]$script:UltimaAccionNota
+                $motivoUi = switch ([string]$op) {
+                    'R' { 'Revisando todo de nuevo.' }
+                    'U' { 'Se espero la reconexion del USB. Revisando de nuevo para ver como quedo.' }
+                    'I' { 'Se instalo la impresora conectada. Revisando de nuevo para confirmar que quedo bien.' }
+                    'L' { 'Se limpio la cola. Revisando de nuevo para ver si ahora imprime.' }
+                    'P' { 'Se instalo la impresora de red. Revisando de nuevo para confirmar que quedo bien.' }
+                    'F' { 'Se instalo o reparo la App Nativa. Revisando de nuevo para confirmar que quedo bien.' }
+                    default { 'Revisando de nuevo.' }
+                }
+                if ($notaUi) { $motivoUi = $notaUi + '  ' + $motivoUi }
+                Push-UiEvent -Tipo 'reinicio' -Datos @{ motivo = $motivoUi }
                 Set-UiFase 'revisando'
                 Reset-RunState
                 $final = Invoke-FudoPrintDoctor

@@ -81,6 +81,21 @@ input[type=text]{font:inherit;font-family:"IBM Plex Mono",monospace;padding:9px 
 .ask h3{font-size:15.5px;margin-bottom:7px}
 .ask p{font-size:13px;color:var(--ink-2);max-width:62ch;margin-bottom:6px}
 .ask-btns{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}
+.soloasesor{display:inline-block;font-size:9.5px;font-weight:700;letter-spacing:.08em;
+  text-transform:uppercase;padding:2px 7px;border-radius:3px;background:var(--sunk);
+  color:var(--muted);margin-bottom:8px}
+.subtitulo{font-size:11.5px;color:var(--muted);margin-left:2px}
+.gest{border:1px solid var(--line);border-left:3px solid var(--fixed);border-radius:8px;
+  background:var(--surface-2);padding:12px 14px;margin-bottom:16px}
+.gest b{display:block;font-size:13.5px;font-weight:600;margin-bottom:3px}
+.gest p{font-size:12.5px;color:var(--ink-2);max-width:62ch;margin-top:3px}
+.gest .cuenta{font-family:"IBM Plex Mono",monospace;font-size:22px;font-weight:600;margin-top:6px;
+  display:block;letter-spacing:-.02em}
+.gest.espera{border-left-color:var(--warn)}
+.askerr{display:flex;gap:8px;align-items:flex-start;margin-top:12px;padding:9px 11px;border-radius:6px;
+  background:var(--fail-bg);color:var(--fail);font-size:12.5px;font-weight:500;max-width:62ch}
+.askerr::before{content:"!";flex:none;width:16px;height:16px;border-radius:50%;background:var(--fail);
+  color:var(--surface);font-size:11px;font-weight:700;display:grid;place-items:center;margin-top:1px}
 .ask ul{margin:6px 0 0;padding-left:20px;font-size:12.5px;color:var(--ink-2)}
 .ticket{background:var(--paper);color:var(--paper-ink);border-radius:3px;padding:12px 14px;margin:10px 0;
   font-family:"IBM Plex Mono",monospace;font-size:11.5px;line-height:1.55;white-space:pre;overflow-x:auto;
@@ -160,6 +175,13 @@ input[type=text]{font:inherit;font-family:"IBM Plex Mono",monospace;padding:9px 
 .who.asesor{background:var(--fixed-bg);color:var(--fixed)}
 .who.soporte,.who.producto{background:var(--fail-bg);color:var(--fail)}
 .art{font-size:11.5px;color:var(--muted);margin-top:3px}
+details.tecnico{margin-top:7px}
+details.tecnico summary{font-size:11.5px;color:var(--muted);cursor:pointer;list-style:none;
+  text-decoration:underline;text-underline-offset:3px;text-decoration-color:var(--line)}
+details.tecnico summary::-webkit-details-marker{display:none}
+details.tecnico summary:hover{color:var(--ink-2)}
+details.tecnico p{font-size:12px;color:var(--muted);margin-top:5px;padding-left:10px;
+  border-left:2px solid var(--line);max-width:66ch}
 .tdo-btn{margin-top:8px;font:inherit;font-size:12px;font-weight:500;padding:6px 12px;border-radius:6px;
   border:1px solid var(--ink-2);background:var(--surface);color:var(--ink);cursor:pointer}
 .tdo-btn:hover{background:var(--surface-2)}
@@ -229,44 +251,50 @@ pre.json{margin:0;padding:12px;font-family:"IBM Plex Mono",monospace;font-size:1
                   stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
           </svg>
         </span>
-        <b>Fudo Print Doctor</b><span class="ver mono" id="tbVer"></span>
+        <b>Fudo Print Doctor</b><span class="subtitulo">revisi&oacute;n de la impresora</span><span class="ver mono" id="tbVer"></span>
       </div>
       <div class="tb-meta">
-        <span>PC <b class="mono" id="tbPc">&mdash;</b></span>
+        <span>Equipo <b class="mono" id="tbPc">&mdash;</b></span>
         <span>Caso <b class="mono" id="tbCaso">&mdash;</b></span>
         <span>Revisando <b id="tbModo">&mdash;</b></span>
       </div>
     </div>
 
     <div class="aviso" id="avisoVer" hidden></div>
+    <div class="aviso" id="avisoDry" hidden>
+      <span>Modo revisi&oacute;n: estamos <b>mirando sin cambiar nada</b> en esta computadora.
+      Las acciones que reparan van a avisar que no aplicaron cambios.</span>
+    </div>
     <div class="aviso caido" id="avisoCaido" hidden>
-      <span id="avisoCaidoTxt">Se perdi&oacute; la conexi&oacute;n con el motor. Si cerraste la ventana negra, el diagn&oacute;stico se cort&oacute;.</span>
+      <span id="avisoCaidoTxt">Se cort&oacute; la conexi&oacute;n con la revisi&oacute;n.</span>
     </div>
 
     <div class="body">
       <div id="askSlot"></div>
+      <div id="gestionSlot"></div>
 
       <section id="faseArranque">
-        <div class="note">
-          <b>Esperando al motor.</b> En unos segundos va a preguntar lo que necesita para arrancar:
-          el kit del asesor, la conversaci&oacute;n de Intercom y qu&eacute; impresora hay que mirar.
+        <div class="note" id="esperandoMotor">
+          <b>Preparando la revisi&oacute;n.</b> En unos segundos vamos a necesitar un par de datos
+          para empezar a revisar la impresora de este local.
         </div>
       </section>
 
       <section id="faseCorrida" hidden>
+        <div class="note" id="motivoReinicio" hidden></div>
         <div class="bar"><i id="barFill"></i></div>
         <div class="run">
           <div>
-            <div class="panel-t">La cadena de impresi&oacute;n, de abajo hacia arriba</div>
+            <div class="panel-t">Qu&eacute; estamos revisando</div>
             <div class="ladder" id="ladder"></div>
           </div>
           <div>
-            <div class="panel-t">Qu&eacute; est&aacute; haciendo ahora</div>
+            <div class="panel-t">En qu&eacute; anda ahora</div>
             <div class="feed" id="feed"></div>
             <div class="touched">
-              <div class="panel-t">Lo que se toc&oacute; en esta PC</div>
+              <div class="panel-t">Qu&eacute; cambiamos en esta computadora</div>
               <ul id="touched"></ul>
-              <p class="empty" id="touchedEmpty">Todav&iacute;a no se modific&oacute; nada.</p>
+              <p class="empty" id="touchedEmpty">Todav&iacute;a no cambiamos nada.</p>
             </div>
           </div>
         </div>
@@ -282,6 +310,7 @@ pre.json{margin:0;padding:12px;font-family:"IBM Plex Mono",monospace;font-size:1
 var TOKEN = "__FPD_TOKEN__";
 var desde = 0, fase = "arranque", checks = [], tocado = [], pasos = {}, total = 11;
 var claveActual = "", claveRespondida = "", resultado = null, menuPreg = null, caido = false, cerrado = false;
+var dryRun = false;
 
 function $(id){ return document.getElementById(id); }
 function el(t,c,x){ var n=document.createElement(t); if(c)n.className=c; if(x!=null)n.textContent=x; return n; }
@@ -308,11 +337,11 @@ function poll(){
       if(cerrado || resultado){
         a.className = "aviso";
         $("avisoCaidoTxt").textContent =
-          "El motor terminó y cerró la herramienta. Lo que ves acá queda: ya podés cerrar esta pestaña.";
+          "La revisi\u00f3n termin\u00f3. Lo que ves ac\u00e1 queda: ya se puede cerrar esta pesta\u00f1a.";
       } else {
         a.className = "aviso caido";
         $("avisoCaidoTxt").textContent =
-          "Se perdió la conexión con el motor. Si cerraste la ventana negra, el diagnóstico se cortó.";
+          "Se cort\u00f3 la conexi\u00f3n con la revisi\u00f3n. Si se cerr\u00f3 la ventana de la herramienta, hay que volver a empezar.";
       }
       a.hidden = false;
       setTimeout(poll, 2000);
@@ -334,6 +363,8 @@ function aplicar(ev){
       $("tbCaso").textContent = esc(d.caseId) || "—";
       $("tbPc").textContent   = esc(d.host) || "—";
       $("tbVer").textContent  = d.version ? ("v"+d.version) : "";
+      dryRun = !!d.dryRun;
+      $("avisoDry").hidden = !dryRun;
       break;
     case "paso.inicio":
       total = d.total || total;
@@ -349,8 +380,10 @@ function aplicar(ev){
     case "log":     linea("  "+esc(d.nivel)+": "+esc(d.texto), d.nivel==="ERROR"?"f":"w"); break;
     case "check":   checks.push(d); break;
     case "toque":   agregarToque(d); break;
-    case "espera":  break;
-    case "reinicio": reiniciar(); break;
+    case "espera":  espera(d); break;
+    case "gestion.inicio": gestionInicio(d); break;
+    case "gestion.fin":    gestionFin(d); break;
+    case "reinicio": reiniciar(d.motivo); break;
     case "resultado": resultado = d; if(d.aviso) aviso(d.aviso); pintarResultado(); break;
     case "cerrado": cerrado = true; break;
     case "cortado": cortado(d); break;
@@ -399,7 +432,54 @@ function agregarToque(d){
   $("touchedEmpty").hidden = true;
 }
 
-function reiniciar(){
+function gestionSlot(){ return $("gestionSlot"); }
+
+function espera(d){
+  // La cuenta regresiva de la reconexion del USB. Sin esto el motor esperaba hasta dos minutos
+  // mostrando el contador en una consola que en modo web nadie esta mirando.
+  var g = gestionSlot();
+  var box = g.querySelector('[data-espera="1"]');
+  if(!box){
+    g.innerHTML = "";
+    box = el("div","gest espera");
+    box.setAttribute("data-espera","1");
+    box.appendChild(el("b",null,esc(d.titulo)||"Esperando"));
+    if(d.texto) box.appendChild(el("p",null,esc(d.texto)));
+    box.appendChild(el("span","cuenta",""));
+    g.appendChild(box);
+  }
+  var seg = Math.max(0, parseInt(d.restante,10)||0);
+  box.querySelector(".cuenta").textContent =
+    String(Math.floor(seg/60)) + ":" + ("0"+(seg%60)).slice(-2);
+}
+
+function gestionInicio(d){
+  var g = gestionSlot(); g.innerHTML = "";
+  var box = el("div","gest");
+  box.appendChild(el("b",null,"Haciendo: "+esc(d.titulo)));
+  if(d.dryRun){
+    box.appendChild(el("p",null,
+      "Estamos en modo revisi\u00f3n, as\u00ed que esto no va a cambiar nada."));
+  }
+  g.appendChild(box);
+}
+
+function gestionFin(d){
+  var g = gestionSlot(); g.innerHTML = "";
+  var box = el("div","gest");
+  box.appendChild(el("b",null,esc(d.titulo)));
+  box.appendChild(el("p",null, esc(d.nota) ||
+    (d.vuelveARevisar ? "Termin\u00f3. Revisando de nuevo para ver c\u00f3mo qued\u00f3."
+                      : "Termin\u00f3 sin novedades.")));
+  g.appendChild(box);
+}
+
+function reiniciar(motivo){
+  // Varias gestiones terminan en "volver a diagnosticar": reparar no es resolver, hay que
+  // volver a medir. Sin decirlo, la pagina se vacia de golpe y parece que volvio al principio.
+  var mr=$("motivoReinicio");
+  if(motivo){ mr.textContent=motivo; mr.hidden=false; } else { mr.hidden=true; }
+  gestionSlot().innerHTML="";
   checks=[]; tocado=[]; pasos={}; resultado=null; menuPreg=null;
   $("ladder").innerHTML=""; $("feed").innerHTML=""; $("touched").innerHTML="";
   $("touchedEmpty").hidden=false; $("barFill").style.width="0";
@@ -414,6 +494,9 @@ function responder(v){
 }
 
 function pregunta(p){
+  // El cartel de 'esperando al motor' es un placeholder: cuando ya hay una pregunta en
+  // pantalla, repetir que el motor va a preguntar algo sobra y confunde.
+  var em = $("esperandoMotor"); if(em) em.hidden = !!p;
   if(!p){ claveActual=""; if(!menuPreg) $("askSlot").innerHTML=""; return; }
   var clave = JSON.stringify(p);
   if(clave===claveRespondida) return;
@@ -424,7 +507,11 @@ function pregunta(p){
   if(p.clase==="menu"){ menuPreg=p; pintarResultado(); return; }
 
   var slot=$("askSlot"); slot.innerHTML="";
+  gestionSlot().innerHTML="";
   var box=el("div","ask"+(p.clase==="peligro"?" peligro":""));
+  // Tramite interno del asesor: se marca para que el cliente que esta mirando entienda que
+  // no le estan pidiendo nada a el.
+  if(p.soloAsesor) box.appendChild(el("div","soloasesor","Paso del asesor"));
   box.appendChild(el("div","ask-k", p.clase==="papel"
       ? "La pregunta que el motor no puede contestar solo" : "Hace falta que decidas"));
   box.appendChild(el("h3",null,esc(p.titulo)));
@@ -447,6 +534,8 @@ function pregunta(p){
     box.appendChild(u);
   }
   if(p.texto2) box.appendChild(el("p",null,esc(p.texto2)));
+  // El error va como error: rojo, con marca, y pegado al control que hay que corregir.
+  if(p.error) box.appendChild(el("div","askerr",esc(p.error)));
 
   if(p.clase==="texto"){
     var fila=el("div","inline"); fila.style.marginTop="12px";
@@ -491,6 +580,9 @@ function pregunta(p){
 }
 
 function cortado(d){
+  // El motor decidio terminar. No es una caida: cuando deje de contestar, el aviso tiene que
+  // ser el tranquilo y no el rojo de 'se perdio la conexion'.
+  cerrado = true;
   fase="fin"; pintarFase();
   var root=$("faseResultado"); root.innerHTML="";
   var v=el("div","verdict no");
@@ -501,6 +593,9 @@ function cortado(d){
 }
 
 /* ---------------- resultado ---------------- */
+var QUIEN = { cliente:"en el local", asesor:"lo hace soporte",
+              soporte:"equipo Fudo", producto:"equipo Fudo" };
+
 function sec(t){ var s=el("section","sec"); s.appendChild(el("div","sec-t",t)); return s; }
 
 function pintarResultado(){
@@ -512,12 +607,12 @@ function pintarResultado(){
 
   var ok = !!dg.resolved;
   var v=el("div","verdict "+(ok?"ok":"no"));
-  v.appendChild(el("div","verdict-k", ok?"Resuelto en esta PC":"No resuelto — hace falta una mano"));
+  v.appendChild(el("div","verdict-k", ok ? "Listo: la impresora qued\u00f3 funcionando" : "Todav\u00eda no imprime: falta resolver esto"));
   v.appendChild(el("h2",null,esc(dg.rootCause)||"Sin causa determinada"));
   var meta=el("div","meta");
   if(dg.confidence) meta.appendChild(el("span",null,"Confianza: "+esc(dg.confidence)));
-  meta.appendChild(el("span",null,"Se tocaron "+tocado.length+" cosas en esta PC"));
-  if(d.modo) meta.appendChild(el("span",null,"Se revisó: "+(d.modo==="Ambos"?"USB y red":"sólo "+String(d.modo).toLowerCase())));
+  meta.appendChild(el("span",null, tocado.length===1 ? "Cambiamos 1 cosa en esta computadora" : ("Cambiamos "+tocado.length+" cosas en esta computadora")));
+  if(d.modo) meta.appendChild(el("span",null,"Revisamos: "+(d.modo==="Ambos"?"USB y red":"s\u00f3lo "+String(d.modo).toLowerCase())));
   v.appendChild(meta);
   root.appendChild(v);
 
@@ -555,26 +650,71 @@ function pintarResultado(){
   }
 
   // que hacer ahora
-  var acc=(d.acciones||[]).filter(function(a){ return a; });
+  // accionesTop viene colapsada por el motor con la misma regla del resumen de consola.
+  var acc=(d.accionesTop && d.accionesTop.length ? d.accionesTop : (d.acciones||[]))
+            .filter(function(a){ return a; });
   if(acc.length){
     var s1=sec("Qué hacer ahora");
     var ul=el("ul","todo");
-    acc.forEach(function(a){
+    // Las primeras tres a la vista y el resto plegado: el mismo corte que hace el resumen de
+    // consola. Diez renglones de golpe no se leen, se saltean.
+    var VISIBLES=3;
+    var ulMas=null;
+    acc.forEach(function(a,idx){
       var li=el("li"), c=el("div");
-      var b=el("b"); b.textContent=esc(a.what);
-      if(a.owner) b.appendChild(el("span","who "+esc(a.owner), esc(a.owner)));
+      // 'local' es el mismo hallazgo contado para la persona del local. Si no esta, se
+      // muestra el texto del motor, que esta escrito para el asesor.
+      var loc = a.local;
+      var b=el("b"); b.textContent = (loc && loc.titulo) ? loc.titulo : (esc(a.what) || esc(a.text));
+      // 'cliente' y 'asesor' son etiquetas internas del motor. En pantalla se dice quien lo hace.
+      if(a.owner) b.appendChild(el("span","who "+esc(a.owner), QUIEN[a.owner] || esc(a.owner)));
       c.appendChild(b);
-      if(a["do"]) c.appendChild(el("p",null,esc(a["do"])));
-      if(a.articleRef) c.appendChild(el("div","art","Artículo "+esc(a.articleRef)));
-      li.appendChild(c); ul.appendChild(li);
+      var tecnico = a["do"] || a.text;
+      var detalle = (loc && loc.texto) ? loc.texto : tecnico;
+      if(detalle) c.appendChild(el("p",null,esc(detalle)));
+      // El texto del motor no se pierde: queda a un clic, para el asesor.
+      if(loc && tecnico){
+        var dtec = el("details","tecnico");
+        dtec.appendChild(el("summary",null,"Ver el detalle técnico"));
+        dtec.appendChild(el("p",null,esc(tecnico)));
+        c.appendChild(dtec);
+      }
+      var arti = a.articleRef || a.ref;
+      if(arti) c.appendChild(el("div","art","Artículo "+esc(arti)));
+      // Si el motor puede ejecutar esta recomendacion y la gestion esta disponible ahora, el
+      // boton va aca y no en una botonera aparte: es la misma cosa dicha una sola vez.
+      var gest = (d.gestiones || {})[a.checkId];
+      if(gest && menuPreg){
+        var hay = (menuPreg.opciones||[]).some(function(o){ return o.v === gest; });
+        if(hay){
+          var bt = el("button","tdo-btn", dryRun ? "Hacerlo (no va a cambiar nada)" : "Hacerlo ahora");
+          bt.addEventListener("click", function(){ responder(gest); });
+          c.appendChild(bt);
+        }
+      }
+      li.appendChild(c);
+      if(idx < VISIBLES){ ul.appendChild(li); }
+      else {
+        if(!ulMas){ ulMas = el("ul","todo"); ulMas.style.marginTop="11px"; }
+        ulMas.appendChild(li);
+      }
     });
-    s1.appendChild(ul); root.appendChild(s1);
+    s1.appendChild(ul);
+    if(ulMas){
+      var dmas = el("details","drawer");
+      dmas.appendChild(el("summary",null,"Ver las otras "+(acc.length-VISIBLES)+" cosas para revisar"));
+      var cont = el("div"); cont.style.padding="4px 14px 14px";
+      cont.appendChild(ulMas);
+      dmas.appendChild(cont);
+      s1.appendChild(dmas);
+    }
+    root.appendChild(s1);
   }
 
   // impresoras
   var colas=d.colas||[];
   if(colas.length){
-    var s2=sec("Impresoras en esta PC");
+    var s2=sec("Impresoras de este local");
     var box=el("div","prn");
     colas.forEach(function(c){
       var r=el("div","prow"+((c.score>0)?" target":""));
@@ -594,7 +734,7 @@ function pintarResultado(){
     var conn=d.conectadas||[];
     if(conn.length){
       var p=el("p","hint"); p.style.marginTop="10px";
-      p.textContent="Hardware conectado: "+conn.map(function(h){
+      p.textContent="Conectadas ahora: "+conn.map(function(h){
         return (h.puerto||"sin puerto")+" → "+(h.nombre||"")+(h.colaWindows?" (cola "+h.colaWindows+")":"");
       }).join("  ·  ");
       s2.appendChild(p);
@@ -602,15 +742,15 @@ function pintarResultado(){
     var off=d.desconectadas||[];
     if(off.length){
       var p2=el("p","hint"); p2.style.marginTop="6px";
-      p2.textContent="Desconectadas: "+off.map(function(h){ return h.nombre||""; }).join(", ")+
-        " — encender la impresora y conectar el USB, preferentemente en el mismo puerto.";
+      p2.textContent="Sin conexi\u00f3n: "+off.map(function(h){ return h.nombre||""; }).join(", ")+
+        " \u2014 hay que encenderlas y enchufar el cable USB, mejor en el mismo lugar de siempre.";
       s2.appendChild(p2);
     }
     root.appendChild(s2);
   }
 
   // lo que se toco
-  var s3=sec("Lo que se tocó en esta PC");
+  var s3=sec("Qu\u00e9 cambiamos en esta computadora");
   if(tocado.length){
     var u3=el("ul");
     u3.style.cssText="list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:6px";
@@ -623,16 +763,20 @@ function pintarResultado(){
       u3.appendChild(li);
     });
     s3.appendChild(u3);
-  } else s3.appendChild(el("p","empty","No se modificó nada en esta PC."));
+  } else s3.appendChild(el("p","empty","No cambiamos nada en esta computadora."));
   root.appendChild(s3);
 
   // detalle
-  var s4=sec("Detalle");
+  var s4=sec("Detalle t\u00e9cnico");
+  var avisoTec=el("p","hint");
+  avisoTec.style.cssText="margin:-4px 0 11px";
+  avisoTec.textContent="Esto es para soporte: el detalle completo de lo que se revis\u00f3.";
+  s4.appendChild(avisoTec);
   var dr=el("details","drawer");
-  dr.appendChild(el("summary",null,"Los "+checks.length+" chequeos, uno por uno"));
+  dr.appendChild(el("summary",null,"Los "+checks.length+" controles, uno por uno"));
   var tw=el("div","tblwrap"), tb=el("table","chk");
   var th=el("thead"), trh=el("tr");
-  ["Chequeo","Id","Resultado"].forEach(function(h){ trh.appendChild(el("th",null,h)); });
+  ["Control","Id","Resultado"].forEach(function(h){ trh.appendChild(el("th",null,h)); });
   th.appendChild(trh); tb.appendChild(th);
   var tbody=el("tbody");
   checks.forEach(function(c){
@@ -645,7 +789,7 @@ function pintarResultado(){
   tb.appendChild(tbody); tw.appendChild(tb); dr.appendChild(tw); s4.appendChild(dr);
 
   var dj=el("details","drawer");
-  dj.appendChild(el("summary",null,"El JSON que le queda al agente"));
+  dj.appendChild(el("summary",null,"Datos t\u00e9cnicos de la revisi\u00f3n (JSON)"));
   var pre=el("pre","json mono","cargando…");
   dj.appendChild(pre);
   dj.addEventListener("toggle", function(){
@@ -661,7 +805,7 @@ function pintarResultado(){
   // resumen de siempre, por si alguien lo quiere pegar en el caso
   if(d.resumen){
     var dt=el("details","drawer");
-    dt.appendChild(el("summary",null,"El resumen en texto (para pegar en Intercom)"));
+    dt.appendChild(el("summary",null,"Resumen en texto, para adjuntar al caso"));
     dt.appendChild(el("pre","json mono", d.resumen));
     root.appendChild(dt);
   }
@@ -686,7 +830,7 @@ function barraAcciones(p){
 
   var a=el("div","endbar");
   if(disp.R){
-    var main=el("button","btn primary","Volver a revisar todo");
+    var main=el("button","btn primary","Revisar todo de nuevo");
     main.addEventListener("click", function(){ responder("R"); });
     a.appendChild(main);
   }
@@ -701,8 +845,8 @@ function barraAcciones(p){
   if(cat.length){
     var adv=el("details","adv");
     var sm=el("summary");
-    sm.appendChild(document.createTextNode("Opciones avanzadas"));
-    sm.appendChild(el("span",null,"gestiones puntuales sin volver a revisar todo"));
+    sm.appendChild(document.createTextNode("Herramientas de soporte"));
+    sm.appendChild(el("span",null,"acciones puntuales, sin volver a revisar todo"));
     adv.appendChild(sm);
     var list=el("div","advlist");
     cat.forEach(function(o){

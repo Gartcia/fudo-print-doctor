@@ -74,6 +74,78 @@ decisiones del diagnóstico. **La interfaz es presentación: no decide nada.** S
 puede abrir —sin permisos, un antivirus en el medio— el motor **avisa y sigue por consola**: la
 interfaz nunca puede ser condición para diagnosticar.
 
+### La pantalla la mira el cliente
+
+El asesor la usa por escritorio remoto, con el dueño del local al lado mirando la misma
+pantalla. Eso cambia para quién está escrito todo:
+
+- **La copia pasó a castellano llano y en primera persona del plural.** *¿Qué impresora hay
+  que revisar?* → **¿Cómo está conectada la impresora que no anda?**, con opciones *Con un
+  cable a esta computadora* / *Por la red* / *No sé, las dos*. *Lo que se tocó en esta PC* →
+  **Qué cambiamos en esta computadora**. Los dueños de cada acción dejaron de ser etiquetas
+  internas: `CLIENTE` → **en el local**, `ASESOR` → **lo hace soporte**.
+
+- **Dos textos por recomendación, uno por público.** El texto que ya tenía el motor está
+  escrito para el asesor y viaja al JSON, a la consola y a la telemetría: es el contrato con
+  el agente y **no se tocó**. Al lado hay ahora una versión para el local, y el técnico queda
+  a un clic. Por ejemplo, para `nativa.sinFirmar`:
+
+  > **Para el local:** *La aplicación de Fudo está desactualizada. Las versiones viejas no
+  > están firmadas y algunos antivirus las borran solas.*
+  > **Técnico:** *Esta PC tiene la Nativa v0.0.36. Desde la v0.0.37 la App Nativa está
+  > firmada digitalmente…*
+
+  Vive en **una tabla única** (`$script:TextosLocal`) indexada por el id del chequeo, y no
+  como un segundo parámetro en cada `Add-Check`: las recomendaciones están escritas en unos
+  80 lugares del motor, y duplicar el texto ahí garantizaba que las dos versiones se
+  desincronizaran. Lo que no está en la tabla cae al texto técnico: **mejor que el cliente
+  lea algo técnico a que lea una traducción inventada que dice otra cosa.**
+
+- **Escenario 106 del self-test:** cada clave de la tabla tiene que ser un chequeo que el
+  motor realmente emite. Es una tabla paralela al código; si alguien renombra un check, el
+  texto para el local desaparece **sin que nadie se entere**, porque la interfaz cae al
+  técnico en silencio. Misma familia que los escenarios 76 y 105.
+
+- **Los pasos internos quedan marcados.** El instalador de la Nativa y el número de caso
+  llevan una marca *Paso del asesor*, para que el cliente no crea que le están pidiendo algo
+  a él. Y se sacó lo que no va delante de un cliente: la anécdota del caso real en la
+  pregunta del modo, y hablar de *“el motor”* en tercera persona.
+
+- **La lista de recomendaciones dejó de ser un choclo.** Mostraba diez renglones, cinco de
+  ellos la misma recomendación de configuración de Fudo partida en pedazos. Ahora usa
+  `Get-ShortActions` — **la misma función del resumen de consola**, para que no puedan
+  divergir — que colapsa esos cinco en una línea. De 10 a 6, con 3 a la vista y el resto
+  plegado.
+
+### Corregido durante las primeras corridas de la interfaz
+
+Seis bugs que aparecieron probando la interfaz a mano. **Ninguno lo vio el self-test**: son
+todos de la capa de presentación, que el self-test no toca.
+
+- **Las acciones del resultado nunca se mostraban.** `nextActions` vive dentro de `diagnosis`,
+  no en la raíz. Leerlo de la raíz daba `$null`, y `@($null)` **no es una lista vacía: es
+  una lista de un elemento nulo**. La interfaz recibía `[null]`, lo filtraba y no dibujaba la
+  sección *Qué hacer ahora* — la parte más útil del diagnóstico — sin que nada avisara.
+- **Los acentos salían como `&#243;`.** El primer embebido convertía cada carácter no ASCII a
+  entidad HTML: funciona en el marcado, pero **no dentro de una cadena de JavaScript**. Ahora
+  la página va en base64 y el build **verifica el ida y vuelta byte por byte**.
+- **Una pregunta repetida no se volvía a dibujar.** La página decidía si una pregunta era
+  nueva comparando su contenido, y el tercer intento del número de caso es idéntico al
+  segundo: quedaba tomado por ya contestado y la tarjeta desaparecía con el motor esperando.
+  Cada pregunta lleva ahora su número de secuencia. **El mismo bug rompía reimprimir el
+  ticket dos veces seguidas**, que es justo la única fuente de verdad del motor.
+- **El error del número de caso era invisible.** Viajaba mezclado con el texto descriptivo y
+  se dibujaba como un párrafo gris igual al de arriba; desde afuera parecía que la página se
+  recargaba sola sin decir nada. Ahora va en campo propio, en rojo y con el contador de
+  intentos, porque a los cinco la corrida se corta.
+- **Las gestiones del menú no informaban nada.** `Invoke-MenuAction` cuenta lo que hizo con
+  `Write-Host`, que en modo web no lo ve nadie: el asesor tocaba *esperar la reconexión del
+  USB*, el motor esperaba dos minutos y en pantalla no pasaba nada. Ahora se ve qué se está
+  ejecutando, la cuenta regresiva y con qué terminó. Y en `-DryRun` un cartel permanente
+  avisa que no se va a cambiar nada.
+- **Cortar por cinco intentos fallidos se mostraba como una caída.** Es una decisión del
+  motor, no un error: ahora se distingue del cartel rojo de conexión perdida.
+
 ### Lo que falta probar
 
 La interfaz se probó punta a punta contra el motor real, pero **contra una PC sin impresora
