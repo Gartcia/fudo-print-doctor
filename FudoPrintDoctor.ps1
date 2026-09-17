@@ -8101,6 +8101,32 @@ function Invoke-SelfTest {
     $kit112d = Test-NativaKitReady
     Assert-Eq 'S112 un .msi viejo y sin firma sigue sin alcanzar' $false ([bool]$kit112d.listo)
 
+    # Escenario 113 (v3.22): leer la version de la Nativa de un instalador .exe.
+    # Los metadatos del archivo son los del runtime de Node que lleva adentro (20.18.1), asi
+    # que hay que sacarla del package.json que el empaquetado deja adentro. Y hay que sacarla
+    # del de la APP: en el mismo binario hay casi 200 package.json, uno por dependencia.
+    $appJson113 = '{' + [char]10 + '  "name": "native-extension",' + [char]10 +
+                  '  "version": "0.0.38",' + [char]10 +
+                  '  "description": "Fudo native extension",' + [char]10 + '  "bin": {}'
+    Assert-Eq 'S113 saca la version del package.json de la app' '0.0.38' (Get-VersionDesdeTextoPaquete -Texto $appJson113)
+
+    # Una dependencia NO tiene que matchear, aunque declare version.
+    $depJson113 = '{' + [char]10 + '  "name": "jsonwebtoken",' + [char]10 + '  "version": "9.0.3",' + [char]10 + '  "main": "index.js"'
+    Assert-Eq 'S113 una dependencia no matchea' '' (Get-VersionDesdeTextoPaquete -Texto $depJson113)
+
+    # Con las dos juntas -que es lo que pasa de verdad- tiene que ganar la de la app aunque
+    # las dependencias vengan primero.
+    $mezcla113 = $depJson113 + ('.' * 500) + $appJson113
+    Assert-Eq 'S113 con dependencias delante igual encuentra la de la app' '0.0.38' (Get-VersionDesdeTextoPaquete -Texto $mezcla113)
+
+    Assert-Eq 'S113 texto vacio no inventa version' '' (Get-VersionDesdeTextoPaquete -Texto '')
+    Assert-Eq 'S113 texto sin package.json tampoco' '' (Get-VersionDesdeTextoPaquete -Texto 'cualquier cosa binaria')
+
+    # Y lo que NO hay que hacer nunca: tomar el numero de version del propio archivo .exe.
+    # Es el de Node y el motor creeria para siempre que hay una actualizacion pendiente.
+    $trampa113 = '"name": "native-extension",' + [char]10 + '  "version": "0.0.38",'
+    Assert-Eq 'S113 la version de la app no es la de Node' $true ((Get-VersionDesdeTextoPaquete -Texto $trampa113) -ne '20.18.1')
+
     function Get-CheckById { param([string]$Id) return (@($script:Checks | Where-Object { $_.id -eq $Id }) | Select-Object -First 1) }
 
     function Reset-State {
@@ -11431,6 +11457,10 @@ function Get-LocalNativeInstallers {
                     $esMsi = [bool]($ruta -match '(?i)\.msi$')
                     $ver = ''
                     if ($esMsi) { $ver = [string](Get-MsiProductVersion -Path $ruta) }
+                    # Desde el 17/09/2026 la Nativa se distribuye como .exe. La version no
+                    # esta en los metadatos del archivo -son los de Node- sino en el
+                    # package.json que el empaquetado deja adentro.
+                    else        { $ver = [string](Get-VersionInstaladorExe -Path $ruta) }
                     $out += [ordered]@{ ruta = $ruta; version = $ver; esMsi = $esMsi; fecha = $f.LastWriteTime }
                 }
             } catch {}
@@ -11455,6 +11485,80 @@ function Find-LocalNativeInstaller {
     $c = @(Get-LocalNativeInstallers) | Select-Object -First 1
     if ($c) { return [string]$c.ruta }
     return ''
+}
+
+function Get-VersionDesdeTextoPaquete {
+    <#
+      La version de la Nativa dentro de un pedazo de texto del instalador empaquetado.
+      Se busca el package.json de la APP, por su nombre propio ('native-extension'), y no el
+      primer '"version"' que aparezca: adentro del .exe hay casi 200, uno por cada dependencia
+      (jsonwebtoken 9.0.3, printer 0.4.0, serialport 13.0.0...). Agarrar el primero seria
+      cuestion de suerte.
+      Aparte de Get-VersionInstaladorExe para poder probarlo sin leer 60 MB de disco: el
+      self-test no toca la PC.
+    #>
+    param([string]$Texto)
+    if (-not $Texto) { return '' }
+    try {
+        $m = [regex]::Match($Texto, '"name"\s*:\s*"native-extension"[\s\S]{0,300}?"version"\s*:\s*"([0-9][^"]{0,24})"')
+        if ($m.Success) { return [string]$m.Groups[1].Value }
+    } catch {}
+    return ''
+}
+
+function Get-VersionInstaladorExe {
+    <#
+      La version de la Nativa que trae un instalador .exe.
+
+      POR QUE NO ALCANZA CON LOS METADATOS DEL ARCHIVO: el .exe es un ejecutable de Node
+      empaquetado, y sus campos de version son los del runtime que lleva adentro
+      (ProductName 'Node.js', ProductVersion 20.18.1, OriginalFilename node.exe). Leer eso
+      seria PEOR que no leer nada: el motor compararia 20.18.1 contra 0.0.38 y creeria para
+      siempre que hay una actualizacion pendiente.
+
+      DE DONDE SALE ENTONCES: el empaquetado deja adentro el package.json de la app, y ese si
+      declara la version de la Nativa. Se lo busca por su nombre propio ("native-extension")
+      y no por el primer "version" que aparezca: adentro hay casi 200, uno por cada
+      dependencia (jsonwebtoken 9.0.3, printer 0.4.0, serialport 13.0.0...).
+
+      Se lee por bloques y no de una: son 60 MB y esto corre en la PC de un local, no en una
+      maquina de desarrollo. Los bloques se superponen para no cortar el patron al medio.
+
+      Devuelve la version, o '' si no se pudo determinar. Nunca tira.
+    #>
+    param([string]$Path)
+    if (-not $Path) { return '' }
+    try { if (-not (Test-Path -LiteralPath $Path)) { return '' } } catch { return '' }
+
+    # Cache por ruta+tamano: Get-LocalNativeInstallers se llama varias veces por corrida y
+    # cada lectura son decenas de MB.
+    $clave = ''
+    try { $clave = [string]$Path + '|' + [string](Get-Item -LiteralPath $Path).Length } catch { return '' }
+    if ($null -eq $script:CacheVersionExe) { $script:CacheVersionExe = @{} }
+    if ($script:CacheVersionExe.ContainsKey($clave)) { return [string]$script:CacheVersionExe[$clave] }
+
+    $ver = ''
+    $fs = $null
+    try {
+        $fs = [System.IO.File]::OpenRead($Path)
+        $tam = 4MB
+        $solapa = 4096
+        $buf = New-Object byte[] $tam
+        $cola = ''
+        while ($true) {
+            $leidos = $fs.Read($buf, 0, $tam)
+            if ($leidos -le 0) { break }
+            $trozo = [System.Text.Encoding]::ASCII.GetString($buf, 0, $leidos)
+            $hallada = Get-VersionDesdeTextoPaquete -Texto ($cola + $trozo)
+            if ($hallada) { $ver = $hallada; break }
+            if ($trozo.Length -gt $solapa) { $cola = $trozo.Substring($trozo.Length - $solapa) }
+            else { $cola = $trozo }
+        }
+    } catch { $ver = '' }
+    finally { try { if ($fs) { $fs.Close(); $fs.Dispose() } } catch {} }
+
+    $script:CacheVersionExe[$clave] = $ver
+    return $ver
 }
 
 function Test-InstaladorFirmadoPorFudo {

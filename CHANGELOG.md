@@ -214,11 +214,30 @@ Lo que sí rompía, y arranca el mismo día:
   **Escenario 112.** Verificado además contra los archivos reales de una PC: el `.exe` nuevo y
   los `.msi` de la 0.0.37 pasan; el `.msi` de la 0.0.27, que no está firmado, queda afuera.
 
-- **El motor no puede actualizar con un `.exe`.** `Test-NativaNecesitaUpdate` pide una versión
+- **El motor ya puede actualizar con un `.exe`.** `Test-NativaNecesitaUpdate` pide una versión
   legible del instalador para no degradar la Nativa — una restauración de cuarentena ya dejó
-  una PC de 0.0.36 a 0.0.18 — y con el `.exe` esa versión no existe. **Se deja como está a
-  propósito**: instalar a ciegas es peor que no instalar. Falta saber de dev cuál es el
-  argumento de instalación silenciosa del `.exe` antes de tocar esto.
+  una PC de 0.0.36 a 0.0.18 — y con el `.exe` esa versión parecía imposible de obtener.
+
+  Sí se puede, pero **no de los metadatos del archivo**: el empaquetado deja adentro el
+  `package.json` de la app, y ese declara la versión de verdad. Se lo busca por su nombre
+  propio (`"name": "native-extension"`, `"description": "Fudo native extension"`) y **no por
+  el primer `"version"` que aparezca**: adentro hay casi 200, uno por cada dependencia
+  (`jsonwebtoken` 9.0.3, `printer` 0.4.0, `serialport` 13.0.0…). Agarrar el primero sería
+  cuestión de suerte.
+
+  Se lee **por bloques de 4 MB con solape**, no de una: son 60 MB y esto corre en la PC de un
+  local. Medido sobre el archivo real: **398 ms**, y con caché por ruta+tamaño porque la lista
+  de instaladores se arma varias veces por corrida.
+
+  **Escenario 113**, sobre la parte que reconoce el patrón — separada a propósito de la que
+  lee el disco, para que el self-test no necesite un archivo de 60 MB ni toque la PC. Incluye
+  el caso que importa: con las dependencias **delante** de la app, igual encuentra la de la app.
+
+> **Falta saber cómo se instala en silencio.** El `.exe` acepta `--uninstall` (es lo que usa
+> su propia entrada de desinstalación), pero no se pudo confirmar cuál es el argumento de
+> instalación desatendida: los `--silent` y `--quiet` que aparecen en el binario pueden ser de
+> npm, que viaja adentro. El motor lo ejecuta sin argumentos, así que **puede abrir una
+> ventana**; el asesor está presente y puede seguirla, pero conviene preguntarle a dev.
 
 > **Y el hueco de la firma quedó cerrado.** En la 0.0.37 empaquetada como `.msi`, el instalador
 > estaba firmado y el `fudo_native_extension.exe` que dejaba **no**. En la 0.0.38 el ejecutable
