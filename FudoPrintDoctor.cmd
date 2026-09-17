@@ -4,8 +4,8 @@ REM  FUDO PRINT DOCTOR - launcher
 REM  Doble clic. Diagnostica y repara el flujo de impresion.
 REM  Se eleva a administrador solo. Deja resultado.json al lado.
 REM ================================================================
-REM  Este archivo hace cinco cosas antes y despues del motor, y las
-REM  cinco salieron de casos reales:
+REM  Este archivo hace seis cosas antes y despues del motor, y todas
+REM  salieron de casos reales:
 REM   1. Verifica que la PC pueda correr el motor (PowerShell 5+ y
 REM      Get-Printer). Una PC con PowerShell 2.0 hacia que el .ps1 no
 REM      parseara, no corriera NADA, y el launcher dijera RESUELTO.
@@ -19,8 +19,14 @@ REM   4. No dice RESUELTO por el codigo de salida: verifica que el
 REM      resultado.json se haya escrito en esta corrida. Un .ps1 que no
 REM      parsea hace que powershell -File salga con codigo 0.
 REM   5. Deja la PC del cliente limpia al terminar.
+REM   6. Abre el diagnostico en el navegador (-Ui web). Esta ventana
+REM      sigue siendo la que manda y sigue mostrando todo: si el
+REM      navegador no abre, o el puerto local esta bloqueado, el motor
+REM      avisa y sigue por consola. La interfaz no puede ser condicion
+REM      para diagnosticar en la PC de un cliente que ya tiene un
+REM      problema.
 REM ================================================================
-REM  LAUNCHER-VERSION: 2   <- subir esto cuando cambie este archivo. El
+REM  LAUNCHER-VERSION: 3   <- subir esto cuando cambie este archivo. El
 REM  updater no lo pisa (lleva la URL de telemetria), asi que hoy la copia
 REM  interna se distribuye a mano. El marcador queda para que el updater
 REM  pueda comparar y refrescarlo preservando la URL.
@@ -113,8 +119,16 @@ echo     - App Nativa de Fudo en cuarentena del antivirus
 echo     - puerto USB cambiado
 echo     - driver e instalacion de la impresora, si falta
 echo.
-echo   Primero te pregunta si la impresora es USB, de red, o las dos.
-echo   Si no sabes, elegi las dos.
+echo   Se abre solo en el navegador de esta PC. Ahi vas a ver lo que
+echo   va encontrando y ahi te va a preguntar lo que necesite.
+echo   NO cierres esta ventana: el diagnostico corre aca.
+echo   Si el navegador no abre, la direccion queda escrita aca abajo.
+echo.
+echo   La pantalla esta hecha para que la pueda mirar el cliente
+echo   mientras vos la usas.
+echo.
+echo   Primero te pregunta como esta conectada la impresora: por cable
+echo   a esta PC, por red, o las dos. Si no sabes, elegi las dos.
 echo.
 echo   Despues te pide el ID de la conversacion de Intercom: son los
 echo   15 numeros, y podes pegar la URL entera.
@@ -134,7 +148,12 @@ REM  El resultado anterior se borra ANTES de correr: es la unica forma
 REM  de saber despues si el motor llego a escribir el de esta corrida.
 del /q "%FPD_JSON%" >nul 2>&1
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%FPD_MOTOR%" -JsonOut "%FPD_JSON%"
+REM  -Ui web: el motor abre una pagina en el navegador de esta PC y muestra ahi
+REM  el diagnostico. Esta ventana sigue siendo la que manda -el diagnostico corre
+REM  aca- y sigue mostrando todo, asi que si el navegador no abre no se pierde
+REM  nada. Si el puerto local no se puede abrir, el motor avisa y sigue solo por
+REM  esta ventana: la interfaz nunca es condicion para diagnosticar.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%FPD_MOTOR%" -Ui web -JsonOut "%FPD_JSON%"
 set FPD_EXIT=%errorlevel%
 
 echo.
