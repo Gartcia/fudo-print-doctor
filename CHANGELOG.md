@@ -146,6 +146,43 @@ todos de la capa de presentación, que el self-test no toca.
 - **Cortar por cinco intentos fallidos se mostraba como una caída.** Es una decisión del
   motor, no un error: ahora se distingue del cartel rojo de conexión perdida.
 
+### Qué nombre le pone el antivirus a la Nativa
+
+Lo pidió producto, y el planteo es correcto: hoy se cambian cosas de la App Nativa
+**esperando** que el antivirus deje de marcarla, sin saber qué la marca. El nombre de la
+detección define el trabajo, y son trabajos distintos:
+
+- **`Trojan:Win32/Wacatac.B!ml`** — lo marcó un modelo estadístico, no una firma. Se ataca con
+  **reputación**: firmar el binario, editor conocido, volumen de instalaciones.
+- **`Behavior:Win32/Persistence`** — el antivirus objeta lo que el programa **hace**. Se ataca
+  cambiando el código.
+
+El motor ya leía el historial de Defender, pero guardaba el `ThreatID` — un número que no le
+sirve a nadie para decidir. El nombre vive en otro cmdlet (`Get-MpThreat`), que se cruza por ese
+mismo id. Ahora:
+
+- **Cada detección sobre un archivo de Fudo viaja con su nombre**, su severidad y su
+  clasificación automática (`ml` / `comportamiento` / `estatico`), en el JSON y en la
+  telemetría.
+- **Sin rutas del cliente**: viaja el nombre del archivo pelado (`fudo_native_extension.exe`),
+  que es un binario nuestro. Hay un assert que lo verifica.
+- **También viaja con qué antivirus convive cada PC**, para poder medir qué porcentaje de los
+  casos queda fuera: el motor sólo puede leer el historial de Defender.
+
+El dato llega **de todas las corridas y retroactivo** — `Get-MpThreatDetection` devuelve el
+historial completo, no sólo lo del día —, así que no hace falta pedirle capturas a clientes
+elegidos a mano.
+
+**Escenario 110** del self-test: la clasificación de los tres tipos, el cruce del id con el
+catálogo, y que la ruta del cliente no se escape en el payload.
+
+> **Hallazgo de la misma sesión, sin resolver:** en dos builds distintos de la 0.0.37 (los `.msi`
+> del 11/09 y del 16/09) **el instalador está firmado por Fudo Group LLC y el ejecutable que
+> instala NO lo está**. El motor asume lo contrario: `NativaVersionFirmada = '0.0.37'` y le dice
+> al asesor que desde esa versión los antivirus dejan de ponerla en cuarentena. Si el `.exe`
+> sigue sin firma, actualizar no evita las cuarentenas. Queda para confirmar con quien arma el
+> instalador antes de tocar esa constante.
+
 ### Lo que falta probar
 
 La interfaz se probó punta a punta contra el motor real, pero **contra una PC sin impresora
