@@ -29,3 +29,7 @@ contexto/
 # NetConfigTools). Nada de eso va al repositorio publico.
 tools/FudoPrintDoctor/
 FudoPrintDoctor-interno.cmd
+# Instalador de la Nativa partido para pasarlo por TeamViewer (limite 25 MB).
+# Son los mismos 60 MB del instalador, troceados: no van al repositorio publico.
+tools/Nativa-partida/
+tools/FudoPrintDoctor-NetConfigTools.zip
