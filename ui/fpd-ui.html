@@ -457,6 +457,10 @@ function gestionInicio(d){
   var g = gestionSlot(); g.innerHTML = "";
   var box = el("div","gest");
   box.appendChild(el("b",null,"Haciendo: "+esc(d.titulo)));
+  // Algunas gestiones tardan (buscar instaladores en el disco, esperar un replug) y no
+  // emiten nada mientras tanto. Sin decirlo, el silencio se lee como que se colgo.
+  box.appendChild(el("p",null,
+    "Puede tardar un rato. Mientras no aparezca el resultado, seguimos trabajando."));
   if(d.dryRun){
     box.appendChild(el("p",null,
       "Estamos en modo revisi\u00f3n, as\u00ed que esto no va a cambiar nada."));
