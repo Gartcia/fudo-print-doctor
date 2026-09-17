@@ -8072,6 +8072,35 @@ function Invoke-SelfTest {
     # Pero se sigue informando: el chequeo no desaparece del diagnostico.
     Assert-Eq 'S111 el chequeo informativo sigue en la lista de chequeos' $true (@($script:Checks | Where-Object { $_.id -eq 'nativa.installed' }).Count -eq 1)
 
+    # Escenario 112 (v3.22, 17/09/2026): la Nativa dejo de distribuirse como .msi y paso a ser
+    # un .exe firmado. El chequeo del kit del asesor exigia que el instalador DECLARARA una
+    # version mayor o igual a la firmada, y un .exe no declara ninguna util: sus metadatos son
+    # los del runtime de Node que lleva adentro (ProductName 'Node.js', version 20.18.1).
+    # Sin esto, desde ese dia el motor le dice a TODOS los asesores que les falta el instalador
+    # -en cada corrida- con el instalador correcto al lado del script.
+    # El numero de version siempre fue un proxy de 'esta firmado'; con el .exe el proxy dejo de
+    # servir, asi que se mira la firma.
+    function Get-LocalNativeInstallers { @([ordered]@{ ruta = 'C:\kit\fudo_native_app.exe'; version = ''; esMsi = $false; fecha = (Get-Date) }) }
+    function Test-InstaladorFirmadoPorFudo { param([string]$Path) $true }
+    $kit112 = Test-NativaKitReady
+    Assert-Eq 'S112 un .exe firmado por Fudo alcanza como kit' $true ([bool]$kit112.listo)
+    Assert-Eq 'S112 y queda anotado que valio por la firma' $true ([bool]$kit112.porFirma)
+
+    function Test-InstaladorFirmadoPorFudo { param([string]$Path) $false }
+    $kit112b = Test-NativaKitReady
+    Assert-Eq 'S112 un .exe sin firma NO alcanza' $false ([bool]$kit112b.listo)
+    Assert-Eq 'S112 y el motivo lo dice' $true ([bool]([string]$kit112b.motivo -match 'ni esta firmado'))
+
+    # El camino historico sigue igual: un .msi que declara la version firmada entra por version.
+    function Get-LocalNativeInstallers { @([ordered]@{ ruta = 'C:\kit\nativa.msi'; version = '0.0.37'; esMsi = $true; fecha = (Get-Date) }) }
+    $kit112c = Test-NativaKitReady
+    Assert-Eq 'S112 un .msi con version firmada sigue alcanzando' $true ([bool]$kit112c.listo)
+    Assert-Eq 'S112 y NO se cuenta como validado por firma' $false ([bool]$kit112c.porFirma)
+
+    function Get-LocalNativeInstallers { @([ordered]@{ ruta = 'C:\kit\viejo.msi'; version = '0.0.27'; esMsi = $true; fecha = (Get-Date) }) }
+    $kit112d = Test-NativaKitReady
+    Assert-Eq 'S112 un .msi viejo y sin firma sigue sin alcanzar' $false ([bool]$kit112d.listo)
+
     function Get-CheckById { param([string]$Id) return (@($script:Checks | Where-Object { $_.id -eq $Id }) | Select-Object -First 1) }
 
     function Reset-State {
@@ -11428,6 +11457,36 @@ function Find-LocalNativeInstaller {
     return ''
 }
 
+function Test-InstaladorFirmadoPorFudo {
+    <#
+      Este instalador esta firmado digitalmente por Fudo?
+
+      POR QUE EXISTE: el kit del asesor se validaba pidiendo que el instalador DECLARARA una
+      version mayor o igual a la primera firmada. Eso funcionaba mientras la Nativa se
+      distribuia como .msi, que declara su ProductVersion. Desde el 17/09/2026 se distribuye
+      como .exe, y ahi el numero de version no sirve: los metadatos del archivo son los del
+      runtime de Node que lleva adentro (ProductName 'Node.js', version 20.18.1), no los de
+      Fudo. Leerlos seria peor que no leer nada.
+
+      El numero de version siempre fue un PROXY de lo que realmente importa -que el binario
+      este firmado, para que el antivirus no se lo lleve-. Con el .exe el proxy dejo de
+      funcionar, asi que se mira el dato de verdad: la firma Authenticode.
+
+      Devuelve $true solo si la firma es valida Y el firmante es Fudo. Una firma valida de
+      cualquier otro es un instalador que no es nuestro.
+    #>
+    param([string]$Path)
+    if (-not $Path) { return $false }
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) { return $false }
+        $sig = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
+        if ([string]$sig.Status -ne 'Valid') { return $false }
+        $sujeto = ''
+        try { $sujeto = [string]$sig.SignerCertificate.Subject } catch {}
+        return [bool]($sujeto -match '(?i)fudo')
+    } catch { return $false }
+}
+
 function Test-NativaKitReady {
     <#
       El asesor trajo el instalador de la Nativa firmada?
@@ -11442,6 +11501,8 @@ function Test-NativaKitReady {
     #>
     $cands = @(Get-LocalNativeInstallers)
     $firmada = [string]$script:NativaVersionFirmada
+
+    # 1) Un .msi que declara una version igual o mayor a la firmada. Es el camino historico.
     $ok = @($cands | Where-Object {
         $v = $null
         try { $v = [version]$_.version } catch { $v = $null }
@@ -11449,13 +11510,25 @@ function Test-NativaKitReady {
     }) | Select-Object -First 1
     if ($ok) {
         return [ordered]@{ listo = $true; ruta = [string]$ok.ruta; version = [string]$ok.version
-                           candidatos = @($cands); motivo = '' }
+                           candidatos = @($cands); motivo = ''; porFirma = $false }
     }
+
+    # 2) Un instalador FIRMADO POR FUDO, declare o no su version. Es el caso del .exe: no
+    #    declara version util -sus metadatos son los de Node- pero la firma es evidencia
+    #    directa de lo unico que importaba. Sin esta rama, desde que la Nativa se distribuye
+    #    como .exe el motor le dice a TODOS los asesores que les falta el instalador, con el
+    #    instalador correcto al lado del script.
+    $firmado = @($cands | Where-Object { Test-InstaladorFirmadoPorFudo -Path ([string]$_.ruta) }) | Select-Object -First 1
+    if ($firmado) {
+        return [ordered]@{ listo = $true; ruta = [string]$firmado.ruta; version = [string]$firmado.version
+                           candidatos = @($cands); motivo = ''; porFirma = $true }
+    }
+
     $mejor = @($cands | Where-Object { $_.version }) | Select-Object -First 1
     $motivo = $(if (@($cands).Count -eq 0) { 'no hay ningun instalador de la App Nativa en esta PC' }
                 elseif ($mejor) { 'el instalador que hay declara la version ' + [string]$mejor.version + ', anterior a la ' + $firmada }
-                else { 'hay instaladores pero ninguno declara su version (solo .exe): no se puede saber si sirven' })
-    return [ordered]@{ listo = $false; ruta = ''; version = ''; candidatos = @($cands); motivo = $motivo }
+                else { 'hay instaladores pero ninguno declara su version ni esta firmado por Fudo' })
+    return [ordered]@{ listo = $false; ruta = ''; version = ''; candidatos = @($cands); motivo = $motivo; porFirma = $false }
 }
 
 function Confirm-NativaKit {

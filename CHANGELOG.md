@@ -183,6 +183,49 @@ catálogo, y que la ruta del cliente no se escape en el payload.
 > sigue sin firma, actualizar no evita las cuarentenas. Queda para confirmar con quien arma el
 > instalador antes de tocar esa constante.
 
+### La Nativa dejó de distribuirse como `.msi`
+
+El 17/09/2026 apareció `fudo_native_app_win_8_and_up.exe` (58,7 MB, firmado por Fudo Group
+LLC), en lugar del `.msi`. Se instala solo, se desinstala con
+`fudo_native_extension.exe --uninstall` y **Windows Installer no participa**.
+
+Lo bueno: el motor ya lo reconocía sin cambios. Lee la versión instalada del **registro**, no
+del archivo, así que detectó `Fudo Native Extension v0.0.38` y los cinco chequeos de la Nativa
+dieron `ok` a la primera. Verificado contra una PC con la 0.0.38 recién instalada.
+
+Lo que sí rompía, y arranca el mismo día:
+
+- **El chequeo del kit del asesor le iba a dar aviso a todo el mundo, en cada corrida, con el
+  instalador correcto al lado del script.** Exigía un instalador que **declarara** una versión
+  igual o mayor a la firmada, y eso sólo lo hace un `.msi`. Un `.exe` no declara ninguna
+  versión útil: **sus metadatos son los del runtime de Node que lleva adentro**
+  (`ProductName: Node.js`, `ProductVersion: 20.18.1`, `OriginalFilename: node.exe`).
+
+  Ojo con ese detalle, porque es una trampa: leer la versión del `.exe` parece el arreglo
+  obvio y es peor que no leerla — el motor compararía `20.18.1` contra `0.0.38` y creería para
+  siempre que hay una actualización pendiente.
+
+  **El número de versión siempre fue un proxy de lo que importaba: que el binario esté
+  firmado, para que el antivirus no se lo lleve.** Con el `.exe` el proxy dejó de funcionar,
+  así que el kit ahora mira **el dato de verdad**: la firma Authenticode, y que el firmante
+  sea Fudo. Una firma válida de cualquier otro no sirve. El camino histórico — un `.msi` que
+  declara la versión firmada — sigue igual.
+
+  **Escenario 112.** Verificado además contra los archivos reales de una PC: el `.exe` nuevo y
+  los `.msi` de la 0.0.37 pasan; el `.msi` de la 0.0.27, que no está firmado, queda afuera.
+
+- **El motor no puede actualizar con un `.exe`.** `Test-NativaNecesitaUpdate` pide una versión
+  legible del instalador para no degradar la Nativa — una restauración de cuarentena ya dejó
+  una PC de 0.0.36 a 0.0.18 — y con el `.exe` esa versión no existe. **Se deja como está a
+  propósito**: instalar a ciegas es peor que no instalar. Falta saber de dev cuál es el
+  argumento de instalación silenciosa del `.exe` antes de tocar esto.
+
+> **Y el hueco de la firma quedó cerrado.** En la 0.0.37 empaquetada como `.msi`, el instalador
+> estaba firmado y el `fudo_native_extension.exe` que dejaba **no**. En la 0.0.38 el ejecutable
+> instalado **sí** está firmado (`CN=Fudo Group LLC`). Queda pendiente revisar con dev si
+> `NativaVersionFirmada = '0.0.37'` sigue siendo el umbral correcto: para el `.msi` de esa
+> versión no lo era.
+
 ### Lo que falta probar
 
 La interfaz se probó punta a punta contra el motor real, pero **contra una PC sin impresora
