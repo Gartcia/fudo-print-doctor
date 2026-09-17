@@ -1412,6 +1412,13 @@ function Add-Check {
         [ValidateSet('ok','warn','fail','fixed','skipped')]
         [string]$Status,
         [bool]$RootCauseCandidate = $false,
+        # Este hallazgo se INFORMA pero no es algo para hacer.
+        # Un 'warn' puede significar dos cosas distintas y el motor las mezclaba: 'hay algo
+        # para mirar' y 'mire y esta bien, te lo cuento'. La segunda no es una accion, y
+        # meterla en 'que hacer ahora' -con boton incluido- llena la lista de renglones que
+        # el propio texto desmiente ("esto es normal y no hay nada que hacer").
+        # Es la misma idea que RootCauseCandidate, aplicada a la lista de acciones.
+        [bool]$Informativo = $false,
         $Evidence = $null,
         [string]$ActionTaken = '',
         [bool]$Reversible = $true,
@@ -1430,6 +1437,7 @@ function Add-Check {
         status             = $Status
         plane              = $Plane
         rootCauseCandidate = $RootCauseCandidate
+        informativo        = $Informativo
         evidence           = $Evidence
         actionTaken        = $ActionTaken
         reversible         = $Reversible
@@ -2196,7 +2204,7 @@ function Test-Layer0-Environment {
     Add-Check -Id 'env.fudoApp' -Layer 0 `
         -Name $(if($fudoPresent){'App Nativa de Fudo en ejecucion'}else{'La App Nativa de Fudo no esta corriendo ahora'}) `
         -Status $(if($fudoPresent){'ok'}else{'warn'}) `
-        -RootCauseCandidate $false `
+        -RootCauseCandidate $false -Informativo $true `
         -Evidence @{ processes = @($fudoProc | Select-Object -First 5 | ForEach-Object { $_.Name }); services = @($fudoSvc | ForEach-Object { $_.Name }) } `
         -ArticleRef 'https://soporte.fu.do/es/articles/16419361' `
         -Recommendation $(if($fudoPresent){''}else{'La Nativa arranca sola cuando se abre Fudo en el navegador: si Fudo esta cerrado, esto es normal y no hay nada que hacer. Solo es un problema si Fudo esta abierto en esta PC y aun asi no corre (ahi si, revisar el antivirus).'})
@@ -2830,9 +2838,12 @@ function Test-Layer0b-NativeApp {
     } else {
         # Instalada pero apagada NO es causa raiz: es un native messaging host y con Fudo
         # cerrado no corre. Que NO este instalada (rama de arriba, status fail) si lo es.
+        # Informativo: esta rama es 'la Nativa ESTA instalada'. Que no corra es el estado
+        # normal con Fudo cerrado. La rama de arriba -no esta instalada, status fail- si es
+        # una accion y no lleva esta marca.
         Add-Check -Id 'nativa.installed' -Layer 0 -Name $(if($procRunning){'App Nativa de Fudo instalada y corriendo'}else{'App Nativa de Fudo instalada (no corre ahora: arranca con Fudo)'}) `
             -Status $(if($procRunning){'ok'}else{'warn'}) `
-            -RootCauseCandidate $false `
+            -RootCauseCandidate $false -Informativo $true `
             -Evidence @{ paths = $install.paths; reg = $install.regInfo; running = $procRunning } `
             -Recommendation $(if($procRunning){''}else{'Esta instalada y no corriendo. Es lo esperado si Fudo no esta abierto en el navegador: la levanta el navegador cuando hace falta. Si Fudo SI esta abierto en esta PC y aun asi no corre, revisar bloqueo del antivirus.'})
 
@@ -6902,6 +6913,10 @@ function Get-NextActions {
     $pending = @($script:Checks | Where-Object { $_.status -in @('fail','warn') } | Sort-Object { $_.layer })
     foreach ($c in $pending) {
         if (-not $c.recommendation) { continue }
+        # Informativo: se cuenta en los chequeos y en el resumen, pero no es una accion.
+        $esInfo = $false
+        try { $esInfo = [bool]$c.informativo } catch {}
+        if ($esInfo) { continue }
         # owner: quien tiene que hacer la accion. cliente = en el local (cable, AV, impresora);
         # asesor = en la PC o en la web app de Fudo; soporte = Soporte Producto.
         $owner = switch ([string]$c.plane) {
@@ -8035,6 +8050,27 @@ function Invoke-SelfTest {
     Assert-Eq 'S110 la version para telemetria lleva el nombre' 'Trojan:Win32/Wacatac.B!ml' ([string]$red110.nombre)
     Assert-Eq 'S110 y el archivo pelado, no la ruta del cliente' 'fudo_native_extension.exe' ([string]$red110.archivo)
     Assert-Eq 'S110 la ruta del cliente NO viaja' $false ([bool]([string]$red110.archivo -match 'cliente'))
+
+    # Escenario 111 (v3.22, visto en pantalla): 'que hacer ahora' listaba cosas que el propio
+    # texto desmiente. Salian como acciones -con boton- 'La App Nativa esta instalada y ahora
+    # no esta corriendo' y 'La App Nativa no esta corriendo ahora', cuyas recomendaciones dicen
+    # textualmente que con Fudo cerrado eso es normal y no hay nada que hacer.
+    # La causa: Get-NextActions metia TODO warn con recomendacion. Un warn puede ser 'hay algo
+    # para mirar' o 'mire y esta bien, te lo cuento', y solo el primero es una accion.
+    # Reset a mano: Reset-State se define mas abajo en el self-test y aca todavia no existe.
+    $script:Checks = New-Object System.Collections.ArrayList
+    $script:Errors = New-Object System.Collections.ArrayList
+    $script:Diagnostics = [ordered]@{}
+    Add-Check -Id 'nativa.installed' -Layer 0 -Name 'instalada, no corre' -Status 'warn' `
+        -RootCauseCandidate $false -Informativo $true -Recommendation 'Esto es normal con Fudo cerrado.'
+    Add-Check -Id 'queue.health' -Layer 2 -Name 'cola trabada' -Status 'warn' `
+        -RootCauseCandidate $true -Recommendation 'Hay 11 comandas trabadas.'
+    $acc111 = @(Get-NextActions -Diag @{ resolved = $false })
+    Assert-Eq 'S111 el hallazgo informativo no es una accion' $false (@($acc111 | ForEach-Object { [string]$_.checkId }) -contains 'nativa.installed')
+    Assert-Eq 'S111 el que si requiere algo sigue estando' $true (@($acc111 | ForEach-Object { [string]$_.checkId }) -contains 'queue.health')
+    Assert-Eq 'S111 y queda una sola accion' 1 (@($acc111).Count)
+    # Pero se sigue informando: el chequeo no desaparece del diagnostico.
+    Assert-Eq 'S111 el chequeo informativo sigue en la lista de chequeos' $true (@($script:Checks | Where-Object { $_.id -eq 'nativa.installed' }).Count -eq 1)
 
     function Get-CheckById { param([string]$Id) return (@($script:Checks | Where-Object { $_.id -eq $Id }) | Select-Object -First 1) }
 
