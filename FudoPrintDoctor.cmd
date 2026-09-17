@@ -26,7 +26,7 @@ REM      avisa y sigue por consola. La interfaz no puede ser condicion
 REM      para diagnosticar en la PC de un cliente que ya tiene un
 REM      problema.
 REM ================================================================
-REM  LAUNCHER-VERSION: 3   <- subir esto cuando cambie este archivo. El
+REM  LAUNCHER-VERSION: 4   <- subir esto cuando cambie este archivo. El
 REM  updater no lo pisa (lleva la URL de telemetria), asi que hoy la copia
 REM  interna se distribuye a mano. El marcador queda para que el updater
 REM  pueda comparar y refrescarlo preservando la URL.
@@ -153,7 +153,12 @@ REM  el diagnostico. Esta ventana sigue siendo la que manda -el diagnostico corr
 REM  aca- y sigue mostrando todo, asi que si el navegador no abre no se pierde
 REM  nada. Si el puerto local no se puede abrir, el motor avisa y sigue solo por
 REM  esta ventana: la interfaz nunca es condicion para diagnosticar.
-powershell -NoProfile -ExecutionPolicy Bypass -File "%FPD_MOTOR%" -Ui web -JsonOut "%FPD_JSON%"
+REM  -NoNativaKitCheck: el instalador de la App Nativa pesa casi 60 MB y no entra
+REM  por la transferencia de archivos del acceso remoto, asi que por decision no
+REM  viaja en el kit. Sin esto el motor lo pediria en cada corrida y nadie podria
+REM  resolverlo. El hallazgo se sigue registrando y viaja en la telemetria; cuando
+REM  haga falta de verdad, se pasa partido con tools\Partir-Nativa.ps1.
+powershell -NoProfile -ExecutionPolicy Bypass -File "%FPD_MOTOR%" -Ui web -NoNativaKitCheck -JsonOut "%FPD_JSON%"
 set FPD_EXIT=%errorlevel%
 
 echo.

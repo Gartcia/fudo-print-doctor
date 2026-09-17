@@ -7665,14 +7665,22 @@ function Invoke-FudoPrintDoctor {
     }
 
     if ($script:NativaKit -and -not [bool]$script:NativaKit.listo) {
+        # Informativo cuando el chequeo se salteo a proposito (-NoNativaKitCheck). Desde el
+        # 17/09/2026 el instalador de la Nativa pesa 58,7 MB y TeamViewer no transfiere mas de
+        # 25 MB, asi que dejo de viajar en el kit por decision: pedirlo en cada corrida seria
+        # un aviso que aparece siempre y que nadie puede resolver, y un aviso asi deja de
+        # leerse. El hallazgo se sigue registrando y sigue viajando en la telemetria.
         Add-Check -Id 'env.nativaKit' -Layer 0 -Name 'Falta el instalador de la App Nativa firmada en esta PC' -Status 'warn' -Plane 'os' `
+            -Informativo ([bool]$script:NativaKitOmitido) `
             -Evidence @{ motivo = [string]$script:NativaKit.motivo; versionFirmada = [string]$script:NativaVersionFirmada
                          candidatos = @(@($script:NativaKit.candidatos) | ForEach-Object { [ordered]@{ ruta = [string]$_.ruta; version = [string]$_.version } })
                          omitido = [bool]$script:NativaKitOmitido } `
             -ArticleRef 'https://soporte.fu.do/es/articles/16419361' `
-            -Recommendation ('No hay un instalador de la App Nativa v' + $script:NativaVersionFirmada + ' o superior en esta PC (' + [string]$script:NativaKit.motivo + '). ' +
+            -Recommendation ('No hay un instalador de la App Nativa en esta PC (' + [string]$script:NativaKit.motivo + '). ' +
                              'Si este cliente tiene una version vieja, el motor no la puede actualizar y el antivirus se la va a volver a comer. ' +
-                             'Copiar el .msi junto a los dos archivos que se copian a la PC del cliente: se arregla una vez y sirve para todos los casos.')
+                             'El instalador pesa casi 60 MB y no entra por la transferencia de archivos del acceso remoto: ' +
+                             'cuando haga falta de verdad, pasarlo partido con tools\Partir-Nativa.ps1 y armarlo en esta PC ' +
+                             'con el Unir-Nativa.cmd, que verifica que haya llegado entero.')
     }
 
     $badArgs = @(Test-Preflight)
@@ -8100,6 +8108,30 @@ function Invoke-SelfTest {
     function Get-LocalNativeInstallers { @([ordered]@{ ruta = 'C:\kit\viejo.msi'; version = '0.0.27'; esMsi = $true; fecha = (Get-Date) }) }
     $kit112d = Test-NativaKitReady
     Assert-Eq 'S112 un .msi viejo y sin firma sigue sin alcanzar' $false ([bool]$kit112d.listo)
+
+    # Escenario 114 (v3.22): la falta del instalador de la Nativa deja de pedir una accion
+    # cuando es una decision y no un olvido.
+    # El instalador pasa a pesar 58,7 MB y la transferencia de archivos del acceso remoto corta
+    # en 25 MB, asi que dejo de viajar en el kit. Sin esto el aviso salia en el 100% de las
+    # corridas pidiendo algo que nadie podia hacer, y un aviso que aparece siempre deja de
+    # leerse. Se sigue registrando: el hallazgo no desaparece del diagnostico ni de la planilla.
+    $script:Checks = New-Object System.Collections.ArrayList
+    $script:Errors = New-Object System.Collections.ArrayList
+    $baseOmit114 = $script:NativaKitOmitido
+    $script:NativaKitOmitido = $true
+    Add-Check -Id 'env.nativaKit' -Layer 0 -Name 'falta el instalador' -Status 'warn' `
+        -Informativo ([bool]$script:NativaKitOmitido) -Recommendation 'No hay instalador en esta PC.'
+    $acc114 = @(Get-NextActions -Diag @{ resolved = $false })
+    Assert-Eq 'S114 salteado a proposito: no pide accion' $false (@($acc114 | ForEach-Object { [string]$_.checkId }) -contains 'env.nativaKit')
+    Assert-Eq 'S114 pero el chequeo se sigue registrando' 1 (@($script:Checks | Where-Object { $_.id -eq 'env.nativaKit' }).Count)
+
+    $script:Checks = New-Object System.Collections.ArrayList
+    $script:NativaKitOmitido = $false
+    Add-Check -Id 'env.nativaKit' -Layer 0 -Name 'falta el instalador' -Status 'warn' `
+        -Informativo ([bool]$script:NativaKitOmitido) -Recommendation 'No hay instalador en esta PC.'
+    $acc114b = @(Get-NextActions -Diag @{ resolved = $false })
+    Assert-Eq 'S114 sin saltear, sigue siendo una accion' $true (@($acc114b | ForEach-Object { [string]$_.checkId }) -contains 'env.nativaKit')
+    $script:NativaKitOmitido = $baseOmit114
 
     # Escenario 113 (v3.22): leer la version de la Nativa de un instalador .exe.
     # Los metadatos del archivo son los del runtime de Node que lleva adentro (20.18.1), asi
