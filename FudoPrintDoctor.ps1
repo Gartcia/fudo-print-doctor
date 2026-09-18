@@ -1444,6 +1444,18 @@ $script:StepLabel   = ''
 $script:StepNote    = ''
 $script:LiveWidth   = 76
 $script:ReconnectedPort = ''   # puerto donde reaparecio la impresora tras reconectar el USB
+
+# Que prueba fisica ya dio OK CON UN HUMANO CONFIRMANDO en esta corrida.
+# De donde sale (caso de Alexis, 18/09/2026, cliente con dos impresoras USB y una que Windows
+# no tomaba): la capa 3 reasigna el puerto probando candidatos con un ticket real y preguntando
+# "salio el papel?", y despues la capa 4 manda OTRO ticket a la misma impresora en el mismo
+# puerto y vuelve a preguntar lo mismo. El asesor veia dos tickets y contestaba dos veces.
+# No es solo molesto: desde la 3.2 esa pregunta es la UNICA fuente de verdad del motor, y una
+# pregunta que se repite se empieza a contestar sin mirar -que es exactamente como la 3.10
+# estuvo ocho versiones creyendo en una respuesta correcta a una pregunta mal hecha.
+# Solo se anota la confirmacion EXPLICITA ($true). "Salio de la cola pero nadie confirmo" no
+# es evidencia reusable y la capa 4 tiene que volver a preguntar.
+$script:PruebaConfirmada = $null
 $script:PresentIds   = $null   # cache de InstanceIds de dispositivos PRESENTES
 $script:PresentIdsOk = $false  # pudimos determinar la presencia?
 
@@ -5798,6 +5810,39 @@ function New-FudoPrinterQueue {
     return @{ ok = $false; name = ''; driver = ''; nota = ('no se pudo crear la cola en ' + $PortName + ' -> ' + ($intentos -join ' | ')) }
 }
 
+function Set-PruebaFisicaConfirmada {
+    <# Un humano confirmo que salio el papel de esta impresora en este puerto, en esta corrida. #>
+    param([string]$Impresora, [string]$Puerto)
+    if (-not $Impresora -or -not $Puerto) { return }
+    $script:PruebaConfirmada = [ordered]@{
+        impresora = [string]$Impresora; puerto = [string]$Puerto; ts = (Get-Date).ToString('o')
+    }
+    Write-DoctorLog -Level 'INFO' -Message ("Prueba fisica confirmada por una persona en '" + $Impresora + "' / " + $Puerto + ": no se vuelve a pedir en esta corrida.")
+}
+
+function Test-PruebaFisicaYaConfirmada {
+    <#
+      Ya hay una confirmacion humana valida para ESTA impresora en ESTE puerto?
+      Devuelve la anotacion, o $null si hay que volver a probar.
+
+      El puerto se relee de Windows en vez de confiar en el objeto que recibimos: entre la
+      capa 3 y la capa 4 puede haber pasado una recreacion de cola o un replug, y una
+      confirmacion sobre USB002 no dice nada de una cola que ahora apunta a USB003. Si no se
+      puede releer, no se reusa: ante la duda se pregunta, que es mas barato que afirmar.
+    #>
+    param($Printer)
+    if ($null -eq $script:PruebaConfirmada) { return $null }
+    $nombre = ''
+    try { $nombre = [string]$Printer.Name } catch {}
+    if (-not $nombre) { return $null }
+    if ([string]$script:PruebaConfirmada.impresora -ne $nombre) { return $null }
+    $puertoAhora = ''
+    try { $puertoAhora = [string](Get-Printer -Name $nombre -ErrorAction Stop).PortName } catch { return $null }
+    if (-not $puertoAhora) { return $null }
+    if ($puertoAhora -ne [string]$script:PruebaConfirmada.puerto) { return $null }
+    return $script:PruebaConfirmada
+}
+
 function Get-DetectedInterface {
     param($Printer)
     if ($Interface -ne 'auto') { return $Interface }
@@ -5831,6 +5876,9 @@ function Repair-QueueRecreate {
     $nombre = [string]$Printer.Name
     $puertoOk = ''
     $temporal = ''
+    # Hubo un SI explicito de una persona, o el ticket solo salio de la cola? Solo lo primero
+    # es evidencia reusable por la capa 4.
+    $confirmadoPorHumano = $false
 
     # Por que fallo CADA candidato. Sin esto la nota decia solo "ninguno de los puertos
     # probados imprimio", que colapsa tres causas muy distintas -no se pudo crear la cola /
@@ -5875,6 +5923,7 @@ function Repair-QueueRecreate {
                             $paso.resultado = 'el ticket salio de la cola pero el asesor dice que no salio papel'
                         } else {
                             $paso.resultado = $(if ($conf) { 'imprimio (confirmado)' } else { 'imprimio (sin confirmar)' })
+                            $confirmadoPorHumano = [bool]($conf -eq $true)
                             $puertoOk = $cp; $temporal = $tmp
                             $intentos += $paso
                             break
@@ -5914,6 +5963,10 @@ function Repair-QueueRecreate {
             }
             $i = $script:TestPrintersCreated.IndexOf($temporal)
             if ($i -ge 0) { $script:TestPrintersCreated.RemoveAt($i) }
+            # La cola recreada se llama igual que la vieja y vive en el puerto que ya imprimio
+            # con una persona mirando: esa confirmacion vale para la capa 4. Se anota recien
+            # aca -y no al probar- porque hasta el rename la evidencia era de la cola temporal.
+            if ($confirmadoPorHumano) { Set-PruebaFisicaConfirmada -Impresora $nombre -Puerto $puertoOk }
             "cola '$nombre' recreada con driver de texto generico en $puertoOk (ticket de prueba OK)"
         }
 
@@ -6071,6 +6124,8 @@ function Test-Layer3-UsbPort {
                     $conf = Confirm-PaperCameOut -Printer $Printer.Name
                     if ($conf -eq $false) { continue }
                     $script:Diagnostics['puertoConfirmado'] = $conf
+                    # Si una persona dijo que si, la capa 4 no tiene que volver a preguntarlo.
+                    if ($conf -eq $true) { Set-PruebaFisicaConfirmada -Impresora ([string]$Printer.Name) -Puerto ([string]$cp) }
                     $chosen = $cp; break
                 } catch {}
             }
@@ -6961,6 +7016,25 @@ function Test-Layer4-HardwarePrint {
             Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica de impresion' -Status 'skipped' -Plane 'hardware' `
                 -Evidence @{ printer = [string]$Printer.Name; reason = [string]$v.reason; skipReason = 'impresora_virtual' } `
                 -Recommendation "No se prueba sobre '$($Printer.Name)': es una impresora virtual y daria un falso OK de hardware."
+            return
+        }
+        # Ya imprimio en este mismo puerto y una persona lo confirmo hace un momento (capa 3,
+        # al reasignar el puerto o al recrear la cola). Mandar un segundo ticket no agrega
+        # ninguna evidencia: la fuente de verdad es el humano, y ya contesto. Caso de Alexis,
+        # 18/09: un cliente con dos impresoras USB recibio dos tickets y la misma pregunta dos
+        # veces en la misma corrida.
+        $yaConfirmada = Test-PruebaFisicaYaConfirmada -Printer $Printer
+        if ($yaConfirmada) {
+            $script:Diagnostics['ticketConfirmado'] = $true
+            Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica ESC/POS por USB (RAW)' -Status 'ok' `
+                -Plane 'hardware' `
+                -Evidence @{ printer = [string]$Printer.Name; port = [string]$yaConfirmada.puerto
+                             sent = $true; quedoEnCola = $false; confirmadoPorHumano = $true
+                             reusadaDeCapa3 = $true; confirmadaEn = [string]$yaConfirmada.ts } `
+                -ArticleRef 'https://soporte.fu.do/es/articles/12044021' `
+                -Recommendation ('El hardware imprime OK (confirmado: salio el papel al probar el puerto ' + [string]$yaConfirmada.puerto + '). ' +
+                                 'No se mando un segundo ticket porque ya habia una confirmacion de una persona sobre esta misma impresora y este mismo puerto. ' +
+                                 'Si la comanda no sale, el problema es la config de Fudo (area/cocina/sala/categorias).')
             return
         }
         try {
@@ -8739,6 +8813,50 @@ function Invoke-SelfTest {
         [ordered]@{ checkId = 'fudo.rooms'; owner = 'asesor'; do = 'Tildar salas'; what = 'Salas'; status = 'warn'; articleRef = '' }
     ) }
     Assert-Eq 'S118 un solo chequeo de Fudo, solo, tambien aparece' 'fudo.rooms' ([string]@((Get-ShortActions -Diag $diag118c -Max 99).shown)[0].checkId)
+
+    # Escenario 119 (v3.23, caso de Alexis del 18/09 con la 3.22 en campo): un cliente con dos
+    # impresoras USB -una que Windows no estaba tomando- recibio DOS tickets de prueba y la
+    # misma pregunta dos veces. La capa 3 prueba los puertos candidatos con un ticket real y
+    # pregunta "salio el papel?"; la capa 4 despues manda otro ticket a la misma impresora en
+    # el mismo puerto y vuelve a preguntar. Preguntar dos veces no es solo molesto: esa
+    # pregunta es la unica fuente de verdad del motor desde la 3.2, y una que se repite se
+    # empieza a contestar sin mirar.
+    function Get-Printer { param([string]$Name, $ErrorAction) return [pscustomobject]@{ Name = $Name; PortName = 'USB002'; DriverName = 'Generic / Text Only' } }
+    $script:PruebaConfirmada = $null
+    Assert-Eq 'S119 sin confirmacion previa, la capa 4 prueba' $true ($null -eq (Test-PruebaFisicaYaConfirmada -Printer ([pscustomobject]@{ Name = 'CAJA' })))
+
+    Set-PruebaFisicaConfirmada -Impresora 'CAJA' -Puerto 'USB002'
+    Assert-Eq 'S119 con el si de una persona sobre esta impresora y este puerto, se reusa' $true ($null -ne (Test-PruebaFisicaYaConfirmada -Printer ([pscustomobject]@{ Name = 'CAJA' })))
+    # Otra impresora del mismo local NO hereda la confirmacion: es justo el caso de Alexis,
+    # dos impresoras en la misma PC. La de cocina tiene que probarse igual.
+    Assert-Eq 'S119 otra impresora no hereda la confirmacion' $true ($null -eq (Test-PruebaFisicaYaConfirmada -Printer ([pscustomobject]@{ Name = 'COCINA' })))
+
+    # Si la cola ya no apunta al puerto confirmado, la evidencia no aplica: pudo recrearse la
+    # cola o moverse el cable entre una capa y la otra.
+    function Get-Printer { param([string]$Name, $ErrorAction) return [pscustomobject]@{ Name = $Name; PortName = 'USB003'; DriverName = 'Generic / Text Only' } }
+    Assert-Eq 'S119 si cambio el puerto, se vuelve a probar' $true ($null -eq (Test-PruebaFisicaYaConfirmada -Printer ([pscustomobject]@{ Name = 'CAJA' })))
+
+    # Y si no se puede releer el puerto, tampoco se reusa: ante la duda se pregunta, que es
+    # mas barato que afirmar que el hardware anda sin haberlo visto.
+    function Get-Printer { param([string]$Name, $ErrorAction) throw 'spooler caido' }
+    Assert-Eq 'S119 si no se puede releer el puerto, no se reusa' $true ($null -eq (Test-PruebaFisicaYaConfirmada -Printer ([pscustomobject]@{ Name = 'CAJA' })))
+
+    # Un 'salio de la cola pero nadie confirmo' NO es evidencia reusable: solo se anota el si
+    # explicito. Se verifica que Set-PruebaFisicaConfirmada nunca se llame con vacios.
+    $script:PruebaConfirmada = $null
+    Set-PruebaFisicaConfirmada -Impresora 'CAJA' -Puerto ''
+    Assert-Eq 'S119 sin puerto no se anota nada' $true ($null -eq $script:PruebaConfirmada)
+    # El mock se saca a mano y no con Reset-Mocks, que se define mas abajo en esta misma
+    # funcion y todavia no existe aca. Sacarlo importa: un mock de Get-Printer vivo se lleva
+    # puestos los escenarios que vienen despues, y un escenario que pasa por el motivo
+    # equivocado es lo peor que le puede pasar a un self-test.
+    Microsoft.PowerShell.Management\Remove-Item Function:\Get-Printer -ErrorAction SilentlyContinue
+
+    # La confirmacion vale para UNA corrida: "revisar todo de nuevo" tiene que volver a
+    # probar, porque lo mas comun que cambia entre dos corridas es el cable.
+    Set-PruebaFisicaConfirmada -Impresora 'CAJA' -Puerto 'USB002'
+    Reset-RunState
+    Assert-Eq 'S119 una corrida nueva no hereda la confirmacion' $true ($null -eq $script:PruebaConfirmada)
 
     function Get-CheckById { param([string]$Id) return (@($script:Checks | Where-Object { $_.id -eq $Id }) | Select-Object -First 1) }
 
@@ -11466,6 +11584,11 @@ function Reset-RunState {
     $script:PresentIdsOk = $false
     $script:ReconnectedPort = ''
     $script:UpdateNote  = ''
+    # La confirmacion humana de la prueba fisica vale para UNA corrida. Si el asesor pide
+    # revisar todo de nuevo es porque algo cambio -y lo mas comun que cambia entre dos
+    # corridas es justamente el cable-, asi que la prueba se vuelve a hacer. Dar por buena la
+    # respuesta de la corrida anterior seria afirmar sobre una PC que ya no es la misma.
+    $script:PruebaConfirmada = $null
     # $script:TestPrintersCreated NO se limpia: son colas reales ya creadas en la PC.
 }
 

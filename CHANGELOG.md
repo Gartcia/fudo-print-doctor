@@ -75,6 +75,26 @@ Ahora, a los pocos segundos, tiene el inventario en pantalla.
   arriba de un veredicto que decía *"impresora instalada pero DESCONECTADA"*. Un texto sobre la
   configuración de Fudo no puede afirmar el estado del hardware: no es lo que ese renglón miró.
 
+- **El motor pedía dos veces el mismo ticket de prueba, en el mismo puerto.** Reportado por
+  Alexis el 18/09 con la 3.22 en campo: un cliente con dos impresoras USB —una que Windows no
+  estaba tomando— recibió dos impresiones de prueba y dos instalaciones del driver genérico.
+  La causa son dos capas haciendo lo mismo: la capa 3 reasigna el puerto probando candidatos
+  con un ticket real y preguntando *"¿salió el papel?"*, y la capa 4 manda otro ticket a la
+  misma impresora en el mismo puerto y vuelve a preguntar. Ahora, cuando una persona confirma
+  en la capa 3, queda anotado impresora + puerto y la capa 4 **reusa esa evidencia** en vez de
+  repetir la prueba (`hw.testprint` con `reusadaDeCapa3 = true`).
+
+  Los límites de esa memoria importan más que la memoria: sólo vale un **sí explícito** (un
+  "salió de la cola pero nadie confirmó" no es evidencia), sólo para **esa impresora** —el caso
+  de Alexis tenía dos, y la segunda se prueba igual—, sólo si la cola **sigue apuntando al
+  mismo puerto** (se relee de Windows, no se confía en el objeto en memoria), y sólo dentro de
+  **la misma corrida**: si el asesor pide revisar todo de nuevo, se vuelve a probar, porque lo
+  más común que cambia entre dos corridas es justamente el cable.
+
+  *Por qué no es sólo una molestia:* desde la 3.2 esa pregunta es la única fuente de verdad del
+  motor. Una pregunta que se repite se empieza a contestar sin mirar, y ahí perdemos lo único
+  que separa "el spooler dijo que sí" de "salió el papel".
+
 ### Aprendido (y es lo que más va a durar)
 
 Armando esta pantalla aparecieron **tres avisos falsos de la misma familia**, y ninguno salía
