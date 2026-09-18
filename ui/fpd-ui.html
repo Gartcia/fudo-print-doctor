@@ -936,7 +936,11 @@ function infTablaPuertos(todos){
     r.appendChild(c2);
 
     var c3 = el("td");
-    if(p.cola) c3.appendChild(el("span","mono",esc(p.cola)));
+    var colasP = p.colas || (p.cola ? [p.cola] : []);
+    if(colasP.length > 1){
+      // Las dos con nombre: "2 colas" sin decir cuales obliga a ir a buscarlas.
+      c3.appendChild(el("span","mono", colasP.join(" + ")));
+    } else if(p.cola) c3.appendChild(el("span","mono",esc(p.cola)));
     else c3.appendChild(el("span","sub", esImp ? "ninguna — no está instalada" : "—"));
     r.appendChild(c3);
 

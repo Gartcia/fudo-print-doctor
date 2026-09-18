@@ -95,6 +95,28 @@ Ahora, a los pocos segundos, tiene el inventario en pantalla.
   motor. Una pregunta que se repite se empieza a contestar sin mirar, y ahí perdemos lo único
   que separa "el spooler dijo que sí" de "salió el papel".
 
+- **El motor podía mandar una cola al puerto que ya usaba otra impresora.** Apareció
+  revisando el reporte de Alexis, y es peor que el ticket duplicado. Los candidatos de puerto
+  excluían los que ya usa otra cola… salvo los **puertos "vivos"** (los que tienen un
+  dispositivo detrás), que se anteponían sin ese filtro. En un local con dos impresoras
+  —cocina sana en USB001, caja que Windows no ve— el primer candidato para reparar la caja
+  era **USB001, el puerto de la cocina**: el motor le reasignaba el puerto, mandaba el ticket,
+  y **el papel salía de la impresora de cocina**. Como la pregunta es *"¿salió el ticket de
+  prueba de 'Caja'?"*, el asesor veía papel y contestaba que sí —con razón—, y la caja quedaba
+  "reparada" apuntando a la cocina, con dos colas en el mismo puerto y las comandas saliendo
+  donde no van.
+
+  Es la lección de la 3.10 con otra ropa: **"¿salió papel?" no distingue de cuál impresora
+  salió.** Ahora ningún puerto ocupado por otra cola del cliente es candidato, y cuando el
+  único puerto vivo está ocupado el motor lo dice con nombre y apellido —*"la cola 'Caja' no
+  tiene a dónde apuntar: el único puerto con una impresora conectada lo usa 'Cocina'; NO hay
+  que apuntar las dos al mismo puerto"*— en vez del genérico "reasignar el puerto", que llevaba
+  al asesor a hacer a mano justo lo que el motor se niega a hacer. La elección de candidatos
+  salió a una función pura (`Get-UsbPortCandidates`) para poder testearla.
+- **El informe mostraba una sola cola por puerto.** Si dos apuntaban al mismo, la segunda era
+  invisible: justo la situación que hay que ver. Ahora se listan las dos y el puerto baja a
+  ámbar explicando que las dos imprimen en la misma impresora.
+
 ### Aprendido (y es lo que más va a durar)
 
 Armando esta pantalla aparecieron **tres avisos falsos de la misma familia**, y ninguno salía
