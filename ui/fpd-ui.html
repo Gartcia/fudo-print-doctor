@@ -988,6 +988,14 @@ function construirInforme(){
            (x==="idle" ? 0 : puertos.filter(function(p){ return p.estado===x; }).length);
   }
   var snap = el("div","inf-snap");
+  // El veredicto, cuando ya hay uno: una palabra, en la misma fila que los contadores.
+  if(resultado){
+    var res = !!((resultado.diagnostico||{}).resolved);
+    var ve = el("div","inf-sn inf-veredicto "+(res?"ok":"fail"));
+    ve.appendChild(ico(res?"ok":"cruz",15));
+    ve.appendChild(el("span","t", res ? "Listo: quedó funcionando" : "Todavía no imprime"));
+    snap.appendChild(ve);
+  }
   [["ok","funcionan"],["fixed","los arreglamos"],["warn","para mirar"],["fail","no funcionan"],["idle","sin revisar"]]
   .forEach(function(par){
     var n = cuenta(par[0]);
@@ -1087,18 +1095,15 @@ function pintarResultado(){
   var d=resultado, dg=d.diagnostico||{}, root=$("faseResultado");
   root.innerHTML="";
 
+  // El cartel de la causa raiz se fue en 3.23. Repetia palabra por palabra lo que el informe
+  // ya muestra -en la corrida que lo destapo, los mismos dos nombres y los mismos dos puertos
+  // que las filas rojas de "impresoras instaladas"- y encima con el texto crudo del motor,
+  // que esta escrito para el JSON y no para una persona. La causa sigue entera en el detalle
+  // tecnico, en el JSON y en la telemetria.
+  // Lo unico que el informe NO puede decir es si el caso quedo resuelto: se puede tener tres
+  // cosas en rojo y la comanda saliendo, o cero y sin salir. Esa palabra va en la tira del
+  // semaforo, que es donde el ojo ya esta, y no en un cartel propio.
   var ok = !!dg.resolved;
-  var v=el("div","verdict "+(ok?"ok":"no"));
-  v.appendChild(el("div","verdict-k", ok ? "Listo: la impresora qued\u00f3 funcionando" : "Todav\u00eda no imprime: falta resolver esto"));
-  v.appendChild(el("h2",null,esc(dg.rootCause)||"Sin causa determinada"));
-  var meta=el("div","meta");
-  // 'Confianza: medium' es vocabulario del motor: no le dice nada a quien mira la pantalla
-  // -ni al cliente, que tambien la mira- y no cambia lo que hay que hacer. Sigue viajando
-  // en el JSON y en la telemetria, que es donde sirve.
-  meta.appendChild(el("span",null, tocado.length===1 ? "Cambiamos 1 cosa en esta computadora" : ("Cambiamos "+tocado.length+" cosas en esta computadora")));
-  if(d.modo) meta.appendChild(el("span",null,"Revisamos: "+(d.modo==="Ambos"?"USB y red":"s\u00f3lo "+String(d.modo).toLowerCase())));
-  v.appendChild(meta);
-  root.appendChild(v);
 
   if(d.abortoPorModo){
     var nn=el("div","note");
@@ -1216,17 +1221,59 @@ function pintarResultado(){
       u3.appendChild(li);
     });
     s3.appendChild(u3);
-  } else s3.appendChild(el("p","empty","No cambiamos nada en esta computadora."));
-  root.appendChild(s3);
+    root.appendChild(s3);
+  }
+  // Si no se toco nada, la seccion no existe. Un titulo entero para decir "no cambiamos nada"
+  // es el mismo gasto de pantalla que ya sacamos en otros lados. Cuando SI se toco algo es de
+  // lo mas importante que hay aca -que le quedo cambiado a la PC del cliente y si se puede
+  // deshacer- y por eso sigue abierta y no plegada.
 
   // detalle
-  var s4=sec("Detalle t\u00e9cnico");
-  var avisoTec=el("p","hint");
-  avisoTec.style.cssText="margin:-4px 0 11px";
-  avisoTec.textContent="Esto es para soporte: el detalle completo de lo que se revis\u00f3.";
-  s4.appendChild(avisoTec);
-  var dr=el("details","drawer");
-  dr.appendChild(el("summary",null,"Los "+checks.length+" controles, uno por uno"));
+  // TODO EL DETALLE TECNICO EN UN SOLO PLIEGUE (v3.23).
+  // Antes eran tres secciones abiertas -los controles uno por uno, el JSON, el resumen en
+  // texto- mas un pie con la ruta del JSON y "reporte enviado al panel de telemetria". Nada
+  // de eso es para el asesor mientras atiende: es para despues, o para escalar. Y la pantalla
+  // tambien la mira el cliente, al que una ruta de %TEMP% no le dice nada bueno.
+  // Se queda adentro lo que TIENE un trabajo: copiar el resumen para pegarlo en el caso, y
+  // saber donde quedo el JSON para adjuntarlo.
+  var sop=el("details","drawer");
+  sop.appendChild(el("summary",null,"Para soporte: resumen del caso, JSON y los "+checks.length+" controles"));
+  var cont=el("div"); cont.style.cssText="padding:12px 14px";
+
+  if(d.resumen){
+    // Lo que el asesor realmente hace con esto es pegarlo en el caso. Un boton que copia es
+    // la accion; el texto abajo es el respaldo por si el portapapeles falla.
+    var bc=el("button","btn sm","Copiar el resumen para el caso");
+    bc.addEventListener("click", function(){
+      try{
+        navigator.clipboard.writeText(d.resumen).then(function(){ bc.textContent="Copiado"; },
+                                                      function(){ bc.textContent="No se pudo copiar"; });
+      }catch(e){ bc.textContent="No se pudo copiar"; }
+    });
+    cont.appendChild(bc);
+    cont.appendChild(el("pre","json mono", d.resumen));
+  }
+  if(d.jsonPath){
+    var pj=el("p","hint"); pj.style.margin="10px 0 0";
+    pj.textContent="JSON completo en "+esc(d.jsonPath);
+    cont.appendChild(pj);
+  }
+
+  var dj=el("details","drawer"); dj.style.marginTop="10px";
+  dj.appendChild(el("summary",null,"Ver el JSON"));
+  var pre=el("pre","json mono","cargando…");
+  dj.appendChild(pre);
+  dj.addEventListener("toggle", function(){
+    if(!dj.open || dj.dataset.cargado) return;
+    dj.dataset.cargado="1";
+    fetch("/json?t="+TOKEN).then(function(r){ return r.text(); })
+      .then(function(t){ pre.textContent=t; })
+      .catch(function(){ pre.textContent="No se pudo leer el JSON."; });
+  });
+  cont.appendChild(dj);
+
+  var dc=el("details","drawer"); dc.style.marginTop="10px";
+  dc.appendChild(el("summary",null,"Los "+checks.length+" controles, uno por uno"));
   var tw=el("div","tblwrap"), tb=el("table","chk");
   var th=el("thead"), trh=el("tr");
   ["Control","Id","Resultado"].forEach(function(h){ trh.appendChild(el("th",null,h)); });
@@ -1239,42 +1286,25 @@ function pintarResultado(){
     var t3=el("td"); t3.appendChild(el("span","chip "+esc(c.estado), esc(c.estado))); tr.appendChild(t3);
     tbody.appendChild(tr);
   });
-  tb.appendChild(tbody); tw.appendChild(tb); dr.appendChild(tw); s4.appendChild(dr);
-
-  var dj=el("details","drawer");
-  dj.appendChild(el("summary",null,"Datos t\u00e9cnicos de la revisi\u00f3n (JSON)"));
-  var pre=el("pre","json mono","cargando…");
-  dj.appendChild(pre);
-  dj.addEventListener("toggle", function(){
-    if(!dj.open || dj.dataset.cargado) return;
-    dj.dataset.cargado="1";
-    fetch("/json?t="+TOKEN).then(function(r){ return r.text(); })
-      .then(function(t){ pre.textContent=t; })
-      .catch(function(){ pre.textContent="No se pudo leer el JSON."; });
-  });
-  s4.appendChild(dj);
-  root.appendChild(s4);
-
-  // resumen de siempre, por si alguien lo quiere pegar en el caso
-  if(d.resumen){
-    var dt=el("details","drawer");
-    dt.appendChild(el("summary",null,"Resumen en texto, para adjuntar al caso"));
-    dt.appendChild(el("pre","json mono", d.resumen));
-    root.appendChild(dt);
-  }
+  tb.appendChild(tbody); tw.appendChild(tb); dc.appendChild(tw);
+  cont.appendChild(dc);
+  sop.appendChild(cont);
+  root.appendChild(sop);
 
   // acciones finales: vienen del menu del motor
   if(menuPreg) root.appendChild(barraAcciones(menuPreg));
 
-  var f=el("div","foot");
-  function tag(t){ var s=el("span"); s.appendChild(el("b",null,"·  "));
-    s.appendChild(document.createTextNode(t)); return s; }
-  if(d.telemetria){
-    f.appendChild(tag(d.telemetria.enviada ? "Reporte enviado al panel de telemetría"
-                                           : "Telemetría: "+esc(d.telemetria.detalle)));
+  // La telemetria SOLO se menciona cuando FALLO. Que el reporte haya salido bien no le sirve
+  // a nadie en pantalla; que no haya salido si, porque esa corrida no va a existir para el
+  // equipo y nadie se iba a enterar. Es la regla de la casa: cuando algo falla en silencio,
+  // el primer arreglo es hacerlo visible.
+  if(d.telemetria && !d.telemetria.enviada){
+    var ft=el("div","foot");
+    var st=el("span"); st.appendChild(el("b",null,"·  "));
+    st.appendChild(document.createTextNode("No se pudo enviar el reporte al panel: "+esc(d.telemetria.detalle)));
+    ft.appendChild(st);
+    root.appendChild(ft);
   }
-  if(d.jsonPath) f.appendChild(tag("JSON en "+esc(d.jsonPath)));
-  root.appendChild(f);
 }
 
 function barraAcciones(p){

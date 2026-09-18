@@ -37,6 +37,16 @@ Ahora, a los pocos segundos, tiene el inventario en pantalla.
   encendida, que el cable esté firme, probarla sin el hub—, que no son el estado de nada y por
   eso no tienen tarjeta. Es la misma regla de 3.22 con los hallazgos informativos, un paso más.
   **Es sólo presentación: `nextActions` viaja entero en el JSON y en la telemetría.**
+- **Se fue el cartel de la causa raíz, y con él medio resultado.** Repetía palabra por palabra
+  lo que el informe ya muestra —en la corrida que lo destapó, los mismos dos nombres y los
+  mismos dos puertos que las filas rojas de "impresoras instaladas"— y con el texto crudo del
+  motor, escrito para el JSON. Lo único que el informe no puede decir es si el caso quedó
+  resuelto: eso quedó como una palabra en la tira del semáforo. La causa sigue entera en el
+  detalle técnico, en el JSON y en la telemetría. En la misma pasada: los tres pliegues de
+  detalle y el pie se juntaron en **uno solo** ("Para soporte"), con un botón que copia el
+  resumen para pegarlo en el caso; la sección "qué cambiamos" desaparece cuando no se cambió
+  nada; y la línea de telemetría aparece **sólo si el envío falló** —que salga bien no le sirve
+  a nadie en pantalla, que no salga sí, porque esa corrida no va a existir para el equipo.
 - **Fuera "Confianza: medium" de la pantalla.** Vocabulario del motor; no le dice nada a quien
   mira —ni al cliente, que también mira— y no cambia lo que hay que hacer. Sigue en el JSON.
 - **La IP local de la PC** viaja en `entorno.redes[].ip`. Sin ella, para decidir qué dirección
