@@ -117,6 +117,21 @@ Ahora, a los pocos segundos, tiene el inventario en pantalla.
   invisible: justo la situación que hay que ver. Ahora se listan las dos y el puerto baja a
   ámbar explicando que las dos imprimen en la misma impresora.
 
+- **El motor dejaba la cola de prueba instalada como `FUDO-TEST-USB00x`.** Cuando el cliente
+  no tenía ninguna cola en Windows, el motor creaba una temporal, imprimía, el humano
+  confirmaba… y esa cola quedaba instalada **con ese nombre**, más una recomendación de
+  instalar la definitiva a mano y borrar esta. O sea: el motor cerraba "resuelto" dejando una
+  cola que Fudo no conoce y trabajo pendiente para el asesor. **El motor está para dejar la PC
+  funcionando, no a mitad de camino.**
+
+  Ahora esa cola se renombra con el nombre real del hardware que hay en el puerto —el mismo
+  que el asesor va a elegir al registrarla en Fudo— y deja de estar en la lista de
+  descartables. Es lo que `Repair-QueueRecreate` ya hacía al renombrar su temporal al nombre
+  original. El nombre se sanea (Windows no acepta `,` `\` ni `!`), se desempata si ya existe,
+  y nunca puede quedar empezando con `FUDO-TEST-`: esa cola la borraría sola la corrida
+  siguiente, que sería el peor final posible. Si el rename falla, la cola queda como estaba y
+  el motor dice explícitamente **que no hay que borrarla, porque es la que está funcionando**.
+
 ### Aprendido (y es lo que más va a durar)
 
 Armando esta pantalla aparecieron **tres avisos falsos de la misma familia**, y ninguno salía

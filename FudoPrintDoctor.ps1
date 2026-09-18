@@ -4160,6 +4160,80 @@ function Install-GenericTextDriver {
     return ''
 }
 
+function Get-NombreLibreParaCola {
+    <#
+      Un nombre de cola valido para Windows y que no choque con uno existente.
+      Windows no acepta ',' '\' ni '!' en el nombre de una impresora, y un nombre repetido
+      hace fallar el rename sin decir por que.
+    #>
+    param([string]$Base, [string[]]$Existentes = @())
+    $n = ([string]$Base) -replace '[,\\!"]', ' '
+    $n = ($n -replace '\s+', ' ').Trim()
+    if ($n.Length -gt 60) { $n = $n.Substring(0, 60).Trim() }
+    if (-not $n) { $n = 'Impresora Fudo' }
+    # Una cola que se llame FUDO-TEST-algo volveria a contarse como del motor en la proxima
+    # corrida y se borraria sola. Seria el peor final posible: dejarla y que desaparezca.
+    if ($n -match $script:TestPrinterRx) { $n = 'Impresora Fudo' }
+    $final = $n
+    $i = 2
+    while (@($Existentes) -contains $final) {
+        $final = $n + ' (' + [string]$i + ')'
+        $i++
+        if ($i -gt 20) { break }
+    }
+    return $final
+}
+
+function Convert-TestQueueToReal {
+    <#
+      La cola de prueba que SI imprimio deja de ser una cola de prueba.
+
+      Por que: hasta la 3.22, cuando el cliente no tenia ninguna cola instalada, el motor
+      creaba FUDO-TEST-USB00x, imprimia, el humano confirmaba... y esa cola quedaba instalada
+      con ese nombre. El motor terminaba diciendo "resuelto" y dejaba una cola con un nombre
+      interno que Fudo no conoce, mas una tarea a mano para el asesor (instalar la definitiva
+      y borrar esta). Eso no es dejar la PC funcionando: es dejarla a mitad de camino y con
+      basura nuestra adentro.
+
+      Ahora se la renombra con el nombre real del hardware que hay en ese puerto -el mismo que
+      el asesor va a ver al registrarla en Fudo- y deja de estar en la lista de descartables.
+      Es lo que ya hacia Repair-QueueRecreate al renombrar la temporal al nombre original para
+      que Fudo la siguiera encontrando.
+
+      Devuelve el nombre nuevo, o '' si no se pudo (y ahi la cola queda como estaba).
+    #>
+    param([string]$Nombre)
+    if (-not $Nombre) { return '' }
+    $q = $null
+    try { $q = Get-Printer -Name $Nombre -ErrorAction Stop } catch { return '' }
+    if (-not $q) { return '' }
+    $puerto = [string]$q.PortName
+
+    $base = ''
+    if ($script:Diagnostics.Contains('printersConnected')) {
+        $dev = @($script:Diagnostics['printersConnected'] | Where-Object { [string]$_.puerto -eq $puerto }) | Select-Object -First 1
+        if ($dev) {
+            $base = [string]$dev.nombre
+            if (-not $base) { $base = (([string]$dev.marca + ' ' + [string]$dev.modelo)).Trim() }
+        }
+    }
+    # Sin identidad del hardware no se inventa un modelo: un nombre generico y claro es mejor
+    # que uno inventado que despues nadie reconoce en la lista de impresoras.
+    if (-not $base) { $base = 'Impresora Fudo ' + $puerto }
+
+    $existentes = @()
+    try { $existentes = @(Get-Printer -ErrorAction SilentlyContinue | ForEach-Object { [string]$_.Name }) } catch {}
+    $nuevo = Get-NombreLibreParaCola -Base $base -Existentes $existentes
+    if ($nuevo -eq $Nombre) { return $Nombre }
+    try { Rename-Printer -Name $Nombre -NewName $nuevo -ErrorAction Stop } catch { return '' }
+
+    $i = $script:TestPrintersCreated.IndexOf($Nombre)
+    if ($i -ge 0) { $script:TestPrintersCreated.RemoveAt($i) }
+    Add-Action -Type 'printer.test_to_real' -Target $Nombre -Before $Nombre -After $nuevo -Reversible $true
+    Write-DoctorLog -Level 'INFO' -Message ("La cola de prueba '" + $Nombre + "' quedo instalada como '" + $nuevo + "' en " + $puerto)
+    return $nuevo
+}
+
 function New-FudoTestPrinter {
     <#
       Crea una cola temporal sobre $PortName. Si la impresora de ese puerto es de una marca
@@ -8365,7 +8439,45 @@ function Invoke-FudoPrintDoctor {
             $tp = $script:Checks | Where-Object { $_.id -eq 'hw.testprint' -and $_.status -eq 'ok' } | Select-Object -First 1
             if ($tp) { $sirvio = $true }
         } catch {}
-        if (-not ($pidioConservar -or $sirvio)) {
+
+        # La cola de prueba que imprimio deja de ser una cola de prueba: se queda con el nombre
+        # real del hardware. Hasta la 3.22 quedaba instalada como FUDO-TEST-USB00x, o sea que
+        # el motor cerraba "resuelto" dejando una cola que Fudo no conoce y una tarea a mano.
+        # El motor esta para dejar la PC funcionando, no a mitad de camino.
+        # Con -KeepTestPrinter no se toca nada: si alguien pidio conservarla es para reprobar.
+        $renombrada = ''
+        if ($sirvio -and -not $pidioConservar -and $printer) {
+            $nombreObjetivo = ''
+            try { $nombreObjetivo = [string]$printer.Name } catch {}
+            if ($nombreObjetivo -and ($nombreObjetivo -match $script:TestPrinterRx)) {
+                $renombrada = Convert-TestQueueToReal -Nombre $nombreObjetivo
+                if ($renombrada) {
+                    $names = @($names | Where-Object { $_ -ne $nombreObjetivo })
+                    # $printer todavia apunta al nombre viejo, que ya no existe, y abajo lo usan
+                    # el rescan final y el chequeo de comandas encoladas. Sin esto el motor
+                    # termina preguntandole a Windows por una impresora que el mismo renombro.
+                    try { $printer = Get-Printer -Name $renombrada -ErrorAction Stop } catch {}
+                    Add-Check -Id 'printer.testKept' -Layer 1 -Name ("La impresora quedo instalada en Windows como '" + $renombrada + "'") -Status 'fixed' -Plane 'os' `
+                        -Evidence @{ colaDePrueba = $nombreObjetivo; quedoComo = $renombrada } `
+                        -ActionTaken ("la cola de prueba '" + $nombreObjetivo + "' se renombro a '" + $renombrada + "'") -Reversible $true `
+                        -ArticleRef 'https://soporte.fu.do/es/articles/16419361' `
+                        -Recommendation ("La impresora no estaba instalada en Windows y ahora si, con el nombre '" + $renombrada + "'. " +
+                                         'Falta un solo paso y es en Fudo: Administracion > Impresoras, darla de alta eligiendo ese nombre, ' +
+                                         'y asignarle la cocina o area que corresponda.')
+                    # El texto de la capa 1 prometia "borrar la de prueba con Remove-Printer":
+                    # ya no hay ninguna de prueba que borrar y seguirlo diciendo manda al asesor
+                    # a borrar la impresora que acabamos de dejarle andando.
+                    $null = Update-CheckFinding -Id 'printer.exists' -Status 'fixed' `
+                        -Name ("Impresora instalada en Windows como '" + $renombrada + "'") `
+                        -EvidenceExtra @{ quedoComo = $renombrada } `
+                        -Recommendation ("La impresora estaba conectada pero sin instalar. Quedo instalada como '" + $renombrada + "'. " +
+                                         'Registrarla en Fudo (Administracion > Impresoras) con ese nombre y asignarle la cocina o area.')
+                }
+            }
+        }
+        # Las que NO sirvieron se borran igual, aunque otra haya servido: una cola de prueba
+        # que no imprimio solo ensucia el panel del cliente.
+        if ((-not $pidioConservar) -and (@($names).Count -gt 0) -and ((-not $sirvio) -or $renombrada)) {
             $sobrevivieron = @()
             foreach ($n in $names) {
                 for ($i = 0; $i -lt 3; $i++) {
@@ -8389,10 +8501,24 @@ function Invoke-FudoPrintDoctor {
                 Add-Check -Id 'printer.testCleanup' -Layer 1 -Name 'Cola de prueba eliminada' -Status 'ok' `
                     -Evidence @{ removed = $names; motivo = 'no imprimio, no deja rastro en el panel del cliente' }
             }
-        } else {
-            Add-Check -Id 'printer.testCleanup' -Layer 1 -Name 'Cola de prueba conservada' -Status 'warn' -Plane 'os' `
-                -Evidence @{ kept = $names } `
-                -Recommendation ("Queda instalada la cola de prueba " + ($names -join ', ') + " porque SI imprimio: sirve como cola definitiva o como referencia del puerto correcto. Borrarla cuando se instale la definitiva: Remove-Printer -Name '" + (@($names)[0]) + "'")
+        } elseif (@($names).Count -gt 0) {
+            # Se llega aca por dos caminos distintos y conviene no confundirlos: o alguien pidio
+            # conservarla con -KeepTestPrinter, o imprimio pero el rename fallo. El segundo es el
+            # unico caso en el que el motor deja una cola con nombre interno, y hay que decir
+            # que hacer con ella.
+            if ($pidioConservar) {
+                Add-Check -Id 'printer.testCleanup' -Layer 1 -Name 'Cola de prueba conservada a pedido' -Status 'ok' -Plane 'os' `
+                    -Evidence @{ kept = $names; motivo = 'se pidio con -KeepTestPrinter' } `
+                    -Recommendation ("Queda instalada " + ($names -join ', ') + " porque se pidio conservarla. Borrarla cuando no haga falta: Remove-Printer -Name '" + (@($names)[0]) + "'")
+            } else {
+                Add-Check -Id 'printer.testCleanup' -Layer 1 -Name 'La cola quedo con el nombre interno del motor' -Status 'warn' -Plane 'os' `
+                    -Evidence @{ kept = $names; motivo = 'imprimio pero no se pudo renombrar' } `
+                    -ArticleRef 'https://soporte.fu.do/es/articles/16419361' `
+                    -Recommendation ("La impresora imprime por " + ($names -join ', ') + ", pero no se pudo renombrar esa cola. " +
+                                     "NO borrarla: es la que esta funcionando. Renombrarla a mano con el nombre de la impresora " +
+                                     "(Panel de control > Dispositivos e impresoras > clic derecho > Propiedades de impresora > pestana General) " +
+                                     "y registrarla en Fudo con ese nombre.")
+            }
         }
     }
 
@@ -8980,6 +9106,21 @@ function Invoke-SelfTest {
     $plan120c = Get-UsbPortCandidates -CurrentPort 'USB002' -UsbPorts @('USB001','USB002') `
                     -LivePorts @('USB001') -ColaPorPuerto @{ 'USB001' = 'COCINA' }
     Assert-Eq 'S120 con todo ocupado no hay candidatos' 0 (@($plan120c.candidatos).Count)
+
+    # Escenario 121 (v3.23): la cola de prueba que imprimio deja de llamarse FUDO-TEST-*.
+    # Hasta la 3.22, cuando el cliente no tenia ninguna cola instalada, el motor creaba
+    # FUDO-TEST-USB00x, imprimia, el humano confirmaba y esa cola quedaba instalada con ese
+    # nombre: el motor cerraba "resuelto" dejando una cola que Fudo no conoce y una tarea a
+    # mano. El motor esta para dejar la PC funcionando, no a mitad de camino.
+    Assert-Eq 'S121 usa el nombre del hardware' 'Xprinter XP-410B' (Get-NombreLibreParaCola -Base 'Xprinter XP-410B' -Existentes @())
+    # Si ya existe una con ese nombre no se pisa: Rename-Printer falla y no dice por que.
+    Assert-Eq 'S121 si el nombre esta tomado, desempata' 'Xprinter XP-410B (2)' (Get-NombreLibreParaCola -Base 'Xprinter XP-410B' -Existentes @('Xprinter XP-410B'))
+    # Windows no acepta ',' '\' ni '!' en el nombre de una impresora.
+    Assert-Eq 'S121 saca los caracteres que Windows rechaza' 'Bixolon SRP-350 III' (Get-NombreLibreParaCola -Base 'Bixolon, SRP-350\III!' -Existentes @())
+    # Y el peor final posible seria dejar una cola que la proxima corrida borre sola por
+    # parecer del motor.
+    Assert-Eq 'S121 nunca queda con nombre de cola del motor' 'Impresora Fudo' (Get-NombreLibreParaCola -Base 'FUDO-TEST-USB001' -Existentes @())
+    Assert-Eq 'S121 sin nombre tampoco queda vacia' 'Impresora Fudo' (Get-NombreLibreParaCola -Base '   ' -Existentes @())
 
     function Get-CheckById { param([string]$Id) return (@($script:Checks | Where-Object { $_.id -eq $Id }) | Select-Object -First 1) }
 
