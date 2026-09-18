@@ -894,6 +894,24 @@ function infFilaCola(c){
   return row;
 }
 
+function infFilaDesconectada(h){
+  var row = el("div","inf-row target"), top = el("div","inf-top");
+  top.appendChild(ico("cola",17));
+  var id = el("div","inf-id"), n = el("div","n");
+  n.appendChild(el("span",null, esc(h.nombre)||"Impresora sin identificar"));
+  id.appendChild(n);
+  id.appendChild(el("div","m", h.puerto ? ("estaba en "+esc(h.puerto)) : "sin puerto asignado"));
+  top.appendChild(id);
+  var a = el("div","inf-act");
+  a.appendChild(infChip("fail","Desconectada"));
+  var bt = infBoton("U","Reconectar el USB",{i:"usb", primary:true});
+  if(bt) a.appendChild(bt);
+  top.appendChild(a);
+  row.appendChild(top);
+  if(h.motivo) row.appendChild(el("div","inf-sym", esc(h.motivo)));
+  return row;
+}
+
 function infTablaPuertos(todos){
   // En una PC real hay 14 puertos y 11 son ruido: COM1..COM6, LPT1..3, FILE:, nul: y el
   // puerto larguisimo de OneNote. Se muestran los que pueden imprimir una comanda; el
@@ -953,6 +971,12 @@ function construirInforme(){
   var cards = tarjetasPC(inv);
   var colas = inv.colas || [], puertos = inv.puertos || [];
   var estCola = colas.map(function(c){ return c.estado==="sana" ? "ok" : (c.estado==="no imprime"?"fail":"warn"); });
+  // Una impresora que Windows conoce y no esta conectada cuenta como rota, y una PC SIN
+  // ninguna impresora tambien. Sin esto el semaforo decia "0 no funcionan" arriba de un
+  // cartel que decia "todavia no imprime": dos afirmaciones opuestas en la misma pantalla,
+  // y la que estaba mal era la del semaforo, porque contaba cosas y no el hecho.
+  (inv.desconectadas||[]).forEach(function(){ estCola.push("fail"); });
+  if(colas.length===0) estCola.push("fail");
 
   function cuenta(x){
     // Los puertos en 'idle' NO se cuentan. Un COM1 o un USB libre no es algo que no pudimos
@@ -987,9 +1011,13 @@ function construirInforme(){
   cont.appendChild(s1);
 
   var s2 = sec("Impresoras instaladas");
-  if(colas.length){
+  var descon = inv.desconectadas || [];
+  if(colas.length || descon.length){
     var box = el("div","inf-prn");
     colas.forEach(function(c){ box.appendChild(infFilaCola(c)); });
+    // Las que Windows conoce y hoy no estan. Van con las otras y no en una nota al pie:
+    // "la impresora que usabas no esta conectada" suele SER la causa raiz, no un detalle.
+    descon.forEach(function(h){ box.appendChild(infFilaDesconectada(h)); });
     s2.appendChild(box);
   } else {
     // Vacio NO es "todo bien": en esta PC Fudo no tiene a donde mandar la comanda.
@@ -1014,6 +1042,34 @@ function construirInforme(){
   return cont;
 }
 
+/* Lo que el informe ya muestra CON su accion al lado no se repite en "que hacer ahora".
+   Es la misma regla que en 3.22 saco de la lista los hallazgos informativos: un renglon que
+   dice lo que el asesor esta viendo tres centimetros mas abajo no es una accion, es ruido, y
+   empuja hacia el pliegue las que si hay que hacer.
+
+   OJO con el criterio, que no es "existe la tarjeta". Es "el informe muestra el hallazgo Y
+   ofrece que hacer": la tarjeta de permisos dice como abrir como administrador, la fila de la
+   impresora desconectada trae el boton de reconectar. En cambio hw.deviceConnected SE QUEDA
+   en la lista aunque la tabla de puertos muestre los USB vacios, porque lo que hay que hacer
+   -mirar que este encendida, que el cable este firme, probarla sin el hub- no esta en ninguna
+   tarjeta y no es algo que el motor pueda hacer por nadie.
+
+   Y esto es SOLO presentacion: nextActions viaja entero en el JSON y en la telemetria, que es
+   de donde leen el agente y el dashboard. */
+var INFORME_CUBRE = {
+  "env.os":1, "env.admin":1, "env.spooler":1, "fudo.extension":1,
+  "nativa.installed":1, "nativa.defenderQuarantine":1, "nativa.defenderExclusion":1,
+  "nativa.sinFirmar":1, "nativa.hostRegistrado":1,
+  "printer.exists":1, "printer.offline":1, "printer.paused":1, "printer.multiple":1,
+  "hw.disconnected":1, "queue.health":1
+};
+function yaEstaEnElInforme(checkId){
+  // Sin informe en pantalla no se filtra nada: si el inventario fallo, la lista completa es
+  // lo unico que queda y esconder la mitad seria dejar al asesor sin nada.
+  if(!inventario) return false;
+  return !!INFORME_CUBRE[String(checkId||"")];
+}
+
 function pintarInforme(){
   // Durante la corrida vive arriba de la escalera; en el resultado lo reubica
   // pintarResultado. Se reconstruye entero en vez de mutar: es barato y no hay estado que
@@ -1036,7 +1092,9 @@ function pintarResultado(){
   v.appendChild(el("div","verdict-k", ok ? "Listo: la impresora qued\u00f3 funcionando" : "Todav\u00eda no imprime: falta resolver esto"));
   v.appendChild(el("h2",null,esc(dg.rootCause)||"Sin causa determinada"));
   var meta=el("div","meta");
-  if(dg.confidence) meta.appendChild(el("span",null,"Confianza: "+esc(dg.confidence)));
+  // 'Confianza: medium' es vocabulario del motor: no le dice nada a quien mira la pantalla
+  // -ni al cliente, que tambien la mira- y no cambia lo que hay que hacer. Sigue viajando
+  // en el JSON y en la telemetria, que es donde sirve.
   meta.appendChild(el("span",null, tocado.length===1 ? "Cambiamos 1 cosa en esta computadora" : ("Cambiamos "+tocado.length+" cosas en esta computadora")));
   if(d.modo) meta.appendChild(el("span",null,"Revisamos: "+(d.modo==="Ambos"?"USB y red":"s\u00f3lo "+String(d.modo).toLowerCase())));
   v.appendChild(meta);
@@ -1078,7 +1136,8 @@ function pintarResultado(){
   // que hacer ahora
   // accionesTop viene colapsada por el motor con la misma regla del resumen de consola.
   var acc=(d.accionesTop && d.accionesTop.length ? d.accionesTop : (d.acciones||[]))
-            .filter(function(a){ return a; });
+            .filter(function(a){ return a; })
+            .filter(function(a){ return !yaEstaEnElInforme(a.checkId); });
   if(acc.length){
     var s1=sec("Qué hacer ahora");
     var ul=el("ul","todo");

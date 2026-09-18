@@ -26,6 +26,19 @@ Ahora, a los pocos segundos, tiene el inventario en pantalla.
   tiene instalada), *rota* (hay una cola apuntando a un USB vacío) y *sin estado* para lo que
   no tiene nada que decir. Un puerto de red **no** se da por bueno por existir: hereda el
   estado de su cola, porque hasta que la capa 3 lo pruebe no hay evidencia de que conteste.
+- **Las impresoras desconectadas entran al informe.** Las que Windows conoce y hoy no están
+  aparecen junto a las instaladas, con su motivo y el botón de reconectar. Faltaban justo
+  donde el motor pone su causa raíz más común: en la corrida de prueba la causa fue *"Xprinter
+  XP-410B (estaba en USB002)"* y el informe no la mencionaba en ningún lado.
+- **"Qué hacer ahora" deja de repetir lo que el informe ya muestra.** Si un hallazgo tiene su
+  tarjeta o su fila **con la acción al lado**, no necesita además un renglón en la lista. En la
+  corrida de prueba pasó de 9 acciones a 2. Lo que se queda: la configuración de Fudo (capa 5,
+  que es de la cuenta y no de la PC) y las instrucciones para una persona —mirar que esté
+  encendida, que el cable esté firme, probarla sin el hub—, que no son el estado de nada y por
+  eso no tienen tarjeta. Es la misma regla de 3.22 con los hallazgos informativos, un paso más.
+  **Es sólo presentación: `nextActions` viaja entero en el JSON y en la telemetría.**
+- **Fuera "Confianza: medium" de la pantalla.** Vocabulario del motor; no le dice nada a quien
+  mira —ni al cliente, que también mira— y no cambia lo que hay que hacer. Sigue en el JSON.
 - **La IP local de la PC** viaja en `entorno.redes[].ip`. Sin ella, para decidir qué dirección
   ponerle a una impresora de red había que pedírsela al cliente por teléfono. Se descarta la
   169.254.*, que es la que Windows se autoasigna cuando **no** consiguió red: informarla como
@@ -41,6 +54,16 @@ Ahora, a los pocos segundos, tiene el inventario en pantalla.
   PWA venía primero, la telemetría reportaba "Nativa 1.0". Estaba así desde la 3.19 y nadie lo
   vio porque el dato solo iba a la planilla; se destapó al ponerlo en una tarjeta en pantalla.
   *Un filtro puesto en la detección no protege a los otros lectores de la misma fuente.*
+
+- **El semáforo decía "0 no funcionan" arriba de un cartel que decía "todavía no imprime".**
+  Contaba cosas —tarjetas, colas, puertos— y una PC sin ninguna impresora instalada no era
+  ninguna de esas cosas, así que no sumaba. Ahora una PC sin impresoras y cada impresora
+  desconectada cuentan como rotas. *Dos afirmaciones opuestas en la misma pantalla, y la que
+  estaba mal era la del resumen, no la del diagnóstico.*
+- **El renglón que colapsa la capa 5 abría con "La impresora anda".** Aparece cada vez que
+  quedan chequeos de configuración de Fudo sin resolver —ande la impresora o no—, y quedó
+  arriba de un veredicto que decía *"impresora instalada pero DESCONECTADA"*. Un texto sobre la
+  configuración de Fudo no puede afirmar el estado del hardware: no es lo que ese renglón miró.
 
 ### Aprendido (y es lo que más va a durar)
 
