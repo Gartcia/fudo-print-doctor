@@ -2,6 +2,71 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.23] - 2026-09-18
+
+**El informe de la PC.** La interfaz deja de mostrar solo el progreso y el veredicto: ahora
+dibuja qué tiene esta computadora, qué impresoras hay instaladas y qué hay conectado en cada
+puerto, con el estado de cada cosa y el botón de la gestión que la resuelve al lado. Y no
+aparece al final: se pinta **apenas terminan las capas de lectura**, mientras el motor sigue
+trabajando.
+
+El motivo es el mismo de siempre, visto desde el otro lado: la corrida completa puede tardar
+minutos —la prueba física espera a que un humano mire si salió el papel— y en todo ese rato el
+asesor miraba una escalera de capas que le cuenta cómo anda el motor, no cómo está el local.
+Ahora, a los pocos segundos, tiene el inventario en pantalla.
+
+### Agregado
+
+- **Evento `inventario`**: el motor lo empuja después de la capa 1 y otra vez después del
+  rescan final, así el informe refleja lo que se reparó en el medio. Si la interfaz no está
+  levantada, es un no-op.
+- **`Get-PortInventory`**: cruza `printerPorts`, `printersConnected` y `colas` y devuelve, por
+  puerto, qué hay del otro lado. Cuatro estados y ninguno es una opinión: *enganchada* (hay
+  device y hay cola), *sin usar* (hay device y ninguna cola: está enchufada y Windows no la
+  tiene instalada), *rota* (hay una cola apuntando a un USB vacío) y *sin estado* para lo que
+  no tiene nada que decir. Un puerto de red **no** se da por bueno por existir: hereda el
+  estado de su cola, porque hasta que la capa 3 lo pruebe no hay evidencia de que conteste.
+- **La IP local de la PC** viaja en `entorno.redes[].ip`. Sin ella, para decidir qué dirección
+  ponerle a una impresora de red había que pedírsela al cliente por teléfono. Se descarta la
+  169.254.*, que es la que Windows se autoasigna cuando **no** consiguió red: informarla como
+  la IP del local sería peor que no decir nada. *Nota: `entorno` viaja en la telemetría, así
+  que esta IP privada ahora también. Las IP de las impresoras ya viajaban.*
+
+### Corregido
+
+- **`entorno.nativaVersion` podía ser la de una PWA de Chrome.** Una app instalada desde el
+  navegador (Chrome > Instalar página como app) se anota con DisplayName `Fudo` y
+  DisplayVersion `1.0`. La 3.19 le puso el filtro `esPwa` a `Find-FudoNativeInstall`, pero
+  `Get-EnvironmentInfo` seguía leyendo `regInfo` **crudo** y tomaba la primera entrada: si la
+  PWA venía primero, la telemetría reportaba "Nativa 1.0". Estaba así desde la 3.19 y nadie lo
+  vio porque el dato solo iba a la planilla; se destapó al ponerlo en una tarjeta en pantalla.
+  *Un filtro puesto en la detección no protege a los otros lectores de la misma fuente.*
+
+### Aprendido (y es lo que más va a durar)
+
+Armando esta pantalla aparecieron **tres avisos falsos de la misma familia**, y ninguno salía
+de un bug: salían de reglas escritas "por las dudas".
+
+1. *"Estás por Wi-Fi, y una impresora de red se puede cortar"* — en una PC sin ninguna
+   impresora de red. Ahora el wifi solo es ámbar **si hay una cola con IP propia**, y dice
+   cuál.
+2. *"15 sin revisar"* en una PC sana: se estaban contando los COM, LPT y los USB libres. Un
+   puerto vacío no es algo que no pudimos revisar, es algo que no tiene nada que decir. En una
+   tarjeta el gris sí significa "no lo miré", y ahí sigue contando.
+3. *"No se pudo revisar si el antivirus se llevó algo de Fudo"* con la Nativa instalada y
+   corriendo. Si la Nativa está y anda, Defender de hecho no se la está llevando: eso es
+   evidencia, y la tarjeta dice "sin bloqueos".
+
+La regla que queda: **una advertencia tiene que salir de algo que se observó, no de algo que
+podría pasar.** Es la lección de los falsos positivos del motor aplicada a la presentación, y
+tiene la misma consecuencia práctica: si el informe se llena de ámbar, el asesor deja de
+mirarlo, que es exactamente lo contrario de para qué existe.
+
+Un corolario de diseño, del mismo origen: **el estado de cada cosa sale de los checks que el
+motor ya manda, no de una segunda opinión calculada en la interfaz.** Los datos que viajan son
+valores (qué Windows, qué Chrome, qué versión); el color lo pone el check. Dos fuentes de
+verdad sobre lo mismo terminan discrepando, y a este proyecto ya le pasó.
+
 ## [3.22] - 2026-09-16
 
 **El motor deja de ser una ventana negra.** Con `-Ui web` levanta una página en `127.0.0.1`, la

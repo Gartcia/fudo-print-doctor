@@ -237,6 +237,89 @@ details.drawer[open] summary::before{content:"\25BE "}
 .foot b{color:var(--ink-2);font-weight:500}
 pre.json{margin:0;padding:12px;font-family:"IBM Plex Mono",monospace;font-size:11px;overflow-x:auto;
   color:var(--ink-2);line-height:1.55;max-height:420px}
+
+/* ---- informe de la PC (v3.23) ----
+   Prefijo inf- a proposito: comparte tokens con el resto pero no pisa ninguna clase de las
+   pantallas que ya andaban. Regla de diseno de toda la seccion: lo que esta bien ocupa dos
+   renglones y no lleva ni chip ni boton; lo que esta mal se toma lo que necesite. Asi el
+   informe entero entra en una pantalla y el ojo va solo a lo que hay que mirar. */
+.inf svg{display:block;flex:none}
+.inf-snap{display:flex;gap:6px;flex-wrap:wrap;margin-bottom:14px}
+.inf-sn{display:flex;align-items:center;gap:7px;border:1px solid var(--line-soft);border-radius:7px;
+  padding:5px 11px 5px 9px;background:var(--surface-2);font-size:11.5px;color:var(--ink-2)}
+.inf-sn .n{font-family:"IBM Plex Mono",monospace;font-size:17px;font-weight:600;letter-spacing:-.03em;line-height:1.1}
+.inf-sn.ok .n,.inf-sn.ok svg{color:var(--ok)} .inf-sn.warn .n,.inf-sn.warn svg{color:var(--warn)}
+.inf-sn.fail .n,.inf-sn.fail svg{color:var(--fail)} .inf-sn.idle .n,.inf-sn.idle svg{color:var(--idle)}
+.inf-sn.fixed .n,.inf-sn.fixed svg{color:var(--fixed)}
+.inf-sn.vacio{opacity:.5}
+
+.inf-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(196px,1fr));gap:7px;align-items:start}
+.inf-card{border:1px solid var(--line-soft);border-left:3px solid var(--idle);border-radius:7px;
+  background:var(--surface);padding:7px 10px 8px;display:flex;flex-direction:column;gap:1px;min-width:0}
+.inf-card.ok{border-left-color:var(--ok)} .inf-card.warn{border-left-color:var(--warn)}
+.inf-card.fail{border-left-color:var(--fail)} .inf-card.fixed{border-left-color:var(--fixed)}
+.inf-card.idle{border-left-color:var(--line)}
+.inf-card .top{display:flex;align-items:center;gap:6px;color:var(--muted)}
+.inf-card .k{font-size:9.5px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;margin-right:auto;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.inf-card.ok .top svg{color:var(--ok)} .inf-card.warn .top svg{color:var(--warn)}
+.inf-card.fail .top svg{color:var(--fail)} .inf-card.fixed .top svg{color:var(--fixed)}
+.inf-card.idle .top svg{color:var(--idle)}
+.inf-card .v{font-size:13px;font-weight:600;letter-spacing:-.01em;line-height:1.3;word-break:break-word}
+.inf-card .d{font-size:11px;color:var(--ink-2);line-height:1.35;margin-top:1px;
+  display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.inf-card .bot{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:5px}
+.inf-dot{width:7px;height:7px;border-radius:50%;flex:none}
+.inf-dot.ok{background:var(--ok)} .inf-dot.warn{background:var(--warn)}
+.inf-dot.fail{background:var(--fail)} .inf-dot.fixed{background:var(--fixed)} .inf-dot.idle{background:var(--idle)}
+
+.inf-prn{display:flex;flex-direction:column;gap:6px}
+.inf-row{display:flex;flex-direction:column;gap:3px;border:1px solid var(--line-soft);border-radius:7px;
+  background:var(--surface);padding:7px 11px}
+.inf-row.target{border-color:var(--fail)}
+.inf-top{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.inf-top > svg{color:var(--muted)}
+.inf-row.target .inf-top > svg{color:var(--fail)}
+.inf-id{display:flex;flex-direction:column;min-width:150px;margin-right:auto;gap:1px}
+.inf-id .n{font-size:13px;font-weight:600;letter-spacing:-.01em;display:flex;align-items:center;gap:6px;flex-wrap:wrap}
+.inf-id .m{font-family:"IBM Plex Mono",monospace;font-size:11px;color:var(--muted)}
+.inf-sym{font-size:11.5px;color:var(--ink-2);padding-left:26px}
+.inf-act{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
+.inf-act .why{font-size:11px;color:var(--muted)}
+.inf-vacio{display:flex;align-items:center;gap:10px;border:1px solid var(--warn);border-radius:7px;
+  background:var(--warn-bg);padding:9px 12px}
+.inf-vacio svg{color:var(--warn)}
+.inf-vacio b{font-size:12.5px;color:var(--ink)}
+.inf-vacio p{font-size:11.5px;color:var(--ink-2)}
+.inf-vacio > div{margin-right:auto}
+
+.inf-tbl{border:1px solid var(--line-soft);border-radius:7px;overflow:auto}
+table.inf-pt{border-collapse:collapse;width:100%;font-size:12px}
+table.inf-pt th{text-align:left;font-size:9.5px;font-weight:600;letter-spacing:.07em;text-transform:uppercase;
+  color:var(--muted);padding:5px 10px;background:var(--surface-2);border-bottom:1px solid var(--line-soft);white-space:nowrap}
+table.inf-pt td{padding:5px 10px;border-bottom:1px solid var(--line-soft);vertical-align:middle}
+table.inf-pt tr:last-child td{border-bottom:0}
+table.inf-pt tr.off td{color:var(--muted)}
+table.inf-pt .pp{display:flex;align-items:center;gap:6px;font-family:"IBM Plex Mono",monospace;
+  font-weight:600;font-size:12px;white-space:nowrap}
+table.inf-pt .sub{font-size:11px;color:var(--muted);font-weight:400;font-family:"IBM Plex Sans",sans-serif}
+table.inf-pt td.act{text-align:right;white-space:nowrap;padding:4px 8px}
+.inf-ley{margin-top:6px;font-size:11px;color:var(--muted)}
+.inf-chip{display:inline-flex;align-items:center;gap:4px;font-size:10.5px;font-weight:600;padding:2px 7px;
+  border-radius:99px;white-space:nowrap}
+.inf-chip.ok{background:var(--ok-bg);color:var(--ok)}
+.inf-chip.warn{background:var(--warn-bg);color:var(--warn)}
+.inf-chip.fail{background:var(--fail-bg);color:var(--fail)}
+.inf-chip.fixed{background:var(--fixed-bg);color:var(--fixed)}
+.inf-chip.idle{background:var(--idle-bg);color:var(--idle)}
+.inf-btn{display:inline-flex;align-items:center;gap:5px;font:inherit;font-size:11.5px;font-weight:500;
+  padding:4px 9px;border-radius:6px;border:1px solid var(--line);background:var(--surface);color:var(--ink);
+  cursor:pointer;white-space:nowrap}
+.inf-btn:hover{background:var(--surface-2);border-color:var(--ink-2)}
+.inf-btn.primary{background:var(--ink);color:var(--surface);border-color:var(--ink)}
+.inf-btn.danger{border-color:var(--fail);color:var(--fail)}
+.inf-badge{font-size:9px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--fixed);
+  background:var(--fixed-bg);padding:1px 6px;border-radius:3px}
 </style>
 
 <div class="wrap">
@@ -283,6 +366,10 @@ pre.json{margin:0;padding:12px;font-family:"IBM Plex Mono",monospace;font-size:1
       <section id="faseCorrida" hidden>
         <div class="note" id="motivoReinicio" hidden></div>
         <div class="bar"><i id="barFill"></i></div>
+        <!-- El informe de la PC se pinta apenas terminan las capas de lectura, mientras el
+             motor sigue trabajando. Va arriba de la escalera a proposito: es lo que le sirve
+             al asesor, la escalera es como anda el motor. -->
+        <div class="inf" id="informeCorrida"></div>
         <div class="run">
           <div>
             <div class="panel-t">Qu&eacute; estamos revisando</div>
@@ -310,7 +397,7 @@ pre.json{margin:0;padding:12px;font-family:"IBM Plex Mono",monospace;font-size:1
 var TOKEN = "__FPD_TOKEN__";
 var desde = 0, fase = "arranque", checks = [], tocado = [], pasos = {}, total = 11;
 var claveActual = "", claveRespondida = "", resultado = null, menuPreg = null, caido = false, cerrado = false;
-var dryRun = false;
+var dryRun = false, inventario = null;
 
 function $(id){ return document.getElementById(id); }
 function el(t,c,x){ var n=document.createElement(t); if(c)n.className=c; if(x!=null)n.textContent=x; return n; }
@@ -378,7 +465,13 @@ function aplicar(ev){
       break;
     case "detalle": linea("│ "+esc(d.texto)); break;
     case "log":     linea("  "+esc(d.nivel)+": "+esc(d.texto), d.nivel==="ERROR"?"f":"w"); break;
-    case "check":   checks.push(d); break;
+    case "check":
+      checks.push(d);
+      // Un check nuevo puede cambiar el color de una tarjeta (la Nativa que se restauro, el
+      // spooler que arranco). Si el informe ya esta en pantalla, se repinta.
+      if(inventario) pintarInforme();
+      break;
+    case "inventario": inventario = d; pintarInforme(); break;
     case "toque":   agregarToque(d); break;
     case "espera":  espera(d); break;
     case "gestion.inicio": gestionInicio(d); break;
@@ -484,7 +577,11 @@ function reiniciar(motivo){
   var mr=$("motivoReinicio");
   if(motivo){ mr.textContent=motivo; mr.hidden=false; } else { mr.hidden=true; }
   gestionSlot().innerHTML="";
-  checks=[]; tocado=[]; pasos={}; resultado=null; menuPreg=null;
+  // El informe tambien se tira: los checks que le dan color acaban de borrarse, y un informe
+  // pintado con la foto de la corrida anterior es exactamente el tipo de dato que hace que
+  // alguien decida sobre algo que ya no es cierto. El motor manda uno nuevo en segundos.
+  checks=[]; tocado=[]; pasos={}; resultado=null; menuPreg=null; inventario=null;
+  $("informeCorrida").innerHTML="";
   $("ladder").innerHTML=""; $("feed").innerHTML=""; $("touched").innerHTML="";
   $("touchedEmpty").hidden=false; $("barFill").style.width="0";
   $("faseResultado").innerHTML="";
@@ -602,6 +699,331 @@ var QUIEN = { cliente:"en el local", asesor:"lo hace soporte",
 
 function sec(t){ var s=el("section","sec"); s.appendChild(el("div","sec-t",t)); return s; }
 
+/* =========================================================================
+   INFORME DE LA PC (v3.23)
+   Que tiene esta computadora, que impresoras hay y que hay en cada puerto.
+   Se dibuja apenas llega el evento 'inventario', que el motor manda cuando terminan las
+   capas de lectura: el asesor tiene el informe en pantalla mientras el motor sigue.
+
+   REGLA que vale por todo el resto: el ESTADO de cada cosa sale de los checks que el motor
+   ya manda, no de una segunda opinion calculada aca. Los datos de abajo son VALORES (que
+   Windows, que Chrome, que version); el color lo pone el check. Si la interfaz juzgara por
+   su cuenta, habria dos verdades sobre lo mismo y un dia van a discrepar.
+   Y lo que no se pudo revisar se pinta gris, nunca verde: "no lo mire" no es "esta bien".
+   ========================================================================= */
+var SVGNS = "http://www.w3.org/2000/svg";
+var ICONOS = {
+  pc:      ["M3 4h18v12H3z","M9 20h6","M12 16v4"],
+  llave:   ["M15.5 3a5.5 5.5 0 1 0 2.9 10.2","M21 8.5a5.5 5.5 0 0 1-2.6 4.7L10 21H6v-4l8.8-8.4"],
+  cola:    ["M7 9V3h10v6","M4 9h16v7H4z","M7 14h10v7H7z"],
+  globo:   ["M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18","M3.5 9h17","M3.5 15h17","M12 3c2.5 2.6 3.8 5.7 3.8 9S14.5 18.4 12 21c-2.5-2.6-3.8-5.7-3.8-9S9.5 5.6 12 3"],
+  pieza:   ["M9 3h6v2.2a1.8 1.8 0 1 0 3.6 0V3H21v6h-2.2a1.8 1.8 0 1 0 0 3.6H21V21h-6v-2.2a1.8 1.8 0 1 0-3.6 0V21H3v-6h2.2a1.8 1.8 0 1 0 0-3.6H3V9"],
+  enchufe: ["M9 3v5","M15 3v5","M6 8h12v3a6 6 0 0 1-6 6 6 6 0 0 1-6-6z","M12 17v4"],
+  escudo:  ["M12 3l8 3v5.5c0 4.7-3.4 8.6-8 9.5-4.6-.9-8-4.8-8-9.5V6z"],
+  escudoX: ["M12 3l8 3v5.5c0 4.7-3.4 8.6-8 9.5-4.6-.9-8-4.8-8-9.5V6z","m9.5 9.5 5 5","m14.5 9.5-5 5"],
+  wifi:    ["M2.5 8.5a15 15 0 0 1 19 0","M6 12.5a10 10 0 0 1 12 0","M9.5 16.5a5 5 0 0 1 5 0","M12 20h.01"],
+  cable:   ["M4 5h16v6H4z","M8 11v3","M16 11v3","M6 14h12v5H6z"],
+  usb:     ["M12 21V5","m8.5 8.5 3.5-4 3.5 4","M12 14l4-3V8.5","M12 17l-4-3v-2.5","M11 21h2"],
+  ok:      ["m5 12.5 4.5 4.5L19 7.5"],
+  alerta:  ["M12 3.5 22 20H2z","M12 10v4","M12 17.5h.01"],
+  cruz:    ["M12 3a9 9 0 1 0 0 18 9 9 0 0 0 0-18","m9 9 6 6","m15 9-6 6"],
+  ojo:     ["M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z","M12 9.5a2.5 2.5 0 1 0 0 5 2.5 2.5 0 0 0 0-5"],
+  llavein: ["M20 6 9 17l-5-5"]
+};
+function ico(nombre, tam){
+  var s = document.createElementNS(SVGNS,"svg"), t = tam || 15;
+  s.setAttribute("viewBox","0 0 24 24"); s.setAttribute("width",t); s.setAttribute("height",t);
+  s.setAttribute("fill","none"); s.setAttribute("stroke","currentColor");
+  s.setAttribute("stroke-width","1.7"); s.setAttribute("stroke-linecap","round");
+  s.setAttribute("stroke-linejoin","round"); s.setAttribute("aria-hidden","true");
+  (ICONOS[nombre]||[]).forEach(function(d){
+    var p = document.createElementNS(SVGNS,"path"); p.setAttribute("d",d); s.appendChild(p);
+  });
+  return s;
+}
+var ICO_ESTADO = { ok:"ok", warn:"alerta", fail:"cruz", fixed:"llavein", idle:"ojo" };
+var ROTULO = { ok:"Funciona", warn:"Para mirar", fail:"No funciona", fixed:"Lo arreglamos", idle:"Sin revisar" };
+
+function infChip(estado, texto){
+  var c = el("span","inf-chip "+estado);
+  c.appendChild(ico(ICO_ESTADO[estado],11));
+  c.appendChild(el("span",null, texto || ROTULO[estado]));
+  return c;
+}
+function infBoton(letra, texto, opts){
+  opts = opts || {};
+  // Solo se dibuja el boton si la gestion esta DISPONIBLE en el menu del motor. Prometer un
+  // boton para algo que el motor no va a poder hacer es peor que no ofrecer nada.
+  if(!menuPreg) return null;
+  var hay = (menuPreg.opciones||[]).some(function(o){ return o.v === letra; });
+  if(!hay) return null;
+  var b = el("button","inf-btn"+(opts.danger?" danger":"")+(opts.primary?" primary":""));
+  b.appendChild(ico(opts.i||"ok",13));
+  b.appendChild(el("span",null, dryRun ? (texto+" (no cambia nada)") : texto));
+  b.addEventListener("click", function(){ responder(letra); });
+  return b;
+}
+/* El estado de un check tal como lo mando el motor. Sin check: 'idle'. */
+function estadoCheck(id){
+  var c = null;
+  for(var i=checks.length-1;i>=0;i--){ if(checks[i].id===id){ c=checks[i]; break; } }
+  if(!c) return "idle";
+  var e = String(c.estado||"");
+  if(e==="skipped" || !ROTULO[e]) return "idle";
+  return e;
+}
+function hayCheck(id){ return checks.some(function(c){ return c.id===id; }); }
+
+function tarjetasPC(inv){
+  var e = inv.entorno || {}, so = e.so || {}, t = [];
+  function tarj(o){ t.push(o); return o; }
+
+  tarj({k:"Windows", i:"pc", v:esc(so.nombre)||"Windows",
+        d:(so.build?("Build "+esc(so.build)+" · "+esc(so.arquitectura)):""),
+        estado:estadoCheck("env.os")});
+
+  var adm = estadoCheck("env.admin");
+  tarj({k:"Permisos", i:"llave", v:e.esAdmin?"Administrador":"Sin permisos de admin",
+        d:e.esAdmin?"":"Hay reparaciones que no se van a poder aplicar. Cerrar esta ventana y abrir con “Ejecutar como administrador”.",
+        estado:adm});
+
+  tarj({k:"Servicio de impresión", i:"cola", v:"Cola de impresión (Spooler)",
+        d:"", estado:estadoCheck("env.spooler")});
+
+  // El navegador no tiene check propio: es un dato, no un hallazgo. Sin Chrome ni Edge SI
+  // es un problema, porque Fudo corre ahi.
+  var nav = e.chrome ? ("Chrome "+esc(e.chrome)) : (e.edge ? ("Edge "+esc(e.edge)) : "No se encontró");
+  tarj({k:"Navegador", i:"globo", v:nav,
+        d:(e.chrome||e.edge)?"":"Fudo corre en el navegador: sin Chrome ni Edge no hay por donde imprimir.",
+        estado:(e.chrome||e.edge)?"ok":"fail"});
+
+  var ext = estadoCheck("fudo.extension");
+  tarj({k:"Extensión de Fudo", i:"pieza",
+        v:ext==="ok"?"Instalada":(ext==="idle"?"No se pudo revisar":"Falta"),
+        d:ext==="ok"?"":(ext==="idle"?"No se encontraron perfiles del navegador en esta cuenta de Windows."
+                                    :"Sin la extensión, Fudo no puede imprimir. La pone el local desde la tienda de Chrome."),
+        estado:ext});
+
+  // La Nativa: el check nativa.installed es el que sabe si esta y si sirve. La version es
+  // un valor y viene de entorno (ya filtrada de las PWA de Chrome, v3.23).
+  var na = estadoCheck("nativa.installed");
+  var naCuar = estadoCheck("nativa.defenderQuarantine");
+  if(naCuar==="fail") na = "fail";
+  tarj({k:"App Nativa", i:"enchufe",
+        v:e.nativaVersion ? ("Versión "+esc(e.nativaVersion)) : (na==="ok"?"Instalada":"No está instalada"),
+        d:(na==="ok"||na==="fixed")?"":"Conecta el navegador con la impresora. Sin ella no sale ninguna comanda.",
+        estado:na, accion:(na==="ok"||na==="fixed")?null:{k:"F", l:"Repararla", i:"enchufe"}});
+
+  // Antivirus. Casi nunca esta "roto": esta bloqueando, o no lo podemos mirar. Y si es de
+  // terceros el motor no lo toca ni lo lee, asi que va gris y no verde.
+  // El motor solo mira la cuarentena cuando la Nativa falta o esta rota: si la Nativa esta
+  // instalada y andando, Defender de hecho NO se la esta llevando, y eso es evidencia
+  // suficiente para decir "sin bloqueos". Dejarlo en gris ahi seria decir "no lo pudimos
+  // revisar" sobre algo que el propio diagnostico ya contesto.
+  var terceros = hayCheck("nativa.thirdPartyAV");
+  var avEstado = "idle";
+  if(terceros)            avEstado = "idle";
+  else if(naCuar!=="idle") avEstado = naCuar;
+  else if(na==="ok" || na==="fixed") avEstado = "ok";
+  tarj({k:"Antivirus", i:(avEstado==="fail")?"escudoX":"escudo",
+        v:terceros?"Antivirus de terceros":"Microsoft Defender",
+        d:terceros?"El motor no toca antivirus que no sean Defender: esto hay que revisarlo a mano."
+                  :(avEstado==="idle"?"No llegamos a revisar si se llevó algo de Fudo.":""),
+        estado:avEstado,
+        rotulo:(avEstado==="fail")?"Bloquea a Fudo":(avEstado==="ok"?"Sin bloqueos":null),
+        accion:(avEstado==="fail")?{k:"F", l:"Sacarla de cuarentena", i:"enchufe"}:null});
+
+  // El wifi de la PC SOLO importa si hay una impresora con IP propia. Si la impresora es
+  // USB, que la PC este por wifi no tiene nada que ver con que salga la comanda: marcarlo
+  // igual seria inventar un problema que nadie observo.
+  var r = (e.redes||[])[0];
+  var colaRed = (inv.colas||[]).filter(function(c){ return /^(IP_|WSD)/i.test(String(c.puerto||"")); })[0];
+  var redWarn = !!(r && r.tipo==="wifi" && colaRed);
+  tarj({k:"Red de esta PC", i:(r && r.tipo==="wifi")?"wifi":"cable",
+        v:r ? ((r.tipo==="wifi"?"Wi-Fi":"Cable")+(r.ip?(" · "+esc(r.ip)):"")) : "Sin red",
+        d:!r ? "No hay ninguna placa de red conectada."
+             : (redWarn ? ("La impresora “"+esc(colaRed.nombre)+"” tiene IP propia y esta PC está por wifi: si el wifi se corta, dejan de salir las comandas.") : ""),
+        estado:!r ? "fail" : (redWarn ? "warn" : "ok")});
+  return t;
+}
+
+function infTarjeta(o){
+  var c = el("div","inf-card "+o.estado), top = el("div","top");
+  top.appendChild(ico(o.i,14));
+  top.appendChild(el("span","k",o.k));
+  top.appendChild(el("span","inf-dot "+o.estado));
+  c.appendChild(top);
+  c.appendChild(el("div","v",o.v));
+  if(o.d) c.appendChild(el("div","d",o.d));
+  // Lo que anda bien no lleva chip ni boton: el borde y el punto ya lo dicen. Es lo que
+  // hace que el informe entre en una pantalla.
+  var bt = o.accion ? infBoton(o.accion.k, o.accion.l, {i:o.accion.i}) : null;
+  if(o.estado!=="ok" || bt){
+    var bot = el("div","bot");
+    if(o.estado!=="ok") bot.appendChild(infChip(o.estado, o.rotulo));
+    if(bt) bot.appendChild(bt);
+    c.appendChild(bot);
+  }
+  return c;
+}
+
+function infFilaCola(c){
+  var mal = (c.estado!=="sana");
+  var estado = (c.estado==="no imprime") ? "fail" : (mal ? "warn" : "ok");
+  var row = el("div","inf-row"+(mal?" target":""));
+  var top = el("div","inf-top");
+  top.appendChild(ico("cola",17));
+  var id = el("div","inf-id"), n = el("div","n");
+  n.appendChild(el("span",null,esc(c.nombre)));
+  if(c.usaFudo) n.appendChild(el("span","inf-badge","le manda Fudo"));
+  id.appendChild(n);
+  id.appendChild(el("div","m", esc(c.puerto)+"  ·  "+esc(c.driver)+
+    (c.trabajos?("  ·  "+c.trabajos+" en cola"):"")));
+  top.appendChild(id);
+
+  var a = el("div","inf-act");
+  a.appendChild(infChip(estado, estado==="ok" ? "Imprime bien" : (estado==="fail"?"No imprime":"Con problemas")));
+  var bt;
+  if((bt = infBoton("T","Imprimir prueba",{i:"cola", primary:mal}))) a.appendChild(bt);
+  if(c.trabajos>0 && (bt = infBoton("L","Limpiar ("+c.trabajos+")",{i:"alerta", danger:true}))) a.appendChild(bt);
+  if(/no tiene ning/.test((c.sintomas||[]).join(" ")) && (bt = infBoton("U","Reconectar el USB",{i:"usb"}))) a.appendChild(bt);
+  if(!mal) a.appendChild(el("span","why","anda bien: no la tocamos"));
+  top.appendChild(a);
+  row.appendChild(top);
+  if(mal && (c.sintomas||[]).length) row.appendChild(el("div","inf-sym", c.sintomas.join("  ·  ")));
+  return row;
+}
+
+function infTablaPuertos(todos){
+  // En una PC real hay 14 puertos y 11 son ruido: COM1..COM6, LPT1..3, FILE:, nul: y el
+  // puerto larguisimo de OneNote. Se muestran los que pueden imprimir una comanda; el
+  // resto se cuenta en un renglon.
+  var ps = todos.filter(function(p){ return p.tipo==="impresora" || p.cola || /^USB\d+/i.test(String(p.puerto)); });
+  var resto = todos.length - ps.length;
+  var w = el("div","inf-tbl"), t = el("table","inf-pt"), th = el("thead"), tr = el("tr");
+  ["Puerto","Qué hay conectado","Cola que lo usa","Estado",""].forEach(function(h){ tr.appendChild(el("th",null,h)); });
+  th.appendChild(tr); t.appendChild(th);
+  var tb = el("tbody");
+  ps.forEach(function(p){
+    var esImp = (p.tipo==="impresora");
+    var r = el("tr", esImp ? "" : "off");
+    var c1 = el("td"), pp = el("div","pp");
+    pp.appendChild(ico(/^(IP_|WSD)/i.test(String(p.puerto)) ? "wifi" : (/^USB\d+/i.test(String(p.puerto)) ? "usb" : "cable"), 13));
+    pp.appendChild(el("span",null,esc(p.puerto)));
+    pp.appendChild(el("span","sub", esImp ? "impresora" : (p.tipo==="vacio" ? "libre" : "no es impresora")));
+    c1.appendChild(pp); r.appendChild(c1);
+
+    var c2 = el("td"); c2.appendChild(el("span",null,esc(p.hay)));
+    if(p.detalle) c2.appendChild(el("span","sub","  ·  "+esc(p.detalle)));
+    r.appendChild(c2);
+
+    var c3 = el("td");
+    if(p.cola) c3.appendChild(el("span","mono",esc(p.cola)));
+    else c3.appendChild(el("span","sub", esImp ? "ninguna — no está instalada" : "—"));
+    r.appendChild(c3);
+
+    var c4 = el("td");
+    // Un puerto libre o que no es impresora no tiene estado: no hay nada bien ni mal.
+    if(p.estado==="idle") c4.appendChild(el("span","sub","—"));
+    else c4.appendChild(infChip(p.estado, p.estado==="ok" ? "Enganchada" : (p.estado==="fail" ? "Rota" : "Sin usar")));
+    r.appendChild(c4);
+
+    var c5 = el("td","act"), bt = null;
+    if(p.estado==="warn" && esImp) bt = infBoton("I","Instalarla",{i:"enchufe"});
+    else if(p.estado==="fail" && /^USB\d+/i.test(String(p.puerto))) bt = infBoton("U","Reconectar",{i:"usb"});
+    else if(p.estado==="fail" && /^(IP_|WSD)/i.test(String(p.puerto))) bt = infBoton("P","Corregir la IP",{i:"wifi"});
+    if(bt) c5.appendChild(bt);
+    r.appendChild(c5);
+    tb.appendChild(r);
+  });
+  if(resto>0){
+    var rr = el("tr","off"), td = el("td");
+    td.colSpan = 5;
+    td.appendChild(el("span","sub","y "+resto+" puerto"+(resto===1?"":"s")+
+      " del sistema (COM, LPT, archivo) — ninguno puede imprimir una comanda"));
+    rr.appendChild(td); tb.appendChild(rr);
+  }
+  t.appendChild(tb); w.appendChild(t);
+  return w;
+}
+
+function construirInforme(){
+  var inv = inventario, cont = el("div","inf");
+  if(!inv) return cont;
+  var cards = tarjetasPC(inv);
+  var colas = inv.colas || [], puertos = inv.puertos || [];
+  var estCola = colas.map(function(c){ return c.estado==="sana" ? "ok" : (c.estado==="no imprime"?"fail":"warn"); });
+
+  function cuenta(x){
+    // Los puertos en 'idle' NO se cuentan. Un COM1 o un USB libre no es algo que no pudimos
+    // revisar: es algo que no tiene nada que decir. Contarlos daba "15 sin revisar" en una PC
+    // sana -mas que todo lo demas junto- y ese numero grande en gris asusta sin motivo.
+    // En las tarjetas el gris SI significa "no lo pudimos mirar", y ahi si cuenta.
+    return cards.filter(function(c){ return c.estado===x; }).length +
+           estCola.filter(function(c){ return c===x; }).length +
+           (x==="idle" ? 0 : puertos.filter(function(p){ return p.estado===x; }).length);
+  }
+  var snap = el("div","inf-snap");
+  [["ok","funcionan"],["fixed","los arreglamos"],["warn","para mirar"],["fail","no funcionan"],["idle","sin revisar"]]
+  .forEach(function(par){
+    var n = cuenta(par[0]);
+    if(n===0 && par[0]==="fixed") return;   // sin reparaciones, ese casillero no existe
+    var b = el("div","inf-sn "+par[0]+(n===0?" vacio":""));
+    b.appendChild(ico(ICO_ESTADO[par[0]],14));
+    b.appendChild(el("span","n",String(n)));
+    b.appendChild(el("span","t",par[1]));
+    snap.appendChild(b);
+  });
+  cont.appendChild(snap);
+
+  var s1 = sec("Esta computadora");
+  var g = el("div","inf-cards");
+  // Primero lo que esta mal: es lo que hay que ver sin buscar, y junta las tarjetas altas
+  // al principio para que la grilla no deje huecos.
+  var PESO = { fail:0, warn:1, fixed:2, idle:3, ok:4 };
+  cards.slice().sort(function(a,b){ return PESO[a.estado]-PESO[b.estado]; })
+       .forEach(function(c){ g.appendChild(infTarjeta(c)); });
+  s1.appendChild(g);
+  cont.appendChild(s1);
+
+  var s2 = sec("Impresoras instaladas");
+  if(colas.length){
+    var box = el("div","inf-prn");
+    colas.forEach(function(c){ box.appendChild(infFilaCola(c)); });
+    s2.appendChild(box);
+  } else {
+    // Vacio NO es "todo bien": en esta PC Fudo no tiene a donde mandar la comanda.
+    var v2 = el("div","inf-vacio"), vt = el("div");
+    v2.appendChild(ico("alerta",16));
+    vt.appendChild(el("b",null,"Esta PC no tiene ninguna impresora instalada."));
+    vt.appendChild(el("p",null,"Las virtuales de Windows (PDF, XPS, OneNote) no cuentan: no pueden imprimir una comanda."));
+    v2.appendChild(vt);
+    var bi = puertos.some(function(p){ return p.tipo==="impresora" && !p.cola; }) ? infBoton("I","Instalar la que está conectada",{i:"enchufe"}) : null;
+    if(bi) v2.appendChild(bi);
+    s2.appendChild(v2);
+  }
+  cont.appendChild(s2);
+
+  if(puertos.length){
+    var s3 = sec("Puertos y qué hay conectado");
+    s3.appendChild(infTablaPuertos(puertos));
+    s3.appendChild(el("p","inf-ley",
+      "Enganchada = hay impresora y una cola que le habla · Sin usar = está conectada pero Windows no la tiene instalada · Rota = la cola apunta a un puerto vacío."));
+    cont.appendChild(s3);
+  }
+  return cont;
+}
+
+function pintarInforme(){
+  // Durante la corrida vive arriba de la escalera; en el resultado lo reubica
+  // pintarResultado. Se reconstruye entero en vez de mutar: es barato y no hay estado que
+  // se pueda quedar viejo.
+  var slot = $("informeCorrida");
+  if(!slot) return;
+  slot.innerHTML = "";
+  slot.appendChild(construirInforme());
+}
+
 function pintarResultado(){
   if(!resultado) return;
   fase = (fase==="fin") ? "fin" : "resultado";
@@ -715,43 +1137,11 @@ function pintarResultado(){
     root.appendChild(s1);
   }
 
-  // impresoras
-  var colas=d.colas||[];
-  if(colas.length){
-    var s2=sec("Impresoras de este local");
-    var box=el("div","prn");
-    colas.forEach(function(c){
-      var r=el("div","prow"+((c.score>0)?" target":""));
-      r.appendChild(el("span","pname",esc(c.nombre)));
-      if(c.puerto) r.appendChild(el("span","pport",esc(c.puerto)));
-      var e=String(c.estado||"");
-      var cl = e==="no imprime"?"fail" : (e==="con problemas"?"warn":"ok");
-      r.appendChild(el("span","chip "+cl, e||"funcionando"));
-      if(c.sintomas && c.sintomas.length){
-        var dd=el("div","psym"), u=el("ul");
-        c.sintomas.forEach(function(x){ u.appendChild(el("li",null,esc(x))); });
-        dd.appendChild(u); r.appendChild(dd);
-      }
-      box.appendChild(r);
-    });
-    s2.appendChild(box);
-    var conn=d.conectadas||[];
-    if(conn.length){
-      var p=el("p","hint"); p.style.marginTop="10px";
-      p.textContent="Conectadas ahora: "+conn.map(function(h){
-        return (h.puerto||"sin puerto")+" → "+(h.nombre||"")+(h.colaWindows?" (cola "+h.colaWindows+")":"");
-      }).join("  ·  ");
-      s2.appendChild(p);
-    }
-    var off=d.desconectadas||[];
-    if(off.length){
-      var p2=el("p","hint"); p2.style.marginTop="6px";
-      p2.textContent="Sin conexi\u00f3n: "+off.map(function(h){ return h.nombre||""; }).join(", ")+
-        " \u2014 hay que encenderlas y enchufar el cable USB, mejor en el mismo lugar de siempre.";
-      s2.appendChild(p2);
-    }
-    root.appendChild(s2);
-  }
+  // El informe de la PC: que tiene esta computadora, que impresoras hay y que hay en cada
+  // puerto. Reemplaza a la seccion "Impresoras de este local", que decia una parte de lo
+  // mismo sin los puertos y sin poder distinguir "no hay impresora" de "no la revisamos".
+  // Va DESPUES de "que hacer ahora" a proposito: primero la accion, despues el respaldo.
+  if(inventario) root.appendChild(construirInforme());
 
   // lo que se toco
   var s3=sec("Qu\u00e9 cambiamos en esta computadora");

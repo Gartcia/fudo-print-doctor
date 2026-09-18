@@ -33,3 +33,8 @@ FudoPrintDoctor-interno.cmd
 # Son los mismos 60 MB del instalador, troceados: no van al repositorio publico.
 tools/Nativa-partida/
 tools/FudoPrintDoctor-NetConfigTools.zip
+
+# Mockups y vistas previas de la interfaz: material de trabajo, no del producto.
+# "informe-de-esta-pc.html" lo genera leer-esta-pc.ps1 y lleva el nombre de la maquina,
+# su IP local y las impresoras del que lo corrio. Nada de eso va a un repo publico.
+ui-mockup/
