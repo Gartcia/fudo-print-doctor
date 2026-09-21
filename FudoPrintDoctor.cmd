@@ -26,7 +26,7 @@ REM      avisa y sigue por consola. La interfaz no puede ser condicion
 REM      para diagnosticar en la PC de un cliente que ya tiene un
 REM      problema.
 REM ================================================================
-REM  LAUNCHER-VERSION: 4   <- subir esto cuando cambie este archivo. El
+REM  LAUNCHER-VERSION: 5   <- subir esto cuando cambie este archivo. El
 REM  updater no lo pisa (lleva la URL de telemetria), asi que hoy la copia
 REM  interna se distribuye a mano. El marcador queda para que el updater
 REM  pueda comparar y refrescarlo preservando la URL.
