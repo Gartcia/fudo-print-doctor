@@ -2,6 +2,99 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.24] - 2026-09-21
+
+**El motor instala la App Nativa solo.** Hasta acá sabía hacerlo y no lo hacía nunca: había que
+ir al menú, opción F. La revisión semanal del 21/09 lo midió sin lugar a dudas —`nativaInstall.intento
+= false` en **49 de 49** corridas, con *"App Nativa de Fudo NO instalada"* como causa raíz en **43
+corridas de 36 PCs**, 27 de ellas con el instalador al lado del script— y los asesores contaban lo
+mismo desde el canal: terminaban instalándola a mano.
+
+El motivo real era más tonto de lo que parecía. El camino de descarga e instalación estaba escrito
+desde hace versiones y se frenaba en una línea:
+
+```
+$script:NativeInstallerUrl = ''     # vacío desde siempre
+```
+
+Sin URL, la función devolvía *"sin URL de instalador configurada"* y guiaba pasos manuales. Ahora
+están las dos URLs públicas de descarga de `fu.do` —la misma que el asesor le pasa al cliente— y el
+motor elige por sistema operativo: `.exe` de Windows 8 en adelante, `.msi` para Windows 7, Vista y
+XP, que en este parque no es un caso teórico.
+
+### Lo que se le agregó al camino de descarga
+
+- **Se verifica la firma antes de ejecutar.** Bajar un binario de internet y correrlo en la PC de un
+  cliente sin mirar quién lo firmó es exactamente lo que el motor no hace consigo mismo (por eso no
+  se autoactualiza). Si el instalador descargado no está firmado por Fudo, **no se ejecuta** y se
+  borra.
+- **Se detecta que el antivirus se comió la descarga.** No es hipotético: en la telemetría hay **14
+  detecciones de Defender sobre archivos `.crdownload`**, o sea que se lleva el instalador *mientras
+  se está bajando*, antes de que nadie lo ejecute. Cuando pasa, `Invoke-WebRequest` termina bien y
+  el archivo ya no está; sin este chequeo el motor decía *"no se pudo lanzar el instalador"* y
+  mandaba al asesor a buscar el problema en el lugar equivocado.
+- **Se verifica el efecto, no el código de salida.** Este camino nunca había cumplido la regla del
+  proyecto: miraba si el proceso estaba corriendo, que con Fudo cerrado es normal que no lo esté.
+  Ahora se relee el disco.
+- Un `.msi` va por `msiexec /qn`, no `Start-Process` directo, así que no se abre un asistente en la
+  pantalla del cliente.
+
+**Escenarios 122 y 123** del self-test: que con la Nativa ausente se intente instalar y quede
+registrado, que sin `-AutoFix` no se toque nada, la elección de URL por sistema operativo, y que un
+instalador sin firmar —o firmado por otro— no se ejecute.
+
+### "Firmada" dejó de significar "el antivirus la deja en paz"
+
+El motor afirmaba en unos veinte lugares que *"desde la v0.0.37 está firmada, así que el antivirus
+deja de ponerla en cuarentena"*. No se sostiene, y ahora hay evidencia de las dos fuentes:
+
+- **Del campo:** tres asesores reportaron lo contrario en el canal. *"El antivirus de Windows es el
+  que bloquea la nativa, al menos esa versión me sigue apareciendo como virulenta"*, con la 0.0.37
+  puesta.
+- **De la telemetría:** de las detecciones sobre archivos de Fudo que llegaron desde la v3.22, hay
+  una del **20/09 sobre una PC con la 0.0.37 instalada**.
+
+Se separó en dos constantes lo que era una sola: `NativaVersionFirmada` (0.0.37, el hecho de la
+firma) y **`NativaVersionRecomendada` (0.0.38)**, que es la que el motor pide, ofrece y usa en todos
+los textos. Donde decía que el antivirus deja de bloquearla, ahora dice que *reduce mucho los
+bloqueos pero no los elimina, y si igual la bloquea, avisá*. Y donde pedía "el `.msi`", ahora acepta
+el instalador en cualquiera de los dos formatos: la 0.0.38 es `.exe`.
+
+### El launcher viejo se ve
+
+Era el único punto ciego total del proyecto: el `.cmd` no se autoactualiza a propósito —lleva la URL
+de reporte, por eso no se pisa— así que el arreglo del 10/09 no llegó a todos, y **una corrida que
+no arranca no reporta nada**. Ya produjo un cierre falso: en una PC con Windows 7 el script falló al
+abrirse y dos líneas abajo la pantalla decía RESUELTO.
+
+Ahora el `.cmd` se identifica con su fecha (`-LauncherStamp`) y el chequeo `env.launcher` avisa si es
+anterior al 10/09/2026. **La ausencia del parámetro cuenta como launcher viejo**, porque los `.cmd`
+nuevos lo mandan siempre: al revés se perdería justo el caso que hay que detectar. **Escenario 124.**
+
+### Dos chequeos que nunca concluían
+
+- **`hw.notInstalled`** salía `warn` en 9 de 9 corridas. Se registra en la capa 1a —"hay un puerto
+  con dispositivo y sin cola"— y ahí es cierto; lo que faltaba era volver a mirarlo, porque la capa 1
+  justamente instala esa cola, y desde la 3.23 le deja además el nombre definitivo. Ahora cierra en
+  `fixed` con el nombre de la cola que quedó, o concluye en `fail` con el puerto que sigue sin
+  instalar. **Escenario 125.**
+- **`env.nativaKit`** salía `warn` en 17 de 17. Con la descarga cableada dejó de ser un hallazgo: que
+  el instalador no viaje en el kit ya no impide actualizar la Nativa. Queda como aviso sólo cuando el
+  motor tampoco puede descargarlo, que es el único caso en el que el asesor tiene algo que hacer.
+
+### Las corridas de prueba se marcan
+
+El banco de pruebas fue el **27% de las corridas de una semana entera** (47 de 175, una sola PC con
+caseId inventado) y no había forma de separarlo del campo, así que la planilla, el resumen y el
+informe de adopción contaban como campo lo que era prueba. Con `FUDO_TELEMETRY_TEST=1` la corrida
+viaja marcada con `esPrueba`. **Escenario 126.**
+
+### Sin implementar, a propósito
+
+- **Mapear `colaQueUsaFudo` en el receptor** (propuesta 4 de la bitácora). Es una línea, pero vive en
+  el Apps Script publicado y desde acá no hay forma de verificar el cambio: tocarlo a ciegas es
+  arriesgar la telemetría de todos. Queda para hacerlo a mano en el editor. Tercera semana.
+
 ## [3.23] - 2026-09-18
 
 **El informe de la PC.** La interfaz deja de mostrar solo el progreso y el veredicto: ahora

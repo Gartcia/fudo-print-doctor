@@ -158,7 +158,13 @@ REM  por la transferencia de archivos del acceso remoto, asi que por decision no
 REM  viaja en el kit. Sin esto el motor lo pediria en cada corrida y nadie podria
 REM  resolverlo. El hallazgo se sigue registrando y viaja en la telemetria; cuando
 REM  haga falta de verdad, se pasa partido con tools\Partir-Nativa.ps1.
-powershell -NoProfile -ExecutionPolicy Bypass -File "%FPD_MOTOR%" -Ui web -NoNativaKitCheck -JsonOut "%FPD_JSON%"
+REM  -LauncherStamp: la fecha de ESTE archivo. El .cmd no se autoactualiza -lleva la
+REM  URL de reporte, por eso no se pisa-, asi que hay asesores con launchers viejos y
+REM  no habia forma de saber quienes: una corrida que no arranca no reporta nada, y un
+REM  launcher anterior al 10/09/2026 puede escribir RESUELTO sin que el motor corra.
+REM  Al publicar un .cmd nuevo, actualizar esta fecha.
+set "FPD_STAMP=2026-09-21"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%FPD_MOTOR%" -Ui web -NoNativaKitCheck -LauncherStamp "%FPD_STAMP%" -JsonOut "%FPD_JSON%"
 set FPD_EXIT=%errorlevel%
 
 echo.
