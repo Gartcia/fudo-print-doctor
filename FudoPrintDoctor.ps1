@@ -481,7 +481,7 @@ $script:TestPrinterRx = '(?i)^FUDO-TEST-'
 # puerto tenga hardware; si el hardware se va, deja de serlo (ver Remove-OrphanOwnQueues).
 $script:OwnQueueRx   = '(?i)^FUDO-(TEST-|USB\d)'
 $script:TestDocRx    = '(?i)fudo print doctor'
-$script:SchemaVersion = '3.24'
+$script:SchemaVersion = '3.25'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -5113,6 +5113,84 @@ function Test-Layer1a-HardwareInventory {
 # ---------------------------------------------------------------------------
 # LAYER 1 - Objeto impresora en Windows (descarta virtuales; instala si hace falta)
 # ---------------------------------------------------------------------------
+function Select-BetweenCandidates {
+    <#
+      Pregunta cual de varios candidatos usar, y se banca los tres contextos del motor:
+      interfaz web, consola, y modo agente (donde no hay nadie a quien preguntarle).
+
+      De donde sale: un asesor reporto que con varias impresoras USB el motor "sigue tomando
+      la primera que encuentra, y capaz se quiere instalar otra". Tenia razon, y lo peor es
+      que el propio motor le ofrecia la salida -"usar -PrinterName para desambiguar"-, que es
+      un parametro de linea de comandos: nadie que le hace doble clic al .cmd lo puede usar.
+      Era una funcion escrita para un usuario que no existe.
+
+      Reglas:
+       - Con un solo candidato NO se pregunta. La mitad de las PCs tiene una sola cola y
+         agregarle una pregunta a esas corridas seria ruido.
+       - Lo que el motor habria elegido solo queda PRESELECCIONADO. Enter sigue siendo el
+         camino rapido, y el ranking por sintomas no se tira: pasa a ser una sugerencia.
+       - Si nadie puede contestar -modo agente, navegador cerrado, timeout- se elige solo,
+         exactamente como antes. Preguntar no puede ser condicion para diagnosticar.
+
+      Devuelve @{ valor; elegidoPorPersona; motivo }.
+    #>
+    param([string]$Id, [string]$Titulo, [string]$Texto = '', $Opciones = @(), [string]$Sugerido = '')
+
+    $ops = @($Opciones | Where-Object { $_ -and [string]$_.v })
+    if (@($ops).Count -le 1) {
+        return @{ valor = [string]$(if (@($ops).Count -eq 1) { @($ops)[0].v } else { $Sugerido })
+                  elegidoPorPersona = $false; motivo = 'un solo candidato: no hay nada que elegir' }
+    }
+    $sug = [string]$Sugerido
+    if (-not $sug -or -not (@($ops | ForEach-Object { [string]$_.v }) -contains $sug)) { $sug = [string]@($ops)[0].v }
+
+    if (-not (Test-HayHumano)) {
+        return @{ valor = $sug; elegidoPorPersona = $false; motivo = 'sin nadie a quien preguntarle: se eligio sola' }
+    }
+
+    if (Test-UiWeb) {
+        $opsUi = @($ops | ForEach-Object {
+            [ordered]@{ v = [string]$_.v; l = [string]$_.l; principal = ([string]$_.v -eq $sug) } })
+        $r = Request-UiAnswer -Id $Id -Clase 'choice' -Titulo $Titulo -Texto $Texto -Opciones $opsUi -SoloAsesor
+        if ($r -and (@($ops | ForEach-Object { [string]$_.v }) -contains [string]$r)) {
+            return @{ valor = [string]$r; elegidoPorPersona = $true; motivo = 'la eligio el asesor' }
+        }
+        return @{ valor = $sug; elegidoPorPersona = $false; motivo = 'nadie contesto: se eligio sola' }
+    }
+
+    Suspend-LiveStatus
+    Write-Host ''
+    Write-Host ('  ' + $Titulo) -ForegroundColor Cyan
+    if ($Texto) { Write-Host ('  ' + $Texto) -ForegroundColor DarkGray }
+    $i = 0
+    foreach ($o in $ops) {
+        $i++
+        Write-Host ('    ' + $i + ') ' + [string]$o.l + $(if ([string]$o.v -eq $sug) { '   <- sugerida' } else { '' }))
+    }
+    $ans = Read-DoctorLine -Prompt ('  Cual? (1-' + @($ops).Count + ', o Enter para la sugerida)')
+    if ($null -eq $ans -or -not ([string]$ans).Trim()) {
+        return @{ valor = $sug; elegidoPorPersona = $false; motivo = 'Enter: se uso la sugerida' }
+    }
+    $n = 0
+    if ([int]::TryParse(([string]$ans).Trim(), [ref]$n) -and $n -ge 1 -and $n -le @($ops).Count) {
+        return @{ valor = [string]@($ops)[$n - 1].v; elegidoPorPersona = $true; motivo = 'la eligio el asesor' }
+    }
+    Write-Host '  No entendi la respuesta: sigo con la sugerida.' -ForegroundColor Yellow
+    return @{ valor = $sug; elegidoPorPersona = $false; motivo = 'respuesta no valida: se uso la sugerida' }
+}
+
+function Get-QueueChoiceLabel {
+    <# Como se describe una cola en la lista para elegir: lo que el asesor necesita para decidir. #>
+    param($Cola)
+    $t = [string]$Cola.nombre
+    if ([string]$Cola.puerto) { $t += '  [' + [string]$Cola.puerto + ']' }
+    if ([string]$Cola.estado) { $t += '  ' + [string]$Cola.estado }
+    $tr = 0
+    try { $tr = [int]$Cola.trabajos } catch {}
+    if ($tr -gt 0) { $t += ' (' + $tr + ' trabajo' + $(if ($tr -eq 1) { '' } else { 's' }) + ')' }
+    return $t
+}
+
 function Resolve-TargetPrinter {
     $allPrinters = @()
     try { $allPrinters = @(Get-Printer -ErrorAction Stop) } catch {
@@ -5226,6 +5304,24 @@ function Resolve-TargetPrinter {
             return $null
         }
 
+        # v3.25: la otra mitad del caso de Facu -"capaz se quiere instalar otra"-. Con varias
+        # impresoras conectadas y ninguna instalada, el motor instalaba sobre el primer puerto
+        # que funcionara y listo. Ahora, si hay mas de uno, se pregunta sobre cual.
+        if (@($livePorts).Count -gt 1) {
+            $elecPuerto = Select-BetweenCandidates -Id 'cualPuerto' `
+                -Titulo 'Hay varias impresoras conectadas y ninguna instalada. En cual instalamos?' `
+                -Texto 'Se va a crear una cola para poder mandarle un ticket de prueba.' `
+                -Opciones @($livePorts | ForEach-Object { @{ v = [string]$_; l = ('Impresora conectada en ' + [string]$_) } }) `
+                -Sugerido ([string]@($livePorts)[0])
+            $script:Diagnostics['eleccionPuerto'] = [ordered]@{
+                elegido = [string]$elecPuerto.valor; elegidoPorPersona = [bool]$elecPuerto.elegidoPorPersona
+                motivo = [string]$elecPuerto.motivo; candidatos = @($livePorts) }
+            # El elegido va primero; los demas quedan de respaldo por si la creacion falla.
+            if ([string]$elecPuerto.valor) {
+                $livePorts = @(@([string]$elecPuerto.valor) + @($livePorts | Where-Object { [string]$_ -ne [string]$elecPuerto.valor }))
+            }
+        }
+
         $chosenName = ''
         $rem = Invoke-Remediation -Description "Instalar cola de prueba con driver generico de texto en $($livePorts -join ', ')" -Type 'printer.install_generic' -Target ($livePorts -join ',') `
             -Before 'sin cola real' -After 'cola FUDO-TEST creada' -Reversible $true -Fix {
@@ -5284,7 +5380,35 @@ function Resolve-TargetPrinter {
                 -Recommendation $(if (@($enfermas).Count -gt 0) {
                         "Se diagnostica '" + [string]@($enfermas)[0].nombre + "', que es la que presenta problemas. " +
                         $(if (@($sanas).Count -gt 0) { 'Las que estan funcionando (' + (@($sanas | ForEach-Object { $_.nombre }) -join ', ') + ') no se tocan.' } else { '' })
-                    } else { 'Ninguna presenta problemas evidentes. Si el cliente dice que una no imprime, correr con -PrinterName "<nombre exacto>".' })
+                    } else { 'Ninguna presenta problemas evidentes. Si el cliente dice que una no imprime, elegirla en la pregunta de arriba.' })
+        }
+
+        # v3.25: con mas de una, cual se diagnostica lo decide el asesor. La que el motor
+        # habria elegido solo -la que peor puntua- queda sugerida.
+        if (@($colas).Count -gt 1) {
+            $sugerida = [string]$(if (@($enfermas).Count -gt 0) { @($enfermas)[0].nombre } else { @($colas)[0].nombre })
+            $elecCola = Select-BetweenCandidates -Id 'cualImpresora' `
+                -Titulo 'Cual de estas impresoras revisamos?' `
+                -Texto 'Las otras no se tocan. Si no sabes cual es la comandera, elegi la sugerida.' `
+                -Opciones @($colas | ForEach-Object { @{ v = [string]$_.nombre; l = (Get-QueueChoiceLabel -Cola $_) } }) `
+                -Sugerido $sugerida
+            $script:Diagnostics['eleccionImpresora'] = [ordered]@{
+                elegida = [string]$elecCola.valor; sugerida = $sugerida
+                elegidoPorPersona = [bool]$elecCola.elegidoPorPersona; motivo = [string]$elecCola.motivo
+                candidatas = @($colas | ForEach-Object { [string]$_.nombre }) }
+            if ([bool]$elecCola.elegidoPorPersona) {
+                $target = $real | Where-Object { [string]$_.Name -eq [string]$elecCola.valor } | Select-Object -First 1
+                if ($target) {
+                    $datos = @($colas | Where-Object { [string]$_.nombre -eq [string]$elecCola.valor }) | Select-Object -First 1
+                    Add-Check -Id 'printer.exists' -Layer 1 -Name "Impresora '$($target.Name)' presente en Windows (la eligio el asesor)" -Status 'ok' `
+                        -Evidence @{ name = [string]$target.Name; driver = [string]$target.DriverName; port = [string]$target.PortName
+                                     elegidoPorPersona = $true; sugerida = $sugerida
+                                     sintomas = @($(if ($datos) { $datos.sintomas } else { @() })) } `
+                        -Recommendation ("Se reviso '$($target.Name)' porque la eligio el asesor" +
+                                         $(if ($sugerida -and $sugerida -ne [string]$target.Name) { " (el motor sugeria '$sugerida')." } else { '.' }))
+                    return $target
+                }
+            }
         }
 
         if (@($enfermas).Count -gt 0) {
@@ -5308,11 +5432,11 @@ function Resolve-TargetPrinter {
     if (@($pos).Count -eq 0) {
         Add-Check -Id 'printer.autodetect' -Layer 1 -Name 'Autodeteccion de impresora termica' -Status 'warn' `
             -Evidence @{ elegida = [string]$target.Name; reales = @($real | ForEach-Object { [string]$_.Name }); descartadasVirtuales = $virtualNames } `
-            -Recommendation "No se reconocio marca POS/termica conocida. Se tomo '$($target.Name)' (impresora real, no virtual). Si no es la correcta, pasar -PrinterName."
+            -Recommendation "No se reconocio marca POS/termica conocida. Se tomo '$($target.Name)' (impresora real, no virtual). Si no es la correcta, volver a correr y elegir otra cuando lo pregunte."
     } elseif (@($ranked).Count -gt 1) {
         Add-Check -Id 'printer.autodetect' -Layer 1 -Name 'Autodeteccion de impresora termica' -Status 'ok' `
             -Evidence @{ elegida = [string]$target.Name; candidatas = @($ranked | ForEach-Object { [string]$_.Name }); descartadasVirtuales = $virtualNames } `
-            -Recommendation $(if (@($pos).Count -gt 1) { "Hay varias termicas; se tomo '$($target.Name)'. Usar -PrinterName para desambiguar." } else { '' })
+            -Recommendation $(if (@($pos).Count -gt 1) { "Hay varias termicas; se tomo '$($target.Name)'. Si no es la correcta, volver a correr y elegir otra cuando lo pregunte." } else { '' })
     }
 
     Add-Check -Id 'printer.exists' -Layer 1 -Name "Impresora '$($target.Name)' presente en Windows" -Status 'ok' `
@@ -12039,6 +12163,80 @@ public class FudoFakeEndpoint {
     $env:FUDO_TELEMETRY_TEST = ''
     Assert-Eq 'S126 sin la variable, no' $false ([bool]($env:FUDO_TELEMETRY_TEST -eq '1'))
     $env:FUDO_TELEMETRY_TEST = $baseTest126
+
+
+    # -----------------------------------------------------------------------
+    # Escenario 127 (v3.25, caso de Facundo Gimeno del 21/09, adherido por Fernando Hildt):
+    # "si el cliente tiene varias impresoras USB sigue tomando la primera que encuentra, y
+    # capaz se quiere instalar otra". Era cierto, y el motor ofrecia como salida -PrinterName,
+    # un parametro de linea de comandos que nadie que hace doble clic al .cmd puede usar.
+    # El 49% de las PCs con telemetria tiene 2 o mas colas: no es un caso de borde.
+    Reset-State
+    Reset-Mocks
+    $ops127 = @(@{ v = 'CAJA'; l = 'CAJA [USB001]' }, @{ v = 'COCINA'; l = 'COCINA [USB002]' })
+
+    # Con un solo candidato NO se pregunta: la mitad del parque tiene una sola cola y una
+    # pregunta ahi es ruido puro.
+    $script:pregunto127 = $false
+    function Test-HayHumano { $script:pregunto127 = $true; $true }
+    $u127 = Select-BetweenCandidates -Id 'x' -Titulo 't' -Opciones @(@{ v = 'CAJA'; l = 'CAJA' }) -Sugerido 'CAJA'
+    Assert-Eq 'S127 con una sola no se pregunta nada' $false ([bool]$script:pregunto127)
+    Assert-Eq 'S127 y se usa esa' 'CAJA' ([string]$u127.valor)
+    Assert-Eq 'S127 y no cuenta como eleccion de una persona' $false ([bool]$u127.elegidoPorPersona)
+
+    # Sin nadie a quien preguntarle (modo agente) se elige sola, igual que antes: preguntar
+    # nunca puede ser condicion para diagnosticar.
+    function Test-HayHumano { $false }
+    $a127 = Select-BetweenCandidates -Id 'x' -Titulo 't' -Opciones $ops127 -Sugerido 'COCINA'
+    Assert-Eq 'S127 sin humano se elige la sugerida' 'COCINA' ([string]$a127.valor)
+    Assert-Eq 'S127 y queda claro que no la eligio nadie' $false ([bool]$a127.elegidoPorPersona)
+
+    # En la interfaz web se pregunta, y la sugerida viaja marcada como principal.
+    function Test-HayHumano { $true }
+    function Test-UiWeb { $true }
+    $script:opsVistas127 = @()
+    function Request-UiAnswer { param($Id, $Titulo, $Texto, $Texto2, $Opciones, $Clase, $Extra, $TimeoutSec, $ErrorPrevio, [switch]$SoloAsesor)
+        $script:opsVistas127 = @($Opciones); 'CAJA' }
+    $w127 = Select-BetweenCandidates -Id 'x' -Titulo 't' -Opciones $ops127 -Sugerido 'COCINA'
+    Assert-Eq 'S127 en la web contesta el asesor y se respeta' 'CAJA' ([string]$w127.valor)
+    Assert-Eq 'S127 y queda registrado que lo eligio una persona' $true ([bool]$w127.elegidoPorPersona)
+    Assert-Eq 'S127 la sugerida va preseleccionada' 'COCINA' ([string]@($script:opsVistas127 | Where-Object { $_.principal }).v)
+
+    # Si nadie contesta -navegador cerrado, timeout- NO se frena el diagnostico.
+    function Request-UiAnswer { param($Id, $Titulo, $Texto, $Texto2, $Opciones, $Clase, $Extra, $TimeoutSec, $ErrorPrevio, [switch]$SoloAsesor) $null }
+    $t127 = Select-BetweenCandidates -Id 'x' -Titulo 't' -Opciones $ops127 -Sugerido 'COCINA'
+    Assert-Eq 'S127 si nadie contesta se sigue con la sugerida' 'COCINA' ([string]$t127.valor)
+    Assert-Eq 'S127 y no se cuenta como elegida por una persona' $false ([bool]$t127.elegidoPorPersona)
+
+    # Una respuesta que no esta entre las opciones no se acepta: elegir una impresora que no
+    # existe seria peor que elegir sola.
+    function Request-UiAnswer { param($Id, $Titulo, $Texto, $Texto2, $Opciones, $Clase, $Extra, $TimeoutSec, $ErrorPrevio, [switch]$SoloAsesor) 'IMPRESORA-QUE-NO-ESTA' }
+    Assert-Eq 'S127 una respuesta fuera de las opciones se descarta' 'COCINA' ([string](Select-BetweenCandidates -Id 'x' -Titulo 't' -Opciones $ops127 -Sugerido 'COCINA').valor)
+
+    # En consola: Enter = la sugerida, un numero valido = esa, cualquier otra cosa = la sugerida.
+    function Test-UiWeb { $false }
+    function Suspend-LiveStatus { }
+    function Read-DoctorLine { param($Prompt) '' }
+    Assert-Eq 'S127 en consola, Enter deja la sugerida' 'COCINA' ([string](Select-BetweenCandidates -Id 'x' -Titulo 't' -Opciones $ops127 -Sugerido 'COCINA').valor)
+    function Read-DoctorLine { param($Prompt) '1' }
+    $c127 = Select-BetweenCandidates -Id 'x' -Titulo 't' -Opciones $ops127 -Sugerido 'COCINA'
+    Assert-Eq 'S127 en consola, el numero elige' 'CAJA' ([string]$c127.valor)
+    Assert-Eq 'S127 y cuenta como eleccion de una persona' $true ([bool]$c127.elegidoPorPersona)
+    function Read-DoctorLine { param($Prompt) '99' }
+    Assert-Eq 'S127 un numero fuera de rango no rompe nada' 'COCINA' ([string](Select-BetweenCandidates -Id 'x' -Titulo 't' -Opciones $ops127 -Sugerido 'COCINA').valor)
+    function Read-DoctorLine { param($Prompt) 'la de la cocina' }
+    Assert-Eq 'S127 una respuesta que no es un numero tampoco' 'COCINA' ([string](Select-BetweenCandidates -Id 'x' -Titulo 't' -Opciones $ops127 -Sugerido 'COCINA').valor)
+
+    # La etiqueta tiene que darle al asesor con que decidir: nombre, puerto y estado.
+    $lbl127 = Get-QueueChoiceLabel -Cola ([ordered]@{ nombre='CAJA'; puerto='USB001'; estado='con problemas'; trabajos=3 })
+    Assert-Eq 'S127 la etiqueta trae el puerto' $true ([bool]($lbl127 -match 'USB001'))
+    Assert-Eq 'S127 y el estado' $true ([bool]($lbl127 -match 'con problemas'))
+    Assert-Eq 'S127 y cuantos trabajos tiene trabados' $true ([bool]($lbl127 -match '3 trabajos'))
+    Assert-Eq 'S127 un solo trabajo va en singular' $true ([bool]((Get-QueueChoiceLabel -Cola ([ordered]@{ nombre='X'; puerto='USB001'; estado='sana'; trabajos=1 })) -match '1 trabajo\)'))
+    Microsoft.PowerShell.Management\Remove-Item Function:\Test-HayHumano -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item Function:\Test-UiWeb -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item Function:\Read-DoctorLine -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item Function:\Request-UiAnswer -ErrorAction SilentlyContinue
 
     Write-Host ""
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)

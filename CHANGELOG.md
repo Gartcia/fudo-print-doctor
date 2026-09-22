@@ -2,6 +2,58 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.25] - 2026-09-22
+
+**Con varias impresoras, cuál se revisa la elige el asesor.** Lo reportó Facundo Gimeno el 21/09 y
+adhirió Fernando Hildt: *"si el cliente tiene varias impresoras USB sigue tomando la primera que
+encuentra, y capaz se quiere instalar otra"*.
+
+Era cierto, y el detalle que lo vuelve interesante es cómo estaba "resuelto". Cuando había más de
+una térmica, el motor escribía:
+
+> *"Hay varias termicas; se tomo 'X'. **Usar -PrinterName para desambiguar**."*
+
+`-PrinterName` es un parámetro de línea de comandos. El asesor le hace doble clic a un `.cmd`. **El
+motor ofrecía una salida que nadie podía tomar** — una función escrita para un usuario que no
+existe. El parámetro sigue estando para el modo agente, que es donde sí tiene sentido.
+
+No es un caso de borde: **el 49% de las PCs con telemetría tiene 2 o más colas** (34 de 69 en las
+corridas 3.2x).
+
+### Cómo quedó
+
+Cuando hay más de un candidato, se pregunta. `Select-BetweenCandidates` se banca los tres contextos
+del motor —interfaz web, consola y modo agente— con tres reglas:
+
+- **Con un solo candidato no se pregunta nada.** La otra mitad del parque tiene una sola cola, y una
+  pregunta ahí es ruido.
+- **Lo que el motor habría elegido solo queda preseleccionado.** El ranking por síntomas no se tira:
+  pasa de ser una decisión a ser una sugerencia, y Enter sigue siendo el camino rápido.
+- **Si nadie puede contestar** —modo agente, navegador cerrado, timeout— se elige solo, exactamente
+  como antes. Preguntar no puede ser condición para diagnosticar.
+
+Se aplica en los dos lugares donde el motor decidía por su cuenta:
+
+- **Cuál revisar**, cuando hay varias colas instaladas. La lista muestra nombre, puerto, estado y
+  cuántos trabajos tiene trabados, que es lo que hace falta para decidir.
+- **En cuál puerto instalar**, cuando hay varias impresoras conectadas y ninguna instalada —la otra
+  mitad del pedido de Facu, *"capaz se quiere instalar otra"*—. El elegido va primero y los demás
+  quedan de respaldo por si la creación falla.
+
+La elección viaja en la telemetría (`eleccionImpresora`, `eleccionPuerto`) con la sugerida al lado.
+Eso mide algo que hoy no se sabe: **cuán seguido el motor elige mal.** Si el asesor casi siempre
+acepta la sugerida, el ranking está bien y el problema era sólo no poder verlo.
+
+**Escenario 127** del self-test: que con una sola no se pregunte, que sin humano se siga solo, que la
+sugerida viaje preseleccionada, que una respuesta fuera de las opciones se descarte, y el camino de
+consola completo (Enter, número válido, número fuera de rango, respuesta que no es un número).
+
+### Pendiente del mismo reporte
+
+Facu también mencionó que *"en algún que otro caso tuve que hacer la asignación de puerto manual"*.
+Eso no se puede diagnosticar desde los datos: la 3.23 cambió justo esa lógica, así que hace falta
+saber si esos casos son anteriores o posteriores. Se le pidió un caso concreto en el canal.
+
 ## [3.24] - 2026-09-21
 
 **El motor instala la App Nativa solo.** Hasta acá sabía hacerlo y no lo hacía nunca: había que
