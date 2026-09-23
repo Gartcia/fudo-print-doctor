@@ -2,6 +2,47 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.26] - 2026-09-23
+
+**Regresión de la 3.24, encontrada en campo en menos de 24 horas.** La reportó Fernando Hildt, en
+dos PCs: *"se descargaba, se instalaba y se ejecutaba (se abrían las ventanas del cmd y del
+powershell). Pero NO avanzaba en los siguientes pasos. Se quedaba en el paso número dos tratando de
+instalarla cuando ya se estaba ejecutando"* — 3-4 minutos hasta que canceló el diagnóstico.
+
+El motor esperaba al instalador con `Start-Process -Wait`. Un `.msi` va con `/qn`: instala y
+termina. **El `.exe` de la App Nativa no**: instala, *levanta la app* y se queda vivo. Esperar a que
+termine es esperar para siempre, y la capa 0b quedaba colgada hasta que alguien cerrara esa ventana.
+
+Lo importante es por qué apareció recién ahora: la línea era la misma desde hacía versiones, pero la
+3.24 juntó las dos condiciones que hacían falta para que pasara — **descargar un `.exe`** (hasta
+entonces lo que llegaba eran `.msi`) y **hacerlo dentro de la reparación automática** (antes sólo
+desde el menú). Cada PC sin la Nativa entra ahí.
+
+La regla del proyecto —verificar el efecto, no el código de salida— ahora se aplica también a la
+espera: **lo que importa no es que el instalador termine, es que la Nativa quede en disco.** En
+cuanto aparece, se sigue. Si no aparece, se corta por plazo (120 s por defecto) y se verifica igual.
+
+**Al instalador no se lo mata**, a propósito: puede estar esperando que alguien complete algo en
+pantalla, y matarle un proceso a mitad de una instalación en la PC de un cliente es peor que esperar.
+Se informa que quedó abierto, y eso viaja en la telemetría, que ahora distingue tres finales
+distintos donde antes había uno: quedó instalada, quedó instalada con el instalador todavía abierto,
+y el instalador sigue abierto sin que la Nativa aparezca.
+
+**Escenario 128** del self-test: un instalador que no termina nunca con la Nativa ya en disco (se
+sigue), uno que no termina y no deja nada (se corta por plazo y no se cuelga), uno que sí termina
+(sigue devolviendo su código de salida) y que el camino del `.msi` no se tocó.
+
+### Y una cosa que el mismo reporte deja clara
+
+Fernando también avisó que **Avast sigue detectando la 0.0.38 como virus**. El texto que recomienda
+esa versión decía que es *"la que el campo reporta estable con el antivirus"*, y con un contraejemplo
+en la mano eso es demasiado: ahora dice que es la que mejor se porta **con Windows Defender**, y que
+con antivirus de terceros no alcanza.
+
+Vale anotar el límite de lo que el motor puede medir: **sólo lee el historial de Defender.** Las
+detecciones de Avast, McAfee o Sophos no aparecen en la telemetría, así que la ausencia de
+detecciones sobre la 0.0.38 dice algo de Defender y nada del resto.
+
 ## [3.25] - 2026-09-22
 
 **Con varias impresoras, cuál se revisa la elige el asesor.** Lo reportó Facundo Gimeno el 21/09 y

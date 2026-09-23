@@ -481,7 +481,7 @@ $script:TestPrinterRx = '(?i)^FUDO-TEST-'
 # puerto tenga hardware; si el hardware se va, deja de serlo (ver Remove-OrphanOwnQueues).
 $script:OwnQueueRx   = '(?i)^FUDO-(TEST-|USB\d)'
 $script:TestDocRx    = '(?i)fudo print doctor'
-$script:SchemaVersion = '3.25'
+$script:SchemaVersion = '3.26'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -3311,7 +3311,8 @@ function Test-Layer0b-NativeApp {
                                  versionInstalador = [string]$up.versionInstalador } `
                     -ArticleRef 'https://soporte.fu.do/es/articles/16419361' `
                     -Recommendation ("Esta PC tiene la Nativa v$($verState.version). La version vigente es la v$($script:NativaVersionRecomendada), " +
-                                     'que es la que el campo reporta estable con el antivirus. Estar firmada (desde la v' + $script:NativaVersionFirmada + ') reduce mucho los bloqueos ' +
+                                     'que es la que mejor se porta con Windows Defender. Con antivirus de terceros no alcanza: hay casos de Avast comiendose la v0.0.38 igual. ' +
+                                     'Estar firmada (desde la v' + $script:NativaVersionFirmada + ') reduce los bloqueos ' +
                                      'pero no los elimina, asi que subir de version es la solucion de fondo: evita tener que agregar exclusiones en cada PC. ' +
                                      'El motor la descarga e instala solo: volver a correr el diagnostico. ' +
                                      'No se actualizo ahora porque ' + [string]$up.motivo + '.')
@@ -12238,6 +12239,69 @@ public class FudoFakeEndpoint {
     Microsoft.PowerShell.Management\Remove-Item Function:\Read-DoctorLine -ErrorAction SilentlyContinue
     Microsoft.PowerShell.Management\Remove-Item Function:\Request-UiAnswer -ErrorAction SilentlyContinue
 
+
+    # -----------------------------------------------------------------------
+    # Escenario 128 (v3.26, regresion de la 3.24 encontrada por Fernando Hildt en dos PCs):
+    # "se descargaba, se instalaba y se ejecutaba... pero NO avanzaba en los siguientes pasos.
+    # Se quedaba en el paso numero dos tratando de instalarla cuando ya se estaba ejecutando",
+    # 3-4 minutos hasta que cancelo el diagnostico.
+    # El .exe de la Nativa instala, LEVANTA LA APP y se queda vivo. Start-Process -Wait espera
+    # a que termine: nunca termina. Un .msi con /qn si termina, por eso no habia aparecido
+    # antes -hasta la 3.24 el motor no instalaba solo y lo que llegaba era .msi-.
+    Reset-State
+    Reset-Mocks
+    function Write-StepDetail { param($Texto) }
+    function Start-Sleep { param($Seconds, $Milliseconds) }
+
+    # El instalador NO termina nunca, y la Nativa aparece en disco a la segunda mirada.
+    $script:miradas128 = 0
+    function Find-FudoNativeInstall {
+        $script:miradas128++
+        [ordered]@{ paths=@(); regInfo=@(); exe=''; manifests=@(); carpeta=''
+                    enDisco=($script:miradas128 -gt 1); soloRegistro=$false; pwa=$false }
+    }
+    function Start-Process { param($FilePath, $ArgumentList, [switch]$PassThru, [switch]$Wait, $ErrorAction)
+        # HasExited siempre false: es justo el instalador que se queda abierto.
+        [pscustomobject]@{ HasExited = $false; ExitCode = $null } }
+    $code128 = Invoke-NativeInstallerFile -Path 'C:\tmp\FudoNativa.exe' -TimeoutSec 30
+    Assert-Eq 'S128 con la Nativa ya en disco no se espera al instalador' 0 ([int]$code128)
+    Assert-Eq 'S128 y queda dicho que el instalador sigue abierto' $true ([bool]$script:InstaladorSigueCorriendo)
+
+    # Y si la Nativa NO aparece, el motor NO se cuelga: corta por plazo y sigue.
+    Reset-State
+    function Find-FudoNativeInstall {
+        [ordered]@{ paths=@(); regInfo=@(); exe=''; manifests=@(); carpeta=''
+                    enDisco=$false; soloRegistro=$false; pwa=$false }
+    }
+    $t0128 = Get-Date
+    $code128b = Invoke-NativeInstallerFile -Path 'C:\tmp\FudoNativa.exe' -TimeoutSec 2
+    $tardo128 = ((Get-Date) - $t0128).TotalSeconds
+    Assert-Eq 'S128 sin efecto se corta por plazo y no se cuelga' $true ([bool]($tardo128 -lt 20))
+    Assert-Eq 'S128 y no se lo mata al cliente' $true ([bool]$script:InstaladorSigueCorriendo)
+
+    # Un instalador que SI termina sigue reportando su codigo de salida, como siempre.
+    Reset-State
+    function Start-Process { param($FilePath, $ArgumentList, [switch]$PassThru, [switch]$Wait, $ErrorAction)
+        [pscustomobject]@{ HasExited = $true; ExitCode = 1603 } }
+    Assert-Eq 'S128 el que termina sigue devolviendo su codigo' 1603 ([int](Invoke-NativeInstallerFile -Path 'C:\tmp\FudoNativa.exe' -TimeoutSec 30))
+    Assert-Eq 'S128 y ese no quedo abierto' $false ([bool]$script:InstaladorSigueCorriendo)
+
+    # Un .msi sigue yendo por msiexec /qn, que termina solo: ese camino no se toca.
+    Reset-State
+    $script:msiArgs128 = ''
+    function Start-Process { param($FilePath, $ArgumentList, [switch]$PassThru, [switch]$Wait, $ErrorAction)
+        $script:msiArgs128 = [string]$FilePath + ' ' + [string]$ArgumentList
+        [pscustomobject]@{ HasExited = $true; ExitCode = 0 } }
+    function Resolve-Path { param($Path) [pscustomobject]@{ Path = [string]$Path } }
+    $null = Invoke-NativeInstallerFile -Path 'C:\kit\FudoNativa.msi'
+    Assert-Eq 'S128 un .msi sigue yendo por msiexec' $true ([bool]($script:msiArgs128 -match 'msiexec'))
+    Assert-Eq 'S128 y en silencio' $true ([bool]($script:msiArgs128 -match '/qn'))
+    Microsoft.PowerShell.Management\Remove-Item Function:\Start-Process -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item Function:\Resolve-Path -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item Function:\Start-Sleep -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item Function:\Find-FudoNativeInstall -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item Function:\Write-StepDetail -ErrorAction SilentlyContinue
+
     Write-Host ""
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)
     # Salida explicita en los dos casos: si el script termina con 'return', $LASTEXITCODE
@@ -13170,7 +13234,8 @@ function Invoke-NativeInstallerFile {
       todos los archivos del producto instalado. Si /fa no aplica (el producto no esta
       registrado, 1605/1614) se cae a /i, que es el camino normal.
     #>
-    param([string]$Path, [string]$ExtraArgs = '', $Reparar = $false)
+    param([string]$Path, [string]$ExtraArgs = '', $Reparar = $false, [int]$TimeoutSec = 120)
+    $script:InstaladorSigueCorriendo = $false
     if (-not $Path) { return $null }
     try {
         if ($Path -match '(?i)\.msi$') {
@@ -13186,8 +13251,39 @@ function Invoke-NativeInstallerFile {
             $pr = Start-Process -FilePath 'msiexec.exe' -ArgumentList $msiArgs -PassThru -Wait -ErrorAction Stop
             return [int]$pr.ExitCode
         }
-        $pr = $(if ($ExtraArgs) { Start-Process -FilePath $Path -ArgumentList $ExtraArgs -PassThru -Wait -ErrorAction Stop }
-                else            { Start-Process -FilePath $Path -PassThru -Wait -ErrorAction Stop })
+        # Un .exe NO se espera con -Wait. El instalador de la Nativa instala, LEVANTA LA APP y
+        # se queda vivo, asi que esperar a que termine es esperar para siempre. Un asesor lo
+        # describio exacto con la 3.24: "se descargaba, se instalaba y se ejecutaba... pero NO
+        # avanzaba en los siguientes pasos", 3-4 minutos hasta que cancelo, en dos PCs. Hasta
+        # la 3.24 no molestaba porque el motor no instalaba solo y lo que llegaba era .msi.
+        # La regla del proyecto aplicada a la espera: lo que importa no es que el instalador
+        # termine, es que la Nativa QUEDE EN DISCO. En cuanto aparece, se sigue.
+        $pr = $(if ($ExtraArgs) { Start-Process -FilePath $Path -ArgumentList $ExtraArgs -PassThru -ErrorAction Stop }
+                else            { Start-Process -FilePath $Path -PassThru -ErrorAction Stop })
+        $limite = (Get-Date).AddSeconds($TimeoutSec)
+        while ((Get-Date) -lt $limite) {
+            $salio = $false
+            try { $salio = [bool]$pr.HasExited } catch { $salio = $true }
+            if ($salio) { break }
+            $ya = $false
+            try { $ya = [bool](Find-FudoNativeInstall).enDisco } catch {}
+            if ($ya) {
+                # Quedo instalada y el instalador sigue abierto (tipicamente porque levanto la
+                # app). No hay nada mas que esperar y no hay que matarle nada al cliente.
+                $script:InstaladorSigueCorriendo = $true
+                return 0
+            }
+            Write-StepDetail 'esperando a que el instalador de la App Nativa termine'
+            Start-Sleep -Seconds 2
+        }
+        try {
+            if (-not [bool]$pr.HasExited) {
+                # Se acabo el plazo y sigue abierto. No se lo mata: puede estar esperando que
+                # alguien apriete algo en pantalla. Se sigue y se verifica el efecto.
+                $script:InstaladorSigueCorriendo = $true
+                return 0
+            }
+        } catch { return $null }
         return [int]$pr.ExitCode
     } catch { return $null }
 }
@@ -13705,8 +13801,10 @@ function Install-FudoNative {
                 intento = $true; instalador = ('descarga: ' + [string]$url); versionInstalador = ''
                 quedoInstalada = [bool]$quedo; versionDespues = [string]$verDespues; exitCode = $code
                 corriendo = [bool]$corriendo
-                motivo = $(if ($quedo) { 'la Nativa quedo en disco (descargada por el motor)' }
+                motivo = $(if ($quedo -and [bool]$script:InstaladorSigueCorriendo) { 'la Nativa quedo en disco (el instalador sigue abierto: levanta la app al terminar)' }
+                           elseif ($quedo) { 'la Nativa quedo en disco (descargada por el motor)' }
                            elseif ($null -eq $code) { 'no se pudo lanzar el instalador descargado' }
+                           elseif ([bool]$script:InstaladorSigueCorriendo) { 'el instalador sigue abierto y la Nativa todavia no aparece: puede estar esperando que alguien lo complete en pantalla' }
                            else { 'el instalador descargado corrio y la Nativa no quedo en disco: revisar si el antivirus la borro' })
             }
             if ($quedo) {
@@ -13715,6 +13813,7 @@ function Install-FudoNative {
                     -Recommendation 'El motor descargo e instalo la App Nativa en esta corrida. Abrir Fudo en el navegador y mandar una comanda de prueba.' `
                     -EvidenceExtra @{ instaladaEnEstaCorrida = $true; descargada = $true; versionDespues = [string]$verDespues })
             }
+            if ([bool]$script:InstaladorSigueCorriendo) { $notas += 'el instalador quedo abierto (no se lo cierra: puede ser la app levantandose)' }
             $notas += $(if ($quedo) { 'quedo instalada' + $(if ($verDespues) { " (v$verDespues)" } else { '' }) }
                         else { 'NO quedo instalada: revisar si el antivirus la borro despues de instalar' })
             ($notas -join ' | ')
