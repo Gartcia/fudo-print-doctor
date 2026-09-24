@@ -481,7 +481,7 @@ $script:TestPrinterRx = '(?i)^FUDO-TEST-'
 # puerto tenga hardware; si el hardware se va, deja de serlo (ver Remove-OrphanOwnQueues).
 $script:OwnQueueRx   = '(?i)^FUDO-(TEST-|USB\d)'
 $script:TestDocRx    = '(?i)fudo print doctor'
-$script:SchemaVersion = '3.26'
+$script:SchemaVersion = '3.27'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -12302,6 +12302,65 @@ public class FudoFakeEndpoint {
     Microsoft.PowerShell.Management\Remove-Item Function:\Find-FudoNativeInstall -ErrorAction SilentlyContinue
     Microsoft.PowerShell.Management\Remove-Item Function:\Write-StepDetail -ErrorAction SilentlyContinue
 
+
+    # -----------------------------------------------------------------------
+    # Escenario 129 (v3.27, caso 215476084398178): con la 3.26 el diagnostico quedo "cargando
+    # infinitamente" en [2/11], sobre la linea "descargando el instalador". La asesora tuvo que
+    # cancelar e instalar la Nativa a mano, en vivo con el cliente.
+    # Dos causas: Invoke-WebRequest -OutFile dibuja su barra por cada bloque recibido y eso
+    # domina el tiempo sobre 58 MB, y entre "descargando" y el final no habia ninguna senal de
+    # vida, asi que una pantalla quieta era indistinguible de una colgada.
+    Reset-State
+    Reset-Mocks
+    $script:detalles129 = @()
+    function Write-StepDetail { param($Texto) $script:detalles129 += [string]$Texto }
+    function Start-Sleep { param($Seconds, $Milliseconds) }
+
+    # Descarga que avanza: se informan los MB a medida que caen.
+    $script:vueltas129 = 0
+    function Get-Item { param($Path, $ErrorAction)
+        $script:vueltas129++
+        [pscustomobject]@{ Length = ([long]$script:vueltas129 * 20MB) } }
+    function New-Object { param($TypeName, $ArgumentList)
+        [pscustomobject]@{ IsBusy = $false } |
+            Add-Member -MemberType ScriptMethod -Name DownloadFileAsync -Value { param($u, $d) } -PassThru |
+            Add-Member -MemberType ScriptMethod -Name CancelAsync -Value { } -PassThru |
+            Add-Member -MemberType ScriptMethod -Name Dispose -Value { } -PassThru }
+    $d129 = Get-FileWithProgress -Url 'https://x/y.exe' -Destino 'C:\tmp\y.exe' -TimeoutSec 30 -Que 'la App Nativa'
+    Assert-Eq 'S129 una descarga que trajo bytes sale ok' $true ([bool]$d129.ok)
+    Assert-Eq 'S129 y se reporta el tamano' $true ([bool]($d129.bytes -gt 0))
+    Assert-Eq 'S129 y cuanto tardo' $true ([bool]($d129.segundos -ge 0))
+
+    # Descarga que no trae nada: NO se declara ok, y el motivo no puede ser "se lo llevo el
+    # antivirus" -que es lo que decia antes por no distinguir los dos casos-.
+    Reset-State
+    $script:vueltas129 = 0
+    function Get-Item { param($Path, $ErrorAction) throw 'no existe' }
+    $d129b = Get-FileWithProgress -Url 'https://x/y.exe' -Destino 'C:\tmp\y.exe' -TimeoutSec 30 -Que 'la App Nativa'
+    Assert-Eq 'S129 sin bytes no se declara ok' $false ([bool]$d129b.ok)
+    Assert-Eq 'S129 y se dice que no bajo nada' $true ([bool]([string]$d129b.error -match 'no se descargo nada'))
+
+    # Una descarga que nunca termina se corta por plazo en vez de colgar el diagnostico, que es
+    # exactamente lo que le paso a la asesora.
+    Reset-State
+    function New-Object { param($TypeName, $ArgumentList)
+        [pscustomobject]@{ IsBusy = $true } |
+            Add-Member -MemberType ScriptMethod -Name DownloadFileAsync -Value { param($u, $d) } -PassThru |
+            Add-Member -MemberType ScriptMethod -Name CancelAsync -Value { $script:cancelo129 = $true } -PassThru |
+            Add-Member -MemberType ScriptMethod -Name Dispose -Value { } -PassThru }
+    function Get-Item { param($Path, $ErrorAction) [pscustomobject]@{ Length = [long]0 } }
+    $script:cancelo129 = $false
+    $t0129 = Get-Date
+    $d129c = Get-FileWithProgress -Url 'https://x/y.exe' -Destino 'C:\tmp\y.exe' -TimeoutSec 1 -Que 'la App Nativa'
+    Assert-Eq 'S129 una descarga eterna se corta por plazo' $false ([bool]$d129c.ok)
+    Assert-Eq 'S129 y lo dice' $true ([bool]([string]$d129c.error -match 'no termino'))
+    Assert-Eq 'S129 y se cancela la bajada' $true ([bool]$script:cancelo129)
+    Assert-Eq 'S129 sin colgar el diagnostico' $true ([bool](((Get-Date) - $t0129).TotalSeconds -lt 30))
+    Microsoft.PowerShell.Management\Remove-Item Function:\New-Object -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item Function:\Get-Item -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item Function:\Start-Sleep -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item Function:\Write-StepDetail -ErrorAction SilentlyContinue
+
     Write-Host ""
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)
     # Salida explicita en los dos casos: si el script termina con 'return', $LASTEXITCODE
@@ -13563,6 +13622,63 @@ function Get-NativeInstallerUrl {
     } catch { return [string]$script:NativeInstallerUrlWin8 }
 }
 
+function Get-FileWithProgress {
+    <#
+      Baja un archivo grande mostrando que avanza, y sin la trampa de PowerShell 5.1.
+
+      Dos cosas hacian que la descarga de la Nativa (58,7 MB) se viera "cargando infinitamente",
+      y una asesora tuvo que cancelar el diagnostico e instalarla a mano:
+
+       1. Invoke-WebRequest -OutFile dibuja su barra de progreso por CADA bloque que recibe, y
+          ese renderizado domina el tiempo: la misma descarga puede tardar decenas de veces mas
+          que lo que tarda la red. Con $ProgressPreference en SilentlyContinue se arregla, y es
+          la razon por la que aca no se usa Invoke-WebRequest.
+       2. No habia ni una senal de vida entre "descargando" y el final. Con 58 MB en la conexion
+          de un cliente, una pantalla quieta es indistinguible de una colgada. Ahora se informan
+          los MB a medida que caen.
+
+      Devuelve @{ ok; bytes; segundos; error }.
+    #>
+    param([string]$Url, [string]$Destino, [int]$TimeoutSec = 300, [string]$Que = 'el archivo')
+
+    $r = [ordered]@{ ok = $false; bytes = 0; segundos = 0; error = '' }
+    $t0 = Get-Date
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+
+    $wc = $null
+    try {
+        $wc = New-Object Net.WebClient
+        $wc.DownloadFileAsync([Uri]$Url, $Destino)
+        $limite = (Get-Date).AddSeconds($TimeoutSec)
+        $ultimo = -1
+        while ($wc.IsBusy -and ((Get-Date) -lt $limite)) {
+            Start-Sleep -Milliseconds 800
+            $mb = 0
+            try { $mb = [int]([math]::Floor((Get-Item $Destino -ErrorAction Stop).Length / 1MB)) } catch {}
+            if ($mb -ne $ultimo) {
+                $ultimo = $mb
+                Write-StepDetail ('descargando ' + $Que + ': ' + $mb + ' MB')
+            }
+        }
+        if ($wc.IsBusy) {
+            try { $wc.CancelAsync() } catch {}
+            $r.error = ('la descarga no termino en ' + $TimeoutSec + ' segundos y se corto')
+        }
+    } catch {
+        $r.error = $_.Exception.Message
+    } finally {
+        if ($wc) { try { $wc.Dispose() } catch {} }
+    }
+
+    try { $r.bytes = [long](Get-Item $Destino -ErrorAction Stop).Length } catch { $r.bytes = 0 }
+    $r.segundos = [int]((Get-Date) - $t0).TotalSeconds
+    # Sin error declarado y con bytes suficientes, la descarga sirvio. El tamano exacto lo
+    # valida quien llama: aca solo sabemos si bajo algo o no bajo nada.
+    if (-not $r.error -and $r.bytes -gt 0) { $r.ok = $true }
+    if (-not $r.error -and $r.bytes -le 0) { $r.error = 'no se descargo nada (sin conexion, o la direccion no respondio)' }
+    return $r
+}
+
 function Test-FudoInstallerSignature {
     <#
       Verifica que el instalador RECIEN DESCARGADO este firmado por Fudo antes de ejecutarlo.
@@ -13757,9 +13873,16 @@ function Install-FudoNative {
             # 2) descargar
             $esMsi = ([string]$url -match '(?i)\.msi(\?|$)')
             $destino = Join-Path $env:TEMP ('FudoNativa-' + (Get-Date).ToString('yyyyMMddHHmmss') + $(if ($esMsi) { '.msi' } else { '.exe' }))
-            Write-StepDetail 'descargando el instalador de la App Nativa (unos 60 MB, puede tardar)'
-            try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
-            Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 600 -OutFile $destino -ErrorAction Stop
+            Write-StepDetail 'descargando el instalador de la App Nativa (58 MB)'
+            $bajada = Get-FileWithProgress -Url $url -Destino $destino -TimeoutSec 300 -Que 'la App Nativa'
+            $script:Diagnostics['nativaDescarga'] = [ordered]@{
+                url = [string]$url; bytes = [long]$bajada.bytes; segundos = [int]$bajada.segundos
+                ok = [bool]$bajada.ok; error = [string]$bajada.error }
+            if (-not [bool]$bajada.ok) {
+                throw ('no se pudo descargar el instalador de la App Nativa: ' + [string]$bajada.error +
+                       '. Pasarlo a mano y dejarlo al lado de FudoPrintDoctor.cmd.')
+            }
+            $notas += ('descarga: ' + [int]([long]$bajada.bytes / 1MB) + ' MB en ' + [int]$bajada.segundos + 's')
             # El antivirus se lleva el instalador MIENTRAS se descarga: en la telemetria hay 14
             # detecciones de Defender sobre archivos .crdownload de Chrome, o sea antes de que
             # nadie lo ejecute. Cuando pasa, Invoke-WebRequest termina bien y el archivo ya no
@@ -13774,9 +13897,12 @@ function Install-FudoNative {
             $notas += "instalador descargado (${tam}KB)"
             # 3) verificar la firma ANTES de ejecutarlo
             $firma = Test-FudoInstallerSignature -Path $destino
-            $script:Diagnostics['nativaDescarga'] = [ordered]@{
-                url = [string]$url; tamKB = $tam; firmaEstado = [string]$firma.estado
-                firmante = [string]$firma.firmante; firmaOk = [bool]$firma.ok }
+            try {
+                $script:Diagnostics['nativaDescarga']['tamKB'] = $tam
+                $script:Diagnostics['nativaDescarga']['firmaEstado'] = [string]$firma.estado
+                $script:Diagnostics['nativaDescarga']['firmante'] = [string]$firma.firmante
+                $script:Diagnostics['nativaDescarga']['firmaOk'] = [bool]$firma.ok
+            } catch {}
             if (-not [bool]$firma.ok) {
                 try { Remove-Item $destino -Force -ErrorAction SilentlyContinue } catch {}
                 throw ('el instalador descargado no tiene firma valida de Fudo (' + [string]$firma.estado + '): NO se ejecuto. Descargarlo a mano desde la web app.')

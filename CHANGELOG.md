@@ -2,6 +2,45 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.27] - 2026-09-24
+
+**El diagnóstico quedaba "cargando infinitamente" en la descarga de la App Nativa.** Segundo reporte
+de campo en dos días sobre el mismo paso, esta vez en vivo con un cliente: la asesora tuvo que
+cancelar el diagnóstico e instalar la Nativa a mano. En pantalla, congelado:
+
+```
+[2/11] App Nativa de Fudo y antivirus - descargando el instalador de la A.
+```
+
+Conviene separarlo del arreglo de ayer, porque **no es el mismo bug**: la 3.26 arregló la *espera al
+instalador*, y esto es la *descarga*, el paso anterior. Dos fallas distintas en el camino que la 3.24
+estrenó, encontradas en orden por dos asesores.
+
+### Las dos causas
+
+**1. `Invoke-WebRequest -OutFile` dibuja su barra de progreso por cada bloque que recibe**, y ese
+renderizado domina el tiempo: sobre 58,7 MB puede tardar decenas de veces más que lo que tarda la
+red. Es una trampa conocida de PowerShell 5.1 y el motor caía de lleno en ella — `$ProgressPreference`
+nunca se tocó en todo el archivo. Ahora la descarga va por `WebClient`, que no tiene ese problema.
+
+**2. No había ninguna señal de vida entre "descargando" y el final.** Con 58 MB sobre la conexión de
+un cliente, una pantalla quieta es indistinguible de una colgada — y la asesora decidió lo único
+razonable con la información que tenía. Ahora se informan los MB a medida que caen.
+
+### Lo demás que cambia
+
+- **Tope de 5 minutos, y se corta.** Antes eran 10 y en la práctica no cortaba nunca a tiempo.
+- **Un fallo de descarga dejó de confundirse con el antivirus.** El chequeo de "el archivo
+  desapareció" asumía que si no está, se lo llevó Defender — cierto cuando la descarga funcionó,
+  falso cuando nunca bajó nada. Ahora se distingue *no bajó nada* de *bajó y desapareció*, que
+  mandan al asesor a lugares opuestos.
+- **Cuánto pesó y cuánto tardó viajan en la telemetría** (`nativaDescarga.bytes`, `.segundos`). Sin
+  eso no hay forma de saber si esto quedó realmente resuelto o sólo se ve mejor.
+
+**Escenario 129** del self-test: una descarga que trae bytes, una que no trae nada (no se declara ok
+y el motivo no es el antivirus) y una que no termina nunca (se corta por plazo, se cancela la bajada
+y el diagnóstico sigue).
+
 ## [3.26] - 2026-09-23
 
 **Regresión de la 3.24, encontrada en campo en menos de 24 horas.** La reportó Fernando Hildt, en
