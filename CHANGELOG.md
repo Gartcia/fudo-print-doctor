@@ -2,6 +2,54 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.28] - 2026-09-24
+
+**Primera vez en el proyecto que este camino se corre contra el instalador real.** Se probó la
+descarga y la instalación de la App Nativa en una PC de verdad, y aparecieron dos cosas: una que
+confirma el arreglo de ayer y otra que nadie había visto.
+
+### La App Nativa corriendo bloquea su propia reinstalación
+
+Medido, con el mismo instalador y el mismo comando:
+
+| | código | tiempo | archivo |
+|---|---|---|---|
+| Con la app abierta | **1603** | 0 s | **no se toca** |
+| Con la app cerrada | **0** | 11 s | reescrito |
+
+Lo único que cambiaba era el proceso vivo. Un instalador no puede reemplazar un ejecutable en uso,
+y el de la Nativa se rinde de inmediato en vez de avisar.
+
+Pega justo en la causa raíz más común que tenemos —*"figura en el registro pero no está en disco"*—:
+el motor reinstalaba, se comía un 1603 y reportaba que el instalador había fallado, sin poder decir
+por qué. **Ahora cierra la App Nativa antes de instalar.** No le cuesta nada al cliente: es un
+*native messaging host*, lo vuelve a levantar el navegador cuando abre Fudo — se verificó que sí
+vuelve solo. Se cierra únicamente cuando el motor está por instalar, nunca porque sí.
+
+Estaba anotado como pendiente desde la bitácora del **04/09** (*"si la Nativa está corriendo y
+bloquea el reemplazo, pedir el cierre de la app antes de actualizar"*) y nunca se había hecho,
+porque hasta hoy no había forma de ver que pasaba.
+
+### Los códigos del instalador dejan de ser números
+
+`1603` era lo único que el asesor veía, y no se puede accionar sobre un número. Ahora se traducen:
+1603 (no pudo reemplazar archivos, normalmente la app en uso), 1618 (hay otra instalación en curso),
+1625/1260 (una política de la PC lo bloquea) y 3010 (salió bien pero pide reiniciar).
+
+### Confirmado: el arreglo de la 3.26 era el correcto
+
+El instalador **sí termina solo**, a los 11 segundos — pero deja la App Nativa corriendo, y
+`Start-Process -Wait` espera al árbol de procesos completo, así que esperaba a un proceso que no
+termina nunca. Es exactamente lo que describió el asesor: *"se instalaba y se ejecutaba, pero NO
+avanzaba"*. Mirar `HasExited` en vez de usar `-Wait` da lo que hace falta.
+
+De paso, dos datos del instalador real que hasta hoy eran suposiciones: la descarga son **61.551.496
+bytes en 56 segundos** con la 3.27, y la firma verifica —`Valid`, `CN=Fudo Group LLC`— o sea que el
+control que agregó la 3.24 acepta el archivo de verdad y no sólo a los mocks.
+
+**Escenario 130** del self-test: que se cierre la Nativa cuando está corriendo, que no se toque nada
+cuando no lo está, y la traducción de cada código.
+
 ## [3.27] - 2026-09-24
 
 **El diagnóstico quedaba "cargando infinitamente" en la descarga de la App Nativa.** Segundo reporte

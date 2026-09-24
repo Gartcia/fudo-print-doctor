@@ -481,7 +481,7 @@ $script:TestPrinterRx = '(?i)^FUDO-TEST-'
 # puerto tenga hardware; si el hardware se va, deja de serlo (ver Remove-OrphanOwnQueues).
 $script:OwnQueueRx   = '(?i)^FUDO-(TEST-|USB\d)'
 $script:TestDocRx    = '(?i)fudo print doctor'
-$script:SchemaVersion = '3.27'
+$script:SchemaVersion = '3.28'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -12361,6 +12361,53 @@ public class FudoFakeEndpoint {
     Microsoft.PowerShell.Management\Remove-Item Function:\Start-Sleep -ErrorAction SilentlyContinue
     Microsoft.PowerShell.Management\Remove-Item Function:\Write-StepDetail -ErrorAction SilentlyContinue
 
+
+    # -----------------------------------------------------------------------
+    # Escenario 130 (v3.28): la App Nativa corriendo bloquea su propia reinstalacion.
+    # Medido en una PC de verdad el 24/09, que es la primera vez en el proyecto que este
+    # camino se corre contra el instalador real:
+    #   - con la app abierta : codigo 1603 en 0 segundos, el archivo NO se toca
+    #   - con la app cerrada : codigo 0 en 11 segundos, el archivo se reescribe
+    # Mismo instalador y mismo comando: lo unico que cambiaba era el proceso vivo.
+    Reset-State
+    Reset-Mocks
+    function Write-StepDetail { param($Texto) }
+    function Start-Sleep { param($Seconds, $Milliseconds) }
+    function Find-FudoNativeInstall { [ordered]@{ enDisco=$false; soloRegistro=$false; pwa=$false } }
+
+    # Con la Nativa corriendo: se la cierra antes de instalar.
+    $script:matados130 = 0
+    function Get-Process { param($Name, $ErrorAction)
+        @([pscustomobject]@{ Name = 'fudo_native_extension' } |
+            Add-Member -MemberType ScriptMethod -Name Kill -Value { $script:matados130++ } -PassThru) }
+    function Start-Process { param($FilePath, $ArgumentList, [switch]$PassThru, [switch]$Wait, $ErrorAction)
+        [pscustomobject]@{ HasExited = $true; ExitCode = 0 } }
+    $null = Invoke-NativeInstallerFile -Path 'C:\tmp\FudoNativa.exe' -TimeoutSec 10
+    Assert-Eq 'S130 si la Nativa esta corriendo, se la cierra antes de instalar' $true ([bool]($script:matados130 -gt 0))
+    Assert-Eq 'S130 y queda registrado que se la cerro' $true ([bool]$script:CerroNativaParaInstalar)
+
+    # Sin la Nativa corriendo no se mata nada.
+    Reset-State
+    $script:matados130 = 0
+    function Get-Process { param($Name, $ErrorAction) @() }
+    $null = Invoke-NativeInstallerFile -Path 'C:\tmp\FudoNativa.exe' -TimeoutSec 10
+    Assert-Eq 'S130 si no esta corriendo no se toca ningun proceso' 0 ([int]$script:matados130)
+    Assert-Eq 'S130 y no se dice que se cerro nada' $false ([bool]$script:CerroNativaParaInstalar)
+
+    # El 1603 deja de ser un numero y pasa a decir que hacer.
+    $n130 = Get-InstallerExitNote -Code 1603
+    Assert-Eq 'S130 el 1603 se traduce' $true ([bool]($n130 -match 'no pudo reemplazar los archivos'))
+    Assert-Eq 'S130 y nombra la causa mas comun' $true ([bool]($n130 -match 'en uso'))
+    Assert-Eq 'S130 el 0 dice que salio bien' $true ([bool]((Get-InstallerExitNote -Code 0) -match 'termino bien'))
+    Assert-Eq 'S130 el 3010 avisa que pide reinicio' $true ([bool]((Get-InstallerExitNote -Code 3010) -match 'reiniciar'))
+    Assert-Eq 'S130 sin codigo se dice que no se pudo lanzar' $true ([bool]((Get-InstallerExitNote -Code $null) -match 'no se pudo lanzar'))
+    Assert-Eq 'S130 un codigo desconocido se muestra igual' $true ([bool]((Get-InstallerExitNote -Code 1234) -match '1234'))
+    Microsoft.PowerShell.Management\Remove-Item Function:\Get-Process -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item Function:\Start-Process -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item Function:\Start-Sleep -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item Function:\Find-FudoNativeInstall -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item Function:\Write-StepDetail -ErrorAction SilentlyContinue
+
     Write-Host ""
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)
     # Salida explicita en los dos casos: si el script termina con 'return', $LASTEXITCODE
@@ -13279,6 +13326,23 @@ function Test-NativaNecesitaUpdate {
     return @{ actualizar = $true; motivo = ('el instalador trae la ' + $Disponible + ' y la PC tiene la ' + $Instalada) }
 }
 
+function Get-InstallerExitNote {
+    <#
+      Traduce el codigo de salida del instalador a algo que le sirva a una persona. 1603 es el
+      unico que aparecio en campo y significa casi siempre lo mismo: no pudo reemplazar
+      archivos en uso.
+    #>
+    param($Code)
+    if ($null -eq $Code) { return 'no se pudo lanzar el instalador' }
+    $c = [int]$Code
+    if ($c -eq 0) { return 'el instalador termino bien' }
+    if ($c -eq 1603) { return 'el instalador no pudo reemplazar los archivos (codigo 1603): normalmente es la App Nativa en uso, o falta permiso sobre la carpeta' }
+    if ($c -eq 1618) { return 'hay otra instalacion de Windows en curso (codigo 1618): esperar a que termine y reintentar' }
+    if ($c -eq 1625 -or $c -eq 1260) { return 'una politica de esta PC bloquea la instalacion (codigo ' + $c + ')' }
+    if ($c -eq 3010) { return 'el instalador termino bien pero pide reiniciar la PC (codigo 3010)' }
+    return 'el instalador termino con codigo ' + $c
+}
+
 function Invoke-NativeInstallerFile {
     <#
       Ejecuta el instalador de la Nativa. Un .msi NO se ejecuta directo: va por msiexec, y en
@@ -13295,7 +13359,25 @@ function Invoke-NativeInstallerFile {
     #>
     param([string]$Path, [string]$ExtraArgs = '', $Reparar = $false, [int]$TimeoutSec = 120)
     $script:InstaladorSigueCorriendo = $false
+    $script:CerroNativaParaInstalar = $false
     if (-not $Path) { return $null }
+    # Un instalador NO puede reemplazar un ejecutable que esta en uso. Medido en una PC de
+    # verdad el 24/09: con la App Nativa corriendo, el instalador devuelve 1603 en cero
+    # segundos y no escribe un solo byte; con la app cerrada devuelve 0 en once segundos y
+    # reescribe el archivo. Mismo instalador, mismo comando: lo unico que cambia es el
+    # proceso vivo. Pega justo en la causa raiz mas comun -'figura en el registro pero no
+    # esta en disco'-, donde el motor reinstalaba y se comia un 1603 sin saber por que.
+    # Cerrarla no le cuesta nada al cliente: es un native messaging host, la vuelve a
+    # levantar el navegador cuando abre Fudo.
+    try {
+        $vivos = @(Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Name -like "*$FudoAppProcess*" })
+        if (@($vivos).Count -gt 0) {
+            Write-StepDetail 'cerrando la App Nativa para poder reemplazar sus archivos'
+            foreach ($p in @($vivos)) { try { $p.Kill() } catch {} }
+            Start-Sleep -Seconds 2
+            $script:CerroNativaParaInstalar = $true
+        }
+    } catch {}
     try {
         if ($Path -match '(?i)\.msi$') {
             $ruta = (Resolve-Path $Path).Path
@@ -13793,7 +13875,8 @@ function Install-FudoNative {
                 Write-StepDetail $(if ([bool]$instAntes.soloRegistro) { 'reinstalando la App Nativa (figura instalada pero falta el archivo)' } else { 'ejecutando el instalador local' })
                 $code = Invoke-NativeInstallerFile -Path $local -ExtraArgs $NativeInstallerArgs -Reparar ([bool]$instAntes.soloRegistro)
                 $salida.code = $code
-                $notas += $(if ($null -eq $code) { 'no se pudo lanzar el instalador' } else { "el instalador termino con codigo $code" })
+                if ([bool]$script:CerroNativaParaInstalar) { $notas += 'se cerro la App Nativa para poder reemplazarla' }
+                $notas += (Get-InstallerExitNote -Code $code)
                 Start-Sleep -Seconds 3
                 ($notas -join ' | ')
             }
@@ -13912,7 +13995,8 @@ function Install-FudoNative {
             #    cliente-: Invoke-NativeInstallerFile ya resuelve msiexec /qn.
             Write-StepDetail 'ejecutando el instalador de la App Nativa'
             $code = Invoke-NativeInstallerFile -Path $destino -ExtraArgs $NativeInstallerArgs
-            $notas += $(if ($null -eq $code) { 'no se pudo lanzar el instalador' } else { "el instalador termino con codigo $code" })
+            if ([bool]$script:CerroNativaParaInstalar) { $notas += 'se cerro la App Nativa para poder reemplazarla' }
+            $notas += (Get-InstallerExitNote -Code $code)
             Start-Sleep -Seconds 3
             # 5) verificar el EFECTO, no el codigo de salida: es la regla del proyecto y este
             #    camino nunca la habia cumplido (miraba solo si el proceso estaba corriendo, que
