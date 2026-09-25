@@ -438,6 +438,9 @@ param(
     [switch]$Json,
     [bool]$WaitReconnect,
     [int]$ReconnectTimeoutSec = 120,
+    # Permite decidir sin consola si se puede desactivar el Modo de impresion protegido.
+    # Sin este parametro y sin nadie a quien preguntarle, NO se toca.
+    [bool]$AllowDisableProtectedPrint,
     [string]$LauncherStamp = '',
     [string]$NativeInstallerUrl = '',
     [string]$NativeInstallerPath = '',
@@ -481,7 +484,7 @@ $script:TestPrinterRx = '(?i)^FUDO-TEST-'
 # puerto tenga hardware; si el hardware se va, deja de serlo (ver Remove-OrphanOwnQueues).
 $script:OwnQueueRx   = '(?i)^FUDO-(TEST-|USB\d)'
 $script:TestDocRx    = '(?i)fudo print doctor'
-$script:SchemaVersion = '3.29'
+$script:SchemaVersion = '3.30'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -4314,6 +4317,87 @@ function Get-ProtectedPrintHowTo {
             'Despues volver a correr el diagnostico.')
 }
 
+function Confirm-DisableProtectedPrint {
+    <#
+      Desactivar el Modo de impresion protegido es la unica cosa que hace el motor que cambia
+      la POSTURA DE SEGURIDAD de la PC y queda asi despues de que nos fuimos. Por eso tiene su
+      propia confirmacion y no se apoya en la de purgar la cola: quien dijo "no purgues" no
+      dijo nada sobre esto.
+      Sin nadie a quien preguntarle (modo agente) NO se toca.
+    #>
+    param([string]$Origen)
+    if ($SkipIrreversible) { return $false }
+    if ($script:BoundParams -and $script:BoundParams.ContainsKey('AllowDisableProtectedPrint')) { return [bool]$AllowDisableProtectedPrint }
+    if (-not (Test-HayHumano)) { return $false }
+
+    $queEs = ('Windows 11 esta bloqueando la instalacion de impresoras que no sean las suyas. ' +
+              'Mientras este puesto, esta impresora no se puede instalar: ni el motor ni vos a mano.')
+    $queImplica = ('Queda desactivado despues de que termines: no se vuelve a activar solo, y volver a activarlo ' +
+                   'haria que Windows rechace de nuevo el driver de la impresora que acabamos de instalar. ' +
+                   'Es una opcion de seguridad de Windows contra drivers de impresora maliciosos.')
+    if (Test-UiWeb) {
+        $r = Request-UiAnswer -Id 'modoProtegido' -Clase 'peligro' -SoloAsesor `
+            -Titulo 'Desactivamos el Modo de impresion protegido de Windows?' `
+            -Texto $queEs -Texto2 $queImplica `
+            -Opciones @(
+                @{ v = 'si'; l = 'Si, desactivarlo'; peligro = $true },
+                @{ v = 'no'; l = 'No, lo veo yo'; principal = $true })
+        return ($r -eq 'si')
+    }
+    Suspend-LiveStatus
+    [Console]::Error.WriteLine('')
+    [Console]::Error.WriteLine('  ------------------------------------------------------------')
+    [Console]::Error.WriteLine('  MODO DE IMPRESION PROTEGIDO DE WINDOWS')
+    [Console]::Error.WriteLine('  ' + $queEs)
+    [Console]::Error.WriteLine('')
+    [Console]::Error.WriteLine('  ' + $queImplica)
+    [Console]::Error.WriteLine('  ------------------------------------------------------------')
+    $ans = Read-DoctorLine -Prompt '  Lo desactivo? (s = si / cualquier otra tecla = no)'
+    if ($null -eq $ans) { return $false }
+    return ([string]$ans -match '(?i)^\s*(s|si|s\u00ED|y|yes)\s*$')
+}
+
+function Disable-ProtectedPrintMode {
+    <#
+      Apaga el Modo de impresion protegido, si una persona lo autoriza.
+      Devuelve @{ applied; note; motivo }.
+
+      Dos cosas que NO hace, y las dos a proposito:
+       - No lo toca cuando viene por politica de la organizacion. Ahi la clave de la PC no tiene
+         efecto -la politica gana- asi que escribirla dejaria al motor diciendo "desactivado"
+         sin haber cambiado nada. Es el patron del falso OK, que en este proyecto ya volvio seis
+         veces; no lo vamos a agregar a proposito.
+       - No lo vuelve a activar al final. Suena prolijo y seria romper lo que acabamos de
+         arreglar: con el modo puesto Windows vuelve a rechazar el driver de la impresora.
+    #>
+    $st = Get-ProtectedPrintMode
+    if (-not [bool]$st.activo) { return @{ applied = $false; note = ''; motivo = 'no estaba activado' } }
+    if ([string]$st.origen -match '(?i)politica') {
+        return @{ applied = $false; note = ''
+                  motivo = ('lo pone una politica de la organizacion, asi que no se puede desactivar desde esta PC: ' +
+                            'hay que pedirselo a quien administra las computadoras del local') }
+    }
+    if (-not (Confirm-DisableProtectedPrint -Origen ([string]$st.origen))) {
+        return @{ applied = $false; note = ''; motivo = 'no se autorizo desactivarlo' }
+    }
+    try {
+        Write-StepDetail 'desactivando el Modo de impresion protegido'
+        Set-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print' `
+                         -Name 'WindowsProtectedPrintMode' -Value 0 -Type DWord -ErrorAction Stop
+    } catch {
+        return @{ applied = $false; note = ''; motivo = ('no se pudo escribir la configuracion: ' + $_.Exception.Message) }
+    }
+    # El spooler lee esto al arrancar: sin reiniciarlo, Windows sigue rechazando el driver.
+    try { Restart-Service -Name 'Spooler' -Force -ErrorAction SilentlyContinue; Start-Sleep -Seconds 2 } catch {}
+    # Verificar el EFECTO, no que la escritura no haya tirado error: es la regla del proyecto.
+    $despues = Get-ProtectedPrintMode
+    if ([bool]$despues.activo) {
+        return @{ applied = $false; note = ''; motivo = 'se escribio la configuracion y Windows la sigue reportando activada' }
+    }
+    Add-Action -Type 'os.protectedPrint' -Target 'WindowsProtectedPrintMode' -Before 'activado' -After 'desactivado' -Reversible $false
+    return @{ applied = $true; note = 'se desactivo el Modo de impresion protegido de Windows'; motivo = '' }
+}
+
 function New-FudoTestPrinter {
     <#
       Crea una cola temporal sobre $PortName. Si la impresora de ese puerto es de una marca
@@ -4330,7 +4414,13 @@ function New-FudoTestPrinter {
         # Con el modo protegido puesto esto NO puede funcionar, asi que no se intenta: se dice
         # que hay que hacer. Intentarlo igual devuelve un error de Windows que no explica nada.
         $wpp = Get-ProtectedPrintMode
-        if ([bool]$wpp.activo) { throw (Get-ProtectedPrintHowTo) }
+        if ([bool]$wpp.activo) {
+            # Antes de rendirse, ofrecerlo: es un cambio que el asesor iba a terminar haciendo a
+            # mano igual, y con el cliente en linea son dos teclas contra una explicacion de
+            # donde queda Configuracion en Windows 11.
+            $off = Disable-ProtectedPrintMode
+            if (-not [bool]$off.applied) { throw ((Get-ProtectedPrintHowTo) + ' (' + [string]$off.motivo + ')') }
+        }
         Write-StepDetail 'instalando el driver de texto generico'
         $drv = Install-GenericTextDriver
     }
@@ -12604,6 +12694,82 @@ public class FudoFakeEndpoint {
     # proyecto ya cometio cinco veces.
     Assert-Eq 'S132 hw.usbDescriptor tiene categoria' 'hardware.no_enumera' ([string]$script:CategoryByCheckId['hw.usbDescriptor'])
     Assert-Eq 'S132 env.protectedPrint tiene categoria' 'os.impresion_protegida' ([string]$script:CategoryByCheckId['env.protectedPrint'])
+
+
+    # -----------------------------------------------------------------------
+    # Escenario 133 (v3.30): el motor puede desactivar el Modo de impresion protegido, pero es
+    # lo unico que hace que cambia la POSTURA DE SEGURIDAD de la PC y queda asi despues de que
+    # nos fuimos. Por eso: con confirmacion, nunca en modo agente, y nunca cuando lo pone una
+    # politica de la organizacion -ahi escribir la clave de la PC no tiene ningun efecto, y el
+    # motor quedaria diciendo "desactivado" sin haber cambiado nada, que es el falso OK que en
+    # este proyecto ya volvio seis veces-.
+    Reset-State
+    Reset-Mocks
+    function Write-StepDetail { param($Texto) }
+    function Start-Sleep { param($Seconds, $Milliseconds) }
+    function Restart-Service { param($Name, [switch]$Force, $ErrorAction) }
+
+    # Sin nadie a quien preguntarle NO se toca, aunque este activado.
+    function Test-HayHumano { $false }
+    function Get-ItemProperty { param($Path, $Name, $ErrorAction)
+        if ([string]$Path -match 'Policies') { throw 'no existe' }
+        [pscustomobject]@{ WindowsProtectedPrintMode = 1 } }
+    $script:escribio133 = $false
+    function Set-ItemProperty { param($Path, $Name, $Value, $Type, $ErrorAction) $script:escribio133 = $true }
+    $d133 = Disable-ProtectedPrintMode
+    Assert-Eq 'S133 en modo agente no se desactiva nada' $false ([bool]$d133.applied)
+    Assert-Eq 'S133 y no se escribe la configuracion' $false ([bool]$script:escribio133)
+
+    # Con politica de la organizacion tampoco, aunque haya alguien: la clave de la PC no manda.
+    Reset-State
+    $script:escribio133 = $false
+    function Test-HayHumano { $true }
+    function Test-UiWeb { $false }
+    function Read-DoctorLine { param($Prompt) 's' }
+    function Get-ItemProperty { param($Path, $Name, $ErrorAction) [pscustomobject]@{ WindowsProtectedPrintMode = 1 } }
+    $d133b = Disable-ProtectedPrintMode
+    Assert-Eq 'S133 con politica de la organizacion no se toca' $false ([bool]$d133b.applied)
+    Assert-Eq 'S133 y no se escribe nada' $false ([bool]$script:escribio133)
+    Assert-Eq 'S133 se dice que hay que pedirselo a quien administra' $true ([bool]([string]$d133b.motivo -match 'administra'))
+
+    # Con el asesor diciendo que si, y siendo configuracion de la PC: se desactiva de verdad.
+    # El efecto se verifica releyendo, no dando por buena la escritura.
+    Reset-State
+    $script:estado133 = 1
+    function Get-ItemProperty { param($Path, $Name, $ErrorAction)
+        if ([string]$Path -match 'Policies') { throw 'no existe' }
+        [pscustomobject]@{ WindowsProtectedPrintMode = $script:estado133 } }
+    function Set-ItemProperty { param($Path, $Name, $Value, $Type, $ErrorAction) $script:estado133 = 0 }
+    $d133c = Disable-ProtectedPrintMode
+    Assert-Eq 'S133 con el si del asesor se desactiva' $true ([bool]$d133c.applied)
+    Assert-Eq 'S133 y queda registrado como cambio NO reversible' $false ([bool](@($script:Actions | Where-Object { $_.type -eq 'os.protectedPrint' })[0].reversible))
+
+    # Si Windows lo sigue reportando activado despues de escribir, NO se declara aplicado.
+    # Verificar el efecto y no el codigo de retorno es la regla del proyecto.
+    Reset-State
+    $script:estado133 = 1
+    function Set-ItemProperty { param($Path, $Name, $Value, $Type, $ErrorAction) }
+    $d133d = Disable-ProtectedPrintMode
+    Assert-Eq 'S133 si sigue activado no se declara aplicado' $false ([bool]$d133d.applied)
+    Assert-Eq 'S133 y se dice exactamente eso' $true ([bool]([string]$d133d.motivo -match 'sigue reportando'))
+
+    # Si el asesor dice que no, no se toca.
+    Reset-State
+    $script:estado133 = 1
+    $script:escribio133 = $false
+    function Read-DoctorLine { param($Prompt) 'n' }
+    function Set-ItemProperty { param($Path, $Name, $Value, $Type, $ErrorAction) $script:escribio133 = $true }
+    $d133e = Disable-ProtectedPrintMode
+    Assert-Eq 'S133 si el asesor dice que no, no se toca' $false ([bool]$d133e.applied)
+    Assert-Eq 'S133 y no se escribio nada' $false ([bool]$script:escribio133)
+    Microsoft.PowerShell.Management\Remove-Item Function:\Get-ItemProperty -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item Function:\Set-ItemProperty -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item Function:\Restart-Service -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item Function:\Read-DoctorLine -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item Function:\Test-HayHumano -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item Function:\Test-UiWeb -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item Function:\Start-Sleep -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item Function:\Write-StepDetail -ErrorAction SilentlyContinue
 
     Write-Host ""
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)

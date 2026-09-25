@@ -2,6 +2,43 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.30] - 2026-09-25
+
+**El motor puede desactivar el Modo de impresión protegido, con el sí de una persona.** La 3.29 lo
+detectaba y explicaba cómo apagarlo; acá lo apaga él, que es lo que el asesor iba a terminar
+haciendo igual. Con el cliente en línea, son dos teclas contra explicarle por teléfono dónde queda
+Configuración en Windows 11.
+
+**Es lo único que hace el motor que cambia la postura de seguridad de la PC y queda así después de
+que nos fuimos.** Todo lo demás es reversible o se limpia solo: las colas de prueba se borran, los
+puertos se reasignan, las exclusiones de antivirus son sobre archivos nuestros. Esto no. Por eso:
+
+- **Con confirmación propia**, no la de purgar la cola: quien dijo *"no purgues"* no dijo nada sobre
+  esto. En pantalla se dice qué es, y —lo importante— **que queda desactivado**.
+- **Nunca en modo agente.** Sin nadie a quien preguntarle, no se toca. Hay `-AllowDisableProtectedPrint`
+  para decidirlo desde afuera, que es el único camino sin humano.
+- **Nunca cuando lo pone una política de la organización.** Ahí la clave de esta PC no tiene efecto
+  —la política gana—, así que escribirla dejaría al motor diciendo *"desactivado"* sin haber cambiado
+  nada. Es el patrón del falso OK, que en este proyecto ya volvió seis veces; no lo vamos a agregar a
+  propósito. En ese caso se dice que hay que pedírselo a quien administra las computadoras del local.
+- **Se verifica el efecto**, no que la escritura no haya tirado error: se relee, y si Windows lo
+  sigue reportando activado, no se declara aplicado.
+- Se reinicia el spooler, porque lee esa configuración al arrancar.
+
+### Lo que no hace, y suena mal hasta que se piensa
+
+**No lo vuelve a activar al terminar.** Sería lo prolijo y sería romper lo que acabamos de arreglar:
+con el modo puesto, Windows vuelve a rechazar el driver de la impresora que recién instalamos. Queda
+dicho en pantalla en el momento de preguntar, porque es contraintuitivo y el asesor tiene que poder
+explicárselo al cliente.
+
+Queda registrado como acción **no reversible** en "qué cambiamos en esta computadora", que es
+exactamente lo que es.
+
+**Escenario 133** del self-test: que en modo agente no se toque, que con política no se escriba nada,
+que con el sí del asesor se desactive y quede registrado como no reversible, que si Windows lo sigue
+reportando activado no se declare aplicado, y que un "no" no escriba nada.
+
 ## [3.29] - 2026-09-25
 
 **Dos máquinas contra las que el motor no podía ganar, y ni siquiera sabía que estaba jugando.**
