@@ -481,7 +481,7 @@ $script:TestPrinterRx = '(?i)^FUDO-TEST-'
 # puerto tenga hardware; si el hardware se va, deja de serlo (ver Remove-OrphanOwnQueues).
 $script:OwnQueueRx   = '(?i)^FUDO-(TEST-|USB\d)'
 $script:TestDocRx    = '(?i)fudo print doctor'
-$script:SchemaVersion = '3.28'
+$script:SchemaVersion = '3.29'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -2601,6 +2601,18 @@ function Test-Layer0-Environment {
         -ArticleRef 'https://soporte.fu.do/es/articles/16419361' `
         -Recommendation $(if($fudoPresent){''}else{'La Nativa arranca sola cuando se abre Fudo en el navegador: si Fudo esta cerrado, esto es normal y no hay nada que hacer. Solo es un problema si Fudo esta abierto en esta PC y aun asi no corre (ahi si, revisar el antivirus).'})
 
+    # v3.29: el modo de impresion protegido de Windows 11. Se mira SIEMPRE, aunque en esta
+    # corrida no haga falta instalar nada: es la unica forma de saber en cuantas PCs del parque
+    # esta puesto, que hoy no lo sabe nadie.
+    $wpp = Get-ProtectedPrintMode
+    $script:Diagnostics['modoImpresionProtegido'] = [ordered]@{ activo = [bool]$wpp.activo; origen = [string]$wpp.origen }
+    if ([bool]$wpp.activo) {
+        Add-Check -Id 'env.protectedPrint' -Layer 0 -Name 'Windows tiene activado el Modo de impresion protegido' -Status 'warn' `
+            -RootCauseCandidate $false -Plane 'os' `
+            -Evidence @{ activo = $true; origen = [string]$wpp.origen } `
+            -Recommendation (Get-ProtectedPrintHowTo)
+    }
+
     return $true
 }
 
@@ -4263,6 +4275,45 @@ function Convert-TestQueueToReal {
     return $nuevo
 }
 
+function Get-ProtectedPrintMode {
+    <#
+      El "Modo de impresion protegido de Windows" (Windows 11) hace que Windows acepte SOLO el
+      driver de clase IPP: los drivers v3 de terceros -y los inbox como "Generic / Text Only"-
+      dejan de poder instalarse. En el Panel aparecen en gris.
+
+      Para este motor es determinante: crear una cola con el generico de texto es SU reparacion
+      principal, asi que con esto activado el motor no puede ganar, y hasta ahora ni siquiera
+      sabia que estaba jugando. Reportaba "no se pudo crear la cola de prueba" y mandaba al
+      asesor a buscar donde no era. Salio de un caso real: una asesora no pudo instalar una
+      impresora generica ni a mano ni con el motor, y lo destrabo desactivar esto.
+
+      No se apaga solo: es una opcion de seguridad de Windows. El motor tampoco desactiva
+      antivirus -solo agrega exclusiones-, y aca vale el mismo criterio.
+
+      Devuelve @{ activo; origen }.
+    #>
+    $r = [ordered]@{ activo = $false; origen = '' }
+    $lugares = @(
+        @{ ruta = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Printers'; origen = 'politica de la organizacion' },
+        @{ ruta = 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Print'; origen = 'configuracion de esta PC' }
+    )
+    foreach ($l in $lugares) {
+        try {
+            $v = (Get-ItemProperty -Path $l.ruta -Name 'WindowsProtectedPrintMode' -ErrorAction Stop).WindowsProtectedPrintMode
+            if ($null -ne $v -and [int]$v -eq 1) { $r.activo = $true; $r.origen = [string]$l.origen; return $r }
+        } catch {}
+    }
+    return $r
+}
+
+function Get-ProtectedPrintHowTo {
+    <# Los pasos para apagarlo, que es lo unico que el asesor puede hacer. #>
+    return ('Windows 11 tiene activado el "Modo de impresion protegido", que solo acepta impresoras con el driver de clase de Windows: ' +
+            'mientras este puesto NO se puede instalar el driver generico de texto, ni a mano ni desde este motor (en el Panel aparece en gris). ' +
+            'Para desactivarlo: Configuracion > Bluetooth y dispositivos > Impresoras y escaneres > Modo de impresion protegido por Windows > desactivar. ' +
+            'Despues volver a correr el diagnostico.')
+}
+
 function New-FudoTestPrinter {
     <#
       Crea una cola temporal sobre $PortName. Si la impresora de ese puerto es de una marca
@@ -4276,10 +4327,18 @@ function New-FudoTestPrinter {
         if ($match) { $drv = [string]$match.driverNombre }
     }
     if (-not $drv) {
+        # Con el modo protegido puesto esto NO puede funcionar, asi que no se intenta: se dice
+        # que hay que hacer. Intentarlo igual devuelve un error de Windows que no explica nada.
+        $wpp = Get-ProtectedPrintMode
+        if ([bool]$wpp.activo) { throw (Get-ProtectedPrintHowTo) }
         Write-StepDetail 'instalando el driver de texto generico'
         $drv = Install-GenericTextDriver
     }
-    if (-not $drv) { throw "No se pudo instalar el driver generico de texto (necesario para la prueba de impresion)." }
+    if (-not $drv) {
+        $wpp2 = Get-ProtectedPrintMode
+        if ([bool]$wpp2.activo) { throw (Get-ProtectedPrintHowTo) }
+        throw "No se pudo instalar el driver generico de texto (necesario para la prueba de impresion)."
+    }
 
     $name = 'FUDO-TEST-' + ($PortName -replace '[^A-Za-z0-9]', '')
     $exists = $false
@@ -4854,6 +4913,40 @@ function Test-PortHasLiveDevice {
     return ([bool](@($live) -contains $PortName))
 }
 
+function Get-UsbDevicesNotEnumerating {
+    <#
+      Dispositivos USB que Windows NO pudo identificar: fallo la solicitud de descriptor. En el
+      Administrador de dispositivos aparecen como "Dispositivo USB desconocido (Error en la
+      solicitud de descriptor de dispositivo)", con codigo de problema 43.
+
+      Por que importa y por que el motor no lo veia: un dispositivo que no entrega descriptores
+      no dice que es, asi que NO se puede clasificar como impresora -y todo el inventario de
+      hardware del motor filtra por "esto parece una impresora"-. El resultado era el peor
+      posible: la impresora figura conectada, no aparece ningun puerto, y nadie puede explicar
+      por que. En un caso real eso mando a una asesora a probar con zadig, que es exactamente
+      el lado contrario: no es un problema de driver, es cable, alimentacion o el puerto fisico.
+
+      Devuelve la lista de dispositivos en ese estado.
+    #>
+    $out = @()
+    try {
+        foreach ($d in @(Get-PnpDevice -PresentOnly -ErrorAction Stop | Where-Object { $_.Status -ne 'OK' })) {
+            $inst = [string]$d.InstanceId
+            if ($inst -notmatch '(?i)^USB\\') { continue }
+            $prob = 0
+            try { $prob = [int]$d.ProblemCode } catch {}
+            $nombre = [string]$d.FriendlyName
+            # 43 es el codigo del fallo de descriptor. El nombre se mira tambien porque esta
+            # localizado y porque en algunas versiones el codigo llega en 0.
+            $esDescriptor = ($prob -eq 43) -or ($nombre -match '(?i)descriptor') -or
+                            ($nombre -match '(?i)unknown usb|usb desconocido|dispositivo usb desconocido')
+            if (-not $esDescriptor) { continue }
+            $out += [ordered]@{ nombre = $nombre; instanceId = $inst; problema = $prob; estado = [string]$d.Status }
+        }
+    } catch {}
+    return @($out)
+}
+
 function Test-Layer1a-HardwareInventory {
     <#
       Primero el fierro: que hay conectado (Administrador de dispositivos) y en que puerto.
@@ -5108,6 +5201,27 @@ function Test-Layer1a-HardwareInventory {
             -Evidence @{ livePortsSinCola = $orphanPorts; colasReales = $installedRealPorts } `
             -ArticleRef 'https://soporte.fu.do/es/articles/16419361' `
             -Recommendation "Hay una impresora conectada en $($orphanPorts -join ', ') que no tiene cola de impresion en Windows. Si esa es la comandera, instalarla sobre ese puerto (driver del fabricante si lo tiene, o 'Generico / Solo texto'). Cuando no hay ninguna otra impresora real, el motor crea una cola FUDO-TEST-* automaticamente para aislar hardware vs configuracion."
+    }
+
+    # v3.29: el USB que no entrega descriptores. Va al final a proposito: recien aca se sabe si
+    # quedo algun puerto de impresora, y el hallazgo solo es accionable cuando NO quedo ninguno.
+    $sinEnumerar = @(Get-UsbDevicesNotEnumerating)
+    $script:Diagnostics['usbSinEnumerar'] = @($sinEnumerar)
+    if (@($sinEnumerar).Count -gt 0) {
+        $hayPuertos = (@($devPorts).Count -gt 0)
+        Add-Check -Id 'hw.usbDescriptor' -Layer 1 `
+            -Name $(if ($hayPuertos) { 'Hay un dispositivo USB que Windows no puede identificar' }
+                    else { 'La impresora esta enchufada pero Windows no la reconoce (falla la solicitud de descriptor)' }) `
+            -Status $(if ($hayPuertos) { 'warn' } else { 'fail' }) `
+            -RootCauseCandidate (-not $hayPuertos) -Plane 'hardware' `
+            -Evidence @{ dispositivos = @($sinEnumerar | ForEach-Object { [ordered]@{ nombre = [string]$_.nombre; problema = $_.problema } })
+                         hayPuertosDeImpresora = $hayPuertos } `
+            -ArticleRef 'https://soporte.fu.do/es/articles/11730817' `
+            -Recommendation ('Windows detecta que hay algo enchufado en el USB pero el dispositivo no le contesta que es: por eso no se le crea ningun puerto y no se puede instalar. ' +
+                             'Esto NO es un problema de driver ni de configuracion, asi que no se arregla instalando nada: es el cable, la alimentacion o el puerto. ' +
+                             'Probar en este orden: (1) cambiar el cable USB -es lo que falla mas seguido-, (2) enchufar la impresora directo a la PC, sin hub ni alargue, ' +
+                             '(3) probar otro puerto USB, preferentemente uno de atras, (4) verificar que la impresora tenga su fuente conectada y encendida. ' +
+                             'Si despues de eso Windows la sigue sin reconocer, el problema esta en la impresora.')
     }
 }
 
@@ -7864,6 +7978,8 @@ $script:CategoryByCheckId = @{
     'hw.disconnected'           = 'hardware.desconectada'
     'printer.disconnected'      = 'hardware.desconectada'
     'hw.notInstalled'           = 'os.driver_faltante'
+    'hw.usbDescriptor'          = 'hardware.no_enumera'
+    'env.protectedPrint'        = 'os.impresion_protegida'
     'hw.directoUsb'             = 'hardware.directo_usb'
     'hw.testprint'              = 'hardware.no_imprime'
     'ok.yaFuncionaba'           = 'ok.ya_funcionaba'
@@ -12408,6 +12524,87 @@ public class FudoFakeEndpoint {
     Microsoft.PowerShell.Management\Remove-Item Function:\Find-FudoNativeInstall -ErrorAction SilentlyContinue
     Microsoft.PowerShell.Management\Remove-Item Function:\Write-StepDetail -ErrorAction SilentlyContinue
 
+
+    # -----------------------------------------------------------------------
+    # Escenario 131 (v3.29, caso del 24/09): una asesora no pudo instalar una impresora
+    # generica ni a mano ni con el motor. La opcion de instalacion manual aparecia en gris.
+    # Era el "Modo de impresion protegido" de Windows 11, que hace que Windows acepte SOLO el
+    # driver de clase IPP. Crear una cola con el generico de texto es LA reparacion principal
+    # de este motor, asi que con eso puesto no puede ganar -y ni siquiera sabia que jugaba-.
+    Reset-State
+    Reset-Mocks
+
+    # Apagado (o la maquina no lo tiene): el motor no dice nada y sigue como siempre.
+    function Get-ItemProperty { param($Path, $Name, $ErrorAction) throw 'no existe' }
+    $w131 = Get-ProtectedPrintMode
+    Assert-Eq 'S131 sin la clave, el modo protegido esta apagado' $false ([bool]$w131.activo)
+
+    # Encendido por configuracion de la PC.
+    function Get-ItemProperty { param($Path, $Name, $ErrorAction)
+        if ([string]$Path -match 'Policies') { throw 'no existe' }
+        [pscustomobject]@{ WindowsProtectedPrintMode = 1 } }
+    $w131b = Get-ProtectedPrintMode
+    Assert-Eq 'S131 con la clave en 1, esta activado' $true ([bool]$w131b.activo)
+    Assert-Eq 'S131 y se distingue de donde sale' $true ([bool]([string]$w131b.origen -match 'esta PC'))
+
+    # Encendido por politica de la organizacion: no es lo mismo, porque el asesor capaz no lo
+    # puede apagar y hay que escalarlo a quien administra las PCs del cliente.
+    function Get-ItemProperty { param($Path, $Name, $ErrorAction)
+        [pscustomobject]@{ WindowsProtectedPrintMode = 1 } }
+    Assert-Eq 'S131 la politica se reconoce como tal' $true ([bool]((Get-ProtectedPrintMode).origen -match 'politica'))
+
+    # Lo importante: con el modo puesto NO se intenta instalar el driver -Windows lo tiene
+    # prohibido- y se dice como desactivarlo. Antes se intentaba y Windows devolvia un error
+    # que no explicaba nada.
+    Reset-State
+    $script:intentoDriver131 = $false
+    function Install-GenericTextDriver { $script:intentoDriver131 = $true; '' }
+    function Get-Printer { param($Name, $ErrorAction) $null }
+    function Get-PrinterPort { param($Name, $ErrorAction) $null }
+    $err131 = ''
+    try { $null = New-FudoTestPrinter -PortName 'USB001' } catch { $err131 = [string]$_.Exception.Message }
+    Assert-Eq 'S131 con el modo puesto no se intenta instalar el driver' $false ([bool]$script:intentoDriver131)
+    Assert-Eq 'S131 y se explica que es el modo protegido' $true ([bool]($err131 -match 'Modo de impresion protegido'))
+    Assert-Eq 'S131 con la ruta para desactivarlo' $true ([bool]($err131 -match 'Impresoras y escaneres'))
+    Microsoft.PowerShell.Management\Remove-Item Function:\Get-ItemProperty -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item Function:\Install-GenericTextDriver -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item Function:\Get-Printer -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item Function:\Get-PrinterPort -ErrorAction SilentlyContinue
+
+    # -----------------------------------------------------------------------
+    # Escenario 132 (v3.29, mismo caso): "si ves la impresora figura conectada y ok, pero no
+    # genera puerto", con "error de solicitud de descriptor". Es un USB que no entrega sus
+    # descriptores: no dice que es, asi que el inventario del motor -que filtra por "esto
+    # parece una impresora"- no lo puede ver. La asesora termino yendo hacia zadig, que es el
+    # lado contrario: no es driver, es cable, alimentacion o puerto.
+    Reset-State
+    Reset-Mocks
+    function Get-PnpDevice { param([switch]$PresentOnly, $ErrorAction)
+        @([pscustomobject]@{ InstanceId = 'USB\VID_0000&PID_0002\5&1234'; FriendlyName = 'Unknown USB Device (Device Descriptor Request Failed)'
+                             Status = 'Error'; ProblemCode = 43; Class = 'USB' },
+          [pscustomobject]@{ InstanceId = 'USB\VID_1234&PID_5678\6&9999'; FriendlyName = 'Mouse'; Status = 'OK'; ProblemCode = 0; Class = 'Mouse' }) }
+    $u132 = @(Get-UsbDevicesNotEnumerating)
+    Assert-Eq 'S132 se detecta el USB que no entrega descriptores' 1 (@($u132).Count)
+    Assert-Eq 'S132 y no se confunde con los que andan bien' $true ([bool]([string]@($u132)[0].nombre -match 'Descriptor'))
+
+    # Un dispositivo con el nombre localizado y sin codigo tambien cuenta: el codigo no siempre
+    # llega, y el nombre esta traducido en las PCs en castellano.
+    function Get-PnpDevice { param([switch]$PresentOnly, $ErrorAction)
+        @([pscustomobject]@{ InstanceId = 'USB\VID_0000&PID_0002\5&1'; FriendlyName = 'Dispositivo USB desconocido'
+                             Status = 'Error'; ProblemCode = 0; Class = 'USB' }) }
+    Assert-Eq 'S132 tambien cuando el nombre esta en castellano y sin codigo' 1 (@(Get-UsbDevicesNotEnumerating).Count)
+
+    # Y nada que reportar cuando no hay ninguno: el chequeo no puede aparecer siempre.
+    function Get-PnpDevice { param([switch]$PresentOnly, $ErrorAction) @() }
+    Assert-Eq 'S132 sin dispositivos rotos no se reporta nada' 0 (@(Get-UsbDevicesNotEnumerating).Count)
+    Microsoft.PowerShell.Management\Remove-Item Function:\Get-PnpDevice -ErrorAction SilentlyContinue
+
+    # Los dos chequeos nuevos tienen que tener categoria propia y texto de asesor: si no, la
+    # CAUSA que sale en pantalla es el nombre crudo del chequeo, que es el error que este
+    # proyecto ya cometio cinco veces.
+    Assert-Eq 'S132 hw.usbDescriptor tiene categoria' 'hardware.no_enumera' ([string]$script:CategoryByCheckId['hw.usbDescriptor'])
+    Assert-Eq 'S132 env.protectedPrint tiene categoria' 'os.impresion_protegida' ([string]$script:CategoryByCheckId['env.protectedPrint'])
+
     Write-Host ""
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)
     # Salida explicita en los dos casos: si el script termina con 'return', $LASTEXITCODE
@@ -12549,6 +12746,12 @@ $script:TextosLocal = @{
     'hw.notInstalled' = @{
         t = 'La impresora esta conectada pero Windows no la tiene instalada'
         d = 'El equipo la ve enchufada pero le falta el programa que la maneja. Lo instalamos nosotros.' }
+    'hw.usbDescriptor' = @{
+        t = 'La impresora esta enchufada pero Windows no la reconoce'
+        d = 'Hay algo conectado al USB que no le contesta a Windows que es, asi que no se le puede asignar lugar ni instalar nada. No se arregla por software: casi siempre es el cable USB, y si no, el puerto o la fuente de la impresora.' }
+    'env.protectedPrint' = @{
+        t = 'Windows tiene bloqueada la instalacion de impresoras'
+        d = 'Es el Modo de impresion protegido de Windows 11: mientras este puesto no se puede instalar ninguna impresora que no sea de las que Windows trae. Se desactiva en Configuracion > Bluetooth y dispositivos > Impresoras y escaneres.' }
     'hw.noPortBound' = @{
         t = 'La impresora esta conectada pero Windows no le asigno lugar'
         d = 'Pasa cuando se enchufa en un puerto nuevo. La reconectamos por software para que Windows la registre bien.' }

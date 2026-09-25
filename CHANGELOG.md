@@ -2,6 +2,62 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.29] - 2026-09-25
+
+**Dos máquinas contra las que el motor no podía ganar, y ni siquiera sabía que estaba jugando.**
+Las dos salieron del mismo caso del 24/09: una asesora no pudo instalar una impresora genérica ni a
+mano ni con el motor, y el hilo terminó con el problema resuelto por otra persona sin que quedara
+claro qué lo había destrabado.
+
+### 1. El Modo de impresión protegido de Windows 11
+
+Con esa opción activada, **Windows acepta solamente el driver de clase IPP**: los drivers v3 —los
+de terceros y los que trae Windows, incluido `Generic / Text Only`— dejan de poder instalarse. En el
+Panel, la opción de instalación manual aparece en gris. Es exactamente lo que se veía en la captura
+del caso.
+
+Para este motor es determinante, porque **crear una cola con el genérico de texto es su reparación
+principal**. Con eso puesto, el motor intentaba, fallaba, y reportaba *"no se pudo crear la cola de
+prueba"* — una frase que manda al asesor a revisar el cable y el driver, que es donde no está el
+problema.
+
+Ahora se detecta siempre (`env.protectedPrint`, en la capa 0), viaja en la telemetría —hoy nadie
+sabe en cuántas PCs del parque está puesto— y cuando el motor tiene que instalar una cola **ni lo
+intenta**: dice qué es y cómo desactivarlo, con la ruta exacta. También distingue si viene de la
+configuración de esa PC o de **una política de la organización**, que no es lo mismo: en el segundo
+caso el asesor probablemente no lo pueda apagar y haya que hablar con quien administra las máquinas
+del cliente.
+
+**No se desactiva solo**, a propósito: es una opción de seguridad de Windows. El motor tampoco
+desactiva antivirus —sólo agrega exclusiones— y acá vale el mismo criterio.
+
+### 2. El USB que no entrega descriptores
+
+Del mismo hilo: *"si ves la impresora figura conectada y ok, pero no genera puerto"*, con *"error de
+solicitud de descriptor"*. Es un dispositivo USB que no le contesta a Windows qué es.
+
+El motivo por el que el motor no lo veía es incómodo y vale entenderlo: **un dispositivo que no
+entrega descriptores no dice que es una impresora**, y todo el inventario de hardware filtra por
+"esto parece una impresora". Así que el aparato existe, está enchufado, y es invisible para el
+motor. El resultado era el peor posible — la impresora figura conectada, no aparece ningún puerto, y
+nadie puede explicar por qué. En el caso real eso llevó a la asesora hacia `zadig`, que es el lado
+exactamente contrario: **no es un problema de driver, es cable, alimentación o puerto físico.**
+
+Ahora se detecta (`hw.usbDescriptor`) y se dice en ese orden: cambiar el cable —es lo que falla más
+seguido—, enchufar directo sin hub, probar otro puerto, verificar la fuente. Es causa raíz sólo
+cuando además no quedó ningún puerto de impresora, que es cuando explica el caso entero.
+
+### Los dos con categoría propia y texto de asesor
+
+`hardware.no_enumera` y `os.impresion_protegida`. Sin eso, la CAUSA que sale en pantalla y en la
+planilla es el nombre crudo del chequeo — el patrón que este proyecto ya cometió cinco veces y que
+tiene su propia fila en la tabla de recaídas.
+
+**Escenarios 131 y 132** del self-test: el modo protegido apagado, encendido por la PC y encendido
+por política; que con el modo puesto no se intente instalar el driver y se explique cómo apagarlo;
+el USB sin descriptores en inglés, en castellano y sin código de problema; y que ninguno de los dos
+chequeos se quede sin categoría.
+
 ## [3.28] - 2026-09-24
 
 **Primera vez en el proyecto que este camino se corre contra el instalador real.** Se probó la
