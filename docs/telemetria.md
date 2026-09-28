@@ -248,3 +248,12 @@ Looker Studio.
   impresora contestó quién es por ESC/POS, o porque el asesor lo dijo), se agrega su prefijo al
   motor. Mirar también `otraSubred.plan`: dice si el motor pudo resolver la instrucción completa
   (marca + IP a poner + herramienta) o en qué se quedó corto.
+- **`hardware`** (desde 3.33, dentro de `telemetry`): las impresoras físicas conectadas, con
+  `marca`, `modelo`, `producto` (el nombre que el aparato informa por USB), `vidPid` y `puerto`.
+  Es lo que permite contar marcas y modelos: hasta la 3.32 solo viajaba `cantidadHardware`, y la
+  marca había que adivinarla por el nombre de la cola, que en un tercio de las PCs con comandera
+  es "Cocina", "Caja" o "Generic / Text Only". El VID identifica al fabricante del chip, no
+  siempre al de la marca: `VID_0416` es el chipset que comparten Xprinter, 3nStar y otras
+  genéricas. No viaja el `instanceId`, porque trae el número de serie del aparato. Las
+  impresoras de red no aparecen acá (no son hardware USB): para esas está `impresoras` con su
+  puerto IP. En Windows 7 `producto` llega vacío, porque falta el módulo que lo lee.

@@ -484,7 +484,7 @@ $script:TestPrinterRx = '(?i)^FUDO-TEST-'
 # puerto tenga hardware; si el hardware se va, deja de serlo (ver Remove-OrphanOwnQueues).
 $script:OwnQueueRx   = '(?i)^FUDO-(TEST-|USB\d)'
 $script:TestDocRx    = '(?i)fudo print doctor'
-$script:SchemaVersion = '3.32'
+$script:SchemaVersion = '3.33'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -3925,24 +3925,69 @@ $script:BrandSupportUrl = [ordered]@{
     'Zebra'          = 'https://www.zebra.com'
 }
 
+function Get-UsbProductInfo {
+    <#
+      v3.33: el nombre de producto que la impresora informa por USB (el iProduct del descriptor,
+      que Windows guarda como DEVPKEY_Device_BusReportedDeviceDesc) y el nodo USB\VID_xxxx&PID_xxxx
+      del que cuelga.
+      Hasta aca la telemetria solo tenia el nombre de la COLA, y la cola la nombra quien la instala:
+      un tercio de las PCs con comandera la tiene como "Cocina", "Caja" o "Generic / Text Only", y
+      ahi no hay forma de saber que impresora es. El nodo USBPRINT\... que trae el puerto tampoco
+      trae el VID: el VID esta en su padre. El descriptor no cambia aunque se renombre la cola ni
+      aunque se cambie el driver, asi que es el dato que identifica al aparato.
+      Solo lee. En el self-test no se llama a Windows: los escenarios lo mockean.
+    #>
+    param([string]$InstanceId)
+    $out = [ordered]@{ parentId = ''; producto = '' }
+    if ($SelfTest -or -not $InstanceId) { return $out }
+    # Windows 7 no tiene el modulo PnpDevice: sin el, no hay dato (y no es un error).
+    if (-not (Get-Command Get-PnpDeviceProperty -ErrorAction SilentlyContinue)) { return $out }
+    $usbId = ''
+    if ($InstanceId -match '(?i)^USB\\VID_') { $usbId = $InstanceId }
+    elseif ($InstanceId -match '(?i)^USBPRINT\\') {
+        try { $usbId = [string](Get-PnpDeviceProperty -InstanceId $InstanceId -KeyName 'DEVPKEY_Device_Parent' -ErrorAction Stop).Data } catch {}
+    }
+    # Dispositivo compuesto: la impresora es la interfaz &MI_xx, y el producto esta en el padre.
+    if ($usbId -match '(?i)&MI_[0-9A-F]{2}') {
+        try {
+            $p2 = [string](Get-PnpDeviceProperty -InstanceId $usbId -KeyName 'DEVPKEY_Device_Parent' -ErrorAction Stop).Data
+            if ($p2 -match '(?i)^USB\\VID_') { $usbId = $p2 }
+        } catch {}
+    }
+    if ($usbId -notmatch '(?i)^USB\\VID_') { return $out }
+    $out.parentId = $usbId
+    try { $out.producto = ([string](Get-PnpDeviceProperty -InstanceId $usbId -KeyName 'DEVPKEY_Device_BusReportedDeviceDesc' -ErrorAction Stop).Data).Trim() } catch {}
+    return $out
+}
+
 function Get-DeviceIdentity {
     <#
       A partir de un device del inventario devuelve marca / modelo / VID-PID / etiqueta legible.
       Fuentes: nombre amigable, InstanceId (USBPRINT\<MARCA><MODELO>\... o USB\VID_xxxx&PID_xxxx).
     #>
     param($Device)
-    $name = ''; $inst = ''
+    $name = ''; $inst = ''; $parent = ''; $producto = ''
     try { $name = [string]$Device.name } catch {}
     try { $inst = [string]$Device.instanceId } catch {}
+    # v3.33: el nodo USB padre y el producto que informa el descriptor (Get-UsbProductInfo).
+    try { $parent = [string]$Device.parentId } catch {}
+    try { $producto = [string]$Device.producto } catch {}
+    # Productos que no dicen nada: los pone el chipset cuando el fabricante no lleno el descriptor.
+    if ($producto -match '(?i)^(usb printing support|usb device|usb printer|printer|impresora|unknown|desconocid.*)\s*$') { $producto = '' }
 
     # OJO: $pid es variable automatica read-only en PowerShell (Process Id) -> usar $devPid
+    # El nodo USBPRINT\... no trae VID: si no esta en el instanceId, se busca en el padre.
     $vid = ''; $devPid = ''
-    if ($inst -match '(?i)VID_([0-9A-F]{4})') { $vid = $Matches[1].ToUpper() }
-    if ($inst -match '(?i)PID_([0-9A-F]{4})') { $devPid = $Matches[1].ToUpper() }
+    foreach ($src in @($inst, $parent)) {
+        if (-not $vid -and $src -match '(?i)VID_([0-9A-F]{4})') {
+            $vid = $Matches[1].ToUpper()
+            if ($src -match '(?i)PID_([0-9A-F]{4})') { $devPid = $Matches[1].ToUpper() }
+        }
+    }
 
-    # marca: primero por texto (nombre o instanceId), despues por VID
+    # marca: primero por texto (nombre, producto USB o instanceId), despues por VID
     $brand = ''
-    $probe = ($name + ' ' + $inst)
+    $probe = ($name + ' ' + $producto + ' ' + $inst)
     foreach ($b in $script:PosBrands) {
         if ($probe -match [regex]::Escape($b)) {
             $brand = switch -Regex ($b) {
@@ -3964,6 +4009,7 @@ function Get-DeviceIdentity {
     $model = ''
     # 'No Printer Attached', 'Printer', 'USB Printing Support'... son etiquetas del driver, no modelos.
     if ($name -and ($name -notmatch '(?i)^(usb printing support|soporte de impresi|compatible usb|unknown|desconocid|dispositivo (compuesto|usb)|generic usb|no printer attached|sin impresora|printer|impresora)\s*$')) { $model = $name }
+    elseif ($producto) { $model = $producto }
     elseif ($inst -match '(?i)^USBPRINT\\([^\\]+)') { $model = ($Matches[1] -replace '_+', ' ').Trim() }
     $brandFirst = ''
     if ($brand) { $brandFirst = ($brand -split ' ')[0] }
@@ -3983,7 +4029,7 @@ function Get-DeviceIdentity {
     else                        { $label = 'Impresora sin identificar' + $(if ($vid) { " [VID_$vid]" } else { '' }) }
 
     return [ordered]@{
-        label = $label; brand = $brand; model = $model; vid = $vid; pid = $devPid
+        label = $label; brand = $brand; model = $model; vid = $vid; pid = $devPid; producto = $producto
         hasOemDriver = [bool](@($script:BrandsWithOemDriver | Where-Object { $brand -like "$_*" }).Count -gt 0)
         vendorUrl = $(if ($brand -and $script:BrandSupportUrl.Contains($brand)) { [string]$script:BrandSupportUrl[$brand] } else { '' })
     }
@@ -5286,6 +5332,12 @@ function Test-Layer1a-HardwareInventory {
     # Identidad + plan de driver por device
     $identified = @()
     foreach ($d in @($devices)) {
+        # v3.33: producto y VID que informa el propio aparato por USB (ver Get-UsbProductInfo).
+        if (-not [string]$d.producto) {
+            $usbInfo = $null
+            try { $usbInfo = Get-UsbProductInfo -InstanceId ([string]$d.instanceId) } catch {}
+            if ($usbInfo) { $d['parentId'] = [string]$usbInfo.parentId; $d['producto'] = [string]$usbInfo.producto }
+        }
         $id = Get-DeviceIdentity -Device $d
         $plan = Get-DriverPlan -Identity $id
         $identified += [ordered]@{
@@ -5293,6 +5345,7 @@ function Test-Layer1a-HardwareInventory {
             marca         = [string]$id.brand
             modelo        = [string]$id.model
             vidPid        = $(if ($id.vid) { "VID_$($id.vid)" + $(if ($id.pid) { "&PID_$($id.pid)" } else { '' }) } else { '' })
+            producto      = [string]$id.producto
             puerto        = [string]$d.portName
             estado        = [string]$d.status
             instanceId    = [string]$d.instanceId
@@ -13301,7 +13354,7 @@ public class FudoFakeEndpoint {
     $script:Diagnostics['nativaDescarga'] = [ordered]@{ firmaOk = $true; bytes = 1 }
     $script:Diagnostics['modoImpresionProtegido'] = [ordered]@{ activo = $false; origen = '' }
     $x134 = Get-TelemetryDiagnosticsExtra
-    Assert-Eq 'S134 viajan las cinco claves (y las de los escenarios 135 y 141)' 'nativaDescarga,eleccionImpresora,eleccionPuerto,modoImpresionProtegido,usbSinEnumerar,extensionAbierta,purgaTemprana,tiempos' (@($x134.Keys) -join ',')
+    Assert-Eq 'S134 viajan las cinco claves (y las de los escenarios 135, 141 y 143)' 'nativaDescarga,eleccionImpresora,eleccionPuerto,modoImpresionProtegido,usbSinEnumerar,extensionAbierta,purgaTemprana,tiempos,hardware' (@($x134.Keys) -join ',')
     Assert-Eq 'S134 con su contenido' $true ([bool]$x134['nativaDescarga'].firmaOk)
     Assert-Eq 'S134 Send-Telemetry las pone en el payload' $true ([bool]((Get-Command Send-Telemetry).ScriptBlock.ToString() -match 'Get-TelemetryDiagnosticsExtra'))
     Reset-State
@@ -13628,6 +13681,55 @@ public class FudoFakeEndpoint {
     Reset-State
 
     Write-Host ""
+    # -----------------------------------------------------------------------
+    # Escenario 143 (v3.33): marca y modelo del aparato en la telemetria. Se pidio la distribucion
+    # de impresoras por marca y conexion, y la telemetria solo tenia el nombre de la cola: un tercio
+    # de las PCs con comandera la tiene como "Cocina" o "Caja". El modelo sale del descriptor USB y
+    # el VID del nodo padre, porque el nodo USBPRINT que trae el puerto no lo tiene.
+    Reset-State
+    Reset-Mocks
+    # a) USBPRINT sin VID, cola renombrada: el VID sale del padre y el modelo del producto USB.
+    $i143 = Get-DeviceIdentity -Device ([ordered]@{ name = 'USB Printing Support'; instanceId = 'USBPRINT\GENERIC\7&1A2B&0&USB001'
+                                                    parentId = 'USB\VID_0416&PID_5011\5&3A&0&2'; producto = 'POS80 Printer USB' })
+    Assert-Eq 'S143 el VID sale del nodo padre' '0416' $i143.vid
+    Assert-Eq 'S143 y el PID' '5011' $i143.pid
+    Assert-Eq 'S143 el modelo sale del producto USB' 'POS80 Printer USB' $i143.model
+    Assert-Eq 'S143 la marca por VID' $true ([string]$i143.brand -match '^Generica')
+    # b) El nombre del device manda sobre el producto, y el VID del instanceId sobre el del padre.
+    $e143 = Get-DeviceIdentity -Device ([ordered]@{ name = 'EPSON TM-T20II Receipt'; instanceId = 'USB\VID_04B8&PID_0E15\X1'
+                                                    parentId = 'USB\VID_0416&PID_5011\Y'; producto = 'TM-T20II' })
+    Assert-Eq 'S143 Epson por nombre' 'Epson' $e143.brand
+    Assert-Eq 'S143 el VID propio gana' '04B8' $e143.vid
+    # c) Un producto vacio de contenido no se toma como modelo.
+    $g143 = Get-DeviceIdentity -Device ([ordered]@{ name = ''; instanceId = 'USBPRINT\POS58\1'; parentId = ''; producto = 'USB Printing Support' })
+    Assert-Eq 'S143 producto generico no es modelo' 'POS58' $g143.model
+    Assert-Eq 'S143 sin padre no hay VID' '' $g143.vid
+    # d) En el self-test Get-UsbProductInfo no le pregunta nada a Windows.
+    $u143 = Get-UsbProductInfo -InstanceId 'USBPRINT\GENERIC\1'
+    Assert-Eq 'S143 el self-test no lee el hardware' '' ([string]$u143.parentId + [string]$u143.producto)
+    # e) De punta a punta: inventario -> printersConnected -> telemetria.
+    Reset-State
+    function Write-StepDetail { param($Texto) }
+    function Get-UsbPrintDevices { @([ordered]@{ source='registry.USBPRINT'; name='USB Printing Support'; instanceId='USBPRINT\GENERIC\7&1&0&USB001'; portName='USB001'; status='enumerado'; problem=0; certeza='alta' }) }
+    function Get-ProblemPrinterDevices { @() }
+    function Get-UsbProductInfo { param($InstanceId) [ordered]@{ parentId = 'USB\VID_0416&PID_5011\5&3A&0&2'; producto = 'POS80 Printer USB' } }
+    function Get-PrinterPort { @([pscustomobject]@{ Name='USB001'; Description='USB' }) }
+    function Get-Printer { @([pscustomobject]@{ Name='Cocina'; DriverName='Generic / Text Only'; PortName='USB001' }) }
+    $err143 = ''
+    try { $null = Test-Layer1a-HardwareInventory } catch { $err143 = $_.Exception.Message }
+    Assert-Eq 'S143 el inventario no explota' '' $err143
+    $h143 = @((Get-TelemetryDiagnosticsExtra)['hardware'])
+    Assert-Eq 'S143 viaja una impresora' 1 $h143.Count
+    Assert-Eq 'S143 con su VID y PID' 'VID_0416&PID_5011' $(if ($h143.Count) { $h143[0].vidPid } else { '' })
+    Assert-Eq 'S143 con el producto USB' 'POS80 Printer USB' $(if ($h143.Count) { $h143[0].modelo } else { '' })
+    Assert-Eq 'S143 con el puerto' 'USB001' $(if ($h143.Count) { $h143[0].puerto } else { '' })
+    Assert-Eq 'S143 sin el instanceId (trae el numero de serie)' $false $(if ($h143.Count) { [bool]$h143[0].Contains('instanceId') } else { $true })
+    # f) Sin hardware, la lista viaja vacia y no nula.
+    Reset-State
+    Assert-Eq 'S143 sin hardware viaja vacia' 0 @((Get-TelemetryDiagnosticsExtra)['hardware']).Count
+    Reset-State
+    Reset-Mocks
+
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)
     # Salida explicita en los dos casos: si el script termina con 'return', $LASTEXITCODE
     # queda sin definir y cualquier automatizacion lo interpreta como fallo.
@@ -15694,6 +15796,24 @@ function Get-TelemetryDiagnosticsExtra {
     }
     # v3.32: cuanto tardo cada paso (ver StepTimes).
     $out['tiempos'] = $(if ($script:StepTimes) { $script:StepTimes } else { $null })
+    # v3.33: que impresoras fisicas hay. Viajaba solo la cantidad (cantidadHardware), y para
+    # saber marcas y modelos habia que adivinar por el nombre de la cola, que en un tercio de
+    # las PCs es "Cocina" o "Caja". Sin instanceId: trae el numero de serie del aparato.
+    $out['hardware'] = @(
+        @($(if ($script:Diagnostics.Contains('printersConnected')) { $script:Diagnostics['printersConnected'] } else { @() })) |
+        Select-Object -First 8 | ForEach-Object {
+            [ordered]@{
+                marca      = [string]$_.marca
+                modelo     = [string]$_.modelo
+                producto   = [string]$_.producto
+                vidPid     = [string]$_.vidPid
+                puerto     = [string]$_.puerto
+                nombre     = [string]$_.nombreCrudo
+                directoUsb = [bool]$_.directoUsb
+                certeza    = [string]$_.certeza
+            }
+        }
+    )
     return $out
 }
 

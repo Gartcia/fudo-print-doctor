@@ -2,6 +2,41 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.33] - 2026-09-28
+
+**Qué impresora es, no solo cómo se llama la cola.** Se pidió la distribución de impresoras de
+los clientes por tipo de conexión y por marca. La conexión estaba en la telemetría, pero la marca
+y el modelo no: solo el nombre de la cola de Windows, que lo pone quien la instala. Sobre 290 PCs
+con comandera en la planilla (24/08 al 28/09), en 93 (un tercio) la cola se llama "Cocina",
+"Caja", "Barra" o "Generic / Text Only" y no hay forma de saber qué aparato hay detrás. En el
+resto, la marca salió de adivinar por el nombre.
+
+### La telemetría manda las impresoras físicas conectadas
+
+El motor ya identificaba cada impresora conectada (marca, modelo, VID/PID) para elegir el driver,
+pero a la planilla viajaba solo la cantidad. Ahora viaja la lista, en `telemetry.hardware`: marca,
+modelo, producto, VID/PID, puerto, y si la maneja un driver directo (Zadig). Sin el `instanceId`,
+porque trae el número de serie del aparato.
+
+### El modelo sale de la propia impresora
+
+Dos agujeros en la identificación que se hacían visibles recién al querer contar:
+
+- **El nodo que trae el puerto (`USBPRINT\...`) no trae el VID**: el VID está en el dispositivo
+  USB del que cuelga. En las impresoras que Windows detecta por esa vía, el VID llegaba vacío.
+  Ahora se busca en el padre.
+- **El nombre de producto que la impresora informa por USB** (el del descriptor, que no cambia
+  aunque se renombre la cola o se cambie el driver) no se leía. Ahora, cuando Windows no le da un
+  nombre útil al dispositivo (*"USB Printing Support"*), el modelo sale de ahí.
+
+Solo lectura. En Windows 7 no está el módulo que lo lee, y el producto llega vacío sin error.
+
+**Lo que no cambia**: la planilla no suma columnas (cambiarlas desalinea la hoja existente); el
+dato va en la columna `json`. Las impresoras de red no aparecen en esta lista porque no son
+hardware USB: para esas sigue estando el puerto IP de la cola.
+
+Escenario 143 del self-test.
+
 ## [3.32] - 2026-09-28
 
 **Lo más rápido primero, y las correcciones que salieron de una sola corrida.** El mismo día
