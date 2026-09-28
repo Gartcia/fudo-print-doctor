@@ -2,6 +2,80 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.32] - 2026-09-28
+
+**Lo más rápido primero, y cinco correcciones que salieron de una sola corrida.** El mismo día
+que salió la 3.31, un asesor contó en el canal que al entrar a la PC ya vio que la solución era
+limpiar la cola, y que el motor le hizo esperar seis minutos para ofrecérselo. Otro asesor se sumó
+con los casos donde la gestión a mano es más rápida. Revisando esa corrida en la telemetría
+aparecieron, además, dos problemas del motor.
+
+### 1. La telemetría mandaba el nombre del usuario de Windows
+
+La huella de la App Nativa viajaba con la ruta completa de su carpeta, y esa ruta tiene adentro el
+nombre de la cuenta de Windows, que muchas veces es el de una persona. El instalador local, cuando
+venía de Descargas, igual. Contradecía la regla del proyecto: la telemetría no lleva rutas.
+
+Ahora el JSON entero se limpia antes de mandarlo: cualquier `C:\Users\<alguien>` pasa a
+`%USERPROFILE%`. No se reemplaza el nombre de la cuenta en todo el texto, porque en los locales es
+común que la cuenta se llame "Caja" o "Admin" y se comería los nombres de las impresoras; el único
+texto que nombraba cuentas (el de la extensión, de la 3.31) se corrigió donde se escribe. El
+`resultado.json` que queda en la PC no cambia.
+
+**Lo que ya está en la planilla no se corrige solo**: las corridas anteriores a esta versión
+tienen esas rutas guardadas.
+
+### 2. Una impresora vieja desconectada ya no impide cerrar el caso
+
+En 16 casos salió el papel y lo único que impidió cerrar fue *"la impresora X está desconectada"*.
+En 14 de ellos esa cola no tenía un solo trabajo, y muchas ni eran comanderas: HP DeskJet, HP
+LaserJet, Pantum, una Zebra de etiquetas, colas viejas en puertos que ya no existen. Si el papel
+salió, la desconectada es por fuerza otra impresora: una cola sin dispositivo no imprime.
+
+Ahora se sigue mostrando —*"Hay otra impresora instalada que no está conectada"*— pero no bloquea,
+**salvo** que tenga trabajos esperando, que es la señal de que Fudo le manda comandas, o que el
+historial diga que Fudo imprime ahí. Si es la comandera de la cocina, eso la sigue marcando.
+
+### 3. "Instalada (v0.0.25)" cuando se instaló la 0.0.38
+
+En la corrida del asesor, el motor bajó e instaló la 0.0.38 —el ejecutable que quedó pesa lo que
+pesa la 0.0.38— y reportó *"instalada por el motor (v0.0.25)"*. El instalador seguía abierto y el
+registro de Windows todavía tenía la versión vieja. Ahora se espera unos segundos a que aparezca la
+versión que se instaló, y si no aparece pero el ejecutable cambió, **no se afirma ninguna** en vez
+de afirmar la vieja. Lo mismo al actualizar: si el archivo se reemplazó y Windows todavía no se
+enteró, se dice exactamente eso.
+
+### 4. La cola trabada se ofrece limpiar al arrancar
+
+Hasta acá, limpiar la cola se ofrecía en la capa 2: después de la App Nativa, del hardware y de
+elegir la impresora. En la corrida del asesor, la Nativa sola fue una descarga de 58 MB más la
+instalación, y la corrida duró diez minutos y medio. Limpiar una cola trabada no depende de nada de
+eso, así que ahora se ofrece **en el primer paso**, para todas las colas del cliente con un atasco
+evidente (3 trabajos o más, el más viejo de hace 5 minutos o más). Las mismas reglas de siempre: es
+lo único irreversible, se pregunta, en modo agente no se hace, y se verifica que haya bajado. Si el
+asesor dice que no, no se le vuelve a preguntar por esa cola más adelante.
+
+Rompe a propósito el orden de capas. El orden existe para no diagnosticar arriba lo que está roto
+abajo; esto no es un diagnóstico, es la reparación más rápida y más frecuente.
+
+### 5. En Windows 7 la versión que va es la 0.0.18
+
+Lo confirmaron dos personas de soporte por separado. El motor le recomendaba la 0.0.38 a esas PCs
+e intentaba actualizarla. Ahora, en Windows 7, Vista y XP la recomendada es la 0.0.18: con esa
+instalada no se la marca desactualizada ni se intenta subirla.
+
+### Para poder medir la velocidad: el tiempo de cada paso
+
+El motor medía cuánto tarda cada paso y lo mostraba en pantalla, pero no lo mandaba: en la planilla
+sólo estaba el total de la corrida. Ahora viaja paso por paso (`tiempos`), que es lo que hace falta
+para decidir con datos qué conviene mover de lugar.
+
+**Escenarios 137 a 141** del self-test: que no viajen rutas de usuario y los nombres de impresoras
+queden intactos; que la impresora vieja no bloquee con papel confirmado y sí bloquee con trabajos,
+con Fudo imprimiendo ahí o sin papel; que no se afirme la versión vieja después de instalar; la
+0.0.18 en Windows 7; y la limpieza al arrancar (sólo colas trabadas de verdad, el "no" que se
+recuerda, el modo agente, que vaya antes de la App Nativa y que cada paso deje su tiempo).
+
 ## [3.31] - 2026-09-28
 
 **La versión de la Nativa que dice el motor es la que está en disco, y un instalador viejo de
