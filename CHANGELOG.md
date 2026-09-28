@@ -2,6 +2,130 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.31] - 2026-09-28
+
+**La versión de la Nativa que dice el motor es la que está en disco, y un instalador viejo de
+Descargas ya no le gana a la descarga de la vigente.** Las dos salieron de la bitácora de la semana
+21/09–27/09, y la primera también de un asesor que lo vio en un cliente.
+
+### 1. Dos Nativas instaladas, y el motor mostraba la vieja
+
+Un asesor, el 26/09: cliente con la 0.0.18 y la 0.0.38 instaladas a la vez, *"Printdoctor solo
+detecta una"* — y la que detectaba era la vieja. El motor tomaba la **primera** entrada del registro
+de Windows, y el registro se recorre por máquina antes que por usuario: ahí vive el `.msi` viejo; la
+`.exe` nueva se instala por usuario. La telemetría lo mostró a escala: el tamaño del ejecutable es
+huella de versión y contradecía a la versión reportada en **43 corridas de 31 PCs**. Consecuencias:
+el motor le pedía subir a la 0.0.38 a quien ya la tenía, y la verificación posterior a instalar leía
+la misma entrada vieja — una PC cerró *"instalada por el motor (v0.0.27)"* con la 0.0.38 en disco.
+
+Ahora la versión sale de la entrada que apunta a la carpeta del ejecutable que hay en disco, y si
+ninguna apunta, de la más alta. Se corrigió en los cuatro lugares que leían "la primera", incluida
+la versión que viaja en la telemetría.
+
+**Lo que la bitácora proponía y no se hizo:** leer la versión del propio ejecutable. Se probó contra
+una Nativa real y `fudo_native_extension.exe` declara *Node.js 20.18.1*: es un runtime de Node
+empaquetado. Con eso, el motor habría reportado "Nativa v20.18.1" en todas las PCs.
+
+Cuando hay más de una anotada, aparece el aviso **"Hay más de una App Nativa anotada en Windows"**,
+que dice cuál está en uso. No compite como causa raíz: la que está en disco funciona. Y no
+recomienda desinstalar sólo la vieja — las dos pueden compartir la carpeta, y el desinstalador de la
+vieja puede llevarse los archivos de la nueva —, sino desinstalar las dos y dejar que el motor
+instale la vigente.
+
+### 2. El instalador de Descargas le ganaba siempre a la descarga
+
+De 50 instalaciones que intentó el motor en la semana, **41 fueron con un instalador que ya estaba
+en la PC (25 PCs) y sólo 2 dejaron la Nativa en disco (5%)**. Las 9 que fueron por descarga dejaron
+7 (78%). 40 de esos 41 instaladores eran de la 0.0.18 a la 0.0.36, casi siempre la misma versión
+que ya figuraba instalada, y el motor repetía el mismo intento corrida tras corrida (una PC, siete
+veces). La descarga sólo se usaba si no había *ningún* instalador en la PC.
+
+Ahora un instalador local anterior a la versión recomendada **sólo se usa si la descarga falla**. Si
+lo eligió una persona —en el menú o con `-NativeInstallerPath`— se respeta: puede ser el caso del
+antivirus de terceros que sólo aguanta una versión vieja. Un instalador que no declara versión (los
+`.exe` no la declaran, y la Nativa es `.exe` desde la 0.0.38) no se descarta: sería adivinar.
+
+### 3. Cinco datos que el CHANGELOG daba por enviados y nunca viajaban
+
+`nativaDescarga` (3.24: bytes, segundos, `firmaOk`), `eleccionImpresora` / `eleccionPuerto` (3.25),
+`modoImpresionProtegido` y `usbSinEnumerar` (3.29) se anotaban en el diagnóstico y nunca se ponían
+en la telemetría: 0 de 9 descargas, 0 de 70 corridas 3.25+, 0 de 44 corridas 3.29+. El *"mirar
+`firmaOk` el mismo día"* que pedía la 3.24 no se podía hacer. Ahora viajan.
+
+### 4. El número de caso de relleno
+
+4 corridas de 3 PCs de campo llegaron con `111111111111111`. Un número así no se cruza con ninguna
+conversación: es lo mismo que no cargarlo, pero parece cargado. Ahora se rechazan los 15 dígitos
+iguales, y el mensaje lo dice.
+
+### 5. La extensión que falta: el motor ofrece abrir la página
+
+*"Falta la extensión de Fudo en el navegador"* fue la causa raíz #1 de la 3.30, y 5 de las 7
+corridas que siguieron fallando con esa causa no aplicaron nada: el motor lo explicaba y el asesor
+tenía que dictarle al cliente la dirección de la tienda. Ahora, con el sí del asesor, se abre la
+página de la extensión en el navegador del cliente. Con tres reglas:
+
+- **Sin elevar.** El motor corre como administrador, y lo que abre directo hereda eso: sería un
+  Chrome como administrador, y posiblemente en una ventana aparte. La página se le pide al
+  escritorio de Windows, que la abre como si la persona hiciera doble clic en un link.
+- **Sólo si en la pantalla está la misma cuenta que corre el motor.** Si la elevación se hizo con
+  otra cuenta, el navegador se abriría en esa y la extensión quedaría en un perfil que el cliente
+  no usa: el motor diría "listo" sin que nada cambie. Ahí no se abre y se dice por qué.
+- **Abrir la página no es agregar la extensión.** Después se ofrece esperar, y se vuelve a mirar el
+  perfil del navegador: recién si la extensión aparece, el hallazgo pasa a reparado. Nunca en modo
+  agente.
+
+**Probado en una PC real, las dos formas:** desde un proceso normal y desde uno elevado como
+administrador (el caso del cliente). En los dos, la página salió como pestaña nueva del Chrome que
+ya estaba abierto, sin elevar: los procesos nuevos eran hijos de ese Chrome, y no se abrió ningún
+navegador aparte. Lo que no se probó es el caso de otra cuenta en la pantalla, que por diseño no
+abre nada.
+
+### 6. Actualizar una Nativa vieja también descarga la vigente
+
+Medido por acción, actualizar una Nativa vieja funcionó **13 de 33 veces (39%), y bajando: 50%, 53%
+y 18% en tres semanas**. Tenía el mismo problema que la instalación del punto 2: sólo probaba con un
+instalador que hubiera en la PC, casi siempre tan viejo como la Nativa instalada. Ahora, si el
+instalador local no sirve —no hay, no declara versión, o es anterior a la recomendada— se descarga
+la vigente, con la misma verificación de firma que ya tenía la instalación. El local queda de
+respaldo si la descarga falla. Se declara actualizada sólo si la versión instalada subió.
+
+Sólo por la `.exe` (Windows 8 en adelante), que es la que trae la versión recomendada. La `.msi` de
+Windows 7 no dice qué versión trae —en campo se reportó la 0.0.18—, así que bajarla podría
+reinstalar la misma: eso espera la confirmación de Producto sobre qué versión va en cada sistema.
+
+La descarga, la verificación de firma y la ejecución pasaron a una sola función que usan la
+instalación y la actualización.
+
+### Hallazgo de método: el self-test bajó el instalador real
+
+Hasta acá ningún escenario del self-test llegaba a la descarga: todos tenían un instalador local, y
+el local siempre ganaba. Al cambiar eso, **cinco escenarios viejos descargaron los 58 MB reales**
+en la PC de desarrollo (no se ejecutaron: el instalador estaba mockeado). Esos escenarios ahora
+prueban el camino local sin URL, como cuando se escribieron, y además **la descarga se niega a
+correr dentro del self-test**: que el self-test no toque la PC no puede depender de que cada
+escenario se acuerde de mockearlo. Con el mismo criterio, abrir el navegador también se niega dentro
+del self-test.
+
+### Lo que no entró
+
+- **Versión recomendada por Windows** (la 0.0.18 en Windows 7): falta que Producto confirme qué va
+  en cada sistema.
+- **`colaQueUsaFudo` en la planilla**: descartado. El dato ya llega a la planilla dentro de la
+  columna `json`; la columna del mismo nombre se llena con otra cosa (las impresoras con trabajos
+  de Fudo en el historial). Cambiarla obliga a republicar el receptor, con riesgo de cortar la
+  telemetría de todos, para ver en una columna lo que ya está guardado.
+
+**Escenario 134** del self-test: la versión con dos Nativas anotadas (del ejecutable, la más alta,
+la PWA afuera, la telemetría igual), el aviso de duplicada, el instalador viejo contra la descarga
+(y la descarga fallida como respaldo), el caseId de relleno, los cinco datos en el payload y que el
+self-test nunca descargue. Y S93c: con descarga disponible, un instalador viejo no se ejecuta.
+**Escenario 135**: la página de la extensión no se abre en modo agente, ni con otra cuenta en la
+pantalla, ni si el asesor dice que no; con el sí se abre, y el hallazgo queda reparado sólo si la
+extensión aparece en el perfil. **Escenario 136**: actualizar descarga sin instalador local o con uno
+viejo, usa el local de respaldo si la descarga falla, no descarga la `.msi` de Windows 7 ni cuando
+la vigente ya está instalada, y la descarga común también se niega en el self-test.
+
 ## [3.30] - 2026-09-25
 
 **El motor puede desactivar el Modo de impresión protegido, con el sí de una persona.** La 3.29 lo

@@ -484,7 +484,7 @@ $script:TestPrinterRx = '(?i)^FUDO-TEST-'
 # puerto tenga hardware; si el hardware se va, deja de serlo (ver Remove-OrphanOwnQueues).
 $script:OwnQueueRx   = '(?i)^FUDO-(TEST-|USB\d)'
 $script:TestDocRx    = '(?i)fudo print doctor'
-$script:SchemaVersion = '3.30'
+$script:SchemaVersion = '3.31'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -2695,7 +2695,8 @@ function Find-FudoNativeInstall {
                 $un = [string]$_.UninstallString
                 $esPwa = [bool]($un -match '(?i)(chrome|msedge|chromium)\.exe')
                 $regInfo += [ordered]@{ name = $_.DisplayName; version = $_.DisplayVersion
-                                        location = $_.InstallLocation; esPwa = $esPwa }
+                                        location = $_.InstallLocation; esPwa = $esPwa
+                                        delExe = $false; _desinst = $un }
                 if ($_.InstallLocation -and -not $esPwa) { $paths += $_.InstallLocation }
             }
         } catch {}
@@ -2720,6 +2721,22 @@ function Find-FudoNativeInstall {
             $mp = Join-Path $c $m
             try { if (Test-Path $mp) { $manifests += $mp } } catch {}
         }
+    }
+    # v3.31: que entrada del registro corresponde al ejecutable que hay en disco. Con dos Nativas
+    # anotadas (un .msi viejo por maquina y la .exe nueva por usuario) es la unica forma de saber
+    # cual de las dos versiones es la que de verdad esta instalada. Se resuelve aca y viaja como
+    # booleano: el desinstalador trae la ruta del perfil del cliente y no tiene por que salir.
+    $carpetaExe = ''
+    if ($exe) { try { $carpetaExe = [string](Split-Path -Parent $exe) } catch {} }
+    foreach ($ri in @($regInfo)) {
+        try {
+            if ($carpetaExe -and -not [bool]$ri.esPwa) {
+                $loc = ([string]$ri.location).Trim().Trim('"').TrimEnd('\')
+                if ($loc -and [string]::Equals($loc, $carpetaExe.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) { $ri['delExe'] = $true }
+                elseif ([string]$ri._desinst -and ([string]$ri._desinst).IndexOf($carpetaExe, [StringComparison]::OrdinalIgnoreCase) -ge 0) { $ri['delExe'] = $true }
+            }
+        } catch {}
+        try { $ri.Remove('_desinst') } catch {}
     }
     $regReales = @(@($regInfo) | Where-Object { -not $_.esPwa })
     return [ordered]@{
@@ -2907,6 +2924,67 @@ function Test-DefenderExclusionNeeded {
     return @{ haceFalta = $false; motivo = 'la Nativa no esta en disco pero Defender nunca la detecto: lo que falta es instalarla, no excluirla' }
 }
 
+function Get-VersionOrZero {
+    <# [version] de un texto, o 0.0 si no es una version. Para ordenar sin que explote. #>
+    param([string]$V)
+    try { return [version]$V } catch { return [version]'0.0' }
+}
+
+function Test-NativaRegApuntaA {
+    <#
+      Esta entrada del registro es la del ejecutable que hay en esa carpeta? Si la marco
+      Find-FudoNativeInstall (delExe) no hace falta mas; si no, se compara InstallLocation.
+    #>
+    param($Entry, [string]$Carpeta)
+    if (-not $Entry) { return $false }
+    try { if ([bool]$Entry.delExe) { return $true } } catch {}
+    if (-not $Carpeta) { return $false }
+    $loc = ''
+    try { $loc = ([string]$Entry.location).Trim().Trim('"').TrimEnd('\') } catch {}
+    if ($loc -and [string]::Equals($loc, $Carpeta.TrimEnd('\'), [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    return $false
+}
+
+function Select-NativaRegEntry {
+    <#
+      v3.31: de que entrada del registro sale la version de la Nativa. Hasta la 3.30 era la
+      PRIMERA entrada no-PWA, y ese orden lo pone el recorrido del registro (HKLM antes que
+      HKCU). Con dos Nativas anotadas -un .msi viejo por maquina y la .exe nueva por usuario,
+      que es justo lo que deja el motor cuando instala la .exe encima de un .msi- ganaba la
+      vieja: un asesor vio "Version 0.0.18" con la 0.0.38 instalada al lado, y la telemetria lo
+      mostro en 43 corridas de 31 PCs (el tamano del ejecutable, que es huella de version,
+      contradecia a la version reportada). El motor le pedia subir a la 0.0.38 a quien ya la
+      tenia, y la verificacion despues de instalar leia la misma entrada vieja.
+      NO se lee la version del ejecutable: fudo_native_extension.exe es un runtime de Node
+      empaquetado y su VersionInfo dice 'Node.js 20.18.1', no la version de la Nativa.
+      Orden: la entrada que apunta a la carpeta del ejecutable en disco; entre esas -o si
+      ninguna apunta- la version mas alta. Devuelve la entrada, o $null si no hay ninguna.
+    #>
+    param($Install)
+    $reg = @()
+    try { $reg = @(@($Install.regInfo) | Where-Object { $_ -and -not $_.esPwa }) } catch {}
+    if (@($reg).Count -eq 0) { return $null }
+    $carpetaExe = ''
+    try { if ([string]$Install.exe) { $carpetaExe = [string](Split-Path -Parent ([string]$Install.exe)) } } catch {}
+    $delExe = @($reg | Where-Object { Test-NativaRegApuntaA -Entry $_ -Carpeta $carpetaExe })
+    $pool = $reg
+    if (@($delExe).Count -gt 0) { $pool = $delExe }
+    return (@($pool | Sort-Object -Property @{ Expression = { Get-VersionOrZero -V ([string]$_.version) }; Descending = $true }) | Select-Object -First 1)
+}
+
+function Get-NativaRegDuplicadas {
+    <#
+      v3.31: las OTRAS Nativas anotadas en el registro, con una version distinta de la que esta
+      en uso. Dos entradas con la misma version (el mismo .msi visto por HKLM y WOW6432Node) no
+      son dos instalaciones.
+    #>
+    param($Install)
+    $elegida = Select-NativaRegEntry -Install $Install
+    if (-not $elegida) { return @() }
+    $vE = [string]$elegida.version
+    return @(@($Install.regInfo) | Where-Object { $_ -and -not $_.esPwa -and [string]$_.version -and ([string]$_.version -ne $vE) })
+}
+
 function Get-NativaVersionState {
     <#
       La Nativa instalada, esta firmada? Devuelve:
@@ -2919,8 +2997,9 @@ function Get-NativaVersionState {
     try {
         # v3.19: las entradas de la app del navegador quedan afuera. Su DisplayVersion 1.0 se
         # leia como la version de la Nativa y rompia toda comparacion de versiones.
-        $reg = @(@($Install.regInfo) | Where-Object { -not $_.esPwa })
-        if (@($reg).Count -gt 0) { $ver = [string]@($reg)[0].version }
+        # v3.31: y de las que quedan, no la primera sino la del ejecutable en disco.
+        $e = Select-NativaRegEntry -Install $Install
+        if ($e) { $ver = [string]$e.version }
     } catch {}
     # confiable: si la Nativa no esta en disco, la version del registro es un recuerdo, no un
     # hecho. Nada que decida instalar o no instalar puede apoyarse en una version no confiable.
@@ -3058,6 +3137,101 @@ function Get-SesionInteractiva {
     if ($out.usuarioSesion -and $out.usuarioMotor) {
         $out.otroPerfil = [bool]($out.usuarioSesion -ne $out.usuarioMotor)
     }
+    return $out
+}
+
+function Start-UrlComoUsuario {
+    <#
+      Abre una direccion en el navegador predeterminado SIN los permisos de administrador del
+      motor. Aislada para poder mockearla en el self-test.
+      Por que explorer.exe y no Start-Process sobre la URL: el launcher se eleva, y todo lo que
+      el motor abre directo hereda esa elevacion -un Chrome corriendo como administrador, que
+      puede abrir una ventana aparte de la que usa el cliente-. explorer.exe le pasa el pedido
+      al escritorio que ya esta abierto, que corre sin elevar en la sesion de quien esta en la
+      pantalla: es lo mismo que si la persona hiciera doble clic en un link.
+    #>
+    param([string]$Url)
+    # El self-test no abre nada en la PC donde corre (mismo criterio que la descarga).
+    if ($SelfTest) { throw 'self-test: el motor no abre el navegador (mockear Start-UrlComoUsuario)' }
+    $exp = 'explorer.exe'
+    try { if ($env:WINDIR) { $exp = Join-Path $env:WINDIR 'explorer.exe' } } catch {}
+    Start-Process -FilePath $exp -ArgumentList ('"' + $Url + '"') -ErrorAction Stop
+}
+
+function Open-FudoExtensionPage {
+    <#
+      v3.31 (bitacora 21/09-27/09): "Falta la extension de Fudo en el navegador" fue la causa
+      raiz #1 de la 3.30, y 5 de las 7 corridas que siguieron fallando con esa causa no
+      aplicaron nada: el motor lo explicaba y el asesor tenia que dictarle al cliente la
+      direccion de la tienda. Ahora, con el si del asesor, se abre la pagina de la extension en
+      el navegador del cliente.
+      Reglas:
+       - Solo con alguien del otro lado. En modo agente no se abre nada.
+       - Solo si el motor corre con la MISMA cuenta que esta en la pantalla. Si la elevacion se
+         hizo con otra cuenta, el navegador se abriria en esa y la extension quedaria en un
+         perfil que el cliente no usa: el motor diria "listo" sin que nada cambie.
+       - Se abre sin elevar (Start-UrlComoUsuario).
+      Abrir la pagina no es agregar la extension: eso lo hace una persona. Por eso despues se
+      ofrece esperar y se VUELVE A MIRAR el perfil; recien ahi el hallazgo pasa a reparado.
+      Devuelve @{ abierta; agregada; motivo }.
+    #>
+    param([string[]]$Ids = @())
+    $out = @{ abierta = $false; agregada = $false; motivo = '' }
+    if (-not (Test-HayHumano)) { $out.motivo = 'sin nadie a quien preguntarle (modo agente): no se abre nada'; return $out }
+    $ses = $null
+    try { $ses = Get-SesionInteractiva } catch {}
+    if (-not $ses -or -not [string]$ses.usuarioSesion) {
+        $out.motivo = 'no se pudo saber quien esta usando la PC: no se abre el navegador a ciegas'; return $out
+    }
+    if ([bool]$ses.otroPerfil) {
+        $out.motivo = ('el motor corre con la cuenta ' + [string]$ses.usuarioMotor + ' y en la pantalla esta ' + [string]$ses.usuarioSesion +
+                       ': el navegador se abriria en la cuenta equivocada'); return $out
+    }
+    $pregunta = 'Abro la pagina de la extension de Fudo en el navegador del cliente?'
+    $detalle = ('Se abre en el navegador que usa esta PC, sin permisos de administrador. Agregarla es un clic ' +
+                'del cliente (o tuyo) en "Agregar a Chrome".')
+    $si = $false
+    if (Test-UiWeb) {
+        $r = Request-UiAnswer -Id 'abrirExtension' -Clase 'modo' -SoloAsesor -Titulo $pregunta -Texto $detalle `
+            -Opciones @(@{ v = 'si'; l = 'Si, abrirla'; principal = $true }, @{ v = 'no'; l = 'No, la agrego yo' })
+        $si = ($r -eq 'si')
+    } else {
+        Suspend-LiveStatus
+        [Console]::Error.WriteLine('')
+        [Console]::Error.WriteLine('  FALTA LA EXTENSION DE FUDO EN EL NAVEGADOR')
+        [Console]::Error.WriteLine('  ' + $detalle)
+        $ans = Read-DoctorLine -Prompt ('  ' + $pregunta + ' (s = si / cualquier otra tecla = no)')
+        $si = ($null -ne $ans -and [string]$ans -match '(?i)^\s*(s|si|y|yes)\s*$')
+    }
+    if (-not $si) { $out.motivo = 'el asesor prefirio no abrirla'; return $out }
+    try { Start-UrlComoUsuario -Url ([string]$script:FudoExtensionUrl) }
+    catch { $out.motivo = ('no se pudo abrir el navegador: ' + $_.Exception.Message); return $out }
+    $out.abierta = $true
+
+    # Verificar el efecto: releer el perfil despues de que la persona diga que la agrego.
+    for ($i = 1; $i -le 3; $i++) {
+        $listo = $false
+        if (Test-UiWeb) {
+            $r2 = Request-UiAnswer -Id ('extensionAgregada' + $i) -Clase 'modo' -SoloAsesor `
+                -Titulo 'Ya se agrego la extension?' `
+                -Texto $(if ($i -gt 1) { 'Todavia no aparece en el navegador. Revisar que se haya tocado "Agregar a Chrome" y que sea el perfil que usa el cliente.' } else { 'Cuando aparezca el aviso de que se agrego, seguimos.' }) `
+                -Opciones @(@{ v = 'si'; l = 'Ya esta, revisar'; principal = $true }, @{ v = 'no'; l = 'Seguir sin esperar' })
+            $listo = ($r2 -eq 'si')
+        } else {
+            if ($i -gt 1) { [Console]::Error.WriteLine('  Todavia no aparece. Revisar que se haya tocado "Agregar a Chrome" y que sea el perfil que usa el cliente.') }
+            $a2 = Read-DoctorLine -Prompt '  Cuando este agregada apreta Enter para revisar (n = seguir sin esperar)'
+            $listo = ($null -ne $a2 -and -not ([string]$a2 -match '(?i)^\s*n'))
+        }
+        if (-not $listo) { $out.motivo = 'se abrio la pagina y no se espero a que la agreguen'; return $out }
+        $st = $null
+        try { $st = Get-FudoExtensionState -Ids @($Ids) } catch {}
+        if ($st -and [bool]$st.instalada) {
+            $out.agregada = $true
+            $out.motivo = ('la extension ya aparece en ' + [string]$st.navegador + ' (perfil ' + [string]$st.perfil + ')')
+            return $out
+        }
+    }
+    $out.motivo = 'se abrio la pagina y la extension todavia no aparece en ningun perfil'
     return $out
 }
 
@@ -3262,6 +3436,32 @@ function Test-Layer0b-NativeApp {
             -Evidence @{ paths = $install.paths; reg = $install.regInfo; running = $procRunning } `
             -Recommendation $(if($procRunning){''}else{'Esta instalada y no corriendo. Es lo esperado si Fudo no esta abierto en el navegador: la levanta el navegador cuando hace falta. Si Fudo SI esta abierto en esta PC y aun asi no corre, revisar bloqueo del antivirus.'})
 
+        # v3.31: dos Nativas anotadas en Windows (caso de un asesor del 26/09: 0.0.18 y 0.0.38,
+        # "el motor solo detecta una", y mostraba la vieja). Se informa y no compite como causa
+        # raiz: la que esta en disco funciona. Lo que NO se recomienda es desinstalar solo la
+        # vieja: las dos pueden compartir %LOCALAPPDATA%\Fudo, y el desinstalador de la vieja
+        # puede llevarse los archivos de la nueva. Desinstalar las dos y dejar que el motor
+        # instale la vigente es el camino que no depende de adivinar eso.
+        $dupsNativa = @(Get-NativaRegDuplicadas -Install $install)
+        if (@($dupsNativa).Count -gt 0) {
+            $enUso = Select-NativaRegEntry -Install $install
+            $otrasVers = @($dupsNativa | ForEach-Object { 'v' + [string]$_.version } | Select-Object -Unique)
+            $carpetaExeDup = ''
+            try { $carpetaExeDup = [string](Split-Path -Parent ([string]$install.exe)) } catch {}
+            $porExe = [bool](Test-NativaRegApuntaA -Entry $enUso -Carpeta $carpetaExeDup)
+            Add-Check -Id 'nativa.duplicada' -Layer 0 `
+                -Name ('Hay mas de una App Nativa anotada en Windows: la v' + [string]$enUso.version + ' y la ' + ($otrasVers -join ', ')) `
+                -Status 'warn' -RootCauseCandidate $false -Plane 'fudo_config' `
+                -Evidence @{ enUso = [string]$enUso.version; otras = @($dupsNativa | ForEach-Object { [string]$_.version })
+                             porEjecutable = $porExe } `
+                -ArticleRef 'https://soporte.fu.do/es/articles/16419361' `
+                -Recommendation ($(if ($porExe) { 'La que esta en uso es la v' + [string]$enUso.version + ': es la que corresponde al archivo que hay en disco. ' }
+                                   else { 'No se pudo saber cual de las dos corresponde al archivo en disco; se toma la mas nueva (v' + [string]$enUso.version + '). ' }) +
+                                 'Tener dos anotadas confunde a cualquiera que mire la version y a los instaladores. No desinstalar solo la vieja: pueden compartir la carpeta ' +
+                                 'y llevarse los archivos de la nueva. Desinstalar las dos desde Configuracion > Aplicaciones y volver a correr el diagnostico: el motor instala la v' +
+                                 $script:NativaVersionRecomendada + ' solo.')
+        }
+
         # 0b.1b Version: desde la firmada, el antivirus deja de ser un tema. Por debajo, la
         # accion de fondo es actualizar la Nativa y no pelearse con el antivirus cada vez.
         $verState = Get-NativaVersionState -Install $install
@@ -3282,7 +3482,7 @@ function Test-Layer0b-NativeApp {
                                  versionFirmada = $script:NativaVersionFirmada; instalador = $up.instalador } `
                     -ActionTaken ([string]$up.nota) -Reversible $true `
                     -ArticleRef 'https://soporte.fu.do/es/articles/16419361' `
-                    -Recommendation ("Se actualizo la App Nativa a la v$($up.versionDespues) con el instalador que estaba en la PC. " +
+                    -Recommendation ("Se actualizo la App Nativa a la v$($up.versionDespues) " + $(if ([bool]$up.descargada) { 'descargando la vigente. ' } else { 'con el instalador que estaba en la PC. ' }) +
                                      $(if ([bool]$up.quedaSinFirmar) {
                                             'OJO: esa version sigue siendo ANTERIOR a la v' + $script:NativaVersionRecomendada + ', que es la que el campo reporta estable, asi que el antivirus todavia puede ponerla en cuarentena. El motor puede bajar la vigente solo: volve a correr el diagnostico. '
                                        } else {
@@ -3390,7 +3590,7 @@ function Test-Layer0b-NativeApp {
         $verAntes   = ''
         $verDespues = ''
         $degradada  = $false
-        try { $verAntes = [string](@($install.regInfo)[0].version) } catch {}
+        try { $eAntes = Select-NativaRegEntry -Install $install; if ($eAntes) { $verAntes = [string]$eAntes.version } } catch {}
         if ($rem.applied) {
             Start-Sleep -Milliseconds 800
             try {
@@ -3405,7 +3605,7 @@ function Test-Layer0b-NativeApp {
                 # el ticket de prueba salio y el caso cerro RESUELTO -con Fudo sin poder imprimir
                 # una sola comanda-. Lo reportaron tres asesores el mismo dia, con video.
                 $volvio = [bool]$reCheck.enDisco
-                try { $verDespues = [string](@(@($reCheck.regInfo) | Where-Object { -not $_.esPwa })[0].version) } catch {}
+                try { $eDesp = Select-NativaRegEntry -Install $reCheck; if ($eDesp) { $verDespues = [string]$eDesp.version } } catch {}
             } catch {}
         }
         $degradada = Test-NativaDegradada -Antes $verAntes -Despues $verDespues
@@ -3618,6 +3818,18 @@ function Test-Layer0b-NativeApp {
                                      ' perfil(es) de navegador de esta cuenta. Sin la extension nadie le habla a la Nativa y la comanda no sale, ' +
                                      'por mas que todo lo demas este bien. Agregarla desde ' + [string]$script:FudoExtensionUrl +
                                      ' y recargar la pestana de Fudo. Un asesor confirmo que agregandola la Nativa levanta sola.')
+                # v3.31: en vez de solo explicarlo, ofrecer abrir la pagina (ver Open-FudoExtensionPage).
+                if ($AutoFix -and -not $DryRun) {
+                    $abrir = Open-FudoExtensionPage -Ids @($nmh.extensionIds)
+                    $script:Diagnostics['extensionAbierta'] = [ordered]@{ abierta = [bool]$abrir.abierta; agregada = [bool]$abrir.agregada; motivo = [string]$abrir.motivo }
+                    if ([bool]$abrir.agregada) {
+                        [void](Update-CheckFinding -Id 'fudo.extension' -Status 'fixed' -RootCauseCandidate $false `
+                            -Name 'Extension de Fudo agregada al navegador en esta corrida' `
+                            -ActionTaken ('se abrio la pagina de la extension y se verifico que quedo: ' + [string]$abrir.motivo) `
+                            -Recommendation 'Recargar la pestana de Fudo y mandar una comanda de prueba.' `
+                            -EvidenceExtra @{ agregadaEnEstaCorrida = $true })
+                    }
+                }
             }
         }
     }
@@ -4720,8 +4932,9 @@ function Get-EnvironmentInfo {
             # el filtro a Find-FudoNativeInstall, pero ACA se seguia leyendo regInfo crudo:
             # si la PWA aparecia primero, la telemetria reportaba "Nativa 1.0" -y ahora, con
             # el informe en pantalla, el asesor lo iba a leer en una tarjeta.
-            $reg = @($script:Diagnostics['nativeInstall'].regInfo | Where-Object { $_ -and -not $_.esPwa })
-            if (@($reg).Count -gt 0) { $nativaVer = [string]@($reg)[0].version }
+            # v3.31: y de las que quedan, la del ejecutable en disco (Select-NativaRegEntry).
+            $eTel = Select-NativaRegEntry -Install $script:Diagnostics['nativeInstall']
+            if ($eTel) { $nativaVer = [string]$eTel.version }
         }
     } catch {}
 
@@ -8602,12 +8815,19 @@ function Test-CaseIdValido {
     $t = [string]$Texto
     if (-not $t) { return '' }
     $t = $t.Trim()
+    $id = ''
     # Un id pelado.
-    if ($t -match '^\d{15}$') { return $t }
-    # Una URL o un texto con el id adentro (.../conversation/215475776099648).
-    $m = [regex]::Match($t, '(?<![0-9])([0-9]{15})(?![0-9])')
-    if ($m.Success) { return [string]$m.Groups[1].Value }
-    return ''
+    if ($t -match '^\d{15}$') { $id = $t }
+    else {
+        # Una URL o un texto con el id adentro (.../conversation/215475776099648).
+        $m = [regex]::Match($t, '(?<![0-9])([0-9]{15})(?![0-9])')
+        if ($m.Success) { $id = [string]$m.Groups[1].Value }
+    }
+    # v3.31: 4 corridas de 3 PCs de campo llegaron con 111111111111111. Un numero de relleno no
+    # se cruza con ninguna conversacion y la corrida se pierde para medir: es lo mismo que no
+    # cargarlo, pero parece cargado.
+    if ($id -match '^(\d)\1{14}$') { return '' }
+    return $id
 }
 
 function Resolve-CaseIdObligatorio {
@@ -8629,7 +8849,7 @@ function Resolve-CaseIdObligatorio {
                 -Texto ('Son los 15 digitos de la conversacion, o la direccion completa. Sirve ' +
                         'para dejar esta revision guardada junto al caso.') `
                 -ErrorPrevio $(if ($iUi -gt 1) {
-                    'Eso no parece un numero de caso: hacen falta 15 digitos. Intento ' +
+                    'Eso no parece un numero de caso: hacen falta los 15 digitos de la conversacion, no un numero de relleno. Intento ' +
                     [string]$iUi + ' de 5; despues de eso la revision se corta.'
                 } else { '' }) `
                 -Extra @{ placeholder = '215475776099648  o la direccion de la conversacion' }
@@ -8657,7 +8877,7 @@ function Resolve-CaseIdObligatorio {
         $resp = Read-DoctorLine -Prompt '  ID de conversacion: '
         $id = Test-CaseIdValido -Texto $resp
         if ($id) { return $id }
-        Write-Host '  Eso no parece un ID de conversacion (hacen falta 15 digitos).' -ForegroundColor Red
+        Write-Host '  Eso no parece un ID de conversacion (hacen falta los 15 digitos de la conversacion, no un numero de relleno).' -ForegroundColor Red
     }
     Write-Host ''
     Write-Host '  Sin ID de conversacion no se puede correr el diagnostico.' -ForegroundColor Red
@@ -11239,6 +11459,9 @@ public class FudoFakeEndpoint {
     # reparacion y el check quedo con el MISMO texto que cuando no se intenta nada. La persona lo
     # intento tres veces y termino reinstalando a mano.
     Reset-State
+    # v3.31: este escenario prueba el camino del instalador LOCAL. Sin URL, como cuando se escribio:
+    # desde la 3.31 un local anterior a la recomendada le cede el lugar a la descarga (escenario 136).
+    function Get-NativeInstallerUrl { '' }
     function Find-LocalNativeInstaller { 'C:\Users\test\Desktop\FudoNativa.msi' }
     function Get-MsiProductVersion { param($Path) '0.0.27' }
     function Find-FudoNativeInstall { [ordered]@{ found = $true; paths = @() } }
@@ -11666,6 +11889,9 @@ public class FudoFakeEndpoint {
     # aplicada mirando solo el codigo de salida, con la Nativa sin instalar.
     Reset-State
     Reset-Mocks
+    # v3.31: estos escenarios prueban el camino del instalador LOCAL. Desde que un local anterior
+    # a la recomendada le cede el lugar a la descarga, sin esto pasarian por la descarga.
+    function Get-NativeInstallerUrl { '' }
     function Find-LocalNativeInstaller { 'C:\kit\FudoNativa.msi' }
     # v3.20: desde que Install-FudoNative elige con Select-LocalNativeInstaller, mockear solo
     # Find-LocalNativeInstaller dejo de alcanzar: la eleccion sale de Get-LocalNativeInstallers,
@@ -11715,6 +11941,20 @@ public class FudoFakeEndpoint {
     Assert-Eq 'S93c no degrada la Nativa instalada' $false ([bool]$r93c.applied)
     Assert-Eq 'S93c y ni siquiera corre el instalador' $false ([bool]$script:llamoInstalador93)
     Assert-Eq 'S93c el motivo lo explica' $true ([bool]([string]$r93c.note -match 'mas viejo'))
+    # v3.31: con descarga disponible, el local viejo no se ejecuta: se va a buscar la vigente.
+    $script:llamoInstalador93 = $false
+    $script:tipos93c = @()
+    function Get-NativeInstallerUrl { 'https://ejemplo.invalid/fudo_native_app.exe' }
+    function Invoke-Remediation {
+        param([string]$Description, [scriptblock]$Fix, [string]$Type, [string]$Target, [string]$Before = '', [string]$After = '', [bool]$Reversible = $true, [string]$Impact = '')
+        $script:tipos93c += $Type
+        if ($Type -eq 'nativa.install') { $script:Diagnostics['nativaInstall'] = [ordered]@{ intento = $true; quedoInstalada = $true; motivo = 'mock' } }
+        @{ applied = $true; note = 'mock' }
+    }
+    $null = Install-FudoNative
+    Assert-Eq 'S93c con descarga disponible se baja la vigente y no se ejecuta el viejo' 'nativa.install' (@($script:tipos93c) -join ',')
+    Microsoft.PowerShell.Management\Remove-Item Function:\Invoke-Remediation -ErrorAction SilentlyContinue
+    function Get-NativeInstallerUrl { '' }
 
     # Escenario 94: por que purgar no alcanza. El caso real: purgar funcionaba -las comandas se
     # borraban- pero cada prueba generaba decenas de trabajos porque el cliente tenia muchas
@@ -12017,6 +12257,7 @@ public class FudoFakeEndpoint {
     # nada: el motor decia que instalaba y el .exe seguia sin aparecer.
     Reset-State
     Reset-Mocks
+    function Get-NativeInstallerUrl { '' }   # v3.31: prueba el camino local, ver escenario 93
     function Get-LocalNativeInstallers { @([ordered]@{ ruta='C:\kit\NATIVA FUDO.msi'; version='0.0.37'; esMsi=$true; fecha=(Get-Date) }) }
     function Get-MsiProductVersion { param($Path) '0.0.37' }
     function Add-MpPreference { param($ExclusionPath, $ExclusionProcess, $ErrorAction) }
@@ -12770,6 +13011,289 @@ public class FudoFakeEndpoint {
     Microsoft.PowerShell.Management\Remove-Item Function:\Test-UiWeb -ErrorAction SilentlyContinue
     Microsoft.PowerShell.Management\Remove-Item Function:\Start-Sleep -ErrorAction SilentlyContinue
     Microsoft.PowerShell.Management\Remove-Item Function:\Write-StepDetail -ErrorAction SilentlyContinue
+
+    # -----------------------------------------------------------------------
+    # Escenario 134 (v3.31, bitacora 21/09-27/09).
+    # a) Dos Nativas anotadas: la version sale de la entrada del ejecutable en disco, no de la
+    #    primera que aparece en el registro (HKLM va antes que HKCU y ahi suele estar el .msi viejo).
+    Reset-State
+    Reset-Mocks
+    $script:inst134 = [ordered]@{ paths=@('C:\Users\x\AppData\Local\Fudo'); manifests=@()
+        exe='C:\Users\x\AppData\Local\Fudo\fudo_native_extension.exe'; carpeta='C:\Users\x\AppData\Local\Fudo'
+        enDisco=$true; soloRegistro=$false; pwa=$false
+        regInfo=@([ordered]@{ name='Fudo Native Extension'; version='0.0.18'; location=''; esPwa=$false },
+                  [ordered]@{ name='Fudo Native Extension'; version='0.0.38'; location='C:\Users\x\AppData\Local\Fudo\'; esPwa=$false }) }
+    Assert-Eq 'S134 la version sale de la entrada del ejecutable, no de la primera' '0.0.38' ([string](Get-NativaVersionState -Install $script:inst134).version)
+    # Si ninguna entrada apunta al ejecutable, la mas alta (y no la primera).
+    $i134b = [ordered]@{ exe=''; enDisco=$false
+        regInfo=@([ordered]@{ version='0.0.18'; location=''; esPwa=$false }, [ordered]@{ version='0.0.36'; location=''; esPwa=$false }) }
+    Assert-Eq 'S134 sin entrada del ejecutable, la mas alta' '0.0.36' ([string](Get-NativaVersionState -Install $i134b).version)
+    # Manda el archivo en disco aunque la otra entrada diga una version mas alta.
+    $i134c = [ordered]@{ exe='C:\x\fudo_native_extension.exe'; enDisco=$true
+        regInfo=@([ordered]@{ version='0.0.38'; location=''; esPwa=$false }, [ordered]@{ version='0.0.27'; location=''; esPwa=$false; delExe=$true }) }
+    Assert-Eq 'S134 manda la entrada del archivo en disco aunque sea mas baja' '0.0.27' ([string](Get-NativaVersionState -Install $i134c).version)
+    # La PWA sigue afuera.
+    $i134d = [ordered]@{ exe=''; regInfo=@([ordered]@{ version='1.0'; esPwa=$true }, [ordered]@{ version='0.0.37'; esPwa=$false }) }
+    Assert-Eq 'S134 la PWA sigue sin contar' '0.0.37' ([string](Get-NativaVersionState -Install $i134d).version)
+    # Y la telemetria reporta la misma.
+    $script:Diagnostics['nativeInstall'] = $script:inst134
+    Assert-Eq 'S134 la telemetria reporta la del ejecutable' '0.0.38' ([string](Get-EnvironmentInfo).nativaVersion)
+
+    # b) La capa 0b informa que hay dos, sin hacerla causa raiz y sin pedir subir a quien ya la tiene.
+    Reset-State
+    function Get-AntivirusState { [ordered]@{ defender = $null; thirdParty = @(); realTime = $null; fudoThreats = @() } }
+    function Get-Process { param($ErrorAction) @() }
+    function Get-SesionInteractiva { [ordered]@{ usuarioMotor='ana'; usuarioSesion='ana'; otroPerfil=$false } }
+    function Get-NativeMessagingState {
+        [ordered]@{ registrado=$true; navegadores=@('Chrome'); manifest='m.json'
+                    exeDelManifest='C:\Users\x\AppData\Local\Fudo\fudo_native_extension.exe'; exeExiste=$true
+                    extensionIds=@('npcjljaedonmjndbliillcmkhidejhmb'); pendientes=@() }
+    }
+    function Get-FudoExtensionState { param($Ids) [ordered]@{ instalada=$true; ids=@($Ids); encontrada='npcjljaedonmjndbliillcmkhidejhmb'
+                                                              navegador='Chrome'; perfil='Default'; perfilesVistos=1 } }
+    function Get-LocalRunHistory { [ordered]@{ ultimaCausa='' } }
+    function Find-FudoNativeInstall { $script:inst134 }
+    Test-Layer0b-NativeApp
+    $d134 = Get-CheckById 'nativa.duplicada'
+    Assert-Eq 'S134 dos Nativas anotadas se informan' $true ([bool]($null -ne $d134))
+    Assert-Eq 'S134 dice cual esta en uso y cual sobra' $true ([bool]([string]$d134.name -match '0\.0\.38' -and [string]$d134.name -match '0\.0\.18'))
+    Assert-Eq 'S134 no compite como causa raiz' $false ([bool]$d134.rootCauseCandidate)
+    Assert-Eq 'S134 no manda a desinstalar solo la vieja' $true ([bool]([string]$d134.recommendation -match 'No desinstalar solo la vieja'))
+    Assert-Eq 'S134 y ya no se le pide subir a la vigente a quien la tiene' 'ok' ([string](Get-CheckById 'nativa.sinFirmar').status)
+    # Con una sola no aparece.
+    Reset-State
+    function Find-FudoNativeInstall {
+        [ordered]@{ paths=@('C:\Users\x\AppData\Local\Fudo'); manifests=@(); exe='C:\Users\x\AppData\Local\Fudo\fudo_native_extension.exe'
+                    carpeta='C:\Users\x\AppData\Local\Fudo'; enDisco=$true; soloRegistro=$false; pwa=$false
+                    regInfo=@([ordered]@{ version='0.0.38'; location=''; esPwa=$false }) }
+    }
+    Test-Layer0b-NativeApp
+    Assert-Eq 'S134 con una sola Nativa no hay aviso de duplicada' $true ([bool]($null -eq (Get-CheckById 'nativa.duplicada')))
+
+    # c) Un instalador local viejo ya no le gana a la descarga de la vigente.
+    Reset-State
+    Reset-Mocks
+    function Write-StepDetail { param($Texto) }
+    function Start-Sleep { param($Seconds, $Milliseconds) }
+    function Get-Process { param($ErrorAction) @() }
+    function Test-IsInteractiveConsole { $false }
+    function Find-FudoNativeInstall { [ordered]@{ paths=@(); regInfo=@(); exe=''; manifests=@(); carpeta=''; enDisco=$false; soloRegistro=$false; pwa=$false } }
+    function Get-NativeInstallerUrl { 'https://ejemplo.invalid/fudo_native_app.exe' }
+    function Get-LocalNativeInstallers { @([ordered]@{ ruta='C:\kit\FudoNativa.msi'; version='0.0.31'; esMsi=$true; fecha=(Get-Date) }) }
+    $script:tipos134 = @()
+    function Invoke-Remediation {
+        param([string]$Description, [scriptblock]$Fix, [string]$Type, [string]$Target, [string]$Before = '', [string]$After = '', [bool]$Reversible = $true, [string]$Impact = '')
+        $script:tipos134 += $Type
+        if ($Type -eq 'nativa.install') { $script:Diagnostics['nativaInstall'] = [ordered]@{ intento = $true; quedoInstalada = $true; motivo = 'mock' } }
+        @{ applied = $true; note = 'mock' }
+    }
+    $null = Install-FudoNative
+    Assert-Eq 'S134 con un instalador local viejo se descarga la vigente' 'nativa.install' (@($script:tipos134) -join ',')
+    Assert-Eq 'S134 y queda anotado cual se descarto' '0.0.31' ([string]$script:Diagnostics['nativaInstall'].localDescartado)
+    # Si la descarga no deja la Nativa instalada, el local es el respaldo.
+    Reset-State
+    $script:tipos134 = @()
+    function Invoke-Remediation {
+        param([string]$Description, [scriptblock]$Fix, [string]$Type, [string]$Target, [string]$Before = '', [string]$After = '', [bool]$Reversible = $true, [string]$Impact = '')
+        $script:tipos134 += $Type
+        @{ applied = $false; note = 'mock: fallo' }
+    }
+    $null = Install-FudoNative
+    Assert-Eq 'S134 si la descarga falla se usa el local' 'nativa.install,nativa.install_local' (@($script:tipos134) -join ',')
+    Assert-Eq 'S134 y queda dicho que la descarga fallo' $true ([bool]$script:Diagnostics['nativaInstall'].descargaFallida)
+    # Un local en la vigente, o sin version declarada (.exe), se sigue usando sin descargar.
+    Reset-State
+    $script:tipos134 = @()
+    function Get-LocalNativeInstallers { @([ordered]@{ ruta='C:\kit\FudoNativa.msi'; version='0.0.38'; esMsi=$true; fecha=(Get-Date) }) }
+    $null = Install-FudoNative
+    Assert-Eq 'S134 un local en la vigente se usa sin descargar' 'nativa.install_local' (@($script:tipos134) -join ',')
+    Reset-State
+    $script:tipos134 = @()
+    function Get-LocalNativeInstallers { @([ordered]@{ ruta='C:\kit\fudo_native_app.exe'; version=''; esMsi=$false; fecha=(Get-Date) }) }
+    function Get-MsiProductVersion { param($Path) '' }
+    $null = Install-FudoNative
+    Assert-Eq 'S134 un .exe sin version declarada no se descarta' 'nativa.install_local' (@($script:tipos134) -join ',')
+    Reset-Mocks
+    # Y si un escenario se olvida de mockear, el self-test igual no descarga: la reparacion
+    # falla en vez de bajar 58 MB.
+    Reset-State
+    function Write-StepDetail { param($Texto) }
+    function Find-FudoNativeInstall { [ordered]@{ paths=@(); regInfo=@(); exe=''; manifests=@(); carpeta=''; enDisco=$false; soloRegistro=$false; pwa=$false } }
+    function Get-NativeInstallerUrl { 'https://ejemplo.invalid/fudo_native_app.exe' }
+    function Get-LocalNativeInstallers { @() }
+    $script:bajo134 = $false
+    function Get-FileWithProgress { param($Url, $Destino, $TimeoutSec, $Que) $script:bajo134 = $true; @{ ok = $false; bytes = 0; segundos = 0; error = 'mock' } }
+    function Add-MpPreference { param($ExclusionPath, $ExclusionProcess, $ErrorAction) }
+    $g134 = Install-FudoNative
+    Assert-Eq 'S134 el self-test nunca descarga' $false ([bool]$script:bajo134)
+    Assert-Eq 'S134 y la reparacion no se da por aplicada' $false ([bool]$g134.applied)
+    Reset-Mocks
+
+    # d) caseId de relleno.
+    Assert-Eq 'S134 un caseId de relleno no sirve' '' (Test-CaseIdValido -Texto '111111111111111')
+    Assert-Eq 'S134 ni pegado en una URL' '' (Test-CaseIdValido -Texto 'https://app.intercom.com/a/inbox/x/inbox/conversation/000000000000000')
+    Assert-Eq 'S134 uno real sigue sirviendo' '215475776099648' (Test-CaseIdValido -Texto '215475776099648')
+
+    # e) Los cinco datos que no viajaban. Send-Telemetry no manda nada en -SelfTest, asi que se
+    #    prueba la funcion que arma las claves y se verifica en el codigo que Send-Telemetry la use.
+    Reset-State
+    $script:Diagnostics['nativaDescarga'] = [ordered]@{ firmaOk = $true; bytes = 1 }
+    $script:Diagnostics['modoImpresionProtegido'] = [ordered]@{ activo = $false; origen = '' }
+    $x134 = Get-TelemetryDiagnosticsExtra
+    Assert-Eq 'S134 viajan las cinco claves (y la de la extension, escenario 135)' 'nativaDescarga,eleccionImpresora,eleccionPuerto,modoImpresionProtegido,usbSinEnumerar,extensionAbierta' (@($x134.Keys) -join ',')
+    Assert-Eq 'S134 con su contenido' $true ([bool]$x134['nativaDescarga'].firmaOk)
+    Assert-Eq 'S134 Send-Telemetry las pone en el payload' $true ([bool]((Get-Command Send-Telemetry).ScriptBlock.ToString() -match 'Get-TelemetryDiagnosticsExtra'))
+    Reset-State
+
+    # -----------------------------------------------------------------------
+    # Escenario 135 (v3.31): la extension que falta. El motor ofrece abrir la pagina, pero solo
+    # con alguien del otro lado, solo en la cuenta que esta en la pantalla, y solo da el hallazgo
+    # por reparado cuando la extension aparece de verdad en el perfil.
+    Reset-State
+    Reset-Mocks
+    function Suspend-LiveStatus { }
+    function Test-UiWeb { $false }
+    $script:abrio135 = ''
+    function Start-UrlComoUsuario { param($Url) $script:abrio135 = [string]$Url }
+    function Get-SesionInteractiva { [ordered]@{ usuarioMotor='ana'; usuarioSesion='ana'; otroPerfil=$false } }
+    $script:resp135 = @()
+    $script:iResp135 = 0
+    function Read-DoctorLine { param($Prompt) $r = $null; if ($script:iResp135 -lt @($script:resp135).Count) { $r = $script:resp135[$script:iResp135] }; $script:iResp135++; $r }
+    $script:nExt135 = 0
+    function Get-FudoExtensionState { param($Ids) $script:nExt135++
+        [ordered]@{ instalada = ($script:nExt135 -gt 1); ids=@($Ids); encontrada=''; navegador='Chrome'; perfil='Default'; perfilesVistos=1 } }
+
+    # Modo agente: no se abre nada.
+    function Test-HayHumano { $false }
+    $o135 = Open-FudoExtensionPage
+    Assert-Eq 'S135 en modo agente no se abre el navegador' '' $script:abrio135
+    # Otra cuenta en la pantalla: tampoco, y se dice por que.
+    function Test-HayHumano { $true }
+    function Get-SesionInteractiva { [ordered]@{ usuarioMotor='admin'; usuarioSesion='cinthia'; otroPerfil=$true } }
+    $o135b = Open-FudoExtensionPage
+    Assert-Eq 'S135 con otra cuenta en la pantalla no se abre' '' $script:abrio135
+    Assert-Eq 'S135 y lo explica' $true ([bool]([string]$o135b.motivo -match 'cuenta equivocada'))
+    function Get-SesionInteractiva { [ordered]@{ usuarioMotor='ana'; usuarioSesion='ana'; otroPerfil=$false } }
+    # El asesor dice que no: no se abre.
+    $script:resp135 = @('n'); $script:iResp135 = 0
+    $null = Open-FudoExtensionPage
+    Assert-Eq 'S135 si el asesor dice que no, no se abre' '' $script:abrio135
+    # Dice que si: se abre la pagina de la extension, y abrirla NO es agregarla.
+    $script:resp135 = @('s', 'n'); $script:iResp135 = 0
+    $o135d = Open-FudoExtensionPage
+    Assert-Eq 'S135 con el si se abre la pagina de la extension' ([string]$script:FudoExtensionUrl) $script:abrio135
+    Assert-Eq 'S135 abrirla no es agregarla' $false ([bool]$o135d.agregada)
+
+    # Por la capa 0b: con el si y la extension apareciendo despues, el hallazgo queda reparado.
+    Reset-State
+    $script:abrio135 = ''
+    $script:nExt135 = 0
+    $script:resp135 = @('s', ''); $script:iResp135 = 0
+    function Get-AntivirusState { [ordered]@{ defender = $null; thirdParty = @(); realTime = $null; fudoThreats = @() } }
+    function Get-Process { param($ErrorAction) @() }
+    function Get-LocalRunHistory { [ordered]@{ ultimaCausa='' } }
+    function Get-NativeMessagingState {
+        [ordered]@{ registrado=$true; navegadores=@('Chrome'); manifest='m.json'
+                    exeDelManifest='C:\Users\x\AppData\Local\Fudo\fudo_native_extension.exe'; exeExiste=$true
+                    extensionIds=@('npcjljaedonmjndbliillcmkhidejhmb'); pendientes=@() }
+    }
+    function Find-FudoNativeInstall {
+        [ordered]@{ paths=@('C:\Users\x\AppData\Local\Fudo'); manifests=@(); exe='C:\Users\x\AppData\Local\Fudo\fudo_native_extension.exe'
+                    carpeta='C:\Users\x\AppData\Local\Fudo'; enDisco=$true; soloRegistro=$false; pwa=$false
+                    regInfo=@([ordered]@{ version='0.0.38'; location=''; esPwa=$false }) }
+    }
+    Test-Layer0b-NativeApp
+    $e135 = Get-CheckById 'fudo.extension'
+    Assert-Eq 'S135 por la capa 0b se abre la pagina' ([string]$script:FudoExtensionUrl) $script:abrio135
+    Assert-Eq 'S135 y con la extension ya en el perfil queda reparado' 'fixed' ([string]$e135.status)
+    Assert-Eq 'S135 y deja de ser causa raiz' $false ([bool]$e135.rootCauseCandidate)
+    # Si no aparece, sigue en fail: abrir la pagina no cuenta como reparacion.
+    Reset-State
+    $script:nExt135 = -10
+    $script:resp135 = @('s', '', '', ''); $script:iResp135 = 0
+    Test-Layer0b-NativeApp
+    Assert-Eq 'S135 si la extension no aparece el hallazgo sigue en fail' 'fail' ([string](Get-CheckById 'fudo.extension').status)
+    Assert-Eq 'S135 y queda dicho en la telemetria' $true ([bool]([string]$script:Diagnostics['extensionAbierta'].motivo -match 'todavia no aparece'))
+    Reset-Mocks
+    Reset-State
+
+    # -----------------------------------------------------------------------
+    # Escenario 136 (v3.31): actualizar una Nativa vieja tambien descarga la vigente. Solo
+    # probaba con un instalador que hubiera en la PC y funcionaba 13 de 33 veces, bajando.
+    Reset-State
+    Reset-Mocks
+    function Write-StepDetail { param($Texto) }
+    function Start-Sleep { param($Seconds, $Milliseconds) }
+    function Get-NativeInstallerUrl { 'https://ejemplo.invalid/fudo_native_app.exe' }
+    $script:local136 = ''
+    $script:verLocal136 = ''
+    function Find-LocalNativeInstaller { $script:local136 }
+    function Get-MsiProductVersion { param($Path) $script:verLocal136 }
+    $script:tipos136 = @()
+    $script:ok136 = @{}
+    $script:verPost136 = '0.0.18'
+    function Invoke-Remediation {
+        param([string]$Description, [scriptblock]$Fix, [string]$Type, [string]$Target, [string]$Before = '', [string]$After = '', [bool]$Reversible = $true, [string]$Impact = '')
+        $script:tipos136 += $Type
+        $sale = $true
+        if ($script:ok136.ContainsKey($Type)) { $sale = [bool]$script:ok136[$Type] }
+        if ($sale) {
+            if ($Type -eq 'nativa.update_download') { $script:verPost136 = '0.0.38' } else { $script:verPost136 = $script:verLocal136 }
+            return @{ applied = $true; note = 'mock' }
+        }
+        @{ applied = $false; note = 'error: no se pudo descargar (mock)' }
+    }
+    function Find-FudoNativeInstall {
+        [ordered]@{ paths=@('C:\x'); exe='C:\x\fudo_native_extension.exe'; enDisco=$true
+                    regInfo=@([ordered]@{ version=$script:verPost136; location=''; esPwa=$false }) }
+    }
+    # Sin instalador en la PC: antes no se hacia nada; ahora se descarga y sube.
+    $u136 = Update-FudoNativeFromLocal -Instalada '0.0.18'
+    Assert-Eq 'S136 sin instalador local se actualiza descargando' 'nativa.update_download' (@($script:tipos136) -join ',')
+    Assert-Eq 'S136 y queda verificado que subio' $true ([bool]$u136.subio)
+    Assert-Eq 'S136 a la vigente' '0.0.38' ([string]$u136.versionDespues)
+    Assert-Eq 'S136 y se sabe que fue por descarga' $true ([bool]$u136.descargada)
+    # Con un local viejo (anterior a la recomendada) tambien se descarga.
+    $script:tipos136 = @(); $script:verPost136 = '0.0.18'
+    $script:local136 = 'C:\kit\viejo.msi'; $script:verLocal136 = '0.0.31'
+    $null = Update-FudoNativeFromLocal -Instalada '0.0.18'
+    Assert-Eq 'S136 con un local viejo se descarga la vigente' 'nativa.update_download' (@($script:tipos136) -join ',')
+    # Si la descarga falla, el local es el respaldo.
+    $script:tipos136 = @(); $script:verPost136 = '0.0.18'
+    $script:ok136 = @{ 'nativa.update_download' = $false }
+    $u136c = Update-FudoNativeFromLocal -Instalada '0.0.18'
+    Assert-Eq 'S136 si la descarga falla se usa el local' 'nativa.update_download,nativa.update_local' (@($script:tipos136) -join ',')
+    Assert-Eq 'S136 y el local igual sube la version' '0.0.31' ([string]$u136c.versionDespues)
+    # Sin local y con la descarga fallando, queda a la vista por que no.
+    $script:tipos136 = @(); $script:verPost136 = '0.0.18'
+    $script:local136 = ''; $script:verLocal136 = ''
+    $u136d = Update-FudoNativeFromLocal -Instalada '0.0.18'
+    Assert-Eq 'S136 una descarga fallida cuenta como intento' $true ([bool]$u136d.intento)
+    Assert-Eq 'S136 no se declara actualizada' $false ([bool]$u136d.subio)
+    Assert-Eq 'S136 y dice por que' $true ([bool]([string]$u136d.porQueNo -match 'no se pudo descargar'))
+    $script:ok136 = @{}
+    # Un local en la vigente se sigue usando sin descargar.
+    $script:tipos136 = @(); $script:verPost136 = '0.0.18'
+    $script:local136 = 'C:\kit\vigente.msi'; $script:verLocal136 = '0.0.38'
+    $null = Update-FudoNativeFromLocal -Instalada '0.0.18'
+    Assert-Eq 'S136 un local en la vigente se usa sin descargar' 'nativa.update_local' (@($script:tipos136) -join ',')
+    # Con la .msi de Windows 7 no se descarga: no se sabe que version trae.
+    $script:tipos136 = @(); $script:local136 = ''; $script:verLocal136 = ''
+    function Get-NativeInstallerUrl { 'https://ejemplo.invalid/fudo_native_app.msi' }
+    $u136f = Update-FudoNativeFromLocal -Instalada '0.0.18'
+    Assert-Eq 'S136 con la .msi de Windows 7 no se descarga' '' (@($script:tipos136) -join ',')
+    Assert-Eq 'S136 y no se hace nada a ciegas' $false ([bool]$u136f.intento)
+    # Con la vigente ya instalada no se descarga nada.
+    function Get-NativeInstallerUrl { 'https://ejemplo.invalid/fudo_native_app.exe' }
+    $script:tipos136 = @()
+    $null = Update-FudoNativeFromLocal -Instalada '0.0.38'
+    Assert-Eq 'S136 con la vigente instalada no se descarga nada' '' (@($script:tipos136) -join ',')
+    # La funcion de descarga comun tambien se niega en el self-test.
+    $e136 = ''
+    try { $null = Invoke-FudoNativeDownload -Url 'https://ejemplo.invalid/x.exe' } catch { $e136 = [string]$_.Exception.Message }
+    Assert-Eq 'S136 la descarga comun no corre en el self-test' $true ([bool]($e136 -match 'self-test'))
+    Reset-Mocks
+    Reset-State
 
     Write-Host ""
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)
@@ -13808,8 +14332,30 @@ function Update-FudoNativeFromLocal {
     #>
     param([string]$Instalada, [bool]$Corriendo = $false)
     $inst = Find-LocalNativeInstaller
+    $verInst = ''
+    if ($inst) { $verInst = [string](Get-MsiProductVersion -Path $inst) }
+    # v3.31 (bitacora 21/09-27/09): actualizar funcionaba 13 de 33 veces y bajando (50%, 53%,
+    # 18% en tres semanas), porque solo probaba con lo que hubiera en la PC, casi siempre un
+    # instalador tan viejo como la Nativa instalada. Ahora, si el local no sirve -no hay, no
+    # declara version, o es anterior a la recomendada- se descarga la vigente. SOLO por la .exe
+    # (Windows 8 en adelante), que es la que trae la recomendada: la .msi de Windows 7 no dice
+    # que version trae (en campo se reporto la 0.0.18), y bajarla podria reinstalar la misma.
+    $url = $NativeInstallerUrl
+    if (-not $url) { $url = $script:NativeInstallerUrl }
+    if (-not $url) { $url = Get-NativeInstallerUrl }
+    $urlEsExe = [bool]($url -and -not ([string]$url -match '(?i)\.msi(\?|$)'))
+    $localNoSirve = ((-not $inst) -or (-not $verInst) -or (Test-InstaladorLocalViejo -Version $verInst))
+    if ($urlEsExe -and $localNoSirve) {
+        $decD = Test-NativaNecesitaUpdate -Instalada $Instalada -Disponible $script:NativaVersionRecomendada
+        if ($decD.actualizar) {
+            $porDescarga = Update-FudoNativeByDownload -Instalada $Instalada -Url $url -Motivo ([string]$decD.motivo)
+            # El local es el respaldo: solo si la descarga no subio la version y el local es mas
+            # nuevo que lo instalado (si no, Test-NativaNecesitaUpdate lo va a frenar abajo).
+            if ([bool]$porDescarga.subio -or -not $inst) { return $porDescarga }
+            Write-Host ("  La descarga no actualizo la Nativa: se prueba con el instalador de la PC (v$verInst).") -ForegroundColor Yellow
+        }
+    }
     if (-not $inst) { return @{ aplicado = $false; subio = $false; intento = $false; motivo = 'no hay instalador de la Nativa en la PC' } }
-    $verInst = Get-MsiProductVersion -Path $inst
     $dec = Test-NativaNecesitaUpdate -Instalada $Instalada -Disponible $verInst
     if (-not $dec.actualizar) {
         return @{ aplicado = $false; subio = $false; intento = $false; motivo = [string]$dec.motivo; instalador = $inst; versionInstalador = $verInst }
@@ -13864,6 +14410,43 @@ function Update-FudoNativeFromLocal {
               nativaCorriendo = [bool]$Corriendo; cerrados = @($salida.cerrados)
               motivo = [string]$dec.motivo }
 }
+function Update-FudoNativeByDownload {
+    <#
+      v3.31: actualiza la Nativa descargando la vigente (ver Update-FudoNativeFromLocal). Mismo
+      criterio que el camino local: se declara actualizada solo si la version instalada SUBIO.
+      Devuelve lo mismo que Update-FudoNativeFromLocal, con descargada = $true.
+    #>
+    param([string]$Instalada, [string]$Url, [string]$Motivo = '')
+    $salida = @{ code = $null }
+    $rem = Invoke-Remediation -Description ('Actualizar la App Nativa a la ' + $script:NativaVersionRecomendada + ' descargando la vigente') `
+        -Type 'nativa.update_download' -Target 'FudoNativa' -Before $Instalada -After $script:NativaVersionRecomendada -Reversible $true -Fix {
+            $dl = Invoke-FudoNativeDownload -Url $Url
+            $salida.code = $dl.code
+            (@($dl.notas) -join ' | ')
+        }
+    # Corrio de verdad (o fallo corriendo): no es lo mismo que auto-fix apagado o dry-run.
+    $corrio = -not ([string]$rem.note -match '^(auto-fix deshabilitado|dry-run)')
+    $verDespues = ''
+    if ($rem.applied) {
+        try { $verDespues = [string](Get-NativaVersionState -Install (Find-FudoNativeInstall)).version } catch {}
+    }
+    $subio = $false
+    try { $subio = ([bool]$verDespues -and ([version]$verDespues -gt [version]$Instalada)) } catch {}
+    $porQueNo = ''
+    if (-not $subio) {
+        $porQueNo = $(
+            if (-not $rem.applied)             { [string]($rem.note -replace '^error:\s*', '') }
+            elseif ($null -eq $salida.code)    { 'no se pudo lanzar el instalador descargado' }
+            elseif ([int]$salida.code -ne 0)   { 'el instalador descargado termino con codigo ' + $salida.code }
+            else                               { 'el instalador descargado termino bien pero la version instalada no cambio (sigue en la ' + $Instalada + ')' }
+        )
+    }
+    return @{ aplicado = [bool]$rem.applied; subio = [bool]$subio; intento = [bool]$corrio; nota = [string]$rem.note
+              instalador = ('descarga: ' + [string]$Url); versionInstalador = [string]$script:NativaVersionRecomendada
+              versionDespues = $verDespues; exitCode = $salida.code; porQueNo = $porQueNo; quedaSinFirmar = $false
+              nativaCorriendo = $false; cerrados = @(); descargada = $true; motivo = $Motivo }
+}
+
 function Select-LocalNativeInstaller {
     <#
       Que instalador de la Nativa usar. Hasta la 3.19 el motor elegia solo -el de version mas
@@ -14150,12 +14733,103 @@ function Test-FudoInstallerSignature {
     return $r
 }
 
+function Invoke-FudoNativeDownload {
+    <#
+      v3.31: descarga e instalacion de la Nativa, en un solo lugar. Hasta la 3.30 vivia
+      adentro de Install-FudoNative y actualizar una Nativa vieja no podia usarla: solo
+      probaba con un instalador que hubiera en la PC. En la telemetria, actualizar funciono
+      13 de 33 veces (39%) y bajando semana a semana; instalar descargando, 7 de 8 (88%).
+      Pasos: exclusiones, descarga, chequeo de que el antivirus no se la llevo, firma de
+      Fudo ANTES de ejecutar, y ejecucion. Tira si algo falla. Verificar el efecto (que la
+      Nativa quede en disco, o que la version suba) le toca a quien la llama.
+      Devuelve @{ code; notas }.
+    #>
+    param([string]$Url)
+    $url = $Url
+    $notas = @()
+    # 1) exclusiones ANTES de bajar el instalador: si no, el AV lo borra en la descarga
+    if ($UseDefenderExclusions) {
+        $rutasExcl = @($env:TEMP)
+        if ($env:LOCALAPPDATA) { $rutasExcl += @((Join-Path $env:LOCALAPPDATA 'Fudo'), (Join-Path $env:LOCALAPPDATA 'Programs')) }
+        foreach ($ruta in @($rutasExcl | Where-Object { $_ })) {
+            try { Add-MpPreference -ExclusionPath $ruta -ErrorAction SilentlyContinue; $notas += "excl $ruta" } catch {}
+        }
+        try { Add-MpPreference -ExclusionProcess "$FudoAppProcess*.exe" -ErrorAction SilentlyContinue } catch {}
+    }
+    # 2) descargar
+    # v3.31: el self-test no baja nada, nunca. Hasta la 3.30 ningun escenario llegaba aca
+    # porque todos tenian un instalador local y el local siempre ganaba; cuando la 3.31
+    # hizo que un local viejo le ceda el lugar a la descarga, cinco escenarios viejos
+    # bajaron el instalador real de 58 MB en la PC de desarrollo (no se ejecuto: estaba
+    # mockeado). Un self-test que "no toca la PC" no puede depender de que cada escenario
+    # se acuerde de mockear esto.
+    if ($SelfTest) { throw 'self-test: el motor no descarga nada (mockear Get-NativeInstallerUrl o Invoke-Remediation)' }
+    $esMsi = ([string]$url -match '(?i)\.msi(\?|$)')
+    $destino = Join-Path $env:TEMP ('FudoNativa-' + (Get-Date).ToString('yyyyMMddHHmmss') + $(if ($esMsi) { '.msi' } else { '.exe' }))
+    Write-StepDetail 'descargando el instalador de la App Nativa (58 MB)'
+    $bajada = Get-FileWithProgress -Url $url -Destino $destino -TimeoutSec 300 -Que 'la App Nativa'
+    $script:Diagnostics['nativaDescarga'] = [ordered]@{
+        url = [string]$url; bytes = [long]$bajada.bytes; segundos = [int]$bajada.segundos
+        ok = [bool]$bajada.ok; error = [string]$bajada.error }
+    if (-not [bool]$bajada.ok) {
+        throw ('no se pudo descargar el instalador de la App Nativa: ' + [string]$bajada.error +
+               '. Pasarlo a mano y dejarlo al lado de FudoPrintDoctor.cmd.')
+    }
+    $notas += ('descarga: ' + [int]([long]$bajada.bytes / 1MB) + ' MB en ' + [int]$bajada.segundos + 's')
+    # El antivirus se lleva el instalador MIENTRAS se descarga: en la telemetria hay 14
+    # detecciones de Defender sobre archivos .crdownload de Chrome, o sea antes de que
+    # nadie lo ejecute. Cuando pasa, Invoke-WebRequest termina bien y el archivo ya no
+    # esta. Sin este chequeo el motor diria 'no se pudo lanzar el instalador' y manda al
+    # asesor a buscar el problema en el lugar equivocado.
+    if (-not (Test-Path $destino)) {
+        throw 'el instalador se descargo y despues desaparecio: se lo llevo el antivirus. Excluir la carpeta temporal en el antivirus y reintentar, o pasar el instalador a mano.'
+    }
+    $tam = 0
+    try { $tam = [int]((Get-Item $destino -ErrorAction Stop).Length / 1024) } catch {}
+    if ($tam -lt 100) { throw "el archivo descargado pesa ${tam}KB: no parece un instalador (revisar la URL, o el antivirus lo vacio)" }
+    $notas += "instalador descargado (${tam}KB)"
+    # 3) verificar la firma ANTES de ejecutarlo
+    $firma = Test-FudoInstallerSignature -Path $destino
+    try {
+        $script:Diagnostics['nativaDescarga']['tamKB'] = $tam
+        $script:Diagnostics['nativaDescarga']['firmaEstado'] = [string]$firma.estado
+        $script:Diagnostics['nativaDescarga']['firmante'] = [string]$firma.firmante
+        $script:Diagnostics['nativaDescarga']['firmaOk'] = [bool]$firma.ok
+    } catch {}
+    if (-not [bool]$firma.ok) {
+        try { Remove-Item $destino -Force -ErrorAction SilentlyContinue } catch {}
+        throw ('el instalador descargado no tiene firma valida de Fudo (' + [string]$firma.estado + '): NO se ejecuto. Descargarlo a mano desde la web app.')
+    }
+    $notas += ('firma verificada (' + [string]$firma.estado + ')')
+    # 4) ejecutar. Un .msi no se lanza directo -abriria el asistente en la pantalla del
+    #    cliente-: Invoke-NativeInstallerFile ya resuelve msiexec /qn.
+    Write-StepDetail 'ejecutando el instalador de la App Nativa'
+    $code = Invoke-NativeInstallerFile -Path $destino -ExtraArgs $NativeInstallerArgs
+    if ([bool]$script:CerroNativaParaInstalar) { $notas += 'se cerro la App Nativa para poder reemplazarla' }
+    $notas += (Get-InstallerExitNote -Code $code)
+    Start-Sleep -Seconds 3
+    return @{ code = $code; notas = @($notas) }
+}
+
+function Test-InstaladorLocalViejo {
+    <#
+      v3.31: un instalador que hay en la PC, es anterior a la version recomendada?
+      Uno sin version declarada NO cuenta como viejo: los .exe no la declaran, y la Nativa se
+      distribuye como .exe desde la 0.0.38. Descartarlo seria adivinar.
+    #>
+    param([string]$Version)
+    if (-not $Version) { return $false }
+    try { return ([version]$Version -lt [version]$script:NativaVersionRecomendada) } catch { return $false }
+}
+
 function Install-FudoNative {
     <#
       Instala la App Nativa de Fudo. Antes agrega las exclusiones de antivirus, porque el bloqueo
       del AV es la causa mas frecuente de que la Nativa no quede funcionando.
       Sin URL de instalador configurada, guia los pasos manuales.
+      -SinDescarga: usar solo lo que hay en la PC (es el respaldo cuando la descarga fallo).
     #>
+    param([switch]$SinDescarga)
     $url = $NativeInstallerUrl
     if (-not $url) { $url = $script:NativeInstallerUrl }
     if (-not $url) { $url = Get-NativeInstallerUrl }
@@ -14175,6 +14849,23 @@ function Install-FudoNative {
     } catch {}
     $eleccion = Select-LocalNativeInstaller -Instalada $(if ($verAntesConfiable) { $verAntes } else { '' })
     $local = [string]$eleccion.ruta
+    # v3.31 (bitacora 21/09-27/09): el instalador de la PC le ganaba siempre a la descarga, y
+    # casi siempre era uno viejo olvidado en Descargas. De 50 intentos, 41 fueron con instalador
+    # local en 25 PCs y solo 2 dejaron la Nativa en disco (5%); 9 fueron por descarga y 7
+    # quedaron (78%). 40 de los 41 locales eran 0.0.18 a 0.0.36 -casi siempre la misma que ya
+    # figuraba instalada-, y el motor repetia el mismo intento corrida tras corrida.
+    # Ahora un local anterior a la recomendada solo se usa si la descarga falla. Si una PERSONA
+    # lo eligio (menu o -NativeInstallerPath), se respeta: puede ser el caso del antivirus de
+    # terceros que solo aguanta una version vieja.
+    $localDescartado = ''
+    if ($local -and $url -and -not $SinDescarga -and -not [bool]$eleccion.elegidoPorPersona -and
+        (Test-InstaladorLocalViejo -Version ([string]$eleccion.version))) {
+        $localDescartado = [string]$eleccion.version
+        Write-Host ''
+        Write-Host ("  Hay un instalador en la PC (v$localDescartado), pero es anterior a la v$($script:NativaVersionRecomendada): se descarga la vigente.") -ForegroundColor Cyan
+        Write-Host '  Si la descarga falla, se usa el de la PC.' -ForegroundColor DarkGray
+        $local = ''
+    }
     if ($local) {
         # v3.18: tres cosas estaban mal en este camino, y las tres las describio un asesor
         # ("el motor dice que instala la nativa, pero al corroborar en la version web sigue sin
@@ -14310,63 +15001,21 @@ function Install-FudoNative {
         return @{ applied = $false; note = 'sin URL de instalador configurada' }
     }
 
-    return (Invoke-Remediation -Description 'Descargar e instalar la App Nativa de Fudo' -Type 'nativa.install' -Target 'FudoNativa' `
+    if ($localDescartado) {
+        # Punto de partida conocido: si la descarga se corta antes de instalar, lo que quede
+        # anotado tiene que decir que no quedo, no lo que dijo una corrida anterior.
+        $script:Diagnostics['nativaInstall'] = [ordered]@{
+            intento = $true; instalador = ('descarga: ' + [string]$url); versionInstalador = ''
+            quedoInstalada = $false; versionDespues = ''; exitCode = $null; corriendo = $null
+            motivo = 'la descarga no llego a instalar la Nativa' }
+    }
+    $resDescarga = (Invoke-Remediation -Description 'Descargar e instalar la App Nativa de Fudo' -Type 'nativa.install' -Target 'FudoNativa' `
         -Before 'no instalada' -After 'instalada' -Reversible $true -Fix {
-            $notas = @()
-            # 1) exclusiones ANTES de bajar el instalador: si no, el AV lo borra en la descarga
-            if ($UseDefenderExclusions) {
-                $rutasExcl = @($env:TEMP)
-                if ($env:LOCALAPPDATA) { $rutasExcl += @((Join-Path $env:LOCALAPPDATA 'Fudo'), (Join-Path $env:LOCALAPPDATA 'Programs')) }
-                foreach ($ruta in @($rutasExcl | Where-Object { $_ })) {
-                    try { Add-MpPreference -ExclusionPath $ruta -ErrorAction SilentlyContinue; $notas += "excl $ruta" } catch {}
-                }
-                try { Add-MpPreference -ExclusionProcess "$FudoAppProcess*.exe" -ErrorAction SilentlyContinue } catch {}
-            }
-            # 2) descargar
-            $esMsi = ([string]$url -match '(?i)\.msi(\?|$)')
-            $destino = Join-Path $env:TEMP ('FudoNativa-' + (Get-Date).ToString('yyyyMMddHHmmss') + $(if ($esMsi) { '.msi' } else { '.exe' }))
-            Write-StepDetail 'descargando el instalador de la App Nativa (58 MB)'
-            $bajada = Get-FileWithProgress -Url $url -Destino $destino -TimeoutSec 300 -Que 'la App Nativa'
-            $script:Diagnostics['nativaDescarga'] = [ordered]@{
-                url = [string]$url; bytes = [long]$bajada.bytes; segundos = [int]$bajada.segundos
-                ok = [bool]$bajada.ok; error = [string]$bajada.error }
-            if (-not [bool]$bajada.ok) {
-                throw ('no se pudo descargar el instalador de la App Nativa: ' + [string]$bajada.error +
-                       '. Pasarlo a mano y dejarlo al lado de FudoPrintDoctor.cmd.')
-            }
-            $notas += ('descarga: ' + [int]([long]$bajada.bytes / 1MB) + ' MB en ' + [int]$bajada.segundos + 's')
-            # El antivirus se lleva el instalador MIENTRAS se descarga: en la telemetria hay 14
-            # detecciones de Defender sobre archivos .crdownload de Chrome, o sea antes de que
-            # nadie lo ejecute. Cuando pasa, Invoke-WebRequest termina bien y el archivo ya no
-            # esta. Sin este chequeo el motor diria 'no se pudo lanzar el instalador' y manda al
-            # asesor a buscar el problema en el lugar equivocado.
-            if (-not (Test-Path $destino)) {
-                throw 'el instalador se descargo y despues desaparecio: se lo llevo el antivirus. Excluir la carpeta temporal en el antivirus y reintentar, o pasar el instalador a mano.'
-            }
-            $tam = 0
-            try { $tam = [int]((Get-Item $destino -ErrorAction Stop).Length / 1024) } catch {}
-            if ($tam -lt 100) { throw "el archivo descargado pesa ${tam}KB: no parece un instalador (revisar la URL, o el antivirus lo vacio)" }
-            $notas += "instalador descargado (${tam}KB)"
-            # 3) verificar la firma ANTES de ejecutarlo
-            $firma = Test-FudoInstallerSignature -Path $destino
-            try {
-                $script:Diagnostics['nativaDescarga']['tamKB'] = $tam
-                $script:Diagnostics['nativaDescarga']['firmaEstado'] = [string]$firma.estado
-                $script:Diagnostics['nativaDescarga']['firmante'] = [string]$firma.firmante
-                $script:Diagnostics['nativaDescarga']['firmaOk'] = [bool]$firma.ok
-            } catch {}
-            if (-not [bool]$firma.ok) {
-                try { Remove-Item $destino -Force -ErrorAction SilentlyContinue } catch {}
-                throw ('el instalador descargado no tiene firma valida de Fudo (' + [string]$firma.estado + '): NO se ejecuto. Descargarlo a mano desde la web app.')
-            }
-            $notas += ('firma verificada (' + [string]$firma.estado + ')')
-            # 4) ejecutar. Un .msi no se lanza directo -abriria el asistente en la pantalla del
-            #    cliente-: Invoke-NativeInstallerFile ya resuelve msiexec /qn.
-            Write-StepDetail 'ejecutando el instalador de la App Nativa'
-            $code = Invoke-NativeInstallerFile -Path $destino -ExtraArgs $NativeInstallerArgs
-            if ([bool]$script:CerroNativaParaInstalar) { $notas += 'se cerro la App Nativa para poder reemplazarla' }
-            $notas += (Get-InstallerExitNote -Code $code)
-            Start-Sleep -Seconds 3
+            # v3.31: los pasos 1 a 4 viven en Invoke-FudoNativeDownload, que usa tambien la
+            # actualizacion. Si algo falla, tira y la reparacion no se da por aplicada.
+            $dl = Invoke-FudoNativeDownload -Url $url
+            $notas = @($dl.notas)
+            $code = $dl.code
             # 5) verificar el EFECTO, no el codigo de salida: es la regla del proyecto y este
             #    camino nunca la habia cumplido (miraba solo si el proceso estaba corriendo, que
             #    con Fudo cerrado es normal que no lo este).
@@ -14397,6 +15046,23 @@ function Install-FudoNative {
                         else { 'NO quedo instalada: revisar si el antivirus la borro despues de instalar' })
             ($notas -join ' | ')
         })
+    if ($localDescartado) {
+        $quedoDesc = $false
+        try { if ($script:Diagnostics.Contains('nativaInstall')) { $quedoDesc = [bool]$script:Diagnostics['nativaInstall'].quedoInstalada } } catch {}
+        if (-not $quedoDesc) {
+            Write-Host ("  La descarga no dejo la Nativa instalada: se prueba con el instalador de la PC (v$localDescartado).") -ForegroundColor Yellow
+            $resLocal = Install-FudoNative -SinDescarga
+            try {
+                if ($script:Diagnostics.Contains('nativaInstall')) {
+                    $script:Diagnostics['nativaInstall']['descargaFallida'] = $true
+                    $script:Diagnostics['nativaInstall']['localDescartado'] = $localDescartado
+                }
+            } catch {}
+            return $resLocal
+        }
+        try { $script:Diagnostics['nativaInstall']['localDescartado'] = $localDescartado } catch {}
+    }
+    return $resDescarga
 }
 
 function Get-TelemetryUrl {
@@ -14595,6 +15261,22 @@ function ConvertTo-TelemetryChecks {
     })
 }
 
+function Get-TelemetryDiagnosticsExtra {
+    <#
+      v3.31 (bitacora 21/09-27/09): cinco datos que el motor anotaba en $script:Diagnostics, que
+      el CHANGELOG daba por enviados, y que Send-Telemetry nunca ponia en el payload: 0 de 9
+      descargas con nativaDescarga, 0 de 70 corridas 3.25+ con la eleccion de impresora/puerto,
+      0 de 44 corridas 3.29+ con el modo protegido y el USB sin enumerar. El "mirar firmaOk el
+      mismo dia" de la 3.24 no se podia hacer. Van en una funcion aparte para que el self-test
+      pueda ver las claves sin mandar nada.
+    #>
+    $out = [ordered]@{}
+    foreach ($k in @('nativaDescarga', 'eleccionImpresora', 'eleccionPuerto', 'modoImpresionProtegido', 'usbSinEnumerar', 'extensionAbierta')) {
+        $out[$k] = $(if ($script:Diagnostics.Contains($k)) { $script:Diagnostics[$k] } else { $null })
+    }
+    return $out
+}
+
 function Send-Telemetry {
     <#
       Manda el resultado a un endpoint para no depender de que el asesor guarde el JSON.
@@ -14721,6 +15403,8 @@ function Send-Telemetry {
                         } else { $null }
                     )
                     $t['nativaInstall'] = $(if ($script:Diagnostics.Contains('nativaInstall')) { $script:Diagnostics['nativaInstall'] } else { $null })
+                    $extra = Get-TelemetryDiagnosticsExtra
+                    foreach ($kx in @($extra.Keys)) { $t[$kx] = $extra[$kx] }
                     # v3.16: impresoras vistas en una subred distinta a la del PC, con su MAC.
                     # La MAC es lo que permite armar la tabla de OUIs por fabricante con datos
                     # reales en vez de adivinarla, y el plan dice si el motor pudo resolver la
