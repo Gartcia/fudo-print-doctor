@@ -1457,7 +1457,6 @@ $script:TelemetryLookup = @()
 $script:StepPlan = [ordered]@{
     'layer0.environment'        = 'Entorno de Windows'
     'layer0.quickQueue'         = 'Colas trabadas'
-    'layer0b.nativeApp'         = 'App Nativa de Fudo y antivirus'
     'layer1a.hardwareInventory' = 'Impresoras conectadas'
     'layer1.resolvePrinter'     = 'Impresora en Windows'
     'layer1.printerState'       = 'Estado de la impresora'
@@ -1465,6 +1464,7 @@ $script:StepPlan = [ordered]@{
     'layer3.usbPort'            = 'Puerto USB'
     'layer3.network'            = 'Conexion de red'
     'layer4.hardwarePrint'      = 'Prueba de impresion'
+    'layer0b.nativeApp'         = 'App Nativa de Fudo y antivirus'
     'layer5.fudoConfig'         = 'Configuracion de Fudo'
     'final.rescan'              = 'Estado final de las impresoras'
     'final.otherQueues'         = 'Comandas encoladas'
@@ -9158,7 +9158,7 @@ function Invoke-FudoPrintDoctor {
     if ($envOk) {
         # v3.32: lo mas rapido primero. Ver Invoke-PurgaTemprana.
         $null = Invoke-Step -Name 'layer0.quickQueue' -Body { Invoke-PurgaTemprana }
-        $null = Invoke-Step -Name 'layer0b.nativeApp' -Body { Test-Layer0b-NativeApp }
+        # v3.32: la App Nativa (capa 0b) se revisa DESPUES de la prueba de papel, ver mas abajo.
         $null = Invoke-Step -Name 'layer0c.staleQueues' -Body { Remove-StaleOwnQueues }
         $null = Invoke-Step -Name 'layer1a.hardwareInventory' -Body { Test-Layer1a-HardwareInventory }
         $null = Invoke-Step -Name 'layer1a.orphanOwnQueues' -Body { Remove-OrphanOwnQueues }
@@ -9192,7 +9192,19 @@ function Invoke-FudoPrintDoctor {
             $null = Invoke-Step -Name 'layer3.network' -Body { Test-Layer3-Network -Printer $printer }
         }
         $null = Invoke-Step -Name 'layer4.hardwarePrint' -Body { Test-Layer4-HardwarePrint -Printer $printer -DetectedInterface $detectedInterface }
+        # v3.32 (feedback de soporte del 28/09): la App Nativa pasa despues de la prueba de papel.
+        # La prueba no la necesita -imprime directo por Windows-, y es lo lento de la corrida: en
+        # el caso que lo motivo fue una descarga de 58 MB mas la instalacion, antes de que el
+        # asesor viera una sola pregunta sobre la impresora. Asi, "salio el papel?" llega en el
+        # primer minuto. Sigue siendo capa 0 para la causa raiz: el orden de EJECUCION cambia, el
+        # de prioridad no (Resolve-Diagnosis ordena por capa, no por cuando se registro).
+        $null = Invoke-Step -Name 'layer0b.nativeApp' -Body { Test-Layer0b-NativeApp }
         $null = Invoke-Step -Name 'layer5.fudoConfig' -Body { Test-Layer5-FudoConfig -DetectedInterface $detectedInterface }
+    }
+    # Con el corte por modo no hay impresora que probar, pero la App Nativa se revisa igual: no
+    # depende de que impresora se eligio (antes corria antes del corte).
+    if ($envOk -and $script:AbortByMode) {
+        $null = Invoke-Step -Name 'layer0b.nativeApp' -Body { Test-Layer0b-NativeApp }
     }
 
     # Colas temporales: SE BORRAN salvo que hayan servido para algo (una cola de prueba que
@@ -13593,7 +13605,20 @@ public class FudoFakeEndpoint {
     # El paso va antes que la App Nativa, que es la parte lenta.
     $main141 = (Get-Command Invoke-FudoPrintDoctor -ErrorAction SilentlyContinue)
     $cuerpo141 = $(if ($main141) { $main141.ScriptBlock.ToString() } else { '' })
-    Assert-Eq 'S141 la limpieza va antes que la App Nativa' $true ([bool]($cuerpo141 -and $cuerpo141.IndexOf('layer0.quickQueue') -ge 0 -and $cuerpo141.IndexOf('layer0.quickQueue') -lt $cuerpo141.IndexOf('layer0b.nativeApp')))
+    Assert-Eq 'S141 la limpieza va antes que la App Nativa' $true ([bool]($cuerpo141 -and $cuerpo141.IndexOf('layer0.quickQueue') -ge 0 -and $cuerpo141.IndexOf('layer0.quickQueue') -lt $cuerpo141.IndexOf("Name 'layer0b.nativeApp'")))
+    # Escenario 142 (v3.32): la App Nativa se revisa despues de la prueba de papel y antes de la
+    # configuracion de Fudo; con el corte por modo, se revisa igual.
+    $iPapel = $cuerpo141.IndexOf("Name 'layer4.hardwarePrint'")
+    $iNat   = $cuerpo141.IndexOf("Name 'layer0b.nativeApp'")
+    $iFudo  = $cuerpo141.IndexOf("Name 'layer5.fudoConfig'")
+    Assert-Eq 'S142 la App Nativa va despues de la prueba de papel' $true ([bool]($iPapel -ge 0 -and $iNat -gt $iPapel))
+    Assert-Eq 'S142 y antes de la configuracion de Fudo' $true ([bool]($iFudo -gt $iNat))
+    Assert-Eq 'S142 con el corte por modo se revisa igual' $true ([bool]($cuerpo141 -match '(?s)AbortByMode\)\s*\{\s*\$null = Invoke-Step -Name ''layer0b\.nativeApp'''))
+    # La prioridad de la causa raiz no cambia por el orden de ejecucion: la Nativa sigue siendo capa 0.
+    Reset-State
+    Add-Check -Id 'printer.offline' -Layer 1 -Name 'Impresora offline' -Status 'fail' -RootCauseCandidate $true -Plane 'os'
+    Add-Check -Id 'nativa.installed' -Layer 0 -Name 'App Nativa de Fudo NO instalada' -Status 'fail' -RootCauseCandidate $true -Plane 'fudo_config'
+    Assert-Eq 'S142 registrada despues, la Nativa sigue ganando como causa' 'nativa.installed' ([string](Resolve-Diagnosis).rootCauseCheckId)
     # Y cada paso deja su tiempo para la telemetria.
     Reset-State
     $script:StepTimes = [ordered]@{}

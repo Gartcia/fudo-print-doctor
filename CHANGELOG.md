@@ -4,7 +4,7 @@ Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado
 
 ## [3.32] - 2026-09-28
 
-**Lo más rápido primero, y cinco correcciones que salieron de una sola corrida.** El mismo día
+**Lo más rápido primero, y las correcciones que salieron de una sola corrida.** El mismo día
 que salió la 3.31, un asesor contó en el canal que al entrar a la PC ya vio que la solución era
 limpiar la cola, y que el motor le hizo esperar seis minutos para ofrecérselo. Otro asesor se sumó
 con los casos donde la gestión a mano es más rápida. Revisando esa corrida en la telemetría
@@ -58,7 +58,24 @@ asesor dice que no, no se le vuelve a preguntar por esa cola más adelante.
 Rompe a propósito el orden de capas. El orden existe para no diagnosticar arriba lo que está roto
 abajo; esto no es un diagnóstico, es la reparación más rápida y más frecuente.
 
-### 5. En Windows 7 la versión que va es la 0.0.18
+### 5. La App Nativa se revisa después de la prueba de papel
+
+Era la segunda cosa que hacía el motor, y la más lenta: en la corrida del asesor, 58 MB de descarga
+más la instalación antes de una sola pregunta sobre la impresora. **La prueba de papel no necesita
+la Nativa**: imprime directo por Windows. El orden de ejecución ahora es:
+
+entorno → cola trabada → impresoras, cola y puerto → **prueba de papel** → App Nativa y extensión →
+configuración de Fudo
+
+Así, *"¿salió el papel?"* —la respuesta que más le importa al asesor— llega en el primer minuto, y
+lo lento queda para después. Lo que no cambia es la **prioridad**: la Nativa sigue siendo capa 0
+para elegir la causa raíz, porque el diagnóstico ordena por capa y no por el momento en que se
+revisó cada cosa. Si el asesor eligió un modo sin impresoras de ese tipo, la Nativa se revisa igual.
+
+Con los tiempos por paso que empiezan a viajar en esta versión se va a poder confirmar en una
+semana cuánto se ganó.
+
+### 6. En Windows 7 la versión que va es la 0.0.18
 
 Lo confirmaron dos personas de soporte por separado. El motor le recomendaba la 0.0.38 a esas PCs
 e intentaba actualizarla. Ahora, en Windows 7, Vista y XP la recomendada es la 0.0.18: con esa
@@ -75,6 +92,8 @@ queden intactos; que la impresora vieja no bloquee con papel confirmado y sí bl
 con Fudo imprimiendo ahí o sin papel; que no se afirme la versión vieja después de instalar; la
 0.0.18 en Windows 7; y la limpieza al arrancar (sólo colas trabadas de verdad, el "no" que se
 recuerda, el modo agente, que vaya antes de la App Nativa y que cada paso deje su tiempo).
+**Escenario 142**: la Nativa va después de la prueba de papel y antes de la configuración de Fudo,
+se revisa igual con el corte por modo, y sigue ganando como causa raíz aunque se registre después.
 
 ## [3.31] - 2026-09-28
 
