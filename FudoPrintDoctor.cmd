@@ -26,7 +26,7 @@ REM      avisa y sigue por consola. La interfaz no puede ser condicion
 REM      para diagnosticar en la PC de un cliente que ya tiene un
 REM      problema.
 REM ================================================================
-REM  LAUNCHER-VERSION: 5   <- subir esto cuando cambie este archivo. El
+REM  LAUNCHER-VERSION: 6   <- subir esto cuando cambie este archivo. El
 REM  updater no lo pisa (lleva la URL de telemetria), asi que hoy la copia
 REM  interna se distribuye a mano. El marcador queda para que el updater
 REM  pueda comparar y refrescarlo preservando la URL.
@@ -47,6 +47,21 @@ set "FPD_MOTOR=%~dp0FudoPrintDoctor.ps1"
 set "FPD_JSON=%~dp0resultado.json"
 set "FPD_RAW=https://raw.githubusercontent.com/Gartcia/fudo-print-doctor/main"
 
+REM ----------------------------------------------------------------
+REM  1) Puede esta PC correr el motor?
+REM  El sondeo se escribe con sintaxis de PowerShell 2.0 a proposito:
+REM  tiene que poder correr justamente en las PCs que vamos a rechazar.
+REM ----------------------------------------------------------------
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$m=0; try { $m=$PSVersionTable.PSVersion.Major } catch {}; if ($m -lt 5) { exit 10 }; if (-not (Get-Command Get-Printer -ErrorAction SilentlyContinue)) { exit 11 }; exit 0"
+if errorlevel 12 goto sin_powershell
+if errorlevel 11 goto windows_viejo
+if errorlevel 10 goto ps_vieja
+REM  Launcher 6 (29/09/2026): este sondeo va ANTES de pedir permisos de
+REM  administrador. Antes iba despues, y en una PC con Windows 7 el asesor
+REM  pasaba por el pedido de permisos -que por TeamViewer deja la pantalla
+REM  en negro hasta que el cliente acepta- para terminar leyendo que el
+REM  motor no puede correr ahi. El sondeo no necesita ser administrador.
+
 net session >nul 2>&1
 if errorlevel 1 goto elevar
 goto admin_ok
@@ -57,15 +72,6 @@ powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
 exit /b
 
 :admin_ok
-REM ----------------------------------------------------------------
-REM  1) Puede esta PC correr el motor?
-REM  El sondeo se escribe con sintaxis de PowerShell 2.0 a proposito:
-REM  tiene que poder correr justamente en las PCs que vamos a rechazar.
-REM ----------------------------------------------------------------
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$m=0; try { $m=$PSVersionTable.PSVersion.Major } catch {}; if ($m -lt 5) { exit 10 }; if (-not (Get-Command Get-Printer -ErrorAction SilentlyContinue)) { exit 11 }; exit 0"
-if errorlevel 12 goto sin_powershell
-if errorlevel 11 goto windows_viejo
-if errorlevel 10 goto ps_vieja
 
 REM ----------------------------------------------------------------
 REM  2) El motor tiene que ser la version publicada, no la que quedo.
@@ -119,10 +125,10 @@ echo     - App Nativa de Fudo en cuarentena del antivirus
 echo     - puerto USB cambiado
 echo     - driver e instalacion de la impresora, si falta
 echo.
-echo   Se abre solo en el navegador de esta PC. Ahi vas a ver lo que
-echo   va encontrando y ahi te va a preguntar lo que necesite.
+echo   Se abre sola una ventana con el diagnostico. Ahi vas a ver lo
+echo   que va encontrando y ahi te va a preguntar lo que necesite.
 echo   NO cierres esta ventana: el diagnostico corre aca.
-echo   Si el navegador no abre, la direccion queda escrita aca abajo.
+echo   Si la ventana no abre, la direccion queda escrita aca abajo.
 echo.
 echo   La pantalla esta hecha para que la pueda mirar el cliente
 echo   mientras vos la usas.
@@ -139,10 +145,10 @@ echo   saber si quedo resuelto, asi que conviene tener la impresora
 echo   a la vista.
 echo   Si hay comandas trabadas en la cola, primero te pregunta.
 echo.
-echo   Enter para empezar, o cerra esta ventana para cancelar.
 echo  ================================================================
-pause >nul
 echo.
+REM  Launcher 6: ya no espera un Enter. Lo pidio un asesor (29/09): era
+REM  un paso mas antes de llegar a lo unico que hay que cargar, el ID.
 
 REM  El resultado anterior se borra ANTES de correr: es la unica forma
 REM  de saber despues si el motor llego a escribir el de esta corrida.
@@ -163,7 +169,7 @@ REM  URL de reporte, por eso no se pisa-, asi que hay asesores con launchers vie
 REM  no habia forma de saber quienes: una corrida que no arranca no reporta nada, y un
 REM  launcher anterior al 10/09/2026 puede escribir RESUELTO sin que el motor corra.
 REM  Al publicar un .cmd nuevo, actualizar esta fecha.
-set "FPD_STAMP=2026-09-21"
+set "FPD_STAMP=2026-09-29"
 powershell -NoProfile -ExecutionPolicy Bypass -File "%FPD_MOTOR%" -Ui web -NoNativaKitCheck -LauncherStamp "%FPD_STAMP%" -JsonOut "%FPD_JSON%"
 set FPD_EXIT=%errorlevel%
 

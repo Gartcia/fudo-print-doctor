@@ -484,7 +484,7 @@ $script:TestPrinterRx = '(?i)^FUDO-TEST-'
 # puerto tenga hardware; si el hardware se va, deja de serlo (ver Remove-OrphanOwnQueues).
 $script:OwnQueueRx   = '(?i)^FUDO-(TEST-|USB\d)'
 $script:TestDocRx    = '(?i)fudo print doctor'
-$script:SchemaVersion = '3.33'
+$script:SchemaVersion = '3.34'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -1766,11 +1766,62 @@ function Start-DoctorUi {
 
     $script:UiUrl = 'http://127.0.0.1:' + [string]$Puerto + '/?t=' + [string]$estado.Token
     if (-not $UiNoOpen) {
-        try { $null = Start-Process -FilePath $script:UiUrl } catch {
-            Write-DoctorLog -Level 'WARN' -Message 'No se pudo abrir el navegador solo; hay que pegar la direccion a mano.'
+        $comoAbrio = Open-UiVentana -Url $script:UiUrl
+        try { $script:Diagnostics['uiApertura'] = [string]$comoAbrio } catch {}
+        if (-not $comoAbrio) {
+            Write-DoctorLog -Level 'WARN' -Message 'No se pudo abrir la ventana del diagnostico sola; hay que pegar la direccion a mano.'
         }
     }
     return $true
+}
+
+function Find-EdgeExe {
+    <# Donde esta msedge.exe, o '' si no esta. Aislada para poder mockearla en el self-test. #>
+    $cands = @()
+    try { if (${env:ProgramFiles(x86)}) { $cands += (Join-Path ${env:ProgramFiles(x86)} 'Microsoft\Edge\Application\msedge.exe') } } catch {}
+    try { if ($env:ProgramFiles) { $cands += (Join-Path $env:ProgramFiles 'Microsoft\Edge\Application\msedge.exe') } } catch {}
+    try { if ($env:LOCALAPPDATA) { $cands += (Join-Path $env:LOCALAPPDATA 'Microsoft\Edge\Application\msedge.exe') } } catch {}
+    foreach ($c in $cands) { try { if (Test-Path -LiteralPath $c) { return [string]$c } } catch {} }
+    return ''
+}
+
+function Start-VentanaEdge {
+    <#
+      Abre la direccion en una ventana propia de Edge, en modo aplicacion (sin pestanas ni barra
+      de direcciones) y con un perfil aparte en %TEMP%. Aislada para poder mockearla.
+      El perfil aparte es lo que la hace independiente del navegador del cliente: no se mezcla con
+      sus pestanas ni con su sesion de Fudo, y arranca aunque Edge ya este abierto. Es siempre la
+      misma carpeta, asi que no crece de corrida en corrida.
+    #>
+    param([string]$Edge, [string]$Url)
+    if ($SelfTest) { throw 'self-test: el motor no abre ventanas (mockear Start-VentanaEdge)' }
+    $perfil = Join-Path $env:TEMP 'FudoPrintDoctor-ui'
+    Start-Process -FilePath $Edge -ArgumentList @(('--app=' + $Url), ('--user-data-dir="' + $perfil + '"'),
+        '--no-first-run', '--no-default-browser-check', '--window-size=1180,860') -ErrorAction Stop
+}
+
+function Open-UiVentana {
+    <#
+      v3.34 (feedback de un asesor, 29/09): la interfaz se abria con el navegador predeterminado
+      de la PC. En una PC lenta tardaba en abrir, y muchas veces abria uno distinto del que el
+      cliente usa para Fudo -el predeterminado no es el de Fudo-, y ademas lo abria con los
+      permisos de administrador del motor.
+      Ahora se abre en una ventana propia de Edge (ver Start-VentanaEdge), que viene en todos los
+      Windows 10 y 11. Si no hay Edge, o no abre, el navegador predeterminado SIN elevar (como la
+      pagina de la extension, ver Start-UrlComoUsuario), y recien si eso tambien falla, como antes.
+      Devuelve como se abrio: 'edge', 'navegador', 'navegador-elevado' o '' si no se pudo.
+    #>
+    param([string]$Url)
+    $edge = ''
+    try { $edge = [string](Find-EdgeExe) } catch {}
+    if ($edge) {
+        try { Start-VentanaEdge -Edge $edge -Url $Url; return 'edge' } catch {}
+    }
+    try { Start-UrlComoUsuario -Url $Url; return 'navegador' } catch {}
+    if (-not $SelfTest) {
+        try { $null = Start-Process -FilePath $Url -ErrorAction Stop; return 'navegador-elevado' } catch {}
+    }
+    return ''
 }
 
 function Stop-DoctorUi {
@@ -13354,7 +13405,7 @@ public class FudoFakeEndpoint {
     $script:Diagnostics['nativaDescarga'] = [ordered]@{ firmaOk = $true; bytes = 1 }
     $script:Diagnostics['modoImpresionProtegido'] = [ordered]@{ activo = $false; origen = '' }
     $x134 = Get-TelemetryDiagnosticsExtra
-    Assert-Eq 'S134 viajan las cinco claves (y las de los escenarios 135, 141 y 143)' 'nativaDescarga,eleccionImpresora,eleccionPuerto,modoImpresionProtegido,usbSinEnumerar,extensionAbierta,purgaTemprana,tiempos,hardware' (@($x134.Keys) -join ',')
+    Assert-Eq 'S134 viajan las cinco claves (y las de los escenarios 135, 141, 143 y 144)' 'nativaDescarga,eleccionImpresora,eleccionPuerto,modoImpresionProtegido,usbSinEnumerar,extensionAbierta,purgaTemprana,uiApertura,tiempos,hardware' (@($x134.Keys) -join ',')
     Assert-Eq 'S134 con su contenido' $true ([bool]$x134['nativaDescarga'].firmaOk)
     Assert-Eq 'S134 Send-Telemetry las pone en el payload' $true ([bool]((Get-Command Send-Telemetry).ScriptBlock.ToString() -match 'Get-TelemetryDiagnosticsExtra'))
     Reset-State
@@ -13678,6 +13729,32 @@ public class FudoFakeEndpoint {
     $null = Invoke-Step -Name 'test.tiempo' -Body { 1 }
     Assert-Eq 'S141 cada paso deja su tiempo' $true ([bool]($script:StepTimes.Contains('test.tiempo')))
     Reset-Mocks
+    Reset-State
+
+    # -----------------------------------------------------------------------
+    # Escenario 144 (v3.34): la interfaz se abre en una ventana propia de Edge, no con el
+    # navegador predeterminado (que muchas veces no es el del cliente) ni con permisos de admin.
+    Reset-State
+    Reset-Mocks
+    $script:abrio144 = @()
+    function Find-EdgeExe { 'C:\Edge\msedge.exe' }
+    function Start-VentanaEdge { param($Edge, $Url) $script:abrio144 += ('edge|' + [string]$Edge + '|' + [string]$Url) }
+    function Start-UrlComoUsuario { param($Url) $script:abrio144 += ('navegador|' + [string]$Url) }
+    Assert-Eq 'S144 con Edge se abre su ventana' 'edge' (Open-UiVentana -Url 'http://127.0.0.1:5/?t=x')
+    Assert-Eq 'S144 con la direccion de la interfaz' 'edge|C:\Edge\msedge.exe|http://127.0.0.1:5/?t=x' (@($script:abrio144) -join ';')
+    # Sin Edge, el navegador predeterminado sin elevar.
+    $script:abrio144 = @()
+    function Find-EdgeExe { '' }
+    Assert-Eq 'S144 sin Edge, el navegador sin elevar' 'navegador' (Open-UiVentana -Url 'http://127.0.0.1:5/')
+    # Si Edge esta pero no abre, tambien.
+    $script:abrio144 = @()
+    function Find-EdgeExe { 'C:\Edge\msedge.exe' }
+    function Start-VentanaEdge { param($Edge, $Url) throw 'no abre' }
+    Assert-Eq 'S144 si Edge no abre, el navegador sin elevar' 'navegador' (Open-UiVentana -Url 'http://127.0.0.1:5/')
+    # Y en el self-test nunca se abre nada de verdad.
+    Reset-Mocks
+    Assert-Eq 'S144 en el self-test no se abre ninguna ventana' '' (Open-UiVentana -Url 'http://127.0.0.1:5/')
+    Assert-Eq 'S144 la interfaz usa esta apertura' $true ([bool]((Get-Command Start-DoctorUi).ScriptBlock.ToString() -match 'Open-UiVentana'))
     Reset-State
 
     Write-Host ""
@@ -15791,7 +15868,7 @@ function Get-TelemetryDiagnosticsExtra {
       pueda ver las claves sin mandar nada.
     #>
     $out = [ordered]@{}
-    foreach ($k in @('nativaDescarga', 'eleccionImpresora', 'eleccionPuerto', 'modoImpresionProtegido', 'usbSinEnumerar', 'extensionAbierta', 'purgaTemprana')) {
+    foreach ($k in @('nativaDescarga', 'eleccionImpresora', 'eleccionPuerto', 'modoImpresionProtegido', 'usbSinEnumerar', 'extensionAbierta', 'purgaTemprana', 'uiApertura')) {
         $out[$k] = $(if ($script:Diagnostics.Contains($k)) { $script:Diagnostics[$k] } else { $null })
     }
     # v3.32: cuanto tardo cada paso (ver StepTimes).

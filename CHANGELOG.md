@@ -2,6 +2,53 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.34] - 2026-09-29
+
+**Menos pasos antes de llegar al diagnóstico.** Salió del feedback que sumaron cuatro asesores en el
+canal el 28 y el 29/09. Trae un launcher nuevo (versión 6) **que hay que repartir**: dos de los
+tres cambios viven en el `.cmd`, y el `.cmd` no se actualiza solo.
+
+### 1. En Windows 7 ya no pide permisos de administrador para nada
+
+El launcher pedía los permisos de administrador y **después** revisaba si la PC podía correr el
+motor. En una PC con Windows 7 el orden era: la pantalla de TeamViewer queda en negro, el cliente
+tiene que aceptar, y recién ahí aparece *"esta PC no puede correr el diagnóstico"*. Una asesora
+contó que muchas veces el cliente no acepta, la sesión se cierra y resuelve a mano. Ahora el
+chequeo va primero: en esas PCs el aviso sale al instante, sin el pedido de permisos.
+
+Aclaración que salió de revisar esto: **en Windows 7 el motor no corre nunca**, aunque la PC tenga
+PowerShell 5, porque necesita la administración de impresoras de Windows, que existe desde Windows
+8. Lo de la 0.0.18 para Windows 7 de la 3.32 queda como está, pero en la práctica no se usa.
+
+### 2. La interfaz se abre en su propia ventana
+
+La interfaz se abría con el navegador predeterminado de la PC. Un asesor contó lo que eso
+implicaba: en una PC lenta tardaba, y muchas veces abría un navegador distinto del que el cliente
+usa para Fudo. Además lo abría con los permisos de administrador del motor.
+
+Ahora se abre en una ventana propia de Edge, que viene en todos los Windows 10 y 11: sin pestañas
+ni barra de direcciones, con un perfil aparte, sin mezclarse con el navegador ni con la sesión de
+Fudo del cliente. Si no hay Edge, o no abre, se usa el navegador predeterminado **sin** permisos de
+administrador. Cómo se abrió viaja en la telemetría (`uiApertura`).
+
+**Probado en una PC real, con el motor corriendo como administrador** (el caso del cliente): se
+abrió rápido una ventana sola de Edge con el diagnóstico, y el navegador de siempre no se tocó.
+
+### 3. No espera un Enter para empezar
+
+El launcher mostraba las instrucciones y esperaba un Enter. Era un paso más antes de lo único que
+hay que cargar, el ID de la conversación. Las instrucciones siguen en pantalla; ya no frena.
+
+### Lo que no se hizo, a propósito
+
+**Avisar antes del pedido de permisos** que la pantalla de TeamViewer se va a poner negra: es algo
+con lo que el soporte ya convive para cualquier acción de administrador, y un aviso más no lo
+resuelve.
+
+**Escenario 144** del self-test: la ventana de Edge con la dirección de la interfaz, el navegador
+sin elevar cuando no hay Edge o no abre, que en el self-test no se abra nada, y que la interfaz use
+esta apertura.
+
 ## [3.33] - 2026-09-28
 
 **Qué impresora es, no solo cómo se llama la cola.** Se pidió la distribución de impresoras de
