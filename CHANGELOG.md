@@ -5,8 +5,8 @@ Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado
 ## [3.34] - 2026-09-29
 
 **Menos pasos antes de llegar al diagnóstico.** Salió del feedback que sumaron cuatro asesores en el
-canal el 28 y el 29/09. Trae un launcher nuevo (versión 6) **que hay que repartir**: dos de los
-tres cambios viven en el `.cmd`, y el `.cmd` no se actualiza solo.
+canal el 28 y el 29/09. Trae un launcher nuevo (versión 6) y un actualizador nuevo **que hay que
+repartir**: casi todo vive en los `.cmd`, y los `.cmd` no se actualizan solos.
 
 ### 1. En Windows 7 ya no pide permisos de administrador para nada
 
@@ -38,6 +38,23 @@ abrió rápido una ventana sola de Edge con el diagnóstico, y el navegador de s
 
 El launcher mostraba las instrucciones y esperaba un Enter. Era un paso más antes de lo único que
 hay que cargar, el ID de la conversación. Las instrucciones siguen en pantalla; ya no frena.
+
+### 4. Los archivos ya no llegan "bloqueados" a la PC del cliente
+
+Lo contó un asesor el 29/09: lo que se baja con el navegador —el ZIP que se comparte por Slack o
+Drive— lleva la marca de Windows de *"este archivo proviene de otro equipo"*. La marca sobrevive a
+descomprimir y a copiar, y en la PC del cliente hace que Windows pida confirmaciones de más, sobre
+todo en Windows 11. La solución a mano era tildar "Desbloquear" en Propiedades.
+
+Ahora lo hacen solos, y sólo sobre los archivos de la herramienta: el
+`Actualizar-FudoPrintDoctor.cmd` desmarca los de su carpeta cada vez que actualiza (así lo que el
+asesor copia al cliente ya va limpio), y el `FudoPrintDoctor.cmd` se desmarca a sí mismo y al motor
+en la PC del cliente. La primera vez que se abre un archivo marcado Windows pregunta igual: un
+archivo no puede sacarse la marca antes de que lo abran. **También hay que repartir el
+`Actualizar-FudoPrintDoctor.cmd` nuevo**, que tampoco se actualiza solo.
+
+Probado con archivos marcados como bajados de internet: el actualizador dejó limpios los tres, y el
+launcher, los dos suyos.
 
 ### Lo que no se hizo, a propósito
 

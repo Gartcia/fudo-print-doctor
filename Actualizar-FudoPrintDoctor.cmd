@@ -45,6 +45,16 @@ move /y launcher.tmp "FudoPrintDoctor.cmd" >nul
 move /y motor.tmp "FudoPrintDoctor.ps1" >nul
 move /y version.tmp "version-descargada.txt" >nul
 
+REM  29/09/2026 (lo conto un asesor): los archivos que se bajan con el navegador
+REM  -el ZIP que se comparte por Slack o Drive- llevan la marca de Windows de
+REM  "descargado de internet". La marca sobrevive a descomprimir y a copiar, y en
+REM  la PC del cliente hace que Windows pida confirmaciones de mas, sobre todo en
+REM  Windows 11. Aca se les saca a los archivos de la herramienta, y solo a esos:
+REM  es lo mismo que tildar "Desbloquear" en Propiedades. Asi lo que el asesor
+REM  copia a la PC del cliente ya va limpio. Unblock-File no existe en PowerShell
+REM  2.0: ahi no hace nada.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "foreach ($f in @('FudoPrintDoctor.cmd','FudoPrintDoctor.ps1','Actualizar-FudoPrintDoctor.cmd')) { try { if (Test-Path -LiteralPath $f) { Unblock-File -LiteralPath $f -ErrorAction Stop } } catch {} }" >nul 2>&1
+
 echo.
 echo  ================================================================
 echo   Listo: Fudo Print Doctor v%NUEVA% en esta carpeta.

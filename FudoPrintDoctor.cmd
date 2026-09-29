@@ -62,6 +62,15 @@ REM  pasaba por el pedido de permisos -que por TeamViewer deja la pantalla
 REM  en negro hasta que el cliente acepta- para terminar leyendo que el
 REM  motor no puede correr ahi. El sondeo no necesita ser administrador.
 
+REM  Launcher 6: si este archivo o el motor llegaron con la marca de Windows
+REM  de "descargado de internet" (el ZIP que se comparte por Slack o Drive la
+REM  arrastra), se les saca aca, y solo a esos dos. La primera vez Windows
+REM  pregunta igual -un archivo no puede desmarcarse antes de que lo abran-,
+REM  pero las corridas siguientes en esta PC ya no. Lo mismo que tildar
+REM  "Desbloquear" en Propiedades.
+set "FPD_SELF=%~f0"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "foreach ($f in @($env:FPD_SELF, $env:FPD_MOTOR)) { try { if ($f -and (Test-Path -LiteralPath $f)) { Unblock-File -LiteralPath $f -ErrorAction Stop } } catch {} }" >nul 2>&1
+
 net session >nul 2>&1
 if errorlevel 1 goto elevar
 goto admin_ok
