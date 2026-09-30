@@ -2,6 +2,42 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.35] - 2026-09-30
+
+**Una cola que no contesta ya no deja la corrida colgada.** Lo reportó un asesor el 29/09: la
+herramienta quedó para siempre en *"Colas trabadas"*, sin ninguna pregunta en pantalla. Borró la
+caché, reintentó, y siempre ahí. Terminó resolviendo a mano. Esa corrida no llegó a la planilla:
+como nunca terminó, nunca reportó.
+
+Leer los trabajos de una cola no tenía límite de tiempo. Si Windows no contesta —una impresora
+compartida desde otra PC que está apagada, o el servicio de cola de impresión trabado—, el motor
+esperaba para siempre. **No era un riesgo nuevo**: el inventario de impresoras lee las colas igual y
+se habría trabado en el paso siguiente. La 3.32 sólo lo adelantó, al poner la limpieza de la cola en
+el primer paso.
+
+Ahora:
+
+- **Cada cola se lee con un límite de 8 segundos.** Si no contesta, se saltea, el diagnóstico sigue
+  y queda un aviso con su nombre: *"La cola de impresión no responde: X"*, con qué hacer. Si ni la
+  lista de impresoras de Windows contesta, se avisa lo mismo y se sigue.
+- **Las impresoras compartidas desde otra PC** (`\\PC\impresora`) no se revisan en la limpieza del
+  arranque: no se pueden limpiar desde esta PC y son las que más se cuelgan.
+- **En pantalla se ve qué cola está revisando**, así, si algo tarda, el asesor sabe cuál es.
+- El inventario usa el mismo límite, y no vuelve a esperar a una cola que ya no contestó.
+- Las colas que no contestaron viajan en la telemetría (`colasSinRespuesta`).
+
+Probado en una PC real: leer una cola tarda menos de un segundo la primera vez y 24 ms las
+siguientes; algo que se cuelga se abandona justo al vencer el límite, y la lectura siguiente anda.
+
+**De paso, lo que dicen los datos del paso nuevo de la 3.32**: en el campo se ofreció limpiar la
+cola al arrancar en 19 corridas y se aceptó en 18. Leer las colas tarda en general menos de un
+segundo; lo que se ve más largo es el tiempo que el asesor tarda en contestar.
+
+**Escenario 145** del self-test: el límite de verdad (lo que no termina se abandona y no se espera;
+lo que termina devuelve su valor), la limpieza que saltea la cola que no contesta y sigue con las
+otras, las compartidas que ni se consultan, el aviso con el nombre, y el inventario que no vuelve a
+esperar a esa cola.
+
 ## [3.34] - 2026-09-29
 
 **Menos pasos antes de llegar al diagnóstico.** Salió del feedback que sumaron cuatro asesores en el

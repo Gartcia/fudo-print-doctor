@@ -484,7 +484,7 @@ $script:TestPrinterRx = '(?i)^FUDO-TEST-'
 # puerto tenga hardware; si el hardware se va, deja de serlo (ver Remove-OrphanOwnQueues).
 $script:OwnQueueRx   = '(?i)^FUDO-(TEST-|USB\d)'
 $script:TestDocRx    = '(?i)fudo print doctor'
-$script:SchemaVersion = '3.34'
+$script:SchemaVersion = '3.35'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -1474,6 +1474,8 @@ $script:StepTotal   = 12     # usb y red son excluyentes
 # asi que no habia forma de saber que parte de una corrida es la lenta.
 $script:StepTimes   = [ordered]@{}
 $script:PurgaTempranaRechazada = @()
+# v3.35: el runspace donde se leen las colas con limite de tiempo (ver Invoke-ConLimite).
+$script:RunspaceLimite = $null
 $script:StepIndex   = 0
 $script:StepLabel   = ''
 $script:StepNote    = ''
@@ -5178,8 +5180,17 @@ function Get-PrinterQueues {
             }
         } catch {}
 
+        # v3.35: con limite de tiempo (ver Invoke-ConLimite). Una cola que no contesta se saltea y
+        # queda a la vista, en vez de dejar la corrida colgada para siempre.
         $jobs = @()
-        try { $jobs = @(Get-PrintJob -PrinterName $nombre -ErrorAction Stop) } catch {}
+        $noResponde = $false
+        if ($script:Diagnostics.Contains('colasSinRespuesta') -and (@($script:Diagnostics['colasSinRespuesta']) -contains $nombre)) {
+            $noResponde = $true
+        } else {
+            $lecI = Get-TrabajosDeCola -Nombre $nombre
+            if ([bool]$lecI.timeout) { $noResponde = $true; Add-ColaSinRespuesta -Nombre $nombre }
+            else { $jobs = @($lecI.jobs) }
+        }
         $masViejo = ''
         # Minutos que lleva esperando el trabajo mas viejo (-1 = no se pudo saber). La fecha
         # formateada sirve para el resumen en pantalla; para decidir si una cola esta trabada
@@ -6200,6 +6211,78 @@ function Test-Layer1-PrinterState {
 # ---------------------------------------------------------------------------
 # LAYER 2 - Salud de la cola de impresion
 # ---------------------------------------------------------------------------
+function Invoke-ConLimite {
+    <#
+      v3.35 (caso de un asesor del 29/09): la corrida quedo colgada para siempre en "Colas
+      trabadas" -se borro la cache, se reintento, y siempre ahi-, y el asesor termino resolviendo
+      a mano. Leer los trabajos de una cola (Get-PrintJob) no tiene limite de tiempo: si Windows
+      no contesta -una impresora compartida desde otra PC que esta apagada, el servicio de cola
+      trabado-, el motor espera para siempre, y como nunca termina, esa corrida no reporta nada.
+      No era un riesgo nuevo: el inventario lee las colas igual. La 3.32 solo lo adelanto.
+      Corre el bloque en un runspace aparte y lo abandona si no termina en TimeoutSec. El
+      runspace se reusa mientras no haya un timeout; si lo hay, se descarta (el hilo trabado en la
+      llamada a Windows no se puede matar, pero el motor ya no lo espera).
+      En el self-test corre directo, para que los mocks sigan valiendo; -Forzar prueba el
+      runspace de verdad. Devuelve @{ ok; timeout; valor }.
+    #>
+    param([scriptblock]$Script, [object[]]$Argumentos = @(), [int]$TimeoutSec = 8, [switch]$Forzar)
+    if ($SelfTest -and -not $Forzar) {
+        try { return @{ ok = $true; timeout = $false; valor = @(& $Script @Argumentos) } }
+        catch { return @{ ok = $false; timeout = $false; valor = @() } }
+    }
+    $ps = $null
+    try {
+        $rs = $script:RunspaceLimite
+        if (-not $rs -or [string]$rs.RunspaceStateInfo.State -ne 'Opened') {
+            $rs = [runspacefactory]::CreateRunspace(); $rs.Open(); $script:RunspaceLimite = $rs
+        }
+        $ps = [PowerShell]::Create()
+        $ps.Runspace = $rs
+        [void]$ps.AddScript($Script.ToString())
+        foreach ($a in @($Argumentos)) { [void]$ps.AddArgument($a) }
+        $h = $ps.BeginInvoke()
+        if (-not $h.AsyncWaitHandle.WaitOne([int]([Math]::Max(1, $TimeoutSec) * 1000))) {
+            try { [void]$ps.BeginStop($null, $null) } catch {}
+            $script:RunspaceLimite = $null
+            return @{ ok = $false; timeout = $true; valor = @() }
+        }
+        $r = @($ps.EndInvoke($h))
+        $conError = $false
+        try { $conError = [bool]($ps.HadErrors -and @($r).Count -eq 0) } catch {}
+        try { $ps.Dispose() } catch {}
+        return @{ ok = (-not $conError); timeout = $false; valor = @($r) }
+    } catch {
+        try { if ($ps) { $ps.Dispose() } } catch {}
+        return @{ ok = $false; timeout = $false; valor = @() }
+    }
+}
+
+function Get-TrabajosDeCola {
+    <# Los trabajos de una cola, con limite de tiempo. Devuelve @{ ok; timeout; jobs }. #>
+    param([string]$Nombre, [int]$TimeoutSec = 8)
+    $r = Invoke-ConLimite -Script { param($n) @(Get-PrintJob -PrinterName $n -ErrorAction Stop) } -Argumentos @($Nombre) -TimeoutSec $TimeoutSec
+    return @{ ok = [bool]$r.ok; timeout = [bool]$r.timeout; jobs = @($r.valor | Where-Object { $_ }) }
+}
+
+function Add-ColaSinRespuesta {
+    <# Registra una cola que Windows no pudo listar a tiempo (una sola vez por cola). #>
+    param([string]$Nombre, [int]$TimeoutSec = 8)
+    if (-not $script:Diagnostics.Contains('colasSinRespuesta')) { $script:Diagnostics['colasSinRespuesta'] = @() }
+    if (@($script:Diagnostics['colasSinRespuesta']) -contains $Nombre) { return }
+    $script:Diagnostics['colasSinRespuesta'] = @(@($script:Diagnostics['colasSinRespuesta']) + @($Nombre))
+    $todas = @($script:Diagnostics['colasSinRespuesta'])
+    $nombre = ('La cola de impresion no responde: ' + ($todas -join ', '))
+    $rec = ("Windows no pudo listar los trabajos de " + ($todas -join ', ') + " en " + $TimeoutSec + " segundos, asi que se salteo y el diagnostico siguio. " +
+            'Suele ser una impresora compartida desde otra PC que esta apagada, o el servicio de cola de impresion trabado. ' +
+            'Reiniciar el servicio de cola de impresion; si es una impresora que ya no se usa, borrarla de Windows.')
+    if (@($script:Checks | Where-Object { $_.id -eq 'queue.noResponde' }).Count -gt 0) {
+        [void](Update-CheckFinding -Id 'queue.noResponde' -Status 'warn' -Name $nombre -Recommendation $rec -EvidenceExtra @{ colas = $todas })
+    } else {
+        Add-Check -Id 'queue.noResponde' -Layer 2 -Name $nombre -Status 'warn' -RootCauseCandidate $true -Plane 'os' `
+            -Evidence @{ colas = $todas; timeoutSeg = $TimeoutSec } -Recommendation $rec
+    }
+}
+
 function Clear-ColaDeImpresion {
     <# Borra los trabajos de una cola. Aislada para poder mockearla en el self-test. #>
     param([string]$Nombre)
@@ -6227,12 +6310,21 @@ function Invoke-PurgaTemprana {
     #>
     if (-not $AutoFix -or $DryRun) { return }
     $cands = @()
+    # v3.35: con limite de tiempo (ver Invoke-ConLimite). Si ni la lista de impresoras contesta,
+    # el servicio de impresion esta trabado: se avisa y se sigue, la capa 0 ya lo va a mirar.
+    $lista0 = Invoke-ConLimite -Script { @(Get-Printer -ErrorAction Stop) } -TimeoutSec 15
+    if ([bool]$lista0.timeout) { Add-ColaSinRespuesta -Nombre '(la lista de impresoras de Windows)' -TimeoutSec 15; return }
     try {
-        foreach ($p in @(Get-Printer -ErrorAction Stop)) {
+        foreach ($p in @($lista0.valor | Where-Object { $_ })) {
             if ((Test-IsVirtualPrinter $p).isVirtual) { continue }
             if ([string]$p.Name -match $script:TestPrinterRx) { continue }
-            $jobs = @()
-            try { $jobs = @(Get-PrintJob -PrinterName ([string]$p.Name) -ErrorAction Stop) } catch {}
+            # Una impresora compartida desde otra PC (\\PC\impresora) no se limpia desde aca, y es la
+            # que mas se cuelga cuando esa PC esta apagada.
+            if ([string]$p.Name -like '\\*') { continue }
+            Write-StepDetail ('revisando la cola ' + [string]$p.Name)
+            $lec = Get-TrabajosDeCola -Nombre ([string]$p.Name)
+            if ([bool]$lec.timeout) { Add-ColaSinRespuesta -Nombre ([string]$p.Name); continue }
+            $jobs = @($lec.jobs)
             if (@($jobs).Count -lt 3) { continue }
             $conFecha = @($jobs | Where-Object { $_.SubmittedTime } | Sort-Object -Property SubmittedTime)
             $min = 0
@@ -13405,7 +13497,7 @@ public class FudoFakeEndpoint {
     $script:Diagnostics['nativaDescarga'] = [ordered]@{ firmaOk = $true; bytes = 1 }
     $script:Diagnostics['modoImpresionProtegido'] = [ordered]@{ activo = $false; origen = '' }
     $x134 = Get-TelemetryDiagnosticsExtra
-    Assert-Eq 'S134 viajan las cinco claves (y las de los escenarios 135, 141, 143 y 144)' 'nativaDescarga,eleccionImpresora,eleccionPuerto,modoImpresionProtegido,usbSinEnumerar,extensionAbierta,purgaTemprana,uiApertura,tiempos,hardware' (@($x134.Keys) -join ',')
+    Assert-Eq 'S134 viajan las cinco claves (y las de los escenarios 135, 141, 143 y 144)' 'nativaDescarga,eleccionImpresora,eleccionPuerto,modoImpresionProtegido,usbSinEnumerar,extensionAbierta,purgaTemprana,uiApertura,colasSinRespuesta,tiempos,hardware' (@($x134.Keys) -join ',')
     Assert-Eq 'S134 con su contenido' $true ([bool]$x134['nativaDescarga'].firmaOk)
     Assert-Eq 'S134 Send-Telemetry las pone en el payload' $true ([bool]((Get-Command Send-Telemetry).ScriptBlock.ToString() -match 'Get-TelemetryDiagnosticsExtra'))
     Reset-State
@@ -13755,6 +13847,50 @@ public class FudoFakeEndpoint {
     Reset-Mocks
     Assert-Eq 'S144 en el self-test no se abre ninguna ventana' '' (Open-UiVentana -Url 'http://127.0.0.1:5/')
     Assert-Eq 'S144 la interfaz usa esta apertura' $true ([bool]((Get-Command Start-DoctorUi).ScriptBlock.ToString() -match 'Open-UiVentana'))
+    Reset-State
+
+    # -----------------------------------------------------------------------
+    # Escenario 145 (v3.35): leer una cola que no contesta ya no deja la corrida colgada.
+    # Caso del 29/09: quedo para siempre en "Colas trabadas" y nunca reporto.
+    Reset-State
+    Reset-Mocks
+    # El limite de verdad, en un runspace aparte (no el camino directo del self-test).
+    $t145 = Get-Date
+    $r145 = Invoke-ConLimite -Script { Start-Sleep -Seconds 20; 'tarde' } -TimeoutSec 1 -Forzar
+    $seg145 = ((Get-Date) - $t145).TotalSeconds
+    Assert-Eq 'S145 lo que no termina a tiempo se abandona' $true ([bool]$r145.timeout)
+    Assert-Eq 'S145 y no se espera' $true ([bool]($seg145 -lt 6))
+    $r145b = Invoke-ConLimite -Script { param($a, $b) $a + $b } -Argumentos @(40, 2) -TimeoutSec 5 -Forzar
+    Assert-Eq 'S145 lo que termina devuelve su valor' '42' ([string]@($r145b.valor)[0])
+    Assert-Eq 'S145 y sin timeout' $false ([bool]$r145b.timeout)
+    # La limpieza al arrancar: saltea la cola que no contesta, no toca las compartidas, y limpia el resto.
+    function Write-StepDetail { param($Texto) }
+    function Start-Sleep { param($Seconds, $Milliseconds) }
+    function Confirm-Irreversible { param($Description, $Impact) $true }
+    function Get-Printer { param($Name, $ErrorAction)
+        @([pscustomobject]@{ Name = 'COCINA'; PortName = 'USB001'; DriverName = 'Generic / Text Only' },
+          [pscustomobject]@{ Name = 'CAJA'; PortName = 'USB002'; DriverName = 'Generic / Text Only' },
+          [pscustomobject]@{ Name = '\\PC-BARRA\EPSON'; PortName = 'USB003'; DriverName = 'Generic / Text Only' }) }
+    $script:consultadas145 = @()
+    function Get-TrabajosDeCola { param($Nombre, $TimeoutSec)
+        $script:consultadas145 += [string]$Nombre
+        if ([string]$Nombre -eq 'COCINA') { return @{ ok = $false; timeout = $true; jobs = @() } }
+        @{ ok = $true; timeout = $false; jobs = @(1..5 | ForEach-Object { [pscustomobject]@{ JobStatus = 'Normal'; SubmittedTime = (Get-Date).AddMinutes(-30) } }) } }
+    $script:limpio145 = @()
+    function Clear-ColaDeImpresion { param($Nombre) $script:limpio145 += [string]$Nombre; 'mock' }
+    function Get-PrintJob { param($PrinterName, $ErrorAction) @() }
+    Invoke-PurgaTemprana
+    Assert-Eq 'S145 la cola que no contesta se saltea y se sigue' 'CAJA' (@($script:limpio145) -join ',')
+    Assert-Eq 'S145 queda a la vista con su nombre' $true ([bool]([string](Get-CheckById 'queue.noResponde').name -match 'COCINA'))
+    Assert-Eq 'S145 la compartida desde otra PC ni se consulta' $false (@($script:consultadas145) -contains '\\PC-BARRA\EPSON')
+    Assert-Eq 'S145 y viaja en la telemetria' 'COCINA' (@($script:Diagnostics['colasSinRespuesta']) -join ',')
+    # El inventario no vuelve a esperar a una cola que ya no contesto.
+    $script:consultadas145 = @()
+    function Test-PortHasLiveDevice { param($PortName) $true }
+    $null = @(Get-PrinterQueues)
+    Assert-Eq 'S145 el inventario no vuelve a esperar a esa cola' $false (@($script:consultadas145) -contains 'COCINA')
+    Assert-Eq 'S145 pero si lee las otras' $true (@($script:consultadas145) -contains 'CAJA')
+    Reset-Mocks
     Reset-State
 
     Write-Host ""
@@ -15868,7 +16004,7 @@ function Get-TelemetryDiagnosticsExtra {
       pueda ver las claves sin mandar nada.
     #>
     $out = [ordered]@{}
-    foreach ($k in @('nativaDescarga', 'eleccionImpresora', 'eleccionPuerto', 'modoImpresionProtegido', 'usbSinEnumerar', 'extensionAbierta', 'purgaTemprana', 'uiApertura')) {
+    foreach ($k in @('nativaDescarga', 'eleccionImpresora', 'eleccionPuerto', 'modoImpresionProtegido', 'usbSinEnumerar', 'extensionAbierta', 'purgaTemprana', 'uiApertura', 'colasSinRespuesta')) {
         $out[$k] = $(if ($script:Diagnostics.Contains($k)) { $script:Diagnostics[$k] } else { $null })
     }
     # v3.32: cuanto tardo cada paso (ver StepTimes).
