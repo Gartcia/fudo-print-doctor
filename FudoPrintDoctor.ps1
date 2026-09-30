@@ -484,7 +484,7 @@ $script:TestPrinterRx = '(?i)^FUDO-TEST-'
 # puerto tenga hardware; si el hardware se va, deja de serlo (ver Remove-OrphanOwnQueues).
 $script:OwnQueueRx   = '(?i)^FUDO-(TEST-|USB\d)'
 $script:TestDocRx    = '(?i)fudo print doctor'
-$script:SchemaVersion = '3.35'
+$script:SchemaVersion = '3.36'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -1476,6 +1476,9 @@ $script:StepTimes   = [ordered]@{}
 $script:PurgaTempranaRechazada = @()
 # v3.35: el runspace donde se leen las colas con limite de tiempo (ver Invoke-ConLimite).
 $script:RunspaceLimite = $null
+# v3.36: desde cuantos trabajos una cola se da por trabada SIN leerlos uno por uno. Leer miles de
+# trabajos solo para ver cuanto hace que espera el mas viejo es lo que dejaba la pantalla quieta.
+$script:ColaMasiva = 50
 $script:StepIndex   = 0
 $script:StepLabel   = ''
 $script:StepNote    = ''
@@ -5184,8 +5187,13 @@ function Get-PrinterQueues {
         # queda a la vista, en vez de dejar la corrida colgada para siempre.
         $jobs = @()
         $noResponde = $false
+        # v3.36: con el conteo de Windows, una cola vacia no se lee y una enorme tampoco.
+        $jcI = Get-JobCountDeCola -Cola $q
+        $masiva = ($jcI -ge [int]$script:ColaMasiva)
         if ($script:Diagnostics.Contains('colasSinRespuesta') -and (@($script:Diagnostics['colasSinRespuesta']) -contains $nombre)) {
             $noResponde = $true
+        } elseif ($jcI -eq 0 -or $masiva) {
+            if ($masiva) { Write-StepDetail ('la cola ' + $nombre + ' tiene ' + $jcI + ' trabajos esperando') }
         } else {
             $lecI = Get-TrabajosDeCola -Nombre $nombre
             if ([bool]$lecI.timeout) { $noResponde = $true; Add-ColaSinRespuesta -Nombre $nombre }
@@ -5208,11 +5216,12 @@ function Get-PrinterQueues {
         }
 
         $puertoVivo = Test-PortHasLiveDevice -PortName $puerto
+        $cant = $(if ($masiva) { $jcI } else { @($jobs).Count })
 
         $score = 0
         $sintomas = @()
-        if (@($jobs).Count -ge 3)  { $score += 40; $sintomas += "$(@($jobs).Count) trabajos encolados" + $(if ($masViejo) { " (el mas viejo del $masViejo)" } else { '' }) }
-        elseif (@($jobs).Count -gt 0) { $score += 10; $sintomas += "$(@($jobs).Count) trabajo(s) en cola" }
+        if ($cant -ge 3)  { $score += 40; $sintomas += "$cant trabajos encolados" + $(if ($masViejo) { " (el mas viejo del $masViejo)" } else { '' }) }
+        elseif ($cant -gt 0) { $score += 10; $sintomas += "$cant trabajo(s) en cola" }
         if (-not $puertoVivo)      { $score += 30; $sintomas += "el puerto $puerto no tiene ningun dispositivo conectado" }
         if ($offline)              { $score += 25; $sintomas += 'marcada como sin conexion (offline)' }
         if ($pausada)              { $score += 20; $sintomas += 'pausada' }
@@ -5220,8 +5229,8 @@ function Get-PrinterQueues {
         $out += [ordered]@{
             nombre = $nombre; puerto = $puerto; driver = [string]$q.DriverName
             esDePrueba = [bool]($nombre -match $script:TestPrinterRx)
-            offline = $offline; pausada = $pausada; trabajos = @($jobs).Count; trabajoMasViejo = $masViejo
-            minutosMasViejo = [int]$minViejo
+            offline = $offline; pausada = $pausada; trabajos = [int]$cant; trabajoMasViejo = $masViejo
+            minutosMasViejo = [int]$minViejo; masiva = [bool]$masiva
             puertoVivo = [bool]$puertoVivo; esPos = (Test-IsPosPrinter $q)
             score = $score; sintomas = @($sintomas)
             estado = $(if ($score -eq 0) { 'sana' } elseif ($score -ge 40) { 'no imprime' } else { 'con problemas' })
@@ -6211,6 +6220,50 @@ function Test-Layer1-PrinterState {
 # ---------------------------------------------------------------------------
 # LAYER 2 - Salud de la cola de impresion
 # ---------------------------------------------------------------------------
+function Disable-ConsoleQuickEdit {
+    <#
+      v3.36 (dos asesores, 30/09): "se resolvio dando un enter en el cmd para que siga corriendo",
+      "tuve que presionar varias veces enter para que se abriera la ventana". Es la "edicion
+      rapida" de la consola de Windows, que viene activada: un clic adentro de la ventana empieza
+      a seleccionar texto y CONGELA al programa en la proxima linea que escribe, hasta que alguien
+      aprieta Enter o Esc. Por TeamViewer ese clic se hace sin querer -al traer la ventana al
+      frente-, y el motor escribe su progreso todo el tiempo. Desde afuera es un cuelgue.
+      Se apaga solo en ESTA ventana, que se cierra al terminar. No toca nada de la PC.
+      Devuelve $true si la apago.
+    #>
+    if ($SelfTest -or $Json -or $Quiet) { return $false }
+    try { if ([Console]::IsInputRedirected) { return $false } } catch { return $false }
+    try {
+        if (-not ('FpdConsola' -as [type])) {
+            Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public static class FpdConsola {
+    [DllImport("kernel32.dll", SetLastError=true)] public static extern IntPtr GetStdHandle(int n);
+    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool GetConsoleMode(IntPtr h, out uint m);
+    [DllImport("kernel32.dll", SetLastError=true)] public static extern bool SetConsoleMode(IntPtr h, uint m);
+}
+'@ -ErrorAction Stop
+        }
+        $h = [FpdConsola]::GetStdHandle(-10)
+        $modoConsola = [uint32]0
+        if (-not [FpdConsola]::GetConsoleMode($h, [ref]$modoConsola)) { return $false }
+        # 0x40 = edicion rapida (se saca); 0x80 = flags extendidos (hace falta para que tome).
+        $nuevo = [uint32](([int64]$modoConsola -bor 0x80) -band 4294967231)
+        return [bool][FpdConsola]::SetConsoleMode($h, $nuevo)
+    } catch { return $false }
+}
+
+function Get-JobCountDeCola {
+    <#
+      Cuantos trabajos tiene la cola segun Windows, sin leerlos (Get-Printer ya lo trae).
+      Devuelve -1 si no se sabe (un objeto de prueba sin el dato, por ejemplo).
+    #>
+    param($Cola)
+    try { if ($null -ne $Cola -and $null -ne $Cola.JobCount) { return [int]$Cola.JobCount } } catch {}
+    return -1
+}
+
 function Invoke-ConLimite {
     <#
       v3.35 (caso de un asesor del 29/09): la corrida quedo colgada para siempre en "Colas
@@ -6321,7 +6374,16 @@ function Invoke-PurgaTemprana {
             # Una impresora compartida desde otra PC (\\PC\impresora) no se limpia desde aca, y es la
             # que mas se cuelga cuando esa PC esta apagada.
             if ([string]$p.Name -like '\\*') { continue }
-            Write-StepDetail ('revisando la cola ' + [string]$p.Name)
+            # v3.36: Windows ya sabe cuantos trabajos tiene la cola. Con 0 no hay nada que leer;
+            # con muchos, esta trabada seguro y leerlos uno por uno es lo que deja la pantalla quieta.
+            $jc = Get-JobCountDeCola -Cola $p
+            if ($jc -eq 0) { continue }
+            if ($jc -ge [int]$script:ColaMasiva) {
+                Write-StepDetail ('la cola ' + [string]$p.Name + ' tiene ' + $jc + ' trabajos esperando')
+                $cands += [ordered]@{ nombre = [string]$p.Name; trabajos = $jc; minutos = -1 }
+                continue
+            }
+            Write-StepDetail ('revisando la cola ' + [string]$p.Name + $(if ($jc -gt 0) { ' (' + $jc + ' trabajos)' } else { '' }))
             $lec = Get-TrabajosDeCola -Nombre ([string]$p.Name)
             if ([bool]$lec.timeout) { Add-ColaSinRespuesta -Nombre ([string]$p.Name); continue }
             $jobs = @($lec.jobs)
@@ -6356,7 +6418,17 @@ function Invoke-PurgaTemprana {
     $resultado = @()
     foreach ($c in @($cands)) {
         $despues = [int]$c.trabajos
-        try { $despues = @(Get-PrintJob -PrinterName ([string]$c.nombre) -ErrorAction SilentlyContinue).Count } catch {}
+        # v3.36: el conteo de Windows primero; leer los trabajos solo si no lo da.
+        $jcD = -1
+        try {
+            $rD = Invoke-ConLimite -Script { param($n) @(Get-Printer -Name $n -ErrorAction Stop) } -Argumentos @([string]$c.nombre) -TimeoutSec 8
+            if ([bool]$rD.ok) { $jcD = Get-JobCountDeCola -Cola (@($rD.valor | Where-Object { $_ }) | Select-Object -First 1) }
+        } catch {}
+        if ($jcD -ge 0) { $despues = $jcD }
+        else {
+            $lecD = Get-TrabajosDeCola -Nombre ([string]$c.nombre)
+            if (-not [bool]$lecD.timeout) { $despues = @($lecD.jobs).Count }
+        }
         $resultado += [ordered]@{ nombre = [string]$c.nombre; antes = [int]$c.trabajos; despues = [int]$despues; bajo = ([int]$despues -lt [int]$c.trabajos) }
     }
     $script:Diagnostics['purgaTemprana'] = [ordered]@{ ofrecida = $true; aplicada = $true; colas = @($resultado) }
@@ -6379,8 +6451,28 @@ function Test-Layer2-Queue {
     param($Printer, $Wmi)
     if ($null -eq $Printer) { return }
     Write-StepDetail 'revisando trabajos en cola'
+    $jcL = Get-JobCountDeCola -Cola $Printer
+    # v3.36: si al arrancar el asesor eligio no limpiarla, ya se sabe que esta trabada: no hace
+    # falta volver a leer miles de trabajos para decir lo mismo.
+    if (@($script:PurgaTempranaRechazada) -contains [string]$Printer.Name) {
+        Add-Check -Id 'queue.health' -Layer 2 -Name 'Cola de impresion trabada (se eligio no limpiarla)' -Status 'warn' -RootCauseCandidate $true `
+            -Evidence @{ jobs = $jcL; rechazadaAlArrancar = $true } -ActionTaken 'el asesor eligio no limpiarla al arrancar' -Reversible $false `
+            -Recommendation ('La cola tiene trabajos trabados' + $(if ($jcL -gt 0) { ' (' + $jcL + ')' } else { '' }) + ' y al arrancar se eligio no limpiarla. Mientras sigan ahi, las comandas nuevas no salen.')
+        return
+    }
+    if ($jcL -ge [int]$script:ColaMasiva) { Write-StepDetail ('la cola tiene ' + $jcL + ' trabajos esperando: leyendolos') }
     $jobs = @()
-    try { $jobs = @(Get-PrintJob -PrinterName $Printer.Name -ErrorAction Stop) } catch {}
+    $lecL = Get-TrabajosDeCola -Nombre ([string]$Printer.Name) -TimeoutSec $(if ($jcL -ge [int]$script:ColaMasiva) { 60 } else { 15 })
+    if ([bool]$lecL.timeout) {
+        if ($jcL -ge 3) {
+            # Enorme y no termina de listarse: esta trabada igual. Se sigue con el conteo de
+            # Windows; los trabajos no se pudieron leer uno por uno.
+            $jobs = @(1..$jcL | ForEach-Object { [pscustomobject]@{ JobStatus = 'sin leer'; SubmittedTime = $null } })
+        } else {
+            Add-ColaSinRespuesta -Nombre ([string]$Printer.Name) -TimeoutSec 15
+            return
+        }
+    } else { $jobs = @($lecL.jobs) }
     Set-StepNote ("$(@($jobs).Count) trabajo(s)")
     $script:Diagnostics['queueDepth'] = @($jobs).Count
 
@@ -6522,7 +6614,7 @@ function Test-Layer2-OtherQueuesBacklog {
         ([string]$_.nombre -ne $objetivo) -and ([int]$_.trabajos -ge 1)
     })
     # Atasco: acumula Y el mas viejo lleva rato. Es lo unico que puede ser causa raiz.
-    $trabadas = @($conTrabajos | Where-Object { [int]$_.trabajos -ge 3 -and [int]$_.minutosMasViejo -ge 5 })
+    $trabadas = @($conTrabajos | Where-Object { [int]$_.trabajos -ge 3 -and ([int]$_.minutosMasViejo -ge 5 -or [bool]$_.masiva) })
     # Sintoma informativo: pocos trabajos pero uno viejo, o varios recien encolados.
     $aInformar = @($conTrabajos | Where-Object { [int]$_.trabajos -ge 3 -or [int]$_.minutosMasViejo -ge 5 })
     if (@($aInformar).Count -eq 0) {
@@ -9348,6 +9440,8 @@ function Invoke-FudoPrintDoctor {
         }
     }
 
+    # v3.36: que un clic en la ventana no congele la corrida (ver Disable-ConsoleQuickEdit).
+    try { $script:Diagnostics['consolaSinEdicionRapida'] = [bool](Disable-ConsoleQuickEdit) } catch {}
     $envOk = Invoke-Step -Name 'layer0.environment' -Body { Test-Layer0-Environment }
     $printer = $null
     $detectedInterface = 'USB'
@@ -13497,7 +13591,7 @@ public class FudoFakeEndpoint {
     $script:Diagnostics['nativaDescarga'] = [ordered]@{ firmaOk = $true; bytes = 1 }
     $script:Diagnostics['modoImpresionProtegido'] = [ordered]@{ activo = $false; origen = '' }
     $x134 = Get-TelemetryDiagnosticsExtra
-    Assert-Eq 'S134 viajan las cinco claves (y las de los escenarios 135, 141, 143 y 144)' 'nativaDescarga,eleccionImpresora,eleccionPuerto,modoImpresionProtegido,usbSinEnumerar,extensionAbierta,purgaTemprana,uiApertura,colasSinRespuesta,tiempos,hardware' (@($x134.Keys) -join ',')
+    Assert-Eq 'S134 viajan las cinco claves (y las de los escenarios 135, 141, 143 y 144)' 'nativaDescarga,eleccionImpresora,eleccionPuerto,modoImpresionProtegido,usbSinEnumerar,extensionAbierta,purgaTemprana,uiApertura,colasSinRespuesta,consolaSinEdicionRapida,tiempos,hardware' (@($x134.Keys) -join ',')
     Assert-Eq 'S134 con su contenido' $true ([bool]$x134['nativaDescarga'].firmaOk)
     Assert-Eq 'S134 Send-Telemetry las pone en el payload' $true ([bool]((Get-Command Send-Telemetry).ScriptBlock.ToString() -match 'Get-TelemetryDiagnosticsExtra'))
     Reset-State
@@ -13890,6 +13984,60 @@ public class FudoFakeEndpoint {
     $null = @(Get-PrinterQueues)
     Assert-Eq 'S145 el inventario no vuelve a esperar a esa cola' $false (@($script:consultadas145) -contains 'COCINA')
     Assert-Eq 'S145 pero si lee las otras' $true (@($script:consultadas145) -contains 'CAJA')
+    Reset-Mocks
+    Reset-State
+
+    # -----------------------------------------------------------------------
+    # Escenario 146 (v3.36): una cola enorme no se lee trabajo por trabajo, y la consola no se
+    # congela con un clic.
+    Reset-State
+    Reset-Mocks
+    function Write-StepDetail { param($Texto) $script:detalles146 += [string]$Texto }
+    function Start-Sleep { param($Seconds, $Milliseconds) }
+    function Confirm-Irreversible { param($Description, $Impact) $true }
+    $script:detalles146 = @()
+    $script:jc146 = @{ 'COCINA' = 2630; 'CAJA' = 0; 'BARRA' = 6 }
+    function Get-Printer { param($Name, $ErrorAction)
+        $todas = @('COCINA', 'CAJA', 'BARRA') | ForEach-Object { [pscustomobject]@{ Name = $_; PortName = 'USB001'; DriverName = 'Generic / Text Only'; JobCount = [int]$script:jc146[$_] } }
+        if ($Name) { @($todas | Where-Object { $_.Name -eq $Name }) } else { $todas } }
+    $script:consultadas146 = @()
+    function Get-TrabajosDeCola { param($Nombre, $TimeoutSec)
+        $script:consultadas146 += [string]$Nombre
+        @{ ok = $true; timeout = $false; jobs = @(1..[int]$script:jc146[[string]$Nombre] | Where-Object { [int]$script:jc146[[string]$Nombre] -gt 0 } | ForEach-Object { [pscustomobject]@{ JobStatus = 'Normal'; SubmittedTime = (Get-Date).AddMinutes(-1) } }) } }
+    $script:limpio146 = @()
+    function Clear-ColaDeImpresion { param($Nombre) $script:limpio146 += [string]$Nombre; $script:jc146[[string]$Nombre] = 0; 'mock' }
+    Invoke-PurgaTemprana
+    Assert-Eq 'S146 la cola enorme se limpia sin leer sus trabajos' 'COCINA' (@($script:limpio146) -join ',')
+    Assert-Eq 'S146 no se lee trabajo por trabajo' $false (@($script:consultadas146) -contains 'COCINA')
+    Assert-Eq 'S146 ni la vacia' $false (@($script:consultadas146) -contains 'CAJA')
+    Assert-Eq 'S146 la chica si, para ver cuanto hace que espera' $true (@($script:consultadas146) -contains 'BARRA')
+    Assert-Eq 'S146 en pantalla se ve cuantos trabajos tiene' $true ([bool](@($script:detalles146) -match '2630 trabajos'))
+    Assert-Eq 'S146 y se verifica que bajo con el conteo de Windows' 'fixed' ([string](Get-CheckById 'queue.purgaTemprana').status)
+    # El inventario tampoco la lee, y la cuenta como trabada.
+    Reset-State
+    $script:jc146 = @{ 'COCINA' = 2630; 'CAJA' = 0; 'BARRA' = 0 }
+    $script:consultadas146 = @()
+    function Test-PortHasLiveDevice { param($PortName) $true }
+    $q146 = @(Get-PrinterQueues)
+    $c146 = @($q146 | Where-Object { $_.nombre -eq 'COCINA' })[0]
+    Assert-Eq 'S146 el inventario no la lee' 0 (@($script:consultadas146).Count)
+    Assert-Eq 'S146 pero sabe cuantos trabajos tiene' 2630 ([int]$c146.trabajos)
+    Assert-Eq 'S146 y que no imprime' 'no imprime' ([string]$c146.estado)
+    $script:Diagnostics['colas'] = @($q146)
+    Test-Layer2-OtherQueuesBacklog -Printer ([pscustomobject]@{ Name = 'CAJA' })
+    Assert-Eq 'S146 una cola enorme cuenta como trabada aunque no se sepa cuanto hace' 'fail' ([string](Get-CheckById 'queue.otherBacklog').status)
+    # La capa 2 no vuelve a leer la que el asesor eligio no limpiar.
+    Reset-State
+    $script:PurgaTempranaRechazada = @('COCINA')
+    $script:consultadas146 = @()
+    Test-Layer2-Queue -Printer ([pscustomobject]@{ Name = 'COCINA'; PortName = 'USB001'; JobCount = 2630 }) -Wmi $null
+    Assert-Eq 'S146 la capa 2 no relee la cola rechazada' 0 (@($script:consultadas146).Count)
+    Assert-Eq 'S146 y la deja a la vista con su cantidad' $true ([bool]([string](Get-CheckById 'queue.health').recommendation -match '2630'))
+    $script:PurgaTempranaRechazada = @()
+    # La consola: en el self-test no se toca, y el motor lo hace antes del primer paso.
+    Assert-Eq 'S146 en el self-test no se toca la consola' $false (Disable-ConsoleQuickEdit)
+    $main146 = (Get-Command Invoke-FudoPrintDoctor).ScriptBlock.ToString()
+    Assert-Eq 'S146 se apaga la edicion rapida antes del primer paso' $true ([bool]($main146.IndexOf('Disable-ConsoleQuickEdit') -ge 0 -and $main146.IndexOf('Disable-ConsoleQuickEdit') -lt $main146.IndexOf("Name 'layer0.environment'")))
     Reset-Mocks
     Reset-State
 
@@ -16004,7 +16152,7 @@ function Get-TelemetryDiagnosticsExtra {
       pueda ver las claves sin mandar nada.
     #>
     $out = [ordered]@{}
-    foreach ($k in @('nativaDescarga', 'eleccionImpresora', 'eleccionPuerto', 'modoImpresionProtegido', 'usbSinEnumerar', 'extensionAbierta', 'purgaTemprana', 'uiApertura', 'colasSinRespuesta')) {
+    foreach ($k in @('nativaDescarga', 'eleccionImpresora', 'eleccionPuerto', 'modoImpresionProtegido', 'usbSinEnumerar', 'extensionAbierta', 'purgaTemprana', 'uiApertura', 'colasSinRespuesta', 'consolaSinEdicionRapida')) {
         $out[$k] = $(if ($script:Diagnostics.Contains($k)) { $script:Diagnostics[$k] } else { $null })
     }
     # v3.32: cuanto tardo cada paso (ver StepTimes).

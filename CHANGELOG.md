@@ -2,6 +2,51 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.36] - 2026-09-30
+
+**"Se resolvió dando un Enter".** Dos asesores contaron lo mismo el 30/09: la herramienta se quedó
+quieta y siguió cuando apretaron Enter en la ventana negra. A una de ellas le pasó con la cola de
+impresión muy llena, y tuvo que apretar Enter varias veces para que se abriera la ventana. Son dos
+problemas distintos.
+
+### 1. Un clic en la ventana congelaba la corrida
+
+La consola de Windows trae activada la **"edición rápida"**: un clic adentro de la ventana empieza a
+seleccionar texto y **congela el programa** en la próxima línea que escribe, hasta que alguien aprieta
+Enter o Esc. Por TeamViewer ese clic se hace sin querer, por ejemplo al traer la ventana al frente,
+y el motor escribe su progreso todo el tiempo. Desde afuera se ve igual que un cuelgue. Puede ser
+también lo que pasó en el caso del 29/09 que motivó la 3.35.
+
+Ahora el motor la apaga en su ventana antes del primer paso. Es un ajuste de esa ventana, que se
+cierra al terminar; no toca nada de la PC. Probado en una consola real: la edición rápida estaba
+activada, quedó apagada, y el resto de la configuración de la ventana no cambió. Viaja en la
+telemetría si se pudo apagar (`consolaSinEdicionRapida`).
+
+### 2. Con la cola muy llena, la pantalla quedaba quieta sin decir por qué
+
+Para decidir si una cola está trabada, el motor leía todos sus trabajos, uno por uno, para ver
+cuánto hacía que esperaba el más viejo. Con miles de trabajos eso tarda mucho, y en pantalla no se
+veía nada. Además, con el límite de tiempo de la 3.35, una cola enorme podía quedar como "no
+responde" cuando en realidad estaba llena.
+
+Windows ya sabe cuántos trabajos tiene cada cola sin leerlos. Ahora:
+
+- una cola **vacía** no se lee;
+- una con **50 trabajos o más** se da por trabada directamente, sin leerlos, y en pantalla dice
+  *"la cola X tiene 2.630 trabajos esperando"*;
+- sólo las de 3 a 49 se leen, para ver cuánto hace que esperan;
+- después de limpiarla, se verifica con el conteo de Windows, no leyendo de nuevo;
+- la cola que el asesor eligió no limpiar al arrancar ya no se vuelve a leer en la capa 2, y la
+  lectura de la cola principal tiene límite de tiempo (más largo si es enorme).
+
+El inventario usa el mismo conteo, y una cola enorme cuenta como trabada aunque no se sepa cuánto
+hace que espera.
+
+**Escenario 146** del self-test: la cola enorme se limpia sin leer sus trabajos, la vacía no se lee,
+la chica sí; se ve la cantidad en pantalla; se verifica con el conteo; el inventario no la lee pero
+la cuenta como trabada; la capa 2 no relee la rechazada; y la edición rápida se apaga antes del
+primer paso (y no en el self-test).
+
 ## [3.35] - 2026-09-30
 
 **Una cola que no contesta ya no deja la corrida colgada.** Lo reportó un asesor el 29/09: la
