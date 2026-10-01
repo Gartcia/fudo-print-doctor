@@ -2,6 +2,67 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.37] - 2026-10-01
+
+**"Solo la App Nativa", y nada que se pregunte donde nadie mira.** Salió del feedback de dos asesores
+del 30/09 y el 01/10. Trae un launcher nuevo (versión 7) **que hay que repartir**.
+
+### 1. Modo "Solo la App Nativa"
+
+Un asesor lo explicó así: cuando las impresoras andaban y el cliente manda una foto donde Fudo dice
+*"verificando"* sin la versión de la Nativa, lo evidente es la Nativa, y esperar a que se revisen
+todas las impresoras, salga el ticket de prueba y se limpie la cola son 3 o 4 minutos de más.
+
+La primera pregunta suma una cuarta opción, **"Solo la App Nativa"**. Con esa opción se revisan la
+Nativa, el antivirus, la extensión y el registro en el navegador —y se instala o actualiza si hace
+falta—, pero no se tocan impresoras: ni colas, ni prueba de papel, ni limpieza. Al terminar, el
+asesor elige: **seguir revisando las impresoras** (sin repetir la Nativa) o **dar el caso por
+cerrado**. Lo sugerido sale de lo que pasó: si se arregló algo y no quedó nada roto, cerrar; si no,
+seguir.
+
+**Qué cuenta como resuelto en este modo.** El criterio de siempre: lo que hizo la herramienta quedó
+funcionando, verificado. Si se instaló, actualizó o registró la Nativa, o se agregó la extensión, y
+no quedó nada roto, el caso cierra sin prueba de papel. Si no había nada que arreglar, la Nativa no
+era el problema y el caso no cierra: lo dice así y sugiere seguir con las impresoras.
+
+### 2. Lo que se preguntaba por la ventana negra
+
+- **El nombre de la impresora nueva** (al instalarla desde el menú), **cuál impresora de red
+  instalar** y **dónde guardar el resultado** se pedían por la consola aunque se estuviera usando la
+  interfaz. Ahora van por la interfaz, con el valor sugerido ya escrito.
+- **Red de seguridad**: si en algún momento el motor igual necesita preguntar por la consola, la
+  trae al frente y la interfaz avisa *"Mirá la ventana negra"*.
+- **"¿Borrar el motor de esta PC al salir?"** la hacía el launcher con la interfaz ya cerrada. Ahora
+  no se pregunta: **se borra siempre**. No le quita nada al asesor: si hay que volver a correrlo, el
+  launcher lo baja solo.
+
+### 3. La ventana se congelaba antes de que arrancara el motor
+
+Dos asesores mandaron captura: la ventana quedaba quieta —en una, el título decía *"Seleccionar
+Administrador: Fudo Print Doctor"*, trabada en *"Descargando el motor..."*— hasta que tocaban una
+tecla. Es la edición rápida de la consola, que la 3.36 apagaba recién cuando arrancaba el motor; las
+descargas del launcher vienen antes.
+
+Lo que no era obvio: **no alcanza con apagarla una vez desde el launcher**. `cmd` vuelve a poner su
+configuración de la ventana cada vez que termina un programa que lanzó (probado: dentro del
+PowerShell queda apagada; al volver a `cmd`, prendida otra vez). Por eso ahora se apaga **adentro de
+cada paso que tarda** —la consulta de la versión publicada y la descarga del motor—, y antes de esos
+pasos la ventana dice qué está haciendo, para que no quede negra sin texto. El código que corre cada
+paso es éste:
+
+```powershell
+try { Add-Type -TypeDefinition 'using System; using System.Runtime.InteropServices; public static class FpdQe { [DllImport("kernel32.dll")] public static extern IntPtr GetStdHandle(int n); [DllImport("kernel32.dll")] public static extern bool GetConsoleMode(IntPtr h, out uint m); [DllImport("kernel32.dll")] public static extern bool SetConsoleMode(IntPtr h, uint m); }'; $h = [FpdQe]::GetStdHandle(-10); $m = [uint32]0; if ([FpdQe]::GetConsoleMode($h, [ref]$m)) { [void][FpdQe]::SetConsoleMode($h, [uint32](([int64]$m -bor 0x80) -band 4294967231)) } } catch {}
+```
+
+Probado en una consola real con las líneas del launcher: durante cada paso la edición rápida queda
+apagada, y la consulta de la versión sigue funcionando.
+
+**Escenario 147** del self-test: la opción nueva en la primera pregunta; resuelto sin papel cuando se
+arregló la Nativa y no quedó nada roto; no resuelto cuando no había nada que arreglar o quedó algo
+roto; seguir o cerrar al terminar (y cerrar en modo agente); que en ese modo no corran las impresoras
+ni los pasos finales que leen colas, y que la Nativa no se revise dos veces; los textos del menú por
+la interfaz con el sugerido escrito; y el aviso de la ventana negra.
+
 ## [3.36] - 2026-09-30
 
 **"Se resolvió dando un Enter".** Dos asesores contaron lo mismo el 30/09: la herramienta se quedó

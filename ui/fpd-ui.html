@@ -474,6 +474,8 @@ function aplicar(ev){
     case "inventario": inventario = d; pintarInforme(); break;
     case "toque":   agregarToque(d); break;
     case "espera":  espera(d); break;
+    case "consola": avisoConsola(d); break;
+    case "consola.fin": gestionSlot().innerHTML = ""; break;
     case "gestion.inicio": gestionInicio(d); break;
     case "gestion.fin":    gestionFin(d); break;
     case "reinicio": reiniciar(d.motivo); break;
@@ -544,6 +546,16 @@ function espera(d){
   var seg = Math.max(0, parseInt(d.restante,10)||0);
   box.querySelector(".cuenta").textContent =
     String(Math.floor(seg/60)) + ":" + ("0"+(seg%60)).slice(-2);
+}
+
+// v3.37: el motor pregunta algo por la ventana negra (la consola) y no por acá. Sin este
+// aviso, el asesor no se entera hasta que va a mirar la consola por su cuenta.
+function avisoConsola(d){
+  var g = gestionSlot(); g.innerHTML = "";
+  var box = el("div","gest espera");
+  box.appendChild(el("b",null,esc(d.titulo)||"Mirá la ventana negra"));
+  if(d.texto) box.appendChild(el("p",null,esc(d.texto)));
+  g.appendChild(box);
 }
 
 function gestionInicio(d){
@@ -642,6 +654,8 @@ function pregunta(p){
     var fila=el("div","inline"); fila.style.marginTop="12px";
     var inp=el("input"); inp.type="text"; inp.id="campoTexto";
     if(p.extra && p.extra.placeholder) inp.placeholder=p.extra.placeholder;
+    // v3.37: el valor sugerido viene escrito, así Continuar sin tocar nada lo acepta.
+    if(p.extra && p.extra.valor){ inp.value=p.extra.valor; }
     var ok=el("button","btn primary","Continuar");
     function enviar(){ if(inp.value.trim()) responder(inp.value.trim()); }
     ok.addEventListener("click", enviar);

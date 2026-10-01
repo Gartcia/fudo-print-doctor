@@ -26,7 +26,7 @@ REM      avisa y sigue por consola. La interfaz no puede ser condicion
 REM      para diagnosticar en la PC de un cliente que ya tiene un
 REM      problema.
 REM ================================================================
-REM  LAUNCHER-VERSION: 6   <- subir esto cuando cambie este archivo. El
+REM  LAUNCHER-VERSION: 7   <- subir esto cuando cambie este archivo. El
 REM  updater no lo pisa (lleva la URL de telemetria), asi que hoy la copia
 REM  interna se distribuye a mano. El marcador queda para que el updater
 REM  pueda comparar y refrescarlo preservando la URL.
@@ -81,13 +81,26 @@ powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
 exit /b
 
 :admin_ok
+REM  Launcher 7 (01/10/2026): apagar la "edicion rapida" de ESTA ventana. Con ella activada,
+REM  un clic adentro (por TeamViewer pasa sin querer, al traer la ventana al frente) pone la
+REM  ventana en modo "Seleccionar" y congela lo que esta corriendo hasta que alguien aprieta
+REM  una tecla. Dos asesores lo mandaron con captura: trabado en "Descargando el motor...".
+REM  El motor ya lo hacia desde la 3.36, pero arranca despues de las descargas de aca abajo.
+REM  OJO: no alcanza con apagarla una vez desde aca. cmd vuelve a poner su configuracion de la
+REM  ventana cada vez que termina un programa que lanzo (probado: dentro del powershell queda
+REM  apagada; al volver a cmd, prendida otra vez). Por eso se apaga ADENTRO de cada paso que
+REM  tarda: las dos descargas de aca abajo la ejecutan primero. FPD_QE es ese codigo en base64
+REM  (UTF-16), para no pelear con las comillas del batch; el legible esta en el CHANGELOG 3.37.
+REM  Es un ajuste de esta ventana, que se cierra al terminar.
+set "FPD_QE=dAByAHkAIAB7ACAAQQBkAGQALQBUAHkAcABlACAALQBUAHkAcABlAEQAZQBmAGkAbgBpAHQAaQBvAG4AIAAnAHUAcwBpAG4AZwAgAFMAeQBzAHQAZQBtADsAIAB1AHMAaQBuAGcAIABTAHkAcwB0AGUAbQAuAFIAdQBuAHQAaQBtAGUALgBJAG4AdABlAHIAbwBwAFMAZQByAHYAaQBjAGUAcwA7ACAAcAB1AGIAbABpAGMAIABzAHQAYQB0AGkAYwAgAGMAbABhAHMAcwAgAEYAcABkAFEAZQAgAHsAIABbAEQAbABsAEkAbQBwAG8AcgB0ACgAIgBrAGUAcgBuAGUAbAAzADIALgBkAGwAbAAiACkAXQAgAHAAdQBiAGwAaQBjACAAcwB0AGEAdABpAGMAIABlAHgAdABlAHIAbgAgAEkAbgB0AFAAdAByACAARwBlAHQAUwB0AGQASABhAG4AZABsAGUAKABpAG4AdAAgAG4AKQA7ACAAWwBEAGwAbABJAG0AcABvAHIAdAAoACIAawBlAHIAbgBlAGwAMwAyAC4AZABsAGwAIgApAF0AIABwAHUAYgBsAGkAYwAgAHMAdABhAHQAaQBjACAAZQB4AHQAZQByAG4AIABiAG8AbwBsACAARwBlAHQAQwBvAG4AcwBvAGwAZQBNAG8AZABlACgASQBuAHQAUAB0AHIAIABoACwAIABvAHUAdAAgAHUAaQBuAHQAIABtACkAOwAgAFsARABsAGwASQBtAHAAbwByAHQAKAAiAGsAZQByAG4AZQBsADMAMgAuAGQAbABsACIAKQBdACAAcAB1AGIAbABpAGMAIABzAHQAYQB0AGkAYwAgAGUAeAB0AGUAcgBuACAAYgBvAG8AbAAgAFMAZQB0AEMAbwBuAHMAbwBsAGUATQBvAGQAZQAoAEkAbgB0AFAAdAByACAAaAAsACAAdQBpAG4AdAAgAG0AKQA7ACAAfQAnADsAIAAkAGgAIAA9ACAAWwBGAHAAZABRAGUAXQA6ADoARwBlAHQAUwB0AGQASABhAG4AZABsAGUAKAAtADEAMAApADsAIAAkAG0AIAA9ACAAWwB1AGkAbgB0ADMAMgBdADAAOwAgAGkAZgAgACgAWwBGAHAAZABRAGUAXQA6ADoARwBlAHQAQwBvAG4AcwBvAGwAZQBNAG8AZABlACgAJABoACwAIABbAHIAZQBmAF0AJABtACkAKQAgAHsAIABbAHYAbwBpAGQAXQBbAEYAcABkAFEAZQBdADoAOgBTAGUAdABDAG8AbgBzAG8AbABlAE0AbwBkAGUAKAAkAGgALAAgAFsAdQBpAG4AdAAzADIAXQAoACgAWwBpAG4AdAA2ADQAXQAkAG0AIAAtAGIAbwByACAAMAB4ADgAMAApACAALQBiAGEAbgBkACAANAAyADkANAA5ADYANwAyADMAMQApACkAIAB9ACAAfQAgAGMAYQB0AGMAaAAgAHsAfQA="
 
 REM ----------------------------------------------------------------
 REM  2) El motor tiene que ser la version publicada, no la que quedo.
 REM ----------------------------------------------------------------
+echo  Buscando la version publicada del motor...
 set "FPD_PUB="
 del /q "%~dp0version.tmp" >nul 2>&1
-powershell -NoProfile -ExecutionPolicy Bypass -Command "try { [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12 } catch {}; try { Invoke-WebRequest -Uri '%FPD_RAW%/VERSION' -UseBasicParsing -TimeoutSec 25 -OutFile '%~dp0version.tmp' } catch {}" >nul 2>&1
+powershell -NoProfile -ExecutionPolicy Bypass -Command "try { iex ([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($env:FPD_QE))) } catch {}; try { [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12 } catch {}; try { Invoke-WebRequest -Uri '%FPD_RAW%/VERSION' -UseBasicParsing -TimeoutSec 25 -OutFile '%~dp0version.tmp' } catch {}" >nul 2>&1
 if exist "%~dp0version.tmp" for /f "usebackq tokens=* delims= " %%v in ("%~dp0version.tmp") do set "FPD_PUB=%%v"
 del /q "%~dp0version.tmp" >nul 2>&1
 
@@ -116,7 +129,7 @@ goto motor_ok
 :bajar_motor
 echo  Descargando el motor...
 echo.
-powershell -NoProfile -ExecutionPolicy Bypass -Command "try { [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12 } catch {}; Invoke-WebRequest -Uri '%FPD_RAW%/FudoPrintDoctor.ps1' -UseBasicParsing -TimeoutSec 90 -OutFile '%FPD_MOTOR%'"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "try { iex ([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($env:FPD_QE))) } catch {}; try { [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12 } catch {}; Invoke-WebRequest -Uri '%FPD_RAW%/FudoPrintDoctor.ps1' -UseBasicParsing -TimeoutSec 90 -OutFile '%FPD_MOTOR%'"
 if not exist "%FPD_MOTOR%" goto sin_motor
 
 :motor_ok
@@ -178,7 +191,7 @@ REM  URL de reporte, por eso no se pisa-, asi que hay asesores con launchers vie
 REM  no habia forma de saber quienes: una corrida que no arranca no reporta nada, y un
 REM  launcher anterior al 10/09/2026 puede escribir RESUELTO sin que el motor corra.
 REM  Al publicar un .cmd nuevo, actualizar esta fecha.
-set "FPD_STAMP=2026-09-29"
+set "FPD_STAMP=2026-10-01"
 powershell -NoProfile -ExecutionPolicy Bypass -File "%FPD_MOTOR%" -Ui web -NoNativaKitCheck -LauncherStamp "%FPD_STAMP%" -JsonOut "%FPD_JSON%"
 set FPD_EXIT=%errorlevel%
 
@@ -209,10 +222,10 @@ set FPD_EXIT=3
 REM  No dejar herramientas nuestras en la PC del cliente. El
 REM  telemetria.txt se borra siempre: lleva la URL interna de reporte.
 del /q "%~dp0telemetria.txt" >nul 2>&1
-echo.
-set "FPD_BORRAR="
-set /p FPD_BORRAR=  Borrar el motor de esta PC al salir? (Enter = si / n = no):
-if /i "%FPD_BORRAR%"=="n" goto fin
+REM  Launcher 7 (01/10/2026): el motor se borra siempre, sin preguntar. La pregunta la
+REM  hacia esta ventana cuando la interfaz ya estaba cerrada, asi que nadie se enteraba de
+REM  que estaba esperando (lo conto un asesor). Borrarlo no le quita nada: si hay que
+REM  correrlo de nuevo en esta PC, este archivo lo vuelve a bajar solo.
 del /q "%FPD_MOTOR%" >nul 2>&1
 echo.
 echo  Listo. Quedo solo resultado.json: adjuntalo al caso y borralo.
