@@ -2,6 +2,52 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.39] - 2026-10-02
+
+**Una asesora abrió el diagnóstico, vio la pantalla pidiéndole el ID de la conversación y no
+pudo tocar nada.** Esperó el timeout, se le cortó la conexión y terminó resolviendo el caso sin
+la herramienta.
+
+### Corregido
+
+- **La ventana del diagnóstico se abría con los permisos de administrador del motor.**
+  `Start-VentanaEdge` lanzaba Edge con `Start-Process`, y el launcher corre elevado: la ventana
+  heredaba esos permisos. **Windows no deja que un programa sin elevar le mande clics ni teclas
+  a una ventana elevada**, así que un asesor cuyo acceso remoto no está elevado la ve perfecta
+  y no la puede usar.
+
+  Se nota en el caso: el cliente tuvo que tipear el PIN del UAC. Si el acceso remoto hubiera
+  estado elevado, lo habría hecho ella.
+
+  *El razonamiento de por qué hay que des-elevar ya estaba escrito — en
+  `Start-UrlComoUsuario`, la función de al lado. La ruta principal, que es la que gana casi
+  siempre, no lo aplicaba.*
+
+- **Ahora las dos puertas des-elevan por el mismo lugar.** `explorer.exe` le pasa el pedido al
+  escritorio que ya está abierto, que corre sin elevar en la sesión de quien mira la pantalla:
+  es lo mismo que si la persona hiciera doble clic.
+
+  El problema es que `explorer.exe` sabe abrir un archivo pero **no sabe pasarle argumentos**, y
+  la ventana de Edge los necesita (`--app`, su perfil aparte). Van metidos en un **acceso
+  directo temporal** en `%TEMP%`, que viaja con ellos y se borra al cerrar la interfaz — lleva
+  la dirección de la corrida con su token.
+
+  Si el acceso directo no se puede crear, cae al navegador predeterminado sin elevar, y recién
+  después al último recurso. **Ninguna ruta termina en una ventana elevada.**
+
+- **Escenario 149**: que la ventana no se lance directo desde el motor, que los argumentos
+  viajen en el acceso directo, y que la otra puerta des-eleve por el mismo lugar.
+
+> **Lo que el caso enseñó, y es más grande que el bug:** en modo consola esa asesora **tampoco**
+> habría podido escribir el ID, porque la ventana negra también está elevada. Esto no es sólo
+> arreglar una regresión de la interfaz: **habilita un escenario que la herramienta nunca
+> soportó** — asesores cuyo acceso remoto no corre como administrador.
+
+### Sin cambios
+
+Nada que redistribuir: el arreglo vive en el `.ps1`, que cada PC se baja sola en la próxima
+corrida. Los `.cmd` desplegados no se tocan.
+
 ## [3.38] - 2026-10-02
 
 **Brasil: nada de lo que ve el cliente dice "Fudo".** Los asesores de Deli empiezan a usar la

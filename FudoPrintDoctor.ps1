@@ -502,7 +502,7 @@ $script:Producto    = 'Fudo'
 $script:PrefijoCola = 'FUDO-'
 $script:NombreCola  = 'Impresora Fudo'
 $script:ReglasTexto = @()
-$script:SchemaVersion = '3.38'
+$script:SchemaVersion = '3.39'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -524,6 +524,7 @@ $script:UiListener = $null
 $script:UiPs       = $null
 $script:UiRunspace = $null
 $script:UiUrl      = ''
+$script:UiAccesoDirecto = ''   # acceso directo temporal con el que se abre la ventana sin elevar
 $script:UiSeq      = 0       # numero de evento; la pagina pide "lo que haya despues de N"
 $script:UiPregSeq  = 0       # numero de PREGUNTA; ver Request-UiAnswer
 # Lo que dejo la ultima gestion del menu. Las ramas de Invoke-MenuAction informan con
@@ -1946,8 +1947,41 @@ function Start-VentanaEdge {
     param([string]$Edge, [string]$Url)
     if ($SelfTest) { throw 'self-test: el motor no abre ventanas (mockear Start-VentanaEdge)' }
     $perfil = Join-Path $env:TEMP 'FudoPrintDoctor-ui'
-    Start-Process -FilePath $Edge -ArgumentList @(('--app=' + $Url), ('--user-data-dir="' + $perfil + '"'),
-        '--no-first-run', '--no-default-browser-check', '--window-size=1180,860') -ErrorAction Stop
+    $argumentos = '--app=' + $Url + ' --user-data-dir="' + $perfil + '"' +
+                  ' --no-first-run --no-default-browser-check --window-size=1180,860'
+    # Pasa por un acceso directo y explorer.exe, NO por Start-Process: ver Start-ArchivoComoUsuario.
+    # Hasta la 3.38 se lanzaba directo y la ventana heredaba los permisos de administrador del
+    # motor, lo que la volvia intocable para el asesor (caso de Mari, 02/10).
+    $lnk = New-AccesoDirectoUi -Destino $Edge -Argumentos $argumentos
+    Start-ArchivoComoUsuario -Ruta $lnk
+}
+
+function New-AccesoDirectoUi {
+    <#
+      Deja un acceso directo en %TEMP% que apunta a un programa con sus argumentos.
+      Existe porque explorer.exe -que es lo unico que des-eleva- sabe abrir un archivo pero no
+      sabe pasarle argumentos. Metidos adentro de un acceso directo, viajan igual.
+      Se borra al cerrar la interfaz: lleva la direccion de la corrida, con su token.
+      Devuelve la ruta del acceso directo.
+    #>
+    param([string]$Destino, [string]$Argumentos)
+    $lnk = Join-Path $env:TEMP 'FudoPrintDoctor-ui.lnk'
+    $ws = $null
+    try {
+        if (Test-Path -LiteralPath $lnk) { Remove-Item -LiteralPath $lnk -Force -ErrorAction SilentlyContinue }
+        $ws = New-Object -ComObject WScript.Shell
+        $sc = $ws.CreateShortcut($lnk)
+        $sc.TargetPath   = $Destino
+        $sc.Arguments    = $Argumentos
+        $sc.WindowStyle  = 1
+        $sc.Description  = 'Fudo Print Doctor'
+        $sc.Save()
+    } finally {
+        try { if ($ws) { [void][Runtime.InteropServices.Marshal]::ReleaseComObject($ws) } } catch {}
+    }
+    if (-not (Test-Path -LiteralPath $lnk)) { throw 'no se pudo crear el acceso directo de la interfaz' }
+    $script:UiAccesoDirecto = $lnk
+    return $lnk
 }
 
 function Open-UiVentana {
@@ -1984,6 +2018,13 @@ function Stop-DoctorUi {
     try { if ($script:UiListener) { $script:UiListener.Stop(); $script:UiListener.Close() } } catch {}
     try { if ($script:UiPs) { $script:UiPs.Dispose() } } catch {}
     try { if ($script:UiRunspace) { $script:UiRunspace.Close(); $script:UiRunspace.Dispose() } } catch {}
+    # El acceso directo lleva la direccion de la corrida con su token: no queda dando vueltas.
+    try {
+        if ($script:UiAccesoDirecto -and (Test-Path -LiteralPath $script:UiAccesoDirecto)) {
+            Remove-Item -LiteralPath $script:UiAccesoDirecto -Force -ErrorAction SilentlyContinue
+        }
+    } catch {}
+    $script:UiAccesoDirecto = ''
     $script:UiListener = $null; $script:UiPs = $null; $script:UiRunspace = $null
 }
 
@@ -3467,9 +3508,30 @@ function Start-UrlComoUsuario {
     param([string]$Url)
     # El self-test no abre nada en la PC donde corre (mismo criterio que la descarga).
     if ($SelfTest) { throw 'self-test: el motor no abre el navegador (mockear Start-UrlComoUsuario)' }
+    Start-ArchivoComoUsuario -Ruta $Url
+}
+
+function Start-ArchivoComoUsuario {
+    <#
+      Le pide al escritorio que abra algo -una direccion o un archivo- SIN los permisos de
+      administrador del motor.
+
+      POR QUE IMPORTA, y es lo que costo un caso real (Mari, 02/10): el launcher se eleva, y
+      todo lo que el motor abre con Start-Process hereda esa elevacion. Windows no deja que un
+      programa sin elevar le mande clics ni teclas a una ventana elevada, asi que un asesor
+      cuyo acceso remoto NO esta elevado ve la ventana del diagnostico y no la puede tocar.
+      Ella la vio, no pudo escribir el ID de la conversacion, y se quedo esperando el timeout.
+
+      explorer.exe le pasa el pedido al escritorio que ya esta abierto, que corre sin elevar en
+      la sesion de quien esta mirando la pantalla: es lo mismo que si la persona hiciera doble
+      clic. Un segundo explorer.exe no arranca un escritorio nuevo, le cede el pedido al que ya
+      existe, y por eso la ventana nace con los permisos de esa persona y no con los nuestros.
+    #>
+    param([string]$Ruta)
+    if ($SelfTest) { throw 'self-test: el motor no abre ventanas (mockear Start-ArchivoComoUsuario)' }
     $exp = 'explorer.exe'
     try { if ($env:WINDIR) { $exp = Join-Path $env:WINDIR 'explorer.exe' } } catch {}
-    Start-Process -FilePath $exp -ArgumentList ('"' + $Url + '"') -ErrorAction Stop
+    Start-Process -FilePath $exp -ArgumentList ('"' + $Ruta + '"') -ErrorAction Stop
 }
 
 function Open-FudoExtensionPage {
@@ -14234,6 +14296,51 @@ public class FudoFakeEndpoint {
     Reset-Mocks
     Assert-Eq 'S144 en el self-test no se abre ninguna ventana' '' (Open-UiVentana -Url 'http://127.0.0.1:5/')
     Assert-Eq 'S144 la interfaz usa esta apertura' $true ([bool]((Get-Command Start-DoctorUi).ScriptBlock.ToString() -match 'Open-UiVentana'))
+
+    # Escenario 149 (v3.39, caso real de una asesora el 02/10): abrio el diagnostico, vio la
+    # pantalla pidiendo el ID de la conversacion y NO pudo tocar nada; espero el timeout y se
+    # le corto la conexion.
+    # Causa: su acceso remoto no corre elevado -se nota en que el cliente tuvo que tipear el PIN
+    # del UAC- y Windows no deja que un programa sin elevar le mande clics ni teclas a una
+    # ventana elevada. La ventana de Edge se abria con Start-Process desde el motor, que esta
+    # elevado, asi que heredaba esos permisos.
+    # Lo caro del caso: en modo consola tampoco habria podido escribir, porque esa ventana
+    # tambien esta elevada. O sea que esto no es solo arreglar una regresion: habilita un
+    # escenario que la herramienta nunca soporto.
+    $script:abrio149 = @()
+    function New-AccesoDirectoUi { param($Destino, $Argumentos) $script:abrio149 += ('lnk|' + [string]$Destino + '|' + [string]$Argumentos); 'C:\Temp\ui.lnk' }
+    function Start-ArchivoComoUsuario { param($Ruta) $script:abrio149 += ('explorer|' + [string]$Ruta) }
+    function Start-Process { param($FilePath, $ArgumentList, $Verb, $PassThru, $Wait, $WindowStyle, $ErrorAction, $RedirectStandardOutput, $RedirectStandardError)
+        $script:abrio149 += ('DIRECTO|' + [string]$FilePath) }
+    $selfBase149 = $SelfTest
+    $SelfTest = $false
+    try { Start-VentanaEdge -Edge 'C:\Edge\msedge.exe' -Url 'http://127.0.0.1:7/?t=zz' } catch {}
+    $SelfTest = $selfBase149
+
+    Assert-Eq 'S149 la ventana NO se lanza directo desde el motor elevado' $false ([bool](@($script:abrio149) -match '^DIRECTO'))
+    Assert-Eq 'S149 va por un acceso directo y el escritorio' 'lnk,explorer' ((@($script:abrio149) | ForEach-Object { ($_ -split '\|')[0] }) -join ',')
+    Assert-Eq 'S149 el acceso directo apunta a Edge' $true ([bool](@($script:abrio149)[0] -match 'msedge\.exe'))
+    Assert-Eq 'S149 y se lleva los argumentos, que explorer solo no sabe pasar' $true ([bool](@($script:abrio149)[0] -match '--app=http://127\.0\.0\.1:7/\?t=zz'))
+    Assert-Eq 'S149 con su perfil aparte' $true ([bool](@($script:abrio149)[0] -match 'user-data-dir'))
+
+    # Y la otra puerta -el navegador predeterminado- tiene que des-elevar por el mismo lugar.
+    $script:abrio149 = @()
+    $SelfTest = $false
+    try { Start-UrlComoUsuario -Url 'http://127.0.0.1:7/' } catch {}
+    $SelfTest = $selfBase149
+    Assert-Eq 'S149 el navegador predeterminado tambien pasa por el escritorio' 'explorer|http://127.0.0.1:7/' (@($script:abrio149) -join ';')
+
+    Microsoft.PowerShell.Management\Remove-Item Function:\Start-Process -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item Function:\New-AccesoDirectoUi -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item Function:\Start-ArchivoComoUsuario -ErrorAction SilentlyContinue
+
+    # Ninguna de las dos puede abrir nada cuando corre el self-test.
+    $tiro149 = $false
+    try { Start-VentanaEdge -Edge 'x' -Url 'y' } catch { $tiro149 = $true }
+    Assert-Eq 'S149 el self-test no abre la ventana de Edge' $true $tiro149
+    $tiro149b = $false
+    try { Start-ArchivoComoUsuario -Ruta 'y' } catch { $tiro149b = $true }
+    Assert-Eq 'S149 ni el escritorio' $true $tiro149b
     Reset-State
 
     # -----------------------------------------------------------------------
