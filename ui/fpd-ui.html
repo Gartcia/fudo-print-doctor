@@ -395,6 +395,9 @@ table.inf-pt td.act{text-align:right;white-space:nowrap;padding:4px 8px}
 <script>
 "use strict";
 var TOKEN = "__FPD_TOKEN__";
+// v3.38: "es" o "pt-BR". Lo inyecta el motor igual que el token. En pt-BR el motor ademas
+// cambia la marca en todo lo que sirve (Fudo -> Deli); aca solo va lo que no es un nombre.
+var IDIOMA = "__FPD_IDIOMA__";
 var desde = 0, fase = "arranque", checks = [], tocado = [], pasos = {}, total = 11;
 var claveActual = "", claveRespondida = "", resultado = null, menuPreg = null, caido = false, cerrado = false;
 var dryRun = false, inventario = null;
@@ -632,14 +635,22 @@ function pregunta(p){
 
   if(p.clase==="papel"){
     var imp = (p.extra && p.extra.impresora) ? p.extra.impresora : "";
-    box.appendChild(el("div","ticket",
-      "      FUDO PRINT DOCTOR\n" +
-      "   ---------------------------\n" +
-      "   Prueba de impresion\n" +
-      "   Impresora: " + imp + "\n" +
-      "   ---------------------------\n" +
-      "   Si estas leyendo esto,\n" +
-      "   el hardware imprime bien.\n"));
+    // Lo mismo que sale en el papel (Get-EscPosTestTicket), para que el cliente lo reconozca.
+    box.appendChild(el("div","ticket", IDIOMA==="pt-BR"
+      ? "        PRINT DOCTOR\n" +
+        "   ---------------------------\n" +
+        "   Teste de impressao\n" +
+        "   Impressora: " + imp + "\n" +
+        "   ---------------------------\n" +
+        "   Se voce esta lendo isto,\n" +
+        "   a impressora funciona.\n"
+      : "      FUDO PRINT DOCTOR\n" +
+        "   ---------------------------\n" +
+        "   Prueba de impresion\n" +
+        "   Impresora: " + imp + "\n" +
+        "   ---------------------------\n" +
+        "   Si estas leyendo esto,\n" +
+        "   el hardware imprime bien.\n"));
   }
   if(p.extra && p.extra.otras && p.extra.otras.length){
     var u=el("ul");

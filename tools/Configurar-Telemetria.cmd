@@ -74,13 +74,28 @@ REM  Verificar el efecto, no el codigo de retorno.
 findstr /c:"FUDO_TELEMETRY_URL=http" "%FPD_OUT%" >nul
 if errorlevel 1 goto fallo
 
+REM  v3.38: la misma URL en la copia interna del launcher de Deli (Brasil),
+REM  PrintDoctor.cmd, si esta. Es el que usan los asesores de Deli. Si no
+REM  sale, no se corta: la copia de Fudo ya quedo bien.
+set "FPD_OUT_BR="
+set "FPD_BASE_BR=%~dp0..\PrintDoctor.cmd"
+if not exist "%FPD_BASE_BR%" set "FPD_BASE_BR=%~dp0PrintDoctor.cmd"
+if not exist "%FPD_BASE_BR%" goto listo
+set "FPD_OUT_BR=%~dp0PrintDoctor-interno.cmd"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$u=$env:FPD_URL; $q=[char]34; $base=[IO.File]::ReadAllText($env:FPD_BASE_BR); $buscar='set ' + $q + 'FUDO_TELEMETRY_URL=' + $q; $poner='set ' + $q + 'FUDO_TELEMETRY_URL=' + $u + $q; if ($base -notlike ('*' + $buscar + '*')) { exit 4 }; [IO.File]::WriteAllText($env:FPD_OUT_BR, $base.Replace($buscar, $poner)); exit 0"
+findstr /c:"FUDO_TELEMETRY_URL=http" "%FPD_OUT_BR%" >nul 2>&1
+if errorlevel 1 set "FPD_OUT_BR="
+
+:listo
 echo.
 echo  ----------------------------------------------------------------
 echo   LISTO: %FPD_OUT%
+if defined FPD_OUT_BR echo   LISTO (Deli, Brasil): %FPD_OUT_BR%
 echo.
 echo   Ese es el archivo para distribuir al equipo. Renombralo a
 echo   FudoPrintDoctor.cmd y mandalo junto con el .msi de la App
 echo   Nativa firmada: el motor lo baja solo, el .msi no.
+if defined FPD_OUT_BR echo   El de Deli se renombra a PrintDoctor.cmd y va a los asesores de Brasil.
 echo.
 echo   NO lo commitees: la URL no va al repositorio.
 echo  ----------------------------------------------------------------

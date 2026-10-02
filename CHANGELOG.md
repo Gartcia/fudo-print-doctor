@@ -2,6 +2,72 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.38] - 2026-10-02
+
+**Brasil: nada de lo que ve el cliente dice "Fudo".** Los asesores de Deli empiezan a usar la
+herramienta con clientes de Brasil. Allá la marca es Deli porque "Fudo", en portugués, se lee como
+una mala palabra. La herramienta lo escribía justo donde más se ve: **en el ticket de prueba, en
+letra doble, sobre el mostrador del cliente**, en el nombre de las colas que quedan instaladas en
+Windows y en el título de la ventana. Trae un launcher nuevo para Brasil, **`PrintDoctor.cmd`,
+que hay que repartir** a los asesores de Deli.
+
+### 1. Modo Brasil
+
+El motor acepta `-Idioma auto|es|pt-BR`. El launcher de Deli pasa `pt-BR`. En `auto`, Brasil se
+detecta solo con evidencia clara: Windows en `pt-BR`, o una zona horaria que solo existe en Brasil
+con un Windows que **no** esté en castellano. La zona sola no alcanza: Argentina comparte el UTC-3
+con Brasilia, y hay PCs de locales argentinos con la zona de Brasilia puesta a mano.
+
+En modo Brasil:
+
+- **El ticket de prueba** sale en portugués, titulado `PRINT DOCTOR` (y `TESTE DE PORTA`,
+  `RECONEXAO`, etc.). Va sin tildes: la página de códigos de la térmica (437) no tiene la *ã*.
+- **Las colas que crea el motor** se llaman `DELI-TEST-*`, `DELI-USB00x` y `Impressora Deli`. El
+  motor reconoce como suyas las `FUDO-*` y las `DELI-*` en cualquier idioma, porque una PC puede
+  tener colas de una corrida anterior en el otro.
+- **La ventana y la consola** dicen "Print Doctor" y "Deli" donde decían "Fudo Print Doctor" y
+  "Fudo". El cambio se hace al mostrar, en un solo lugar. "Fudo" pegado a otra palabra, en una ruta
+  o en un nombre de archivo (`Fudo.exe`) no se toca.
+- **Lo que se guarda no cambia**: el JSON y la telemetría siguen con los textos en castellano,
+  porque son los que agrupa la bitácora. Con dos idiomas, cada problema se contaría dos veces.
+  Los dos suman el campo `idioma`.
+
+El documento que se manda a la cola ahora se llama `Print Doctor Test` en los dos idiomas.
+Los tickets viejos (`Fudo Print Doctor Test`) se siguen reconociendo como propios.
+
+**Qué falta.** Los textos del diagnóstico y de la ventana siguen en castellano. Lo que cambió es la
+marca y lo que queda en la PC del cliente. La traducción va en dos pasos más: primero la
+ventana (botones, títulos, tarjetas) y después los textos del motor.
+
+### 2. El launcher de Deli: `PrintDoctor.cmd`
+
+Es `FudoPrintDoctor.cmd` con los textos en portugués. Guarda el motor como `PrintDoctor.ps1` y lo
+corre con `-Idioma pt-BR`. **No se edita a mano**: lo genera `tools\Generar-LauncherDeli.ps1` desde
+el launcher de Fudo, y el self-test falla si quedó desfasado. El launcher de Fudo lleva un caso real
+en cada línea, y una copia mantenida a mano se quedaría atrás en el primer arreglo.
+`tools\Configurar-Telemetria.cmd` ahora arma también la copia interna de Deli
+(`PrintDoctor-interno.cmd`).
+
+**Requiere esta versión publicada.** El launcher baja el motor publicado, y uno anterior a la 3.38
+no conoce `-Idioma`.
+
+### 3. Dos parámetros que nunca anduvieron
+
+Al levantar la ventana en modo Brasil, salía en castellano. La variable interna del idioma se
+llamaba igual que el parámetro, y en PowerShell `$script:Idioma` **es** el parámetro `-Idioma`: al
+inicializar el estado se le pisaba el valor. El escenario nuevo del self-test, que revisa el código
+buscando ese choque, encontró dos más que estaban desde antes: **`-TelemetryUrl` y
+`-NativeInstallerUrl` se borraban al arrancar**, así que pasarlos no hacía nada. No se notaba porque
+el launcher usa la variable `FUDO_TELEMETRY_URL` y la Nativa se busca por versión de Windows.
+Ahora andan.
+
+**Escenario 148** del self-test: detección del idioma (lo explícito manda; con Windows en
+castellano, la zona de Brasilia no alcanza), la conversión de la marca (también con rutas,
+identificadores y JSON), el ticket en portugués, en ASCII y sin "Fudo", los cinco títulos de ticket,
+los nombres de cola y el reconocimiento de lo propio en los dos idiomas, la ventana y la consola
+convirtiendo, castellano sin cambios, ningún ticket con el título fijo, `PrintDoctor.cmd` al día con
+el launcher de Fudo y ninguna asignación `$script:` a un parámetro del script.
+
 ## [3.37] - 2026-10-01
 
 **"Solo la App Nativa", y nada que se pregunte donde nadie mira.** Salió del feedback de dos asesores

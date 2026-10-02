@@ -27,6 +27,7 @@ Pensado para que un agente decida el próximo paso sin leer prosa.
   "host": "CAJA-01",
   "timestamp": "2026-08-21T14:39:59-03:00",
   "interface": "USB" | "Ethernet",
+  "idioma": "es" | "pt-BR",     // v3.38: idioma de lo que se mostro; los textos del JSON van siempre en castellano
   "dryRun": false,
   "autoFix": true,
   "printer": { "name": "...", "driver": "...", "port": "USB001", "workOffline": false },

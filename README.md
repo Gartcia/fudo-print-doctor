@@ -30,6 +30,12 @@ firma y versión legible) y guarda un `.bak` antes de reemplazar.
 Para trabajar en la PC de un cliente, copiale **dos archivos**: `FudoPrintDoctor.cmd` y
 `FudoPrintDoctor.ps1`. Si solo copiaste el `.cmd` y esa PC tiene internet, él baja el `.ps1` solo.
 
+**Brasil (Deli):** los asesores de Deli usan `PrintDoctor.cmd` en lugar de `FudoPrintDoctor.cmd`.
+Es el mismo launcher en portugués, y corre el motor con `-Idioma pt-BR`: el ticket de prueba sale en
+portugués, las colas que quedan en Windows se llaman `DELI-*` / `Impressora Deli`, y la ventana dice
+"Print Doctor" y "Deli", nunca "Fudo". Los textos del diagnóstico todavía están en castellano. El
+`PrintDoctor.cmd` no se edita a mano: se genera con `tools\Generar-LauncherDeli.ps1`.
+
 ## Uso rápido (asesores)
 
 Copiar la carpeta a la PC del cliente y **doble clic en `FudoPrintDoctor.cmd`**. Eso es todo.
@@ -333,6 +339,7 @@ Contrato completo del JSON: [`docs/contrato-json.md`](docs/contrato-json.md).
 | Parámetro | Default | Para qué |
 |---|---|---|
 | `-PrinterName` | autodetecta | Nombre exacto de la cola en Windows |
+| `-Idioma` | `auto` | `auto` \| `es` \| `pt-BR`. En `pt-BR` (Brasil) la marca es Deli en todo lo que ve el cliente |
 | `-Interface` | `auto` | `auto` \| `USB` \| `Ethernet` |
 | `-PrinterIp` / `-Port` | — / `9100` | Impresora de red (interfaz "Directo Ethernet" de Fudo) |
 | `-AutoFix` | `$true` | Aplicar reparaciones seguras |
