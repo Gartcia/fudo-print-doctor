@@ -603,6 +603,29 @@ function reiniciar(motivo){
 }
 
 /* ---------------- preguntas ---------------- */
+/* v3.40 (dos asesores, 05/10): "le doy a Cerrar y se queda trabado". El motor terminaba bien,
+   pero la pagina no mostraba nada y no cerraba la ventana: quedaba igual, y despues aparecia un
+   cartelito chico abajo. Ahora se ve que se esta cerrando, se intenta cerrar la ventana sola y,
+   si el navegador no lo permite, se dice grande y claro que ya se puede cerrar. */
+function cerrarVentana(){
+  if($("cierreFinal")) return;
+  cerrado = true;
+  var ov=el("div"); ov.id="cierreFinal";
+  ov.style.cssText="position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:50;padding:16px";
+  var v=el("div","verdict ok"); v.style.cssText="max-width:520px;width:100%;box-shadow:var(--shadow)";
+  v.appendChild(el("div","verdict-k","Revisión terminada"));
+  var h=el("h2",null,"Cerrando…"); v.appendChild(h);
+  var m=el("div","meta"); var t=el("span",null,"El resultado ya quedó guardado."); m.appendChild(t); v.appendChild(m);
+  ov.appendChild(v); document.body.appendChild(ov);
+  fetch("/responder?t="+TOKEN+"&v=S").catch(function(){}).then(function(){
+    setTimeout(function(){ try{ window.close(); }catch(e){} }, 400);
+    setTimeout(function(){
+      h.textContent = "Listo. Ya podés cerrar esta ventana.";
+      t.textContent = "El resultado ya quedó guardado. Cerrala con la X de arriba a la derecha.";
+    }, 1500);
+  });
+}
+
 function responder(v){
   claveRespondida = claveActual;
   $("askSlot").innerHTML = "";
@@ -1348,7 +1371,7 @@ function barraAcciones(p){
   }
   var links=el("div","links");
   var cerrar=el("button",null,"Cerrar");
-  cerrar.addEventListener("click", function(){ responder("S"); });
+  cerrar.addEventListener("click", function(){ cerrarVentana(); });
   links.appendChild(cerrar);
   a.appendChild(links);
   cont.appendChild(a);

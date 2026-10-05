@@ -2,6 +2,136 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.40] - 2026-10-05
+
+**Tres casos de la misma semana en los que el motor decía algo que no era cierto.** Un
+asesor abrió la página de la extensión y le salió en Edge, cuando el cliente usa Chrome, y el
+motor dio la extensión por agregada. Otro esperó cinco minutos frente a una ventana gris que no
+cargó nunca. Y en ocho corridas el motor dijo "la cola se limpió y no bajó" con una cola que,
+en dos de ellas, ya estaba vacía. Sale de la bitácora del 28/09 al 04/10.
+
+### 1. La extensión se abre en el navegador del cliente, y se verifica ahí
+
+Caso real (01/10, 3.37): la página de la extensión se abrió en el navegador predeterminado, que
+era Edge, y el cliente trabaja en Chrome. La extensión quedó en Edge, y el motor la dio por
+agregada porque la buscaba en *cualquier* navegador. En la telemetría hay **dos corridas que
+cerraron resueltas con "Extensión agregada"** y la extensión en Edge con Chrome instalado.
+Ninguna volvió, así que no se sabe si Fudo quedó andando.
+
+- **Si en la PC hay Chrome y Edge, el asesor elige en cuál se abre**: es quien sabe dónde usa
+  Fudo el cliente. Chrome va primero. En consola: `c` = Chrome, `e` = Edge (y `s` sigue
+  valiendo, es Chrome). Con un solo navegador no se pregunta cuál.
+- **Se abre en ese navegador, sin elevar**, por el mismo camino que la ventana del diagnóstico
+  desde la 3.39 (un acceso directo abierto por el escritorio). Si ya está abierto, la página
+  sale como una pestaña más en la ventana del cliente.
+- **Solo cuenta como agregada si aparece en ese navegador.** Si queda en otro, se dice:
+  "la extensión aparece en Edge pero no en Chrome, que es donde el cliente usa Fudo".
+- La búsqueda de la extensión ya no se corta en el primer navegador donde la encuentra:
+  ahora informa todos (`enNavegadores`), y `extensionAbierta` lleva el navegador elegido.
+
+**Qué no cambió:** el chequeo inicial sigue dando la extensión por puesta si está en cualquier
+navegador. Cambiarlo marcaría como faltante la de un cliente que usa Edge y tiene Chrome
+instalado sin usar, y el motor no tiene cómo saber cuál usa sin preguntar.
+
+### 2. La cola: decide la última lectura, y el trabajo único que no se borra
+
+En 8 corridas (7 PCs) la causa fue "La cola se limpió y no bajó: sigue trabada", **todas con
+1 trabajo antes y 1 después**. En dos, la lectura de 2,5 segundos más tarde ya daba 0: la cola
+se había vaciado, solo que tarde, y el motor afirmaba que seguía trabada. El veredicto usaba la
+lectura inmediata.
+
+En las otras seis el trabajo seguía ahí, y el texto culpaba a "algo que regenera trabajos",
+que no aplica a un trabajo solo. Un trabajo único que no se borra suele quedar en "Eliminando"
+esperando un puerto que no contesta.
+
+- **El veredicto usa la última lectura**: si la cola bajó en cualquiera de las dos, bajó.
+- **Si quedan uno o dos trabajos que no se van, se reinicia el servicio de impresión** y se
+  vuelve a medir. Es reversible y es lo mismo que el motor ya hacía con una impresora offline,
+  así que no se pregunta. En modo diagnóstico no se aplica.
+- **Si ni así se van, la causa apunta a la impresora o a su puerto**, no a la purga: "Un
+  trabajo no se borra de la cola: la impresora o su puerto no lo recibe", con qué revisar.
+- `purgaMedicion` suma `spoolerReiniciado`, `trasSpooler` y `final`.
+
+**Lo que no se hizo:** la bitácora proponía además vaciar `spool\PRINTERS`. Eso borra los
+trabajos de *todas* las impresoras de la PC, no solo de la trabada, y es irreversible. Primero
+hay que ver en la telemetría cuántas veces alcanza con reiniciar el servicio.
+
+### 3. Una ventana en blanco ya no cuesta 15 minutos
+
+Caso real (04/10): "luego de 5 minutos printdoctor no se ejecutó". En la captura, la ventana del
+diagnóstico abierta y **gris**, y en la consola "¿Desea terminar el trabajo por lotes (S/N)?".
+La página no cargó nunca, y el motor la daba por viva hasta que pidiera su primera
+actualización: esperaba los 15 minutos completos el ID de la conversación en una ventana que no
+mostraba nada.
+
+- **Apenas se abre la ventana, se le dan 20 segundos para cargar.** Si no carga, se abre de
+  nuevo con el navegador predeterminado (sin elevar). Si tampoco carga, **el diagnóstico sigue en
+  la consola** y se avisa ahí: "LA VENTANA DEL DIAGNÓSTICO NO CARGÓ. Seguimos por acá".
+- Con `-UiNoOpen` (la dirección se pega a mano) no se espera nada. Si la ventana no se pudo
+  abrir sola, se espera el triple antes de pasar a la consola, para dar tiempo a pegarla.
+- **Ctrl+C en la consola ya no corta el diagnóstico mientras se espera en la ventana.** Desde
+  que la consola no tiene edición rápida (3.36), Ctrl+C no copia: corta. Es probable que el
+  asesor del caso haya intentado copiar la dirección que la consola invita a pegar. Falta
+  confirmarlo con él.
+- Dato nuevo en la telemetría: `uiCarga` (`ok`, `reabierta`, `consola`).
+
+### 4. Una copia que no reporta se avisa al arrancar
+
+Caso real (05/10): un asesor preguntó en el canal cuándo se sube el reporte. En su propia captura,
+abajo de todo y en gris, decía *"No se pudo enviar el reporte al panel: no configurada"*. Sus
+corridas llegaron a la planilla hasta el 29/09, con el launcher interno. **Desde que salió el
+launcher 7 (01/10) no llegó casi ninguna**, y nadie se enteró en cinco días. El `.cmd` del
+repositorio trae la dirección del reporte vacía a propósito, y nunca se armó la copia interna del
+launcher 7. Las filas por día bajaron de 42 (30/09) a 28, 18, 9 y 6.
+
+- **Si la copia no tiene la dirección del reporte, se avisa antes de empezar** y se espera a que el
+  asesor lo vea: "Esta copia de la herramienta NO está reportando", con qué hacer. **No corta el
+  diagnóstico.** En modo agente no se pregunta.
+- Las copias internas del launcher 7 (Fudo y Deli) se generaron aparte y se reparten a mano, como
+  siempre: no van al repositorio.
+
+### 5. "Cerrar" cierra, o dice claro que ya se puede cerrar
+
+Dos asesores (05/10): *"cuando ya fue resuelto el problema y le doy a Cerrar no lo hace, se queda
+trabado; entonces cierro la ventana directamente"*. El motor terminaba bien, pero la página no
+mostraba nada: el botón quedaba igual. Nunca intentaba cerrar la ventana, y al rato aparecía un
+cartel chico abajo: "ya se puede cerrar esta pestaña".
+
+- Al tocar **Cerrar** se ve enseguida "Revisión terminada — Cerrando…".
+- **La ventana intenta cerrarse sola.** Se probó en el navegador integrado y la cerró.
+- Si el navegador no lo permite, se ve grande: **"Listo. Ya podés cerrar esta ventana. El resultado
+  ya quedó guardado."**
+
+**Qué no cambió:** la ventana negra del launcher sigue terminando con "Presione una tecla para
+continuar". Cambiarla es tocar el launcher, que se reparte a mano.
+
+### Evaluado y no implementado
+
+- **Mandar una señal a la telemetría al arrancar**, para que los casos que se cortan dejen
+  fila. Agrega una fila por corrida a la planilla, y el dashboard y la bitácora cuentan filas
+  como corridas: las métricas se duplicarían. Hay que decidirlo junto con el receptor y no se
+  puede verificar desde el self-test.
+- **Modo de impresión protegido que da `activo = false` en 166 de 166 corridas** con un caso a
+  la vista. Hay que ver en una PC con el modo activado dónde lo guarda Windows; leer claves
+  supuestas no lo arregla.
+- **Impresora de red enchufada directo a la placa de red de la PC** (sin DHCP, 169.254): el
+  barrido ignora esa placa. Sin hardware para probarlo, y el camino Ethernet sigue sin probar
+  contra una impresora real.
+
+### Self-test
+
+- **Escenario 150**: la cola con `antes 1 / después 1 / rebote 0` queda reparada; el trabajo
+  único reinicia el servicio y se vuelve a medir, y si no se va apunta al puerto (en dry-run no
+  reinicia nada); la extensión se abre en el navegador elegido y no cuenta si aparece en otro;
+  la búsqueda en disco informa todos los navegadores; la ventana que no carga se reabre una vez
+  y pasa a la consola; Ctrl+C se desactiva durante la espera.
+- La lista de navegadores devuelve vacío dentro del self-test: el resultado no puede depender
+  de qué navegadores tenga la máquina donde corre.
+
+### Sin cambios
+
+Nada que redistribuir: todo vive en el `.ps1`.
+
 ## [3.39] - 2026-10-02
 
 **Una asesora abrió el diagnóstico, vio la pantalla pidiéndole el ID de la conversación y no
