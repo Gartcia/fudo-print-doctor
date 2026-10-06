@@ -92,6 +92,8 @@ function ConvertTo-LauncherDeli {
         ,@('echo   sacale una captura y escribi en #fudo-print-doctor: es un bug', 'echo   aqui em cima, tire um print e escreva em #fudo-print-doctor: e um')
         ,@('echo   del motor, no del cliente.', 'echo   bug do motor, nao do cliente.')
         ,@('echo  Listo. Quedo solo resultado.json: adjuntalo al caso y borralo.', 'echo  Pronto. Ficou so o resultado.json: anexe ao caso e apague.')
+        ,@('echo  Esta ventana se cierra sola en 15 segundos.', 'echo  Esta janela fecha sozinha em 15 segundos.')
+        ,@('echo  Si queres leer algo de aca arriba, apreta N y queda abierta.', 'echo  Se quiser ler algo aqui em cima, aperte N e ela fica aberta.')
         ,@('echo   ESTA PC NO PUEDE CORRER EL DIAGNOSTICO', 'echo   ESTE PC NAO CONSEGUE RODAR O DIAGNOSTICO')
         ,@('echo   Tiene una version de PowerShell anterior a la 5, que es de', 'echo   Tem uma versao do PowerShell anterior a 5, que e do')
         ,@('echo   Windows 7 o anterior. El motor no puede funcionar ahi.', 'echo   Windows 7 ou anterior. O motor nao funciona nele.')

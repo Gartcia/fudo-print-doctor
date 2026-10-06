@@ -102,8 +102,11 @@ cartel chico abajo: "ya se puede cerrar esta pestaña".
 - Si el navegador no lo permite, se ve grande: **"Listo. Ya podés cerrar esta ventana. El resultado
   ya quedó guardado."**
 
-**Qué no cambió:** la ventana negra del launcher sigue terminando con "Presione una tecla para
-continuar". Cambiarla es tocar el launcher, que se reparte a mano.
+**Launcher 8 (06/10):** la ventana negra tampoco se queda esperando una tecla. Si la revisión
+terminó, avisa y se cierra sola a los 15 segundos; con **N** queda abierta, por si la revisión
+siguió por consola y falta leer algo. Si el motor falló, sigue esperando como antes, para que el
+error se pueda leer. Probado en una PC real: la ventana se cerró y la fila llegó a la planilla.
+**Hay que repartirlo**: la copia interna se manda a mano (la de Deli también).
 
 ### Evaluado y no implementado
 

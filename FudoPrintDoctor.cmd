@@ -26,7 +26,7 @@ REM      avisa y sigue por consola. La interfaz no puede ser condicion
 REM      para diagnosticar en la PC de un cliente que ya tiene un
 REM      problema.
 REM ================================================================
-REM  LAUNCHER-VERSION: 7   <- subir esto cuando cambie este archivo. El
+REM  LAUNCHER-VERSION: 8   <- subir esto cuando cambie este archivo. El
 REM  updater no lo pisa (lleva la URL de telemetria), asi que hoy la copia
 REM  interna se distribuye a mano. El marcador queda para que el updater
 REM  pueda comparar y refrescarlo preservando la URL.
@@ -191,7 +191,7 @@ REM  URL de reporte, por eso no se pisa-, asi que hay asesores con launchers vie
 REM  no habia forma de saber quienes: una corrida que no arranca no reporta nada, y un
 REM  launcher anterior al 10/09/2026 puede escribir RESUELTO sin que el motor corra.
 REM  Al publicar un .cmd nuevo, actualizar esta fecha.
-set "FPD_STAMP=2026-10-01"
+set "FPD_STAMP=2026-10-05"
 powershell -NoProfile -ExecutionPolicy Bypass -File "%FPD_MOTOR%" -Ui web -NoNativaKitCheck -LauncherStamp "%FPD_STAMP%" -JsonOut "%FPD_JSON%"
 set FPD_EXIT=%errorlevel%
 
@@ -229,6 +229,24 @@ REM  correrlo de nuevo en esta PC, este archivo lo vuelve a bajar solo.
 del /q "%FPD_MOTOR%" >nul 2>&1
 echo.
 echo  Listo. Quedo solo resultado.json: adjuntalo al caso y borralo.
+
+REM  Launcher 8 (05/10/2026): dos asesores contaron que al tocar "Cerrar" en la
+REM  ventana del diagnostico "se queda trabado" y cerraban todo a mano. Una parte
+REM  era la pagina (se arreglo en el motor 3.40); la otra era esta ventana, que se
+REM  quedaba esperando una tecla. Si la revision termino, se cierra sola. Si el
+REM  motor fallo, sigue esperando: el error en rojo hay que poder leerlo. Con N
+REM  queda abierta, por si la revision siguio por esta consola y falta leer algo.
+if "%FPD_EXIT%"=="0" goto cierre_solo
+if "%FPD_EXIT%"=="2" goto cierre_solo
+goto fin
+
+:cierre_solo
+echo.
+echo  Esta ventana se cierra sola en 15 segundos.
+echo  Si queres leer algo de aca arriba, apreta N y queda abierta.
+choice /c SN /t 15 /d S /n >nul 2>&1
+if errorlevel 2 goto fin
+exit /b %FPD_EXIT%
 
 :fin
 echo.
