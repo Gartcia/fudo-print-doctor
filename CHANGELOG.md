@@ -2,6 +2,35 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.41] - 2026-10-06
+
+**Una cola con decenas de miles de trabajos dejaba la corrida colgada en la limpieza.** Caso
+real (06/10, 3.40): dos colas con 56.936 y 55.315 trabajos. El asesor aceptó limpiarlas y la
+corrida quedó para siempre en "Colas trabadas", sin reportar nada: la limpieza le pedía a
+Windows que cancelara los trabajos de a uno (`CancelAllJobs`) sin límite de tiempo, y si eso
+fallaba los leía y borraba uno por uno (`Get-PrintJob | Remove-PrintJob`). Con 112 mil, eso son
+horas. La 3.36 ya había sacado la *lectura* de las colas enormes; la *limpieza* seguía igual.
+
+- **Si las únicas colas con trabajos son las que el asesor aceptó limpiar, se vacía el
+  spooler de una vez**: se detiene el servicio de impresión, se borran los archivos de los
+  trabajos (`.SHD`, `.SPL`, `.TMP`, nada más) de la carpeta del spooler y se vuelve a arrancar.
+  Es lo que hace un técnico a mano, y tarda segundos con cualquier cantidad. Como borra los
+  trabajos de *todas* las colas, solo se usa cuando ninguna otra cola tiene trabajos según el
+  conteo de Windows (si no se sabe, cuenta como que tiene).
+- **Si otra cola tiene trabajos, o el servicio no se puede detener, se sigue cola por cola**,
+  pero una cola enorme ya no cae nunca en leer y borrar de a uno: `CancelAllJobs` corre con
+  límite de 3 minutos y, si no termina, se dice.
+- **Lo mismo en la capa 2**, que limpiaba y después contaba lo que quedaba leyendo los trabajos
+  sin límite: con una cola enorme, ahora cuenta con el conteo de Windows.
+- La telemetría lleva `limpiezaSpooler` (colas y archivos borrados) cuando se usó el vaciado.
+
+**Qué no cambió:** sigue siendo irreversible y se pregunta igual. Una cola chica se limpia como
+siempre.
+
+**Sin probar contra hardware real**: detener el spooler y borrar su carpeta es el procedimiento
+estándar, pero no se probó con 100 mil trabajos encolados. Mirar en la telemetría las primeras
+corridas con `limpiezaSpooler`: cuánto tardó el paso `layer0.quickQueue` y si la cola quedó en 0.
+
 ## [3.40] - 2026-10-05
 
 **Tres casos de la misma semana en los que el motor decía algo que no era cierto.** Un

@@ -502,7 +502,7 @@ $script:Producto    = 'Fudo'
 $script:PrefijoCola = 'FUDO-'
 $script:NombreCola  = 'Impresora Fudo'
 $script:ReglasTexto = @()
-$script:SchemaVersion = '3.40'
+$script:SchemaVersion = '3.41'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -6844,14 +6844,121 @@ function Add-ColaSinRespuesta {
 }
 
 function Clear-ColaDeImpresion {
-    <# Borra los trabajos de una cola. Aislada para poder mockearla en el self-test. #>
-    param([string]$Nombre)
+    <#
+      Borra los trabajos de una cola. Aislada para poder mockearla en el self-test.
+      v3.41: con -Masiva, CancelAllJobs corre con limite de tiempo y NO cae en Remove-PrintJob:
+      con decenas de miles de trabajos, leerlos y borrarlos de a uno lleva horas.
+    #>
+    param([string]$Nombre, [switch]$Masiva, [int]$TimeoutSec = 180)
+    if ($Masiva) {
+        $r = Invoke-ConLimite -Script { param($n)
+            $w = @(Get-CimInstance -ClassName Win32_Printer -ErrorAction Stop | Where-Object { [string]$_.Name -eq $n }) | Select-Object -First 1
+            if (-not $w) { throw 'cola no encontrada' }
+            $null = Invoke-CimMethod -InputObject $w -MethodName 'CancelAllJobs' -ErrorAction Stop
+            'CancelAllJobs'
+        } -Argumentos @($Nombre) -TimeoutSec $TimeoutSec
+        if ([bool]$r.timeout) { return ('CancelAllJobs sin terminar en ' + $TimeoutSec + ' s') }
+        if ([bool]$r.ok) { return 'CancelAllJobs' }
+        return 'CancelAllJobs fallo'
+    }
     try {
         $w = @(Get-CimInstance -ClassName Win32_Printer -ErrorAction Stop | Where-Object { [string]$_.Name -eq $Nombre }) | Select-Object -First 1
         if ($w) { $null = Invoke-CimMethod -InputObject $w -MethodName 'CancelAllJobs' -ErrorAction Stop; return 'CancelAllJobs' }
     } catch {}
     try { Get-PrintJob -PrinterName $Nombre -ErrorAction SilentlyContinue | Remove-PrintJob -ErrorAction SilentlyContinue } catch {}
     return 'Remove-PrintJob'
+}
+
+function Clear-SpoolerCompleto {
+    <#
+      v3.41 (caso de un asesor del 06/10): dos colas con 56.936 y 55.315 trabajos. El asesor
+      acepto limpiarlas y la corrida quedo para siempre en "Colas trabadas", sin reportar nada:
+      la limpieza le pedia a Windows que cancelara los trabajos de a uno, y si eso fallaba los
+      leia y borraba uno por uno. Con 112 mil, eso son horas.
+      Lo que hace un tecnico a mano: detener el servicio de impresion, borrar los archivos de
+      los trabajos de la carpeta del spooler y volver a arrancarlo. Tarda segundos con cualquier
+      cantidad. Borra los trabajos de TODAS las colas, asi que solo se usa cuando las unicas
+      colas con trabajos son las que el asesor acepto limpiar (Clear-ColasTrabadas lo decide).
+      Solo toca archivos de trabajos (.SHD, .SPL, .TMP), aunque la carpeta este cambiada.
+      Devuelve @{ ok; nota; borrados }.
+    #>
+    param([string]$Carpeta = '')
+    if (-not $Carpeta) {
+        $Carpeta = Join-Path $env:SystemRoot 'System32\spool\PRINTERS'
+        try {
+            $d = [string](Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Print\Printers' -Name 'DefaultSpoolDirectory' -ErrorAction Stop).DefaultSpoolDirectory
+            if ($d -and (Test-Path -LiteralPath $d)) { $Carpeta = $d }
+        } catch {}
+    }
+    if (-not (Test-Path -LiteralPath $Carpeta)) { return @{ ok = $false; nota = ('no se encontro la carpeta de trabajos: ' + $Carpeta); borrados = 0 } }
+    Write-StepDetail 'deteniendo el servicio de impresion'
+    try { Stop-Service -Name 'Spooler' -Force -ErrorAction Stop }
+    catch { return @{ ok = $false; nota = ('no se pudo detener el servicio de impresion: ' + $_.Exception.Message); borrados = 0 } }
+    $borrados = 0; $fallidos = 0
+    try {
+        $archivos = @([System.IO.Directory]::GetFiles($Carpeta) | Where-Object { [System.IO.Path]::GetExtension([string]$_) -match '^(?i)\.(shd|spl|tmp)$' })
+        Write-StepDetail ('borrando ' + @($archivos).Count + ' archivos de trabajos')
+        foreach ($f in $archivos) {
+            try { [System.IO.File]::Delete([string]$f); $borrados++ } catch { $fallidos++ }
+            if ($borrados -gt 0 -and ($borrados % 20000) -eq 0) { Write-StepDetail ('borrados ' + $borrados + ' de ' + @($archivos).Count) }
+        }
+    } catch {}
+    finally {
+        Write-StepDetail 'arrancando el servicio de impresion'
+        try { Start-Service -Name 'Spooler' -ErrorAction Stop }
+        catch { try { Start-Sleep -Seconds 2; Start-Service -Name 'Spooler' -ErrorAction SilentlyContinue } catch {} }
+    }
+    Start-Sleep -Seconds 2
+    $nota = ('servicio de impresion detenido, ' + $borrados + ' archivos de trabajos borrados' + $(if ($fallidos -gt 0) { ' (' + $fallidos + ' no se pudieron borrar)' } else { '' }) + ', servicio arrancado')
+    return @{ ok = $true; nota = $nota; borrados = $borrados }
+}
+
+function Clear-ColasTrabadas {
+    <#
+      v3.41: limpia las colas que el asesor acepto limpiar. Si alguna es enorme y ninguna OTRA
+      cola tiene trabajos (segun el conteo de Windows), se vacia el spooler entero de una vez
+      (Clear-SpoolerCompleto): el efecto es el mismo y tarda segundos. Si otra cola tiene
+      trabajos -o no se sabe-, no se toca lo que no se pregunto: cola por cola, con limite de
+      tiempo para las enormes. Devuelve la nota de lo que se hizo.
+    #>
+    param([object[]]$Candidatas, [object[]]$Colas)
+    $nombres = @($Candidatas | ForEach-Object { [string]$_.nombre })
+    $masivas = @($Candidatas | Where-Object { [int]$_.trabajos -ge [int]$script:ColaMasiva })
+    if (@($masivas).Count -gt 0) {
+        $otrasConTrabajos = @($Colas | Where-Object { $_ -and ($nombres -notcontains [string]$_.Name) -and ((Get-JobCountDeCola -Cola $_) -ne 0) })
+        if (@($otrasConTrabajos).Count -eq 0) {
+            $sp = Clear-SpoolerCompleto
+            if ([bool]$sp.ok) { $script:Diagnostics['limpiezaSpooler'] = [ordered]@{ colas = $nombres; borrados = [int]$sp.borrados }; return [string]$sp.nota }
+            Write-StepDetail ([string]$sp.nota)
+        }
+    }
+    $notas = @()
+    foreach ($c in @($Candidatas)) {
+        $esMasiva = ([int]$c.trabajos -ge [int]$script:ColaMasiva)
+        if ($esMasiva) { Write-StepDetail ('limpiando ' + [string]$c.nombre + ' (' + [int]$c.trabajos + ' trabajos): puede tardar hasta 3 minutos') }
+        $notas += ([string]$c.nombre + ': ' + (Clear-ColaDeImpresion -Nombre ([string]$c.nombre) -Masiva:$esMasiva))
+    }
+    return ($notas -join ' | ')
+}
+
+function Get-ConteoCola {
+    <#
+      Cuantos trabajos quedan en una cola despues de limpiarla. Con -Masiva usa el conteo de
+      Windows (leer 50 mil trabajos para contarlos es lo que colgaba la corrida); sin el, lee
+      los trabajos como siempre.
+    #>
+    param([string]$Nombre, [switch]$Masiva)
+    if ($Masiva) {
+        $r = Invoke-ConLimite -Script { param($n) @(Get-Printer -Name $n -ErrorAction Stop) } -Argumentos @($Nombre) -TimeoutSec 15
+        if ([bool]$r.ok) {
+            $jc = Get-JobCountDeCola -Cola (@($r.valor | Where-Object { $_ }) | Select-Object -First 1)
+            if ($jc -ge 0) { return $jc }
+        }
+        $lec = Get-TrabajosDeCola -Nombre $Nombre -TimeoutSec 30
+        if (-not [bool]$lec.timeout) { return @($lec.jobs).Count }
+        return -1
+    }
+    return @(Get-PrintJob -PrinterName $Nombre -ErrorAction SilentlyContinue).Count
 }
 
 function Invoke-PurgaTemprana {
@@ -6870,10 +6977,12 @@ function Invoke-PurgaTemprana {
     #>
     if (-not $AutoFix -or $DryRun) { return }
     $cands = @()
+    $todasLasColas = @()
     # v3.35: con limite de tiempo (ver Invoke-ConLimite). Si ni la lista de impresoras contesta,
     # el servicio de impresion esta trabado: se avisa y se sigue, la capa 0 ya lo va a mirar.
     $lista0 = Invoke-ConLimite -Script { @(Get-Printer -ErrorAction Stop) } -TimeoutSec 15
     if ([bool]$lista0.timeout) { Add-ColaSinRespuesta -Nombre '(la lista de impresoras de Windows)' -TimeoutSec 15; return }
+    $todasLasColas = @($lista0.valor | Where-Object { $_ })
     try {
         foreach ($p in @($lista0.valor | Where-Object { $_ })) {
             if ((Test-IsVirtualPrinter $p).isVirtual) { continue }
@@ -6908,9 +7017,7 @@ function Invoke-PurgaTemprana {
         -Target (@($cands | ForEach-Object { [string]$_.nombre }) -join ', ') `
         -Before ([string](@($cands | ForEach-Object { [int]$_.trabajos }) | Measure-Object -Sum).Sum + ' jobs') -After '0 jobs' -Reversible $false `
         -Impact 'se descartan las comandas que estan esperando; hay que volver a imprimirlas desde Fudo. Se ofrece ahora porque es lo mas rapido de resolver: el resto de la revision sigue despues.' -Fix {
-            $notas = @()
-            foreach ($c in @($cands)) { $notas += ([string]$c.nombre + ': ' + (Clear-ColaDeImpresion -Nombre ([string]$c.nombre))) }
-            ($notas -join ' | ')
+            Clear-ColasTrabadas -Candidatas @($cands) -Colas @($todasLasColas)
         }
     if (-not $rem.applied) {
         # Una persona dijo que no: la capa 2 no vuelve a preguntar lo mismo. En modo agente no
@@ -7005,10 +7112,17 @@ function Test-Layer2-Queue {
             -Recommendation ("La cola tiene $(@($jobs).Count) trabajos trabados y al arrancar se eligio no limpiarla. Mientras sigan ahi, las comandas nuevas no salen.")
         return
     }
+    # v3.41: una cola enorme se limpia y se cuenta sin leer sus trabajos (ver Clear-SpoolerCompleto).
+    $masivaL = ($jcL -ge [int]$script:ColaMasiva)
     if ($isStuck) {
         $rem = Invoke-Remediation -Description "Limpiar cola trabada ($(@($jobs).Count) trabajos) en '$($Printer.Name)'" -Type 'queue.purge' -Target $Printer.Name `
             -Before "$(@($jobs).Count) jobs" -After '0 jobs' -Reversible $false `
             -Impact 'se descartan las comandas que estan esperando en la cola; hay que volver a imprimirlas desde Fudo' -Fix {
+                if ($masivaL) {
+                    $lt = Invoke-ConLimite -Script { @(Get-Printer -ErrorAction Stop) } -TimeoutSec 15
+                    $colasL = $(if ([bool]$lt.ok) { @($lt.valor | Where-Object { $_ }) } else { @([pscustomobject]@{ Name = '(sin lista)'; JobCount = -1 }) })
+                    return (Clear-ColasTrabadas -Candidatas @([ordered]@{ nombre = [string]$Printer.Name; trabajos = $jcL }) -Colas $colasL)
+                }
                 try {
                     if ($Wmi) { $null = Invoke-CimMethod -InputObject $Wmi -MethodName 'CancelAllJobs' -ErrorAction Stop; 'CancelAllJobs() OK' }
                     else { Get-PrintJob -PrinterName $Printer.Name | Remove-PrintJob -ErrorAction SilentlyContinue; 'Remove-PrintJob OK' }
@@ -7028,9 +7142,9 @@ function Test-Layer2-Queue {
         $despues = $antes
         $rebote = $antes
         if ($rem.applied) {
-            try { $despues = @(Get-PrintJob -PrinterName $Printer.Name -ErrorAction SilentlyContinue).Count } catch {}
+            try { $despues = Get-ConteoCola -Nombre ([string]$Printer.Name) -Masiva:$masivaL; if ($despues -lt 0) { $despues = $antes } } catch {}
             Start-Sleep -Milliseconds 2500
-            try { $rebote = @(Get-PrintJob -PrinterName $Printer.Name -ErrorAction SilentlyContinue).Count } catch {}
+            try { $rebote = Get-ConteoCola -Nombre ([string]$Printer.Name) -Masiva:$masivaL; if ($rebote -lt 0) { $rebote = $despues } } catch {}
         }
         $colasTodas = @()
         if ($script:Diagnostics.Contains('colas')) { $colasTodas = @($script:Diagnostics['colas'] | Where-Object { -not $_.esDePrueba }) }
@@ -14183,7 +14297,7 @@ public class FudoFakeEndpoint {
     $script:Diagnostics['nativaDescarga'] = [ordered]@{ firmaOk = $true; bytes = 1 }
     $script:Diagnostics['modoImpresionProtegido'] = [ordered]@{ activo = $false; origen = '' }
     $x134 = Get-TelemetryDiagnosticsExtra
-    Assert-Eq 'S134 viajan las cinco claves (y las de los escenarios 135, 141, 143 y 144)' 'nativaDescarga,eleccionImpresora,eleccionPuerto,modoImpresionProtegido,usbSinEnumerar,extensionAbierta,purgaTemprana,uiApertura,uiCarga,colasSinRespuesta,consolaSinEdicionRapida,despuesNativa,tiempos,hardware' (@($x134.Keys) -join ',')
+    Assert-Eq 'S134 viajan las cinco claves (y las de los escenarios 135, 141, 143, 144 y 151)' 'nativaDescarga,eleccionImpresora,eleccionPuerto,modoImpresionProtegido,usbSinEnumerar,extensionAbierta,purgaTemprana,uiApertura,uiCarga,colasSinRespuesta,consolaSinEdicionRapida,despuesNativa,limpiezaSpooler,tiempos,hardware' (@($x134.Keys) -join ',')
     Assert-Eq 'S134 con su contenido' $true ([bool]$x134['nativaDescarga'].firmaOk)
     Assert-Eq 'S134 Send-Telemetry las pone en el payload' $true ([bool]((Get-Command Send-Telemetry).ScriptBlock.ToString() -match 'Get-TelemetryDiagnosticsExtra'))
     Reset-State
@@ -14782,6 +14896,91 @@ public class FudoFakeEndpoint {
     Assert-Eq 'S150 Cerrar pasa por el cierre nuevo' $true ([bool]($html150 -match 'cerrarVentana\(\); \}\);'))
     Assert-Eq 'S150 que intenta cerrar la ventana sola' $true ([bool]($html150 -match 'window\.close\(\)'))
     Assert-Eq 'S150 y si no puede lo dice claro' $true ([bool]($html150 -match 'Ya pod\u00e9s cerrar esta ventana'))
+    Reset-Mocks
+    Reset-State
+
+    # -----------------------------------------------------------------------
+    # Escenario 151 (v3.41, caso de un asesor del 06/10): dos colas con 56.936 y 55.315 trabajos.
+    # Acepto limpiarlas y la corrida quedo para siempre en "Colas trabadas".
+    Reset-State
+    Reset-Mocks
+    function Write-StepDetail { param($Texto) }
+    function Start-Sleep { param($Seconds, $Milliseconds) }
+    function Confirm-Irreversible { param($Description, $Impact) $true }
+    $script:jc151 = @{ 'Generic / Text Only' = 56936; 'Comandera' = 55315; 'CAJA' = 0 }
+    function Get-Printer { param($Name, $ErrorAction)
+        $todas = @($script:jc151.Keys | ForEach-Object { [pscustomobject]@{ Name = $_; PortName = 'USB001'; DriverName = 'Generic / Text Only'; JobCount = [int]$script:jc151[$_] } })
+        if ($Name) { @($todas | Where-Object { $_.Name -eq $Name }) } else { $todas } }
+    $script:leidas151 = @()
+    function Get-TrabajosDeCola { param($Nombre, $TimeoutSec)
+        $script:leidas151 += [string]$Nombre
+        @{ ok = $true; timeout = $false; jobs = @(1..([int]$script:jc151[[string]$Nombre]) | Where-Object { [int]$script:jc151[[string]$Nombre] -gt 0 } | ForEach-Object { [pscustomobject]@{ JobStatus = 'Normal'; SubmittedTime = (Get-Date).AddMinutes(-1) } }) } }
+    function Get-PrintJob { param($PrinterName, $ErrorAction) $script:leidas151 += ('PJ:' + [string]$PrinterName); @() }
+    $script:spooler151 = 0
+    function Clear-SpoolerCompleto { param($Carpeta) $script:spooler151++; foreach ($k in @($script:jc151.Keys)) { $script:jc151[$k] = 0 }; @{ ok = $true; nota = 'spooler vaciado'; borrados = 224502 } }
+    $script:cola151 = @()
+    function Clear-ColaDeImpresion { param($Nombre, [switch]$Masiva) $script:cola151 += ([string]$Nombre + '|' + [bool]$Masiva); $script:jc151[[string]$Nombre] = 0; 'mock' }
+    Invoke-PurgaTemprana
+    Assert-Eq 'S151 solo las enormes tienen trabajos: se vacia el spooler de una vez' 1 ([int]$script:spooler151)
+    Assert-Eq 'S151 y no se limpian de a una' 0 (@($script:cola151).Count)
+    Assert-Eq 'S151 sin leer un solo trabajo' 0 (@($script:leidas151).Count)
+    Assert-Eq 'S151 y se verifica que bajaron' 'fixed' ([string](Get-CheckById 'queue.purgaTemprana').status)
+    Assert-Eq 'S151 la telemetria dice como se limpio' 224502 ([int]$script:Diagnostics['limpiezaSpooler'].borrados)
+    # Si otra cola tiene trabajos, no se borra lo que no se pregunto: cola por cola, con limite.
+    Reset-State
+    $script:jc151 = @{ 'Generic / Text Only' = 56936; 'Comandera' = 55315; 'CAJA' = 2 }
+    $script:spooler151 = 0; $script:cola151 = @(); $script:leidas151 = @()
+    Invoke-PurgaTemprana
+    Assert-Eq 'S151 con otra cola con trabajos no se vacia el spooler' 0 ([int]$script:spooler151)
+    Assert-Eq 'S151 se limpian las dos, como enormes' 'Comandera|True,Generic / Text Only|True' ((@($script:cola151) | Sort-Object) -join ',')
+    # Si no se puede detener el servicio, se sigue cola por cola.
+    Reset-State
+    $script:jc151 = @{ 'Generic / Text Only' = 56936; 'Comandera' = 0; 'CAJA' = 0 }
+    $script:cola151 = @()
+    function Clear-SpoolerCompleto { param($Carpeta) @{ ok = $false; nota = 'no se pudo detener'; borrados = 0 } }
+    Invoke-PurgaTemprana
+    Assert-Eq 'S151 si el servicio no se detiene, se limpia la cola igual' 'Generic / Text Only|True' (@($script:cola151) -join ',')
+    # La capa 2 tambien: una cola enorme se limpia y se cuenta sin leerla.
+    Reset-State
+    function Clear-SpoolerCompleto { param($Carpeta) $script:spooler151++; foreach ($k in @($script:jc151.Keys)) { $script:jc151[$k] = 0 }; @{ ok = $true; nota = 'spooler vaciado'; borrados = 10 } }
+    $script:jc151 = @{ 'Comandera' = 3000; 'CAJA' = 0 }
+    $script:spooler151 = 0; $script:leidas151 = @()
+    function Get-TrabajosDeCola { param($Nombre, $TimeoutSec) $script:leidas151 += [string]$Nombre; @{ ok = $false; timeout = $true; jobs = @() } }
+    Test-Layer2-Queue -Printer ([pscustomobject]@{ Name = 'Comandera'; PortName = 'USB001'; JobCount = 3000 }) -Wmi $null
+    Assert-Eq 'S151 capa 2: vacia el spooler' 1 ([int]$script:spooler151)
+    Assert-Eq 'S151 capa 2: no cuenta leyendo trabajos' 0 (@($script:leidas151 | Where-Object { [string]$_ -like 'PJ:*' }).Count)
+    Assert-Eq 'S151 capa 2: y queda reparada' 'fixed' ([string](Get-CheckById 'queue.health').status)
+    # Una cola enorme nunca cae en leer y borrar de a uno.
+    Reset-Mocks
+    function Get-CimInstance { param($ClassName, $ErrorAction) throw 'sin WMI' }
+    $script:pj151 = 0
+    function Get-PrintJob { param($PrinterName, $ErrorAction) $script:pj151++; @() }
+    $n151 = Clear-ColaDeImpresion -Nombre 'Comandera' -Masiva
+    Assert-Eq 'S151 enorme y sin WMI: no lee los trabajos' 0 ([int]$script:pj151)
+    Assert-Eq 'S151 y lo dice' 'CancelAllJobs fallo' ([string]$n151)
+    # El vaciado de verdad, sobre una carpeta de prueba: solo archivos de trabajos, y el servicio vuelve a arrancar.
+    Reset-Mocks
+    function Write-StepDetail { param($Texto) }
+    function Start-Sleep { param($Seconds, $Milliseconds) }
+    $script:sv151 = @()
+    function Stop-Service { param($Name, [switch]$Force, $ErrorAction) $script:sv151 += 'stop' }
+    function Start-Service { param($Name, $ErrorAction) $script:sv151 += 'start' }
+    $tmp151 = Join-Path ([IO.Path]::GetTempPath()) ('fpd151-' + [guid]::NewGuid().ToString('N'))
+    $null = New-Item -ItemType Directory -Force -Path $tmp151
+    foreach ($f in @('FP00001.SHD', 'FP00001.SPL', 'FP00002.shd', 'FP00002.spl', 'otro.txt')) { Set-Content -LiteralPath (Join-Path $tmp151 $f) -Value 'x' }
+    try {
+        $sp151 = Clear-SpoolerCompleto -Carpeta $tmp151
+        $quedan151 = @(Get-ChildItem -LiteralPath $tmp151 | ForEach-Object { $_.Name })
+    } finally { Remove-Item -LiteralPath $tmp151 -Recurse -Force -ErrorAction SilentlyContinue }
+    Assert-Eq 'S151 borra los archivos de trabajos' 4 ([int]$sp151.borrados)
+    Assert-Eq 'S151 y nada mas' 'otro.txt' (@($quedan151) -join ',')
+    Assert-Eq 'S151 detiene y vuelve a arrancar el servicio' 'stop,start' (@($script:sv151) -join ',')
+    # Si no se puede detener, no borra nada.
+    function Stop-Service { param($Name, [switch]$Force, $ErrorAction) throw 'acceso denegado' }
+    $script:sv151 = @()
+    $sp151b = Clear-SpoolerCompleto -Carpeta ([IO.Path]::GetTempPath())
+    Assert-Eq 'S151 sin detener el servicio no hace nada' $false ([bool]$sp151b.ok)
+    Assert-Eq 'S151 ni lo arranca' 0 (@($script:sv151).Count)
     Reset-Mocks
     Reset-State
 
@@ -17188,7 +17387,7 @@ function Get-TelemetryDiagnosticsExtra {
       pueda ver las claves sin mandar nada.
     #>
     $out = [ordered]@{}
-    foreach ($k in @('nativaDescarga', 'eleccionImpresora', 'eleccionPuerto', 'modoImpresionProtegido', 'usbSinEnumerar', 'extensionAbierta', 'purgaTemprana', 'uiApertura', 'uiCarga', 'colasSinRespuesta', 'consolaSinEdicionRapida', 'despuesNativa')) {
+    foreach ($k in @('nativaDescarga', 'eleccionImpresora', 'eleccionPuerto', 'modoImpresionProtegido', 'usbSinEnumerar', 'extensionAbierta', 'purgaTemprana', 'uiApertura', 'uiCarga', 'colasSinRespuesta', 'consolaSinEdicionRapida', 'despuesNativa', 'limpiezaSpooler')) {
         $out[$k] = $(if ($script:Diagnostics.Contains($k)) { $script:Diagnostics[$k] } else { $null })
     }
     # v3.32: cuanto tardo cada paso (ver StepTimes).
