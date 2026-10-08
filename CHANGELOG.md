@@ -2,6 +2,44 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.42] - 2026-10-08
+
+**Ahora se puede medir el éxito de cada acción, y saber cuándo se corrió una que no hacía
+falta.** Lo pidió Gastón el 08/10, después de cruzar la telemetría acción por acción. La
+planilla solo traía el *nombre* de lo que se aplicó, y con eso aparecieron tres agujeros:
+
+- **Lo que el asesor elegía del menú no llegaba nunca.** La telemetría se manda al mostrar el
+  resultado; el menú viene después, y al volver a revisar la lista de acciones se vaciaba. Una
+  cola limpiada con la L, una Nativa instalada con la F o una impresora instalada con la I no
+  existían en la planilla.
+- **Un arreglo que tiraba error no dejaba rastro**, y una purga que el asesor rechazaba
+  tampoco. El porcentaje de éxito por acción daba más alto de lo real.
+- **No se podía distinguir "el arreglo no dura" de "se corrió algo que no hacía falta".**
+  Reasignar el puerto USB se repetía en la revisión siguiente de la misma PC en el 34% de las
+  veces (90 de 265), y en 77 de esas la revisión anterior lo había dejado verificado.
+
+Qué viaja ahora en `telemetry`:
+
+- **`accionesDetalle`**: cada intento de acción de la revisión, con `origen` (`auto`,
+  `confirmada` si hubo que preguntarle al asesor, `menu`), `resultado` (`aplicada`, `error`,
+  `no_confirmada`), `necesaria` (si el problema estaba cuando corrió), `verificado` (cómo
+  terminó el chequeo de esa acción), `repetida` (`no_se_sostuvo` si la revisión anterior en esa
+  PC ya la había dejado bien, `reintento` si no), `antes`, `error` y `ms`.
+- **`gestionesMenu`**: lo que el asesor eligió del menú después de la revisión anterior, con
+  sus acciones adentro. Viaja en la revisión que sigue, que es la que dice si sirvió. Pedir
+  limpiar una cola que no tiene trabajos, o instalar una impresora que ya no está sin
+  instalar, queda como `necesaria: false`.
+- La lista `acciones` de siempre no cambia, para que los cruces viejos sigan andando. Guardar la
+  URL de telemetría y prender el log no se miden: no arreglan nada del cliente.
+
+Para marcar las repeticiones, el motor guarda en la PC (en el mismo lugar donde ya guardaba el
+estado de la revisión anterior) qué acciones hizo y si quedaron verificadas.
+
+**Qué no cambió:** el motor hace exactamente lo mismo que antes; esto solo anota. Una acción
+automática cuenta como necesaria porque corre después de que un chequeo midió el problema; las
+excepciones visibles (limpiar una cola con 0 trabajos, reasignar un puerto al mismo puerto) se
+marcan solas.
+
 ## [3.41] - 2026-10-06
 
 **Una cola con decenas de miles de trabajos dejaba la corrida colgada en la limpieza.** Caso

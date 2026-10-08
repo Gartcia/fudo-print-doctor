@@ -480,6 +480,19 @@ $script:StartTime    = Get-Date
 $script:Diagnostics  = [ordered]@{}   # datos crudos recolectados
 $script:Errors       = New-Object System.Collections.ArrayList   # fallas internas del motor
 $script:TestPrintersCreated = New-Object System.Collections.ArrayList   # colas temporales creadas por el motor
+# v3.42: seguimiento de cada accion. $script:Actions guarda solo lo aplicado y lo usa la logica
+# del motor; esta lista guarda TODOS los intentos (aplicados, con error, no confirmados) con lo
+# que hace falta para medir el exito por accion. Ver Add-AccionDetalle.
+$script:AccionesDetalle = New-Object System.Collections.ArrayList
+# Quien disparo la accion que se esta aplicando: 'auto' (la revision) o 'menu' (una gestion
+# que eligio el asesor). Invoke-Remediation la pasa a 'confirmada' si hubo que preguntar.
+$script:OrigenAccion = 'auto'
+# Gestiones del menu hechas despues de mandar la telemetria de la revision. Sobreviven a
+# Reset-RunState a proposito: viajan en la telemetria de la revision siguiente, que es la que
+# mide si sirvieron. Antes se perdian: la lista de acciones se vaciaba al volver a revisar.
+$script:GestionesPendientes = New-Object System.Collections.ArrayList
+# Lo que la gestion en curso sabe de si hacia falta (ver Invoke-GestionMenu).
+$script:GestionNecesaria = $null
 # Las colas que crea el motor no son del cliente: no pueden contarse como evidencia.
 # v3.38: en Brasil las colas se llaman DELI-*. Se reconocen las dos siempre: una PC puede tener
 # colas de una corrida en un idioma y diagnosticarse despues en el otro.
@@ -502,7 +515,7 @@ $script:Producto    = 'Fudo'
 $script:PrefijoCola = 'FUDO-'
 $script:NombreCola  = 'Impresora Fudo'
 $script:ReglasTexto = @()
-$script:SchemaVersion = '3.41'
+$script:SchemaVersion = '3.42'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -2207,7 +2220,8 @@ function Add-Check {
 }
 
 function Add-Action {
-    param([string]$Type, [string]$Target, [string]$Before, [string]$After, [bool]$Reversible = $true)
+    param([string]$Type, [string]$Target, [string]$Before, [string]$After, [bool]$Reversible = $true,
+          [string]$Origen = '', $Necesaria = $null, [int]$Ms = -1)
     $a = [ordered]@{
         type       = $Type
         target     = $Target
@@ -2217,6 +2231,58 @@ function Add-Action {
         ts         = (Get-Date).ToString('o')
     }
     [void]$script:Actions.Add($a)
+    Add-AccionDetalle -Type $Type -Resultado 'aplicada' -Before $Before -After $After -Origen $Origen -Necesaria $Necesaria -Ms $Ms
+}
+
+# v3.42: lo que no es una reparacion no entra en la medicion por accion (dejar guardada la URL
+# de telemetria o prender un log no arregla nada del cliente).
+$script:AccionesNoReparacion = @('telemetry.persist', 'telemetry.persist_file', 'log.enable')
+
+function Test-AccionNecesaria {
+    <#
+      v3.42: habia algo que arreglar cuando la accion corrio? $true / $false / $null (no se sabe).
+      Las automaticas corren despues de que un chequeo midio el problema, asi que por defecto lo
+      son. Las excepciones se ven en lo que la accion dejo anotado: un puerto que se reasigna al
+      mismo puerto, una cola que se limpia con 0 trabajos. Una gestion del menu la elige una
+      persona y no tiene esa garantia: si nadie lo midio, queda sin saber.
+    #>
+    param([string]$Before, [string]$After, [string]$Origen)
+    $b = ([string]$Before).Trim(); $a = ([string]$After).Trim()
+    if ($b -match '^0\s+(jobs|trabajos)\b') { return $false }
+    if ($b -and $a -and $b -eq $a) { return $false }
+    if ($Origen -eq 'auto' -or $Origen -eq 'confirmada') { return $true }
+    return $null
+}
+
+function Add-AccionDetalle {
+    <#
+      v3.42: anota un intento de accion para la telemetria. La planilla solo traia el nombre de
+      lo que se aplico: no se podia saber si una accion habia fallado (si tiraba error no quedaba
+      en ningun lado), si la eligio el asesor, si hacia falta, ni si repetia algo que la revision
+      anterior ya habia arreglado. 'verificado' y 'repetida' se completan al cerrar la revision
+      (Complete-AccionesSeguimiento), cuando ya estan los chequeos finales.
+    #>
+    param([string]$Type, [string]$Resultado, [string]$Before = '', [string]$After = '',
+          [string]$Origen = '', $Necesaria = $null, [int]$Ms = -1, [string]$Fallo = '')
+    if (-not $Type) { return }
+    if ($script:AccionesNoReparacion -contains $Type) { return }
+    if (-not $Origen) { $Origen = [string]$script:OrigenAccion }
+    if ($null -eq $Necesaria) { $Necesaria = Test-AccionNecesaria -Before $Before -After $After -Origen $Origen }
+    $antes = [string]$Before
+    if ($antes.Length -gt 80) { $antes = $antes.Substring(0, 80) }
+    $falloCorto = [string]$Fallo
+    if ($falloCorto.Length -gt 160) { $falloCorto = $falloCorto.Substring(0, 160) }
+    [void]$script:AccionesDetalle.Add([ordered]@{
+        tipo       = $Type
+        origen     = $Origen
+        resultado  = $Resultado
+        necesaria  = $Necesaria
+        verificado = $null
+        repetida   = ''
+        antes      = $antes
+        error      = $falloCorto
+        ms         = $(if ($Ms -ge 0) { $Ms } else { $null })
+    })
 }
 
 function Write-LiveStatus {
@@ -2870,7 +2936,10 @@ function Invoke-Remediation {
         [string]$Before = '',
         [string]$After = '',
         [bool]$Reversible = $true,
-        [string]$Impact = ''
+        [string]$Impact = '',
+        # v3.42: si el que llama midio que no hacia falta (o que si), lo dice aca. Si no, se
+        # deduce de Before/After (ver Test-AccionNecesaria).
+        $Necesaria = $null
     )
     if (-not $AutoFix) {
         return @{ applied = $false; note = "auto-fix deshabilitado: $Description" }
@@ -2879,21 +2948,106 @@ function Invoke-Remediation {
         Write-DoctorLog -Level 'INFO' -Message "DRY-RUN: aplicaria -> $Description"
         return @{ applied = $false; note = "dry-run: $Description" }
     }
+    $origen = [string]$script:OrigenAccion
     if (-not $Reversible) {
         if (-not (Confirm-Irreversible -Description $Description -Impact $Impact)) {
             Write-DoctorLog -Level 'WARN' -Message "NO aplicada (irreversible, sin confirmacion): $Description"
+            Add-AccionDetalle -Type $Type -Resultado 'no_confirmada' -Before $Before -After $After -Origen $origen -Necesaria $Necesaria
             return @{ applied = $false; note = "pendiente de confirmacion (irreversible): $Description" }
         }
+        if ($origen -eq 'auto') { $origen = 'confirmada' }
     }
+    $t0 = Get-Date
     try {
         $result = & $Fix
-        Add-Action -Type $Type -Target $Target -Before $Before -After $After -Reversible $Reversible
+        Add-Action -Type $Type -Target $Target -Before $Before -After $After -Reversible $Reversible `
+            -Origen $origen -Necesaria $Necesaria -Ms ([int]((Get-Date) - $t0).TotalMilliseconds)
         Write-DoctorLog -Level 'INFO' -Message "FIX aplicado: $Description"
         return @{ applied = $true; note = ([string]$result) }
     } catch {
-        Write-DoctorLog -Level 'ERROR' -Message "FIX fallo ($Description): $($_.Exception.Message)"
-        return @{ applied = $false; note = "error: $($_.Exception.Message)" }
+        $msgFix = [string]$_.Exception.Message
+        Write-DoctorLog -Level 'ERROR' -Message "FIX fallo ($Description): $msgFix"
+        # v3.42: antes un arreglo que tiraba error no dejaba rastro en la telemetria, asi que el
+        # porcentaje de exito por accion salia mas alto de lo real.
+        Add-AccionDetalle -Type $Type -Resultado 'error' -Before $Before -After $After -Origen $origen `
+            -Necesaria $Necesaria -Ms ([int]((Get-Date) - $t0).TotalMilliseconds) -Fallo $msgFix
+        return @{ applied = $false; note = "error: $msgFix" }
     }
+}
+
+# v3.42: que chequeo dice si cada accion quedo bien. Sale de cruzar la telemetria: en las
+# corridas con cada accion, el chequeo que termina en 'fixed'. Una accion que no esta aca viaja
+# igual, con verificado = null.
+$script:CheckPorAccion = @{
+    'device.rebind'             = 'hw.noPortBound'
+    'queue.purge'               = 'queue.health'
+    'queue.purge_for_test'      = 'queue.health'
+    'printer.setport'           = 'conn.usb'
+    'printer.recreate'          = 'conn.usb'
+    'nativa.install'            = 'nativa.installed'
+    'nativa.install_local'      = 'nativa.installed'
+    'nativa.update_local'       = 'nativa.sinFirmar'
+    'nativa.update_download'    = 'nativa.sinFirmar'
+    'nativa.registrar_host'     = 'nativa.hostRegistrado'
+    'testprint.retarget'        = 'hw.testprint'
+    'printer.install_generic'   = 'printer.exists'
+    'printer.test_to_real'      = 'printer.testKept'
+    'printer.remove_stale_test' = 'printer.testCleanup'
+    'printer.remove_orphan_own' = 'printer.testCleanup'
+    'printer.online'            = 'printer.offline'
+    'printer.resume'            = 'printer.paused'
+    'defender.restore_exclude'  = 'nativa.defenderQuarantine'
+    'defender.exclude'          = 'nativa.defenderExclusion'
+    'service.start'             = 'env.spooler'
+    'spooler.restart'           = 'env.spooler'
+}
+
+function Complete-AccionesSeguimiento {
+    <#
+      v3.42: cierra el seguimiento de las acciones de esta revision y de las gestiones del menu
+      que viajan con ella:
+        verificado: como termino el chequeo de esa accion (ok/fixed = true, warn/fail = false).
+        repetida:   la revision anterior en esta PC ya habia hecho lo mismo.
+                    'no_se_sostuvo' = la anterior la dejo verificada y el problema volvio.
+                    'reintento'     = la anterior no la pudo dejar bien.
+                    'repetida'      = la anterior no tenia como verificarla.
+      Lo pidio Gaston (08/10): reasignar el puerto USB se repetia en la revision siguiente en el
+      34% de las veces, y en 77 la anterior la habia dejado verificada. Con lo que viajaba no se
+      podia distinguir "el arreglo no dura" de "se corrio algo que no hacia falta".
+      Devuelve lo que hay que guardar para la proxima revision: 'tipo=1;tipo=0;tipo='.
+    #>
+    param($Historial)
+    $previas = @{}
+    $txt = ''
+    try { $txt = [string]$Historial.ultimasAcciones } catch {}
+    foreach ($par in @($txt -split ';' | Where-Object { $_ })) {
+        $p = @($par -split '=', 2)
+        $previas[[string]$p[0]] = $(if ($p.Count -gt 1) { [string]$p[1] } else { '' })
+    }
+    $todas = @(@($script:AccionesDetalle) + @(@($script:GestionesPendientes) | ForEach-Object { @($_.acciones) }) | Where-Object { $_ })
+    foreach ($d in $todas) {
+        $tipo = [string]$d.tipo
+        $cid = ''
+        if ($script:CheckPorAccion.ContainsKey($tipo)) { $cid = [string]$script:CheckPorAccion[$tipo] }
+        if ($cid) {
+            $c = @(@($script:Checks) | Where-Object { $_ -and [string]$_.id -eq $cid }) | Select-Object -Last 1
+            if ($c) {
+                $st = [string]$c.status
+                if ($st -eq 'fixed' -or $st -eq 'ok') { $d.verificado = $true }
+                elseif ($st -eq 'fail' -or $st -eq 'warn') { $d.verificado = $false }
+            }
+        }
+        if ($previas.ContainsKey($tipo)) {
+            $d.repetida = $(switch ([string]$previas[$tipo]) { '1' { 'no_se_sostuvo' } '0' { 'reintento' } default { 'repetida' } })
+        }
+    }
+    $guardar = [ordered]@{}
+    foreach ($d in @($todas | Where-Object { [string]$_.resultado -eq 'aplicada' })) {
+        $tipo = [string]$d.tipo
+        $v = $(if ($d.verificado -eq $true) { '1' } elseif ($d.verificado -eq $false) { '0' } else { '' })
+        if (-not $guardar.Contains($tipo) -or $v -eq '1') { $guardar[$tipo] = $v }
+    }
+    return (@($guardar.Keys | ForEach-Object { [string]$_ + '=' + [string]$guardar[$_] }) -join ';')
 }
 
 # ---------------------------------------------------------------------------
@@ -5400,7 +5554,7 @@ function Get-PcId {
 
 function Get-LocalRunHistory {
     <# Que paso en las corridas anteriores de ESTA PC (guardado en HKCU, sin datos del cliente). #>
-    $r = [ordered]@{ corridas = 0; ultimoStatus = ''; ultimaCausa = ''; ultimaFecha = '' }
+    $r = [ordered]@{ corridas = 0; ultimoStatus = ''; ultimaCausa = ''; ultimaFecha = ''; ultimasAcciones = '' }
     try {
         $k = 'HKCU:\Software\Fudo\PrintDoctor'
         if (Test-Path $k) {
@@ -5409,6 +5563,7 @@ function Get-LocalRunHistory {
             try { $r.ultimoStatus = [string]$v.UltimoStatus } catch {}
             try { $r.ultimaCausa  = [string]$v.UltimaCausa } catch {}
             try { $r.ultimaFecha  = [string]$v.UltimaFecha } catch {}
+            try { $r.ultimasAcciones = [string]$v.UltimasAcciones } catch {}
         }
     } catch {}
     return $r
@@ -5416,7 +5571,7 @@ function Get-LocalRunHistory {
 
 function Save-LocalRunHistory {
     <# Deja el resultado de esta corrida para que la proxima pueda contar la transicion. #>
-    param([string]$Status, [string]$Causa, [int]$Corridas)
+    param([string]$Status, [string]$Causa, [int]$Corridas, [string]$Acciones = '')
     try {
         $k = 'HKCU:\Software\Fudo\PrintDoctor'
         if (-not (Test-Path $k)) { New-Item -Path $k -Force -ErrorAction Stop | Out-Null }
@@ -5424,6 +5579,9 @@ function Save-LocalRunHistory {
         New-ItemProperty -Path $k -Name 'UltimoStatus' -Value $Status   -PropertyType String -Force -ErrorAction SilentlyContinue | Out-Null
         New-ItemProperty -Path $k -Name 'UltimaCausa'  -Value $Causa    -PropertyType String -Force -ErrorAction SilentlyContinue | Out-Null
         New-ItemProperty -Path $k -Name 'UltimaFecha'  -Value ((Get-Date).ToString('o')) -PropertyType String -Force -ErrorAction SilentlyContinue | Out-Null
+        # v3.42: que acciones hizo esta revision y si quedaron verificadas. Se pisa siempre,
+        # tambien con vacio: lo que importa es lo que hizo la revision INMEDIATA anterior.
+        New-ItemProperty -Path $k -Name 'UltimasAcciones' -Value $Acciones -PropertyType String -Force -ErrorAction SilentlyContinue | Out-Null
     } catch {}
 }
 
@@ -10326,8 +10484,13 @@ function Invoke-FudoPrintDoctor {
         pcId          = $(Invoke-Step -Name 'env.pcid' -Body { Get-PcId })
         corrida       = $(
             $h = Invoke-Step -Name 'env.history' -Body { Get-LocalRunHistory }
-            if (-not $h) { $h = [ordered]@{ corridas = 0; ultimoStatus = ''; ultimaCausa = ''; ultimaFecha = '' } }
+            if (-not $h) { $h = [ordered]@{ corridas = 0; ultimoStatus = ''; ultimaCausa = ''; ultimaFecha = ''; ultimasAcciones = '' } }
             $nro = ([int]$h.corridas + 1)
+            # v3.42: verificado y repetida de cada accion, antes de pisar el historial.
+            $accGuardar = ''
+            try { $accGuardar = [string](Complete-AccionesSeguimiento -Historial $h) } catch {
+                Write-DoctorLog -Level 'WARN' -Message ('No se pudo cerrar el seguimiento de acciones: ' + $_.Exception.Message)
+            }
             $st = [string]$diag.status
             $trans = 'primera'
             if ([int]$h.corridas -gt 0) {
@@ -10336,7 +10499,7 @@ function Invoke-FudoPrintDoctor {
                 elseif ($st -eq 'resolved') { $trans = 'sigue_ok' }
                 else { $trans = 'sigue_fallando' }
             }
-            $null = Invoke-Step -Name 'env.saveHistory' -Body { Save-LocalRunHistory -Status $st -Causa ([string]$diag.rootCause) -Corridas $nro }
+            $null = Invoke-Step -Name 'env.saveHistory' -Body { Save-LocalRunHistory -Status $st -Causa ([string]$diag.rootCause) -Corridas $nro -Acciones $accGuardar }
             [ordered]@{
                 numero = $nro
                 statusAnterior = [string]$h.ultimoStatus
@@ -10373,6 +10536,12 @@ function Invoke-FudoPrintDoctor {
             # log), asi que no coincidia con la lista de autoFixesApplied.
             autoFixCount    = @($diag.autoFixesApplied).Count
             accionesCount   = @($script:Actions).Count
+            # v3.42: cada intento de accion con origen, resultado, si hacia falta, si quedo
+            # verificada y si repite algo de la revision anterior. Ver Add-AccionDetalle.
+            accionesDetalle = @($script:AccionesDetalle)
+            # Lo que el asesor eligio del menu despues de la revision anterior. Se mide aca
+            # porque esta revision es la que dice si sirvio. Ver Invoke-GestionMenu.
+            gestionesMenu   = @($script:GestionesPendientes)
             resolved        = $diag.resolved
             escalated       = $diag.needsEscalation
             category        = $category
@@ -10907,6 +11076,9 @@ function Invoke-SelfTest {
     function Reset-State {
         $script:Checks  = New-Object System.Collections.ArrayList
         $script:Actions = New-Object System.Collections.ArrayList
+        $script:AccionesDetalle = New-Object System.Collections.ArrayList
+        $script:GestionesPendientes = New-Object System.Collections.ArrayList
+        $script:OrigenAccion = 'auto'
         $script:Errors  = New-Object System.Collections.ArrayList
         $script:Diagnostics = [ordered]@{}
         $script:AbortByMode = $false
@@ -15272,6 +15444,101 @@ public class FudoFakeEndpoint {
     Reset-State
     Reset-Mocks
 
+    # Escenario 152 (v3.42, pedido de Gaston del 08/10): exito por accion medido por el motor.
+    # La telemetria solo traia el nombre de lo aplicado. Un arreglo que tiraba error no dejaba
+    # rastro, no se sabia si la accion la habia elegido el asesor, y lo que se elegia del menu no
+    # llegaba nunca: la lista se vaciaba al volver a revisar. Reasignar el puerto USB se repetia
+    # en la revision siguiente en el 34% de los casos y no se podia saber por que.
+    Reset-State
+    Reset-Mocks
+    # a) Una reparacion que anda: origen auto, aplicada, necesaria, con duracion.
+    $null = Invoke-Remediation -Description 'rebind' -Type 'device.rebind' -Target 'X' -Before 'sin puerto USB' -After 'puerto asignado' -Fix { 'ok' }
+    $d152 = @($script:AccionesDetalle)
+    Assert-Eq 'S152 la aplicada queda en el detalle' 1 $d152.Count
+    Assert-Eq 'S152 origen auto' 'auto' $d152[0].origen
+    Assert-Eq 'S152 resultado aplicada' 'aplicada' $d152[0].resultado
+    Assert-Eq 'S152 una automatica es necesaria' $true $d152[0].necesaria
+    Assert-Eq 'S152 lleva la duracion' $true ($null -ne $d152[0].ms)
+    # b) Una que tira error: no entra en Actions (la logica del motor no cambia), si en el detalle.
+    Reset-State
+    $null = Invoke-Remediation -Description 'falla' -Type 'printer.online' -Target 'X' -Fix { throw 'acceso denegado' }
+    Assert-Eq 'S152 la fallida no es una accion aplicada' 0 @($script:Actions).Count
+    Assert-Eq 'S152 la fallida queda como error' 'error' @($script:AccionesDetalle)[0].resultado
+    Assert-Eq 'S152 con su motivo' 'acceso denegado' @($script:AccionesDetalle)[0].error
+    # c) Irreversible: si se confirma sale 'confirmada'; si no, 'no_confirmada'.
+    Reset-State
+    function Confirm-Irreversible { param($Description, $Impact) $true }
+    $null = Invoke-Remediation -Description 'purga' -Type 'queue.purge' -Target 'X' -Before '12 jobs' -After '0 jobs' -Reversible $false -Fix { 'ok' }
+    function Confirm-Irreversible { param($Description, $Impact) $false }
+    $null = Invoke-Remediation -Description 'purga' -Type 'queue.purge' -Target 'X' -Before '12 jobs' -After '0 jobs' -Reversible $false -Fix { 'ok' }
+    Assert-Eq 'S152 la confirmada' 'confirmada' @($script:AccionesDetalle)[0].origen
+    Assert-Eq 'S152 la rechazada' 'no_confirmada' @($script:AccionesDetalle)[1].resultado
+    # d) Lo que no hacia falta: una cola con 0 trabajos, un puerto al mismo puerto.
+    Assert-Eq 'S152 limpiar 0 trabajos no hacia falta' $false (Test-AccionNecesaria -Before '0 jobs' -After '0 jobs' -Origen 'auto')
+    Assert-Eq 'S152 mismo puerto no hacia falta' $false (Test-AccionNecesaria -Before 'USB001' -After 'USB001' -Origen 'auto')
+    Assert-Eq 'S152 del menu sin medir no se sabe' $null (Test-AccionNecesaria -Before 'x' -After 'y' -Origen 'menu')
+    # e) Lo que no es reparacion no entra en la medicion.
+    Reset-State
+    Add-Action -Type 'log.enable' -Target 'X' -Before 'deshabilitado' -After 'habilitado'
+    Assert-Eq 'S152 prender un log no se mide' 0 @($script:AccionesDetalle).Count
+    # f) Verificado y repetida contra los chequeos finales y la revision anterior.
+    Reset-State
+    Add-Action -Type 'device.rebind' -Target 'X' -Before 'sin puerto USB' -After 'USB001'
+    Add-Action -Type 'queue.purge' -Target 'X' -Before '8 jobs' -After '0 jobs'
+    Add-Action -Type 'printer.online' -Target 'X' -Before 'WorkOffline=True' -After 'WorkOffline=False'
+    [void]$script:Checks.Add([ordered]@{ id = 'hw.noPortBound'; status = 'fixed' })
+    [void]$script:Checks.Add([ordered]@{ id = 'queue.health'; status = 'fail' })
+    $g152 = Complete-AccionesSeguimiento -Historial ([ordered]@{ ultimasAcciones = 'device.rebind=1;queue.purge=0;nativa.install=' })
+    $d152 = @($script:AccionesDetalle)
+    Assert-Eq 'S152 rebind verificado' $true $d152[0].verificado
+    Assert-Eq 'S152 rebind que ya se habia arreglado no se sostuvo' 'no_se_sostuvo' $d152[0].repetida
+    Assert-Eq 'S152 purga no verificada' $false $d152[1].verificado
+    Assert-Eq 'S152 purga que ya habia fallado es reintento' 'reintento' $d152[1].repetida
+    Assert-Eq 'S152 sin chequeo final queda sin saber' $null $d152[2].verificado
+    Assert-Eq 'S152 lo que no se repite no se marca' '' $d152[2].repetida
+    Assert-Eq 'S152 lo que se guarda para la proxima' 'device.rebind=1;queue.purge=0;printer.online=' $g152
+    Assert-Eq 'S152 sin historial no explota' 'device.rebind=1;queue.purge=0;printer.online=' (Complete-AccionesSeguimiento -Historial $null)
+    # g) Gestion del menu: limpiar una cola que no tenia nada queda como no necesaria.
+    Reset-State
+    $script:Diagnostics['colas'] = @([ordered]@{ nombre = 'COCINA'; trabajos = 0 })
+    $v152 = Invoke-GestionMenu -Op 'L'
+    Assert-Eq 'S152 la gestion vuelve a revisar' $true $v152
+    Assert-Eq 'S152 la gestion queda pendiente' 1 @($script:GestionesPendientes).Count
+    Assert-Eq 'S152 limpiar sin trabajos no hacia falta' $false @($script:GestionesPendientes)[0].necesaria
+    # h) Con trabajos: la purga sale con origen menu, adentro de la gestion y no de la revision.
+    $script:Diagnostics['colas'] = @([ordered]@{ nombre = 'COCINA'; trabajos = 7 })
+    function Confirm-Irreversible { param($Description, $Impact) $true }
+    function Get-PrintJob { param($PrinterName, $ErrorAction) @() }
+    function Remove-PrintJob { param($ErrorAction) }
+    $null = Invoke-GestionMenu -Op 'L'
+    $gm152 = @($script:GestionesPendientes)[1]
+    Assert-Eq 'S152 con trabajos hacia falta' $true $gm152.necesaria
+    Assert-Eq 'S152 la purga viaja en la gestion' 'queue.purge' $(if (@($gm152.acciones).Count) { @($gm152.acciones)[0].tipo } else { '' })
+    Assert-Eq 'S152 con origen menu' 'menu' $(if (@($gm152.acciones).Count) { @($gm152.acciones)[0].origen } else { '' })
+    Assert-Eq 'S152 no queda en las acciones de la revision' 0 @($script:AccionesDetalle).Count
+    Assert-Eq 'S152 el origen vuelve a auto' 'auto' $script:OrigenAccion
+    # i) Volver a revisar no borra las gestiones: viajan con la revision siguiente.
+    $bk152 = $script:Diagnostics
+    Reset-RunState
+    Assert-Eq 'S152 las gestiones sobreviven a volver a revisar' 2 @($script:GestionesPendientes).Count
+    $script:Diagnostics = $bk152
+    # j) La revision siguiente mide la gestion contra sus chequeos.
+    [void]$script:Checks.Add([ordered]@{ id = 'queue.health'; status = 'ok' })
+    $g152b = Complete-AccionesSeguimiento -Historial ([ordered]@{ ultimasAcciones = '' })
+    Assert-Eq 'S152 la gestion queda verificada' $true @(@($script:GestionesPendientes)[1].acciones)[0].verificado
+    Assert-Eq 'S152 y se guarda para la proxima' 'queue.purge=1' $g152b
+    # k) Las gestiones R, N y A no se anotan: no tocan nada del cliente.
+    Reset-State
+    $null = Invoke-GestionMenu -Op 'R'
+    Assert-Eq 'S152 volver a revisar no es una gestion' 0 @($script:GestionesPendientes).Count
+    # l) Que viaje: el resultado lo lleva en telemetry y Write-DoctorResult las descarta despues.
+    $cuerpo152 = (Get-Command Invoke-FudoPrintDoctor).ScriptBlock.ToString()
+    Assert-Eq 'S152 el resultado lleva el detalle' $true ($cuerpo152 -match 'accionesDetalle\s*=')
+    Assert-Eq 'S152 el resultado lleva las gestiones' $true ($cuerpo152 -match 'gestionesMenu\s*=')
+    Assert-Eq 'S152 se guarda lo que hizo esta revision' $true ($cuerpo152 -match 'Save-LocalRunHistory[^\r\n]*-Acciones')
+    Reset-State
+    Reset-Mocks
+
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)
     # Salida explicita en los dos casos: si el script termina con 'return', $LASTEXITCODE
     # queda sin definir y cualquier automatizacion lo interpreta como fallo.
@@ -15287,6 +15554,9 @@ function Reset-RunState {
     <# Deja todo listo para una corrida nueva dentro de la misma sesion. #>
     $script:Checks      = New-Object System.Collections.ArrayList
     $script:Actions     = New-Object System.Collections.ArrayList
+    # $script:GestionesPendientes NO se limpia: viaja en la telemetria de esta corrida nueva.
+    $script:AccionesDetalle = New-Object System.Collections.ArrayList
+    $script:OrigenAccion = 'auto'
     $script:Errors      = New-Object System.Collections.ArrayList
     $script:Log         = New-Object System.Collections.ArrayList
     $script:Diagnostics = [ordered]@{}
@@ -15632,6 +15902,53 @@ function Show-DoctorMenu {
     return $r
 }
 
+# v3.42: las gestiones del menu que tocan algo en la PC. R (revisar), N (buscar en la red) y A
+# (actualizar el motor) no arreglan nada del cliente.
+$script:GestionesQueTocan = @('U', 'I', 'L', 'P', 'F')
+
+function Invoke-GestionMenu {
+    <#
+      v3.42: corre una gestion del menu y la deja anotada para la telemetria.
+      Antes, lo que el asesor elegia del menu no llegaba nunca a la planilla: la telemetria ya se
+      habia mandado al mostrar el resultado, y al volver a revisar Reset-RunState vaciaba la
+      lista de acciones. Una purga con la L o una Nativa instalada con la F no existian.
+      La gestion queda en $script:GestionesPendientes y viaja con la revision siguiente, que es
+      la que dice si sirvio. Las acciones que corren adentro salen con origen 'menu'.
+    #>
+    param([string]$Op)
+    $desde = @($script:AccionesDetalle).Count
+    $script:OrigenAccion = 'menu'
+    $script:GestionNecesaria = $null
+    $t0 = Get-Date
+    $volver = $false
+    try { $volver = Invoke-MenuAction -Op $Op }
+    finally { $script:OrigenAccion = 'auto' }
+    if ($script:GestionesQueTocan -contains [string]$Op) {
+        $acc = @()
+        $hasta = @($script:AccionesDetalle).Count
+        if ($hasta -gt $desde) {
+            for ($i = $desde; $i -lt $hasta; $i++) { $acc += $script:AccionesDetalle[$i] }
+            $script:AccionesDetalle.RemoveRange($desde, $hasta - $desde)
+        }
+        $nec = $script:GestionNecesaria
+        if ($null -eq $nec -and @($acc).Count -gt 0) {
+            $nec = $(if (@($acc | Where-Object { $_.necesaria -eq $true }).Count -gt 0) { $true }
+                     elseif (@($acc | Where-Object { $_.necesaria -eq $false }).Count -eq @($acc).Count) { $false }
+                     else { $null })
+        }
+        $nota = [string]$script:UltimaAccionNota
+        if ($nota.Length -gt 120) { $nota = $nota.Substring(0, 120) }
+        [void]$script:GestionesPendientes.Add([ordered]@{
+            op        = [string]$Op
+            necesaria = $nec
+            ms        = [int]((Get-Date) - $t0).TotalMilliseconds
+            nota      = $nota
+            acciones  = @($acc)
+        })
+    }
+    return $volver
+}
+
 function Invoke-MenuAction {
     <# Ejecuta la opcion elegida. Devuelve $true si hay que volver a diagnosticar. #>
     param([string]$Op)
@@ -15677,11 +15994,17 @@ function Invoke-MenuAction {
                 if ($script:Diagnostics.Contains('printersConnected')) {
                     $sinPuerto = @($script:Diagnostics['printersConnected'] | Where-Object { -not $_.puerto })
                 }
-                if (@($sinPuerto).Count -eq 0) { Write-Host '  Ya no hay impresoras conectadas sin instalar.' -ForegroundColor Yellow; return $true }
+                if (@($sinPuerto).Count -eq 0) {
+                    $script:GestionNecesaria = $false
+                    Write-Host '  Ya no hay impresoras conectadas sin instalar.' -ForegroundColor Yellow; return $true
+                }
+                $script:GestionNecesaria = $true
                 try { $oemDriver = [string](@($sinPuerto | Where-Object { $_.driverNombre })[0].driverNombre) } catch {}
                 Write-Host ''
                 Write-Host '  Reiniciando el dispositivo para que Windows le asigne un puerto USB...' -ForegroundColor Cyan
                 $r = Repair-BindUsbPort -InstanceIds @($sinPuerto | ForEach-Object { [string]$_.instanceId })
+                Add-Action -Type 'device.rebind' -Target (@($sinPuerto | ForEach-Object { [string]$_.nombre }) -join ', ') `
+                    -Before 'sin puerto USB' -After $(if (@($r.puertos).Count -gt 0) { @($r.puertos) -join ', ' } else { 'sin puerto' }) -Necesaria $true
                 if (@($r.puertos).Count -eq 0) {
                     Write-Host ('  No se pudo: ' + [string]$r.nota) -ForegroundColor Yellow
                     Write-Host '  Probar a mano: con la impresora encendida, desenchufar el USB, esperar 5 segundos y enchufarlo en un puerto directo (sin hub).' -ForegroundColor Yellow
@@ -15698,6 +16021,7 @@ function Invoke-MenuAction {
                 return $true
             }
             $puerto = @($huerfanos)[0]
+            $script:GestionNecesaria = $true
             $nombre = ''
             try { $nombre = Read-DoctorTexto -Id 'nombreImpresora' -Titulo ('Como se llama la impresora nueva en ' + $puerto + '?') `
                       -Texto 'Es el nombre con el que va a aparecer en Windows y en Fudo. Podes dejar el sugerido.' `
@@ -15708,24 +16032,40 @@ function Invoke-MenuAction {
                     try { Rename-Printer -Name $creada -NewName $nombre -ErrorAction Stop; $creada = $nombre
                           $i = $script:TestPrintersCreated.IndexOf($creada); if ($i -ge 0) { $script:TestPrintersCreated.RemoveAt($i) } } catch {}
                 }
+                Add-Action -Type 'printer.install_generic' -Target ([string]$creada) -Before ('puerto ' + $puerto + ' sin cola') -After 'cola creada' -Necesaria $true
                 Write-Host ("  Cola '" + $creada + "' creada en " + $puerto) -ForegroundColor Green
                 Write-Host '  Acordate de registrarla en Fudo (Administracion > Impresoras) con su cocina/area.' -ForegroundColor Yellow
-            } catch { Write-Host ("  No se pudo crear: " + $_.Exception.Message) -ForegroundColor Red }
+            } catch {
+                Add-AccionDetalle -Type 'printer.install_generic' -Resultado 'error' -Before ('puerto ' + $puerto + ' sin cola') -Necesaria $true -Fallo $_.Exception.Message
+                Write-Host ("  No se pudo crear: " + $_.Exception.Message) -ForegroundColor Red
+            }
             return $true
         }
 
         'L' {
             $conCola = @()
             if ($script:Diagnostics.Contains('colas')) { $conCola = @($script:Diagnostics['colas'] | Where-Object { [int]$_.trabajos -gt 0 }) }
-            if (@($conCola).Count -eq 0) { Write-Host '  No hay colas con trabajos pendientes.' -ForegroundColor Yellow; return $true }
+            if (@($conCola).Count -eq 0) {
+                # v3.42: el asesor pidio limpiar y no habia nada que limpiar. Es justo el caso de
+                # "correr una solucion que no hacia falta", y tiene que verse en la telemetria.
+                $script:GestionNecesaria = $false
+                Write-Host '  No hay colas con trabajos pendientes.' -ForegroundColor Yellow; return $true
+            }
+            $script:GestionNecesaria = $true
             $nombre = [string]@($conCola)[0].nombre
             $cant = [string]@($conCola)[0].trabajos
             if (Confirm-Irreversible -Description "Limpiar la cola de '$nombre' ($cant trabajos)" -Impact 'se descartan las comandas que estan esperando; hay que volver a imprimirlas desde Fudo') {
+                $t0L = Get-Date
                 try {
                     Get-PrintJob -PrinterName $nombre -ErrorAction SilentlyContinue | Remove-PrintJob -ErrorAction SilentlyContinue
-                    Add-Action -Type 'queue.purge' -Target $nombre -Before "$cant jobs" -After '0 jobs' -Reversible $false
+                    Add-Action -Type 'queue.purge' -Target $nombre -Before "$cant jobs" -After '0 jobs' -Reversible $false -Ms ([int]((Get-Date) - $t0L).TotalMilliseconds)
                     Write-Host ("  Cola de '" + $nombre + "' limpiada.") -ForegroundColor Green
-                } catch { Write-Host ("  No se pudo limpiar: " + $_.Exception.Message) -ForegroundColor Red }
+                } catch {
+                    Add-AccionDetalle -Type 'queue.purge' -Resultado 'error' -Before "$cant jobs" -After '0 jobs' -Fallo $_.Exception.Message
+                    Write-Host ("  No se pudo limpiar: " + $_.Exception.Message) -ForegroundColor Red
+                }
+            } else {
+                Add-AccionDetalle -Type 'queue.purge' -Resultado 'no_confirmada' -Before "$cant jobs" -After '0 jobs'
             }
             return $true
         }
@@ -17615,6 +17955,8 @@ function Write-DoctorResult {
     # La telemetria se manda ANTES de serializar: si no, el JSON se guardaba con
     # telemetria=null y sin las lineas de log del envio, y no habia forma de depurarlo.
     $null = Send-Telemetry -Result $Obj
+    # v3.42: las gestiones del menu viajan una sola vez, en la revision que les sigue.
+    $script:GestionesPendientes = New-Object System.Collections.ArrayList
     try {
         if ($Obj -is [System.Collections.IDictionary]) {
             $Obj['telemetria'] = $script:TelemetryStatus
@@ -17884,7 +18226,7 @@ try {
             foreach ($oUi in @(Get-MenuOptions)) { if ([string]$oUi.k -eq [string]$op) { $etiquetaUi = [string]$oUi.t } }
             Push-UiEvent -Tipo 'gestion.inicio' -Datos @{ op = $op; titulo = $etiquetaUi
                                                           dryRun = [bool]$DryRun }
-            $volverACorrer = Invoke-MenuAction -Op $op
+            $volverACorrer = Invoke-GestionMenu -Op $op
             Push-UiEvent -Tipo 'gestion.fin' -Datos @{ op = $op; titulo = $etiquetaUi
                                                        nota = [string]$script:UltimaAccionNota
                                                        vuelveARevisar = [bool]$volverACorrer }

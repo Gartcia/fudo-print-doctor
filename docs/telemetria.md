@@ -95,6 +95,24 @@ completo (que sí incluye rutas): usarlo solo para depurar un caso puntual.
 La última columna de la planilla (`json`) guarda el payload crudo, para poder reprocesar después
 sin perder nada.
 
+### Éxito por acción (desde la 3.42)
+
+Dentro de `telemetry` viajan dos listas para medir cada acción y no solo la corrida:
+
+| Campo | Qué es |
+|---|---|
+| `accionesDetalle[]` | cada intento de acción de la revisión |
+| `.origen` | `auto` (la revisión), `confirmada` (hubo que preguntarle al asesor), `menu` |
+| `.resultado` | `aplicada`, `error` (el arreglo falló), `no_confirmada` (el asesor dijo que no) |
+| `.necesaria` | si el problema estaba cuando corrió (`null` = no se pudo saber) |
+| `.verificado` | cómo terminó el chequeo de esa acción: `true` (ok/fixed), `false` (warn/fail), `null` |
+| `.repetida` | `no_se_sostuvo` (la revisión anterior en esa PC ya la había dejado bien), `reintento`, o vacío |
+| `.antes`, `.error`, `.ms` | lo que había antes, el motivo del error, cuánto tardó |
+| `gestionesMenu[]` | lo que el asesor eligió del menú después de la revisión anterior (`op`, `necesaria`, `nota`, `acciones[]`) |
+
+Las gestiones del menú viajan en la revisión siguiente a la que las ofreció: es la que dice si
+sirvieron. "Aplicada" no quiere decir que funcionó: para eso está `verificado`.
+
 ## 4. Leer los datos
 
 Desde la planilla directamente, o por la API del Apps Script:
