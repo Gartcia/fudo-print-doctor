@@ -136,6 +136,13 @@
       Red   - solo colas en puertos de red (IP_*, *9100*, WSD-*). No se reporta la falta de
               hardware USB como problema.
       Ambos - revisa las dos y reporta lo que encuentra en cada una (comportamiento historico).
+      Nativa - solo la App Nativa y la extension.
+    v3.43, herramientas de soporte: hacen una sola cosa y nada mas.
+      Soporte   - pregunta cual herramienta usar (en vez de preguntar como esta conectada).
+      Cola      - limpiar las colas de impresion que el asesor elija.
+      BuscarRed - buscar impresoras en la red por IP y, si se quiere, instalar una.
+      Bluetooth - buscar impresoras Bluetooth vinculadas, levantar su cola en el puerto COM
+                  y mandar un ticket de prueba.
     El modo elegido viaja en la telemetria (campo modo) y se muestra en el encabezado.
 
 .PARAMETER CheckUpdate
@@ -409,7 +416,7 @@ CHANGELOG
 [CmdletBinding()]
 param(
     [string]$PrinterName,
-    [ValidateSet('auto','USB','Red','Ambos','Nativa')]
+    [ValidateSet('auto','USB','Red','Ambos','Nativa','Soporte','Cola','BuscarRed','Bluetooth')]
     [string]$Modo = 'auto',
     # v3.38: idioma de lo que ve el cliente. 'auto' = portugues si la PC es de Brasil.
     [ValidateSet('auto','es','pt-BR')]
@@ -515,7 +522,7 @@ $script:Producto    = 'Fudo'
 $script:PrefijoCola = 'FUDO-'
 $script:NombreCola  = 'Impresora Fudo'
 $script:ReglasTexto = @()
-$script:SchemaVersion = '3.42'
+$script:SchemaVersion = '3.43'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -523,6 +530,15 @@ $script:RunMode = 'Ambos'
 # proposito: varias gestiones del menu terminan en 'volver a diagnosticar', y volver a
 # preguntar lo mismo en cada vuelta es pedirle dos veces el mismo dato a alguien que ya lo dio.
 $script:ModoElegido = ''
+# v3.43 (pedido de soporte del 12/10): "pensar en print doctor como un toolkit mas que como un
+# agente que haga todo". Dos formas de usarlo: la revision completa de siempre, o elegir una
+# herramienta que hace una sola cosa. Las herramientas son modos de corrida como 'Nativa': asi
+# el resultado, la telemetria y el menu del final funcionan igual sin duplicar nada.
+$script:ModosHerramienta = @('Cola', 'BuscarRed', 'Bluetooth')
+# Modos que NO recorren la cadena de impresion (colas, puertos, prueba de papel por capas).
+$script:ModosPuntuales = @('Nativa', 'Cola', 'BuscarRed', 'Bluetooth')
+# 'Completo' o 'Soporte'. Sobrevive a Reset-RunState, igual que ModoElegido.
+$script:PerfilElegido = ''
 # v3.37: la App Nativa ya se reviso en esta corrida (modo "Solo la App Nativa").
 $script:NativaRevisada = $false
 # Hay una linea de progreso abierta (escrita con `r, sin salto)? Ver Suspend-LiveStatus.
@@ -2598,9 +2614,20 @@ function Resolve-RunMode {
       PC no hay nada por USB. Preguntarlo al arrancar evita ese diagnostico enganoso.
       'auto' = preguntar si hay un humano; en modo agente equivale a 'Ambos' (historico).
     #>
-    if ($Modo -ne 'auto') { return $Modo }
+    if ($Modo -notin @('auto', 'Soporte')) { return $Modo }
     # Segunda vuelta o posterior: ya se eligio en esta sesion.
     if ($script:ModoElegido) { return $script:ModoElegido }
+    # v3.43: primero, como se va a usar. Sin nadie a quien preguntarle, la revision completa
+    # de siempre (el contrato del modo agente no cambia).
+    if (-not (Test-HayHumano)) { return 'Ambos' }
+    if (-not $script:PerfilElegido) {
+        $script:PerfilElegido = $(if ($Modo -eq 'Soporte') { 'Soporte' } else { Request-PerfilUso })
+    }
+    if ($script:PerfilElegido -eq 'Soporte') {
+        $h = Request-Herramienta
+        $script:ModoElegido = $h
+        return $h
+    }
     if (Test-UiWeb) {
         $r = Request-UiAnswer -Id 'modo' -Clase 'modo' `
             -Titulo 'Como esta conectada la impresora que no anda?' `
@@ -2644,6 +2671,79 @@ function Resolve-RunMode {
         if ($k -eq '3') { $script:ModoElegido = 'Ambos'; return 'Ambos' }
         if ($k -eq '4') { $script:ModoElegido = 'Nativa'; return 'Nativa' }
         Write-Host '    Opcion invalida. Escribi 1, 2, 3 o 4.' -ForegroundColor Yellow
+    }
+    return 'Ambos'
+}
+
+function Request-PerfilUso {
+    <#
+      v3.43 (canal, 12/10): "si solo queres borrar colas de impresion, ejecutar doctor sigue
+      siendo mas lento, ademas hace todo el proceso", y "pensar en print doctor como un toolkit
+      mas que como un agente que haga todo". Hay dos usos distintos: el de quien no sabe que
+      tiene la PC (la revision completa encuentra el problema) y el de quien ya lo sabe y
+      necesita UNA cosa. Devuelve 'Completo' o 'Soporte'. Sin respuesta, 'Completo'.
+    #>
+    if (Test-UiWeb) {
+        $r = Request-UiAnswer -Id 'perfil' -Clase 'modo' -SoloAsesor `
+            -Titulo 'Como lo queres usar?' `
+            -Texto 'La revision completa encuentra el problema sola. Las herramientas hacen una sola cosa, para cuando ya sabes que hay que hacer.' `
+            -Opciones @(
+                @{ v = 'Completo'; l = 'Revision completa'; detalle = 'Revisa toda la cadena de impresion y arregla lo que encuentra'; principal = $true },
+                @{ v = 'Soporte';  l = 'Elegir una herramienta'; detalle = 'Limpiar colas, buscar impresoras de red, Bluetooth, la App Nativa...' })
+        if ($r -eq 'Soporte') { return 'Soporte' }
+        return 'Completo'
+    }
+    Write-Host ''
+    Write-Host '  Como lo queres usar?' -ForegroundColor Cyan
+    Write-Host '    1  Revision completa     - revisa toda la cadena y arregla lo que encuentra'
+    Write-Host '    2  Elegir una herramienta - hace una sola cosa (limpiar colas, red, Bluetooth...)'
+    Write-Host ''
+    for ($i = 0; $i -lt 3; $i++) {
+        $k = Read-DoctorKey -Prompt '  Opcion (1/2, Enter = revision completa)'
+        if ($null -eq $k) { return 'Completo' }
+        $k = ([string]$k).Trim()
+        if ($k -eq '' -or $k -eq '1') { return 'Completo' }
+        if ($k -eq '2') { return 'Soporte' }
+        Write-Host '    Opcion invalida. Escribi 1 o 2.' -ForegroundColor Yellow
+    }
+    return 'Completo'
+}
+
+function Get-HerramientasSoporte {
+    <# Las herramientas, en el orden en que se ofrecen. 'v' es el modo de corrida. #>
+    return @(
+        @{ v = 'Cola';      l = 'Limpiar colas de impresion';           detalle = 'Borra los trabajos trabados de las colas que elijas. Nada mas.' },
+        @{ v = 'Nativa';    l = 'Revisar la App Nativa y la extension'; detalle = 'Instalarla, actualizarla o registrarla en el navegador' },
+        @{ v = 'USB';       l = 'Revisar las impresoras USB';           detalle = 'Colas, puertos USB y prueba de papel' },
+        @{ v = 'Red';       l = 'Revisar las impresoras de red';        detalle = 'Las que ya estan instaladas en Windows con su IP' },
+        @{ v = 'BuscarRed'; l = 'Buscar impresoras en la red';          detalle = 'Para las que no estan en Windows: las encuentra por IP y, si queres, instala una' },
+        @{ v = 'Bluetooth'; l = 'Impresora Bluetooth';                  detalle = 'Busca las vinculadas a esta computadora, crea su cola y manda un ticket de prueba' }
+    )
+}
+
+function Request-Herramienta {
+    <# v3.43: que herramienta usar. Devuelve el modo de corrida. Sin respuesta, revision completa. #>
+    $hs = @(Get-HerramientasSoporte)
+    if (Test-UiWeb) {
+        $ops = @($hs) + @(@{ v = 'Ambos'; l = 'Mejor la revision completa'; detalle = 'Revisa todo, USB y red' })
+        $r = Request-UiAnswer -Id 'herramienta' -Clase 'modo' -SoloAsesor -Titulo 'Que hacemos?' -Opciones $ops
+        foreach ($h in $ops) { if ([string]$h.v -eq [string]$r) { return [string]$h.v } }
+        return 'Ambos'
+    }
+    Write-Host ''
+    Write-Host '  Que hacemos?' -ForegroundColor Cyan
+    $i = 0
+    foreach ($h in $hs) { $i++; Write-Host ('    ' + $i + '  ' + [string]$h.l + ' - ' + [string]$h.detalle) }
+    Write-Host '    0  Mejor la revision completa'
+    Write-Host ''
+    for ($j = 0; $j -lt 3; $j++) {
+        $k = Read-DoctorKey -Prompt ('  Opcion (1-' + @($hs).Count + ', 0 = revision completa)')
+        if ($null -eq $k) { return 'Ambos' }
+        $k = ([string]$k).Trim()
+        if ($k -eq '0' -or $k -eq '') { return 'Ambos' }
+        $n = 0
+        if ([int]::TryParse($k, [ref]$n) -and $n -ge 1 -and $n -le @($hs).Count) { return [string]@($hs)[$n - 1].v }
+        Write-Host '    Opcion invalida.' -ForegroundColor Yellow
     }
     return 'Ambos'
 }
@@ -3000,6 +3100,9 @@ $script:CheckPorAccion = @{
     'defender.exclude'          = 'nativa.defenderExclusion'
     'service.start'             = 'env.spooler'
     'spooler.restart'           = 'env.spooler'
+    # v3.43: herramientas de soporte.
+    'printer.install_network'   = 'red.instalada'
+    'printer.install_bt'        = 'bt.cola'
 }
 
 function Complete-AccionesSeguimiento {
@@ -7219,6 +7322,430 @@ function Invoke-PurgaTemprana {
             })
 }
 
+# ---------------------------------------------------------------------------
+# HERRAMIENTAS DE SOPORTE (v3.43)
+# Pedido del canal del 12/10: "si solo queres borrar colas de impresion, ejecutar doctor sigue
+# siendo mas lento, ademas hace todo el proceso", y "que al abrirlo tengamos un menu con todas
+# las opciones y al elegir una haga solamente eso". Cada herramienta hace UNA cosa, deja sus
+# hallazgos como checks (para que el resultado, la pantalla y la telemetria sean los de
+# siempre) y nunca da el caso por resuelto sin que alguien vea salir el papel.
+# ---------------------------------------------------------------------------
+function Request-ElegirDeLista {
+    <#
+      Elegir uno (o todos) de una lista, por la interfaz o por consola.
+      Devuelve el indice (0..n-1), -1 para todos (solo con -ConTodos) o $null si no se eligio.
+    #>
+    param([string]$Id, [string]$Titulo, [string]$Texto = '', [object[]]$Items, [switch]$ConTodos, [string]$Cancelar = 'Ninguno, terminar aca')
+    $lista = @($Items)
+    if (@($lista).Count -eq 0) { return $null }
+    if (-not (Test-HayHumano)) { return $null }
+    if (Test-UiWeb) {
+        $ops = @()
+        if ($ConTodos) { $ops += @{ v = 'todos'; l = ('Todas (' + @($lista).Count + ')'); principal = $true } }
+        for ($i = 0; $i -lt @($lista).Count; $i++) { $ops += @{ v = [string]($i + 1); l = [string]$lista[$i].l; detalle = [string]$lista[$i].detalle } }
+        $ops += @{ v = 'no'; l = $Cancelar }
+        $r = Request-UiAnswer -Id $Id -Clase 'modo' -SoloAsesor -Titulo $Titulo -Texto $Texto -Opciones $ops
+        if ($ConTodos -and [string]$r -eq 'todos') { return -1 }
+        $n = 0
+        if ([int]::TryParse([string]$r, [ref]$n) -and $n -ge 1 -and $n -le @($lista).Count) { return ($n - 1) }
+        return $null
+    }
+    Suspend-LiveStatus
+    Write-Host ''
+    Write-Host ('  ' + $Titulo) -ForegroundColor Cyan
+    if ($Texto) { Write-Host ('  ' + $Texto) -ForegroundColor DarkGray }
+    for ($i = 0; $i -lt @($lista).Count; $i++) {
+        Write-Host ('    ' + ($i + 1) + '  ' + [string]$lista[$i].l + $(if ($lista[$i].detalle) { '  (' + [string]$lista[$i].detalle + ')' } else { '' }))
+    }
+    $prompt = '  Numero' + $(if ($ConTodos) { ', T = todas' } else { '' }) + ', Enter = ' + $Cancelar.ToLower()
+    $ans = Read-DoctorLine -Prompt $prompt
+    if ($null -eq $ans) { return $null }
+    $ans = ([string]$ans).Trim()
+    if ($ConTodos -and $ans -match '^(?i)(t|todas|todos)$') { return -1 }
+    $n = 0
+    if ([int]::TryParse($ans, [ref]$n) -and $n -ge 1 -and $n -le @($lista).Count) { return ($n - 1) }
+    return $null
+}
+
+function Invoke-HerramientaColas {
+    <#
+      Limpiar colas y nada mas. A diferencia de la limpieza del arranque (Invoke-PurgaTemprana),
+      no pide que la cola parezca trabada: el asesor eligio esta herramienta porque ya sabe que
+      hay que limpiar. Se muestran las colas con trabajos, se elige cuales, y como es la unica
+      accion irreversible del motor, se confirma igual. Despues se mide: si en una quedan 1 o 2
+      trabajos que no se van, se reinicia el servicio de impresion (lo mismo que la capa 2).
+    #>
+    $lista = Invoke-ConLimite -Script { @(Get-Printer -ErrorAction Stop) } -TimeoutSec 15
+    if ([bool]$lista.timeout) { Add-ColaSinRespuesta -Nombre '(la lista de impresoras de Windows)' -TimeoutSec 15; return }
+    $todas = @($lista.valor | Where-Object { $_ })
+    $conTrabajos = @()
+    foreach ($p in $todas) {
+        if ((Test-IsVirtualPrinter $p).isVirtual) { continue }
+        if ([string]$p.Name -match $script:TestPrinterRx) { continue }
+        if ([string]$p.Name -like '\\*') { continue }
+        $jc = Get-JobCountDeCola -Cola $p
+        if ($jc -lt 0) {
+            $lec = Get-TrabajosDeCola -Nombre ([string]$p.Name)
+            if ([bool]$lec.timeout) { Add-ColaSinRespuesta -Nombre ([string]$p.Name); continue }
+            $jc = @($lec.jobs).Count
+        }
+        if ($jc -gt 0) { $conTrabajos += [ordered]@{ nombre = [string]$p.Name; trabajos = [int]$jc } }
+    }
+    $script:Diagnostics['herramientaColas'] = [ordered]@{ colasRevisadas = @($todas).Count; conTrabajos = @($conTrabajos) }
+    if (@($conTrabajos).Count -eq 0) {
+        Set-StepNote 'ninguna con trabajos'
+        Add-Check -Id 'queue.health' -Layer 2 -Name 'Ninguna cola tiene trabajos esperando' -Status 'ok' -Plane 'os' `
+            -Evidence @{ colasRevisadas = @($todas).Count; herramienta = $true } `
+            -Recommendation 'No hay nada que limpiar: ninguna impresora de Windows tiene trabajos esperando. Si la comanda no sale, el problema esta en otro lado: usar la revision completa.'
+        return
+    }
+    $elegidas = @($conTrabajos)
+    if (@($conTrabajos).Count -gt 1) {
+        $items = @($conTrabajos | ForEach-Object { @{ l = [string]$_.nombre; detalle = ([string]$_.trabajos + ' trabajo(s)') } })
+        $idx = Request-ElegirDeLista -Id 'colasElegir' -Titulo 'Que colas limpiamos?' -Items $items -ConTodos `
+            -Texto 'Se borran los trabajos que estan esperando; las comandas que hagan falta hay que volver a imprimirlas desde Fudo.' -Cancelar 'Ninguna, terminar aca'
+        if ($null -eq $idx) { $elegidas = @() }
+        elseif ($idx -ge 0) { $elegidas = @(@($conTrabajos)[$idx]) }
+    }
+    $script:Diagnostics['herramientaColas']['elegidas'] = @($elegidas | ForEach-Object { [string]$_.nombre })
+    $listaTxt = (@($conTrabajos | ForEach-Object { "'" + [string]$_.nombre + "' (" + [int]$_.trabajos + ')' }) -join ', ')
+    if (@($elegidas).Count -eq 0) {
+        Add-Check -Id 'queue.health' -Layer 2 -Name ('Colas con trabajos esperando, sin limpiar: ' + $listaTxt) -Status 'warn' -RootCauseCandidate $true -Plane 'os' `
+            -Evidence @{ conTrabajos = @($conTrabajos); herramienta = $true } `
+            -Recommendation 'Se eligio no limpiar ninguna. Mientras los trabajos sigan ahi, las comandas nuevas de esas impresoras no salen.'
+        return
+    }
+    $antesTotal = [int](@($elegidas | ForEach-Object { [int]$_.trabajos }) | Measure-Object -Sum).Sum
+    $rem = Invoke-Remediation -Description ('Limpiar la cola: ' + (@($elegidas | ForEach-Object { "'" + [string]$_.nombre + "' (" + [int]$_.trabajos + ' trabajos)' }) -join ', ')) `
+        -Type 'queue.purge' -Target (@($elegidas | ForEach-Object { [string]$_.nombre }) -join ', ') `
+        -Before ([string]$antesTotal + ' jobs') -After '0 jobs' -Reversible $false -Necesaria $true `
+        -Impact 'se descartan las comandas que estan esperando; hay que volver a imprimirlas desde Fudo' -Fix {
+            Clear-ColasTrabadas -Candidatas @($elegidas) -Colas @($todas)
+        }
+    if (-not $rem.applied) {
+        Add-Check -Id 'queue.health' -Layer 2 -Name ('Colas con trabajos esperando, sin limpiar: ' + $listaTxt) -Status 'warn' -RootCauseCandidate $true -Plane 'os' `
+            -Evidence @{ conTrabajos = @($conTrabajos); herramienta = $true; nota = [string]$rem.note } `
+            -Recommendation ('No se limpio (' + [string]$rem.note + '). Mientras los trabajos sigan ahi, las comandas nuevas de esas impresoras no salen.')
+        return
+    }
+    Start-Sleep -Milliseconds 2500
+    $resultado = @()
+    foreach ($c in @($elegidas)) {
+        $d = Get-ConteoCola -Nombre ([string]$c.nombre) -Masiva:([int]$c.trabajos -ge [int]$script:ColaMasiva)
+        if ($d -lt 0) { $d = [int]$c.trabajos }
+        $resultado += [ordered]@{ nombre = [string]$c.nombre; antes = [int]$c.trabajos; despues = [int]$d; final = [int]$d }
+    }
+    # Uno o dos que no se van: suele ser un trabajo en "Eliminando" esperando un puerto que no
+    # contesta. Reiniciar el servicio (reversible) lo saca casi siempre.
+    $remSp = $null
+    $trabados = @($resultado | Where-Object { [int]$_.despues -gt 0 -and [int]$_.despues -le 2 })
+    if (@($trabados).Count -gt 0) {
+        $remSp = Invoke-Remediation -Description 'Reiniciar el servicio de impresion: quedaron trabajos que no se borran' `
+            -Type 'spooler.restart' -Target 'Spooler' -Before ([string](@($trabados | ForEach-Object { [int]$_.despues }) | Measure-Object -Sum).Sum + ' jobs') -After '0 jobs' -Fix {
+                Restart-Service -Name 'Spooler' -Force -ErrorAction Stop
+                Start-Sleep -Seconds 2
+                'servicio de impresion reiniciado'
+            }
+        if ($remSp.applied) {
+            foreach ($r in $resultado) {
+                if ([int]$r.despues -gt 0 -and [int]$r.despues -le 2) {
+                    try { $r.final = @(Get-PrintJob -PrinterName ([string]$r.nombre) -ErrorAction SilentlyContinue).Count } catch {}
+                }
+            }
+        }
+    }
+    $script:Diagnostics['herramientaColas']['resultado'] = @($resultado)
+    $script:Diagnostics['herramientaColas']['spoolerReiniciado'] = [bool]($remSp -and $remSp.applied)
+    $quedan = @($resultado | Where-Object { [int]$_.final -gt 0 })
+    $texto = (@($resultado | ForEach-Object { "'" + [string]$_.nombre + "' (" + [int]$_.antes + ' -> ' + [int]$_.final + ')' }) -join ', ')
+    Set-StepNote ('limpiadas: ' + @($resultado).Count)
+    if (@($quedan).Count -eq 0) {
+        Add-Check -Id 'queue.health' -Layer 2 -Name ('Colas limpiadas: ' + $texto) -Status 'fixed' -RootCauseCandidate $true -Plane 'os' `
+            -Evidence @{ colas = @($resultado); herramienta = $true } -ActionTaken ([string]$rem.note) -Reversible $false `
+            -Recommendation ('Se borraron los trabajos que estaban esperando (' + $texto + '). Volver a imprimir desde Fudo las comandas que hagan falta. ' +
+                             'Si la cola se vuelve a llenar sin que salga nada, el problema no es la cola: usar la revision completa.')
+        return
+    }
+    $quedanTxt = (@($quedan | ForEach-Object { "'" + [string]$_.nombre + "' (" + [int]$_.final + ')' }) -join ', ')
+    $volvieron = @($quedan | Where-Object { [int]$_.final -gt [int]$_.despues -or [int]$_.final -gt 2 })
+    Add-Check -Id 'queue.health' -Layer 2 -Name ('Quedaron trabajos sin borrar: ' + $quedanTxt) -Status 'fail' -RootCauseCandidate $true -Plane 'os' `
+        -Evidence @{ colas = @($resultado); herramienta = $true; spoolerReiniciado = [bool]($remSp -and $remSp.applied) } `
+        -ActionTaken ([string]$rem.note) -Reversible $false `
+        -Recommendation $(if (@($volvieron).Count -gt 0) {
+                'Despues de limpiar volvieron a aparecer trabajos (' + $quedanTxt + '): algo los esta mandando de nuevo. Suele pasar con muchas impresoras instaladas apuntando al mismo lugar. Usar la revision completa.'
+            } else {
+                'Quedaron trabajos que Windows no puede borrar' + $(if ($remSp -and $remSp.applied) { ', ni reiniciando el servicio de impresion' } else { '' }) +
+                ' (' + $quedanTxt + '). Pasa cuando la impresora no acepta lo que le mandan: revisar que este encendida, con papel y la tapa cerrada, y el cable. Despues reiniciar la PC o usar la revision completa.'
+            })
+}
+
+function Add-CheckPruebaHerramienta {
+    <#
+      La prueba de papel de una herramienta. Mismo criterio que la capa 4: que Windows o la red
+      acepten los bytes no prueba nada; el unico juez es la persona que mira la impresora.
+    #>
+    param($Salio, [string]$Donde, [hashtable]$Evidence = @{}, [string]$SiNoSale = '')
+    $ev = @{ donde = $Donde; confirmadoPorHumano = $Salio; herramienta = [string]$script:RunMode }
+    foreach ($k in @($Evidence.Keys)) { $ev[$k] = $Evidence[$k] }
+    $script:Diagnostics['ticketConfirmado'] = $Salio
+    if ($Salio -eq $true) {
+        Add-Check -Id 'hw.testprint' -Layer 4 -Name ('Salio el ticket de prueba (' + $Donde + ')') -Status 'ok' -Plane 'hardware' -Evidence $ev `
+            -Recommendation 'La impresora imprime desde esta computadora. Si todavia no esta en Fudo, darla de alta en Administracion > Impresoras con el nombre de su cola, y asignarle la cocina o area.'
+    } elseif ($Salio -eq $false) {
+        Add-Check -Id 'hw.testprint' -Layer 4 -Name ('No salio el ticket de prueba (' + $Donde + ')') -Status 'fail' -RootCauseCandidate $true -Plane 'hardware' -Evidence $ev `
+            -Recommendation ('La impresora acepto el ticket pero no salio papel. Revisar el rollo (que quede papel y que este del lado correcto) y que la tapa este bien cerrada. ' + $SiNoSale)
+    } else {
+        Add-Check -Id 'hw.testprint' -Layer 4 -Name ('Ticket de prueba enviado, sin confirmar (' + $Donde + ')') -Status 'warn' -Plane 'hardware' -Evidence $ev `
+            -Recommendation 'El ticket se envio, que es todo lo que se puede verificar desde la computadora. Hay que confirmar con alguien en el local si salio el papel.'
+    }
+}
+
+function Invoke-HerramientaBuscarRed {
+    <#
+      Buscar impresoras en la red por IP, sin depender de que esten instaladas en Windows.
+      Caso del canal (09/10): "las impresoras de red las toma unicamente si estan instaladas en
+      Windows; generalmente no lo estan, se conectan colocando la IP desde Fudo". En modo Red,
+      sin cola de red en Windows, el motor cortaba sin buscar nada (11 corridas en una semana).
+      Lista lo que contesta en el puerto de impresion, dice cuales ya tienen cola, y si el
+      asesor quiere instala una y manda un ticket de prueba.
+    #>
+    $prefijos = @(Get-LocalSubnetPrefixes)
+    if (@($prefijos).Count -eq 0) {
+        Add-Check -Id 'red.busqueda' -Layer 3 -Name 'No se pudo saber en que red esta esta computadora' -Status 'warn' -RootCauseCandidate $true -Plane 'os' `
+            -Evidence @{ prefijos = @() } `
+            -Recommendation 'Esta computadora no tiene una IP de red local (o no se pudo leer). Revisar que este conectada a la red del local, por cable o wifi.'
+        return
+    }
+    $enc = @()
+    foreach ($pref in @($prefijos | Select-Object -First 3)) { $enc += @(Find-NetworkPrinters -Prefix $pref -TcpPort $Port) }
+    $inst = @(Get-InstalledNetworkPrinters)
+    $script:Diagnostics['impresorasEnRed'] = @($enc)
+    $script:Diagnostics['impresorasRedInstaladas'] = @($inst)
+    $redes = (@($prefijos | Select-Object -First 3 | ForEach-Object { $_ + '.x' }) -join ', ')
+    if (@($enc).Count -eq 0) {
+        Add-Check -Id 'red.busqueda' -Layer 3 -Name ('No se encontro ninguna impresora en la red (' + $redes + ')') -Status 'warn' -RootCauseCandidate $true -Plane 'hardware' `
+            -Evidence @{ prefijos = @($prefijos); puerto = $Port } `
+            -ArticleRef 'https://soporte.fu.do/es/articles/11730816' `
+            -Recommendation ('Nada contesto en el puerto ' + $Port + ' en ' + $redes + '. Revisar que la impresora este encendida y con el cable de red puesto. ' +
+                             'Para saber su IP: apagarla, mantener FEED apretado y encenderla (imprime su configuracion). ' +
+                             'Si la IP es de otra red que la de esta computadora, hay que cambiarle la IP a la impresora o conectarla a la misma red.')
+        return
+    }
+    $filas = @()
+    foreach ($e in $enc) {
+        $ya = @($inst | Where-Object { [string]$_.ip -eq [string]$e.ip })
+        $colasYa = @(@($ya | ForEach-Object { @($_.colas) }) | Where-Object { $_ })
+        $filas += [ordered]@{ ip = [string]$e.ip; puerto = [int]$e.puerto; tipo = [string]$e.tipo; colas = @($colasYa) }
+    }
+    $txt = (@($filas | ForEach-Object { [string]$_.ip + ':' + [string]$_.puerto + $(if (@($_.colas).Count -gt 0) { " (cola '" + (@($_.colas) -join "', '") + "')" } else { ' (sin cola en Windows)' }) }) -join '; ')
+    Set-StepNote ('encontradas: ' + @($filas).Count)
+    Add-Check -Id 'red.busqueda' -Layer 3 -Name ('Impresoras encontradas en la red: ' + @($filas).Count) -Status 'ok' -Plane 'hardware' `
+        -Evidence @{ prefijos = @($prefijos); encontradas = @($filas) } `
+        -Recommendation ('Contestaron: ' + $txt + '. Para usarlas desde Fudo con Directo Ethernet alcanza con cargar la IP y el puerto en Administracion > Impresoras. ' +
+                         'Para usarlas como impresora del sistema, tienen que tener cola en Windows.')
+    $sinCola = @($filas | Where-Object { @($_.colas).Count -eq 0 })
+    if (@($sinCola).Count -eq 0) { return }
+    $items = @($sinCola | ForEach-Object { @{ l = ([string]$_.ip + ':' + [string]$_.puerto); detalle = [string]$_.tipo } })
+    $idx = Request-ElegirDeLista -Id 'redInstalar' -Titulo 'Instalamos alguna en Windows?' -Items $items `
+        -Texto 'Hace falta si en Fudo se usa como impresora del sistema. Para Directo Ethernet no hace falta.' -Cancelar 'No, ninguna'
+    if ($null -eq $idx -or $idx -lt 0) { return }
+    $elegida = @($sinCola)[$idx]
+    $sug = $script:PrefijoCola + (([string]$elegida.ip) -replace '\.', '-')
+    $nombre = ''
+    try { $nombre = Read-DoctorTexto -Id 'nombreImpresoraRed' -Titulo ('Como se llama la impresora de ' + [string]$elegida.ip + '?') `
+              -Texto 'Es el nombre con el que va a aparecer en Windows y en Fudo. Podes dejar el sugerido.' `
+              -Sugerido $sug -Prompt ('  Nombre para la impresora (Enter = ' + $sug + ')') } catch {}
+    if (-not $nombre) { $nombre = $sug }
+    $rem = Invoke-Remediation -Description ("Instalar la impresora de red " + [string]$elegida.ip + " como '" + $nombre + "'") `
+        -Type 'printer.install_network' -Target $nombre -Before 'sin cola' -After ([string]$elegida.ip) -Necesaria $true -Fix {
+            $creada = New-NetworkPrinter -Ip ([string]$elegida.ip) -TcpPort ([int]$elegida.puerto) -Name $nombre
+            if (-not $creada) { throw 'Windows no creo la cola' }
+            $script:ColaRedCreada = [string]$creada
+            ("cola '" + $creada + "' creada apuntando a " + [string]$elegida.ip + ':' + [string]$elegida.puerto)
+        }
+    if (-not $rem.applied) {
+        Add-Check -Id 'red.instalada' -Layer 1 -Name ('No se pudo instalar la impresora de red ' + [string]$elegida.ip) -Status $(if ([string]$rem.note -match '^error') { 'fail' } else { 'warn' }) -RootCauseCandidate $true -Plane 'os' `
+            -Evidence @{ ip = [string]$elegida.ip; nota = [string]$rem.note } -Recommendation ([string]$rem.note)
+        return
+    }
+    Add-Check -Id 'red.instalada' -Layer 1 -Name ("Impresora de red instalada en Windows como '" + [string]$script:ColaRedCreada + "' (" + [string]$elegida.ip + ')') -Status 'fixed' -Plane 'os' `
+        -Evidence @{ ip = [string]$elegida.ip; puerto = [int]$elegida.puerto; cola = [string]$script:ColaRedCreada } -ActionTaken ([string]$rem.note) -Reversible $true `
+        -ArticleRef 'https://soporte.fu.do/es/articles/11730816' `
+        -Recommendation ("Quedo instalada como '" + [string]$script:ColaRedCreada + "'. Falta darla de alta en Fudo (Administracion > Impresoras) con ese nombre y asignarle la cocina o area.")
+    if (-not $TestPrint) { return }
+    $ok = $false
+    try { $ok = [bool](Send-EscPosOverTcp -Ip ([string]$elegida.ip) -TcpPort ([int]$elegida.puerto)) } catch {}
+    if (-not $ok) {
+        Add-Check -Id 'hw.testprint' -Layer 4 -Name ('No se pudo mandar el ticket de prueba a ' + [string]$elegida.ip) -Status 'fail' -RootCauseCandidate $true -Plane 'hardware' `
+            -Evidence @{ ip = [string]$elegida.ip; puerto = [int]$elegida.puerto; sent = $false; herramienta = 'BuscarRed' } `
+            -Recommendation 'La impresora contesto en la busqueda pero no acepto el ticket. Apagarla y prenderla, y volver a probar.'
+        return
+    }
+    $salio = Confirm-PaperCameOut -Printer ([string]$elegida.ip + ':' + [string]$elegida.puerto)
+    Add-CheckPruebaHerramienta -Salio $salio -Donde ([string]$elegida.ip + ':' + [string]$elegida.puerto) -Evidence @{ ip = [string]$elegida.ip; sent = $true } `
+        -SiNoSale 'Si la luz esta en rojo o titilando, es la impresora.'
+}
+
+function Send-TicketPruebaACola {
+    <# El ticket de prueba ESC/POS, crudo, a una cola de Windows. Aislado para poder mockearlo. #>
+    param([string]$Cola)
+    if ($SelfTest) { throw 'self-test: el motor no imprime nada (mockear Send-TicketPruebaACola)' }
+    Initialize-RawPrinterHelper
+    $bytes = [System.Text.Encoding]::GetEncoding(437).GetBytes((Get-EscPosTestTicket -Caption (Get-TicketCaption 'manual')))
+    return [bool]([FudoRawPrinter]::SendBytes($Cola, $bytes))
+}
+
+function Get-NombreBluetoothRegistro {
+    <# El nombre con el que se vinculo un dispositivo Bluetooth, del registro. '' si no esta. #>
+    param([string]$Mac)
+    try {
+        $v = (Get-ItemProperty -Path ('HKLM:\SYSTEM\CurrentControlSet\Services\BTHPORT\Parameters\Devices\' + $Mac.ToLower()) -Name 'Name' -ErrorAction Stop).Name
+        return ([Text.Encoding]::UTF8.GetString([byte[]]$v)).Trim([char]0).Trim()
+    } catch { return '' }
+}
+
+function Get-BluetoothPrinterPorts {
+    <#
+      Los puertos COM de Bluetooth por los que se puede imprimir.
+      Una impresora Bluetooth clasica se vincula como "puerto serie sobre Bluetooth": Windows le
+      crea DOS puertos COM. El SALIENTE lleva la direccion del dispositivo en el id; el ENTRANTE
+      lleva ceros y es para que otro equipo se conecte a esta PC: por ahi no se imprime nunca.
+      Solo se devuelven los salientes. Devuelve @(@{ com; mac; nombre; colas }).
+    #>
+    $ents = @()
+    try { $ents = @(Get-CimInstance -ClassName Win32_PnPEntity -Filter "DeviceID LIKE 'BTHENUM%'" -ErrorAction Stop) } catch { return @() }
+    $nombres = @{}
+    foreach ($e in $ents) {
+        $md = [regex]::Match([string]$e.DeviceID, '(?i)^BTHENUM\\DEV_([0-9A-F]{12})')
+        if ($md.Success -and [string]$e.Name) { $nombres[$md.Groups[1].Value.ToUpper()] = [string]$e.Name }
+    }
+    $colas = @()
+    try { $colas = @(Get-Printer -ErrorAction SilentlyContinue) } catch {}
+    $out = @()
+    foreach ($e in $ents) {
+        $mc = [regex]::Match([string]$e.Name, '(?i)\((COM\d+)\)')
+        if (-not $mc.Success) { continue }
+        $mm = [regex]::Match([string]$e.DeviceID, '(?i)&([0-9A-F]{12})_')
+        if (-not $mm.Success) { continue }
+        $mac = $mm.Groups[1].Value.ToUpper()
+        if ($mac -eq '000000000000') { continue }
+        $com = $mc.Groups[1].Value.ToUpper()
+        $nom = [string]$nombres[$mac]
+        if (-not $nom) { $nom = Get-NombreBluetoothRegistro -Mac $mac }
+        if (-not $nom) { $nom = 'Dispositivo Bluetooth ' + $mac }
+        $colasCom = @($colas | Where-Object { ([string]$_.PortName).TrimEnd(':').ToUpper() -eq $com } | ForEach-Object { [string]$_.Name })
+        if (@($out | Where-Object { [string]$_.com -eq $com }).Count -gt 0) { continue }
+        $out += [ordered]@{ com = $com; mac = $mac; nombre = $nom; colas = @($colasCom) }
+    }
+    return @($out | Sort-Object { [int](([string]$_.com) -replace '\D', '') })
+}
+
+function Invoke-HerramientaBluetooth {
+    <#
+      Pedido del canal (11/10, dos asesores): impresoras Bluetooth. Hasta aca el motor las
+      descartaba como no-impresoras y nunca las miraba.
+      Se buscan las vinculadas a esta PC, se elige una, se le levanta la cola de Windows en su
+      puerto COM (o se adopta la que ya tenga) y se manda un ticket de prueba que tiene que
+      confirmar una persona. Nada es automatico: mandar bytes a un puerto COM que no es una
+      impresora puede trabar otro dispositivo, por eso solo se usan los puertos salientes de
+      Bluetooth y siempre se elige a mano.
+      SIN PROBAR CONTRA HARDWARE REAL al publicarse (13/10/2026). Salio de los casos del canal.
+    #>
+    $bt = @(Get-BluetoothPrinterPorts)
+    $script:Diagnostics['bluetooth'] = @($bt)
+    if (@($bt).Count -eq 0) {
+        Add-Check -Id 'bt.vinculada' -Layer 1 -Name 'No hay ninguna impresora Bluetooth vinculada a esta computadora' -Status 'fail' -RootCauseCandidate $true -Plane 'hardware' `
+            -Evidence @{ puertos = 0 } `
+            -Recommendation ('Encender la impresora y vincularla desde Configuracion > Bluetooth y dispositivos > Agregar dispositivo > Bluetooth ' +
+                             '(si pide PIN, suele ser 0000 o 1234). Cuando figure vinculada, volver a elegir esta herramienta: Windows le asigna un puerto COM y por ahi se imprime. ' +
+                             'Si la impresora es Bluetooth de bajo consumo (BLE) no crea puerto COM y esta herramienta no la puede usar.')
+        return
+    }
+    $txt = (@($bt | ForEach-Object { [string]$_.nombre + ' (' + [string]$_.com + ')' }) -join ', ')
+    Add-Check -Id 'bt.vinculada' -Layer 1 -Name ('Dispositivos Bluetooth con puerto serie: ' + $txt) -Status 'ok' -Plane 'hardware' `
+        -Evidence @{ dispositivos = @($bt) } -Recommendation ''
+    # Se elige SIEMPRE a mano, aunque haya uno solo: en la PC de desarrollo el unico puerto serie
+    # Bluetooth era de unos auriculares. Windows no distingue una impresora de cualquier otro
+    # dispositivo con puerto serie, y el nombre lo tiene que leer una persona. Sin nadie que
+    # elija (modo agente), se lista y no se toca nada.
+    if (-not (Test-HayHumano)) {
+        Add-Check -Id 'bt.cola' -Layer 1 -Name 'No se creo ninguna cola: hace falta que alguien elija cual es la impresora' -Status 'skipped' -Plane 'os' `
+            -Evidence @{ skipReason = 'sin_humano' } `
+            -Recommendation 'Correr esta herramienta con alguien mirando la pantalla y elegir cual es la impresora: Windows no distingue una impresora de cualquier otro dispositivo Bluetooth con puerto serie.'
+        return
+    }
+    $items = @($bt | ForEach-Object { @{ l = ([string]$_.nombre + ' (' + [string]$_.com + ')'); detalle = $(if (@($_.colas).Count -gt 0) { 'ya tiene cola: ' + (@($_.colas) -join ', ') } else { 'sin cola en Windows' }) } })
+    $idx = Request-ElegirDeLista -Id 'btElegir' -Titulo 'Cual es la impresora?' -Items $items `
+        -Texto 'Aparecen todos los dispositivos Bluetooth con puerto serie (celulares, auriculares...). Elegir solo la impresora: a cualquier otro no hay que mandarle nada.' -Cancelar 'Ninguno es la impresora'
+    if ($null -eq $idx -or $idx -lt 0) {
+        Add-Check -Id 'bt.cola' -Layer 1 -Name 'Ninguno de los dispositivos Bluetooth es la impresora' -Status 'warn' -RootCauseCandidate $true -Plane 'hardware' `
+            -Evidence @{ dispositivos = @($bt) } `
+            -Recommendation ('Encender la impresora y vincularla desde Configuracion > Bluetooth y dispositivos > Agregar dispositivo > Bluetooth (si pide PIN, suele ser 0000 o 1234), ' +
+                             'y volver a elegir esta herramienta. Si la impresora es Bluetooth de bajo consumo (BLE) no crea puerto COM y esta herramienta no la puede usar.')
+        return
+    }
+    $elegida = @($bt)[$idx]
+    $com = [string]$elegida.com
+    $cola = ''
+    if (@($elegida.colas).Count -gt 0) {
+        $cola = [string]@($elegida.colas)[0]
+        Add-Check -Id 'bt.cola' -Layer 1 -Name ("La impresora Bluetooth ya tiene su cola en Windows: '" + $cola + "' (" + $com + ')') -Status 'ok' -Plane 'os' `
+            -Evidence @{ com = $com; cola = $cola; adoptada = $true } -Recommendation ''
+    } else {
+        $sug = $script:PrefijoCola + 'BT-' + (([string]$elegida.nombre) -replace '[^A-Za-z0-9]', '')
+        if ($sug.Length -gt 40) { $sug = $sug.Substring(0, 40) }
+        $nombre = ''
+        try { $nombre = Read-DoctorTexto -Id 'nombreImpresoraBt' -Titulo ('Como se llama la impresora de ' + $com + '?') `
+                  -Texto 'Es el nombre con el que va a aparecer en Windows y en Fudo. Podes dejar el sugerido.' `
+                  -Sugerido $sug -Prompt ('  Nombre para la impresora (Enter = ' + $sug + ')') } catch {}
+        if (-not $nombre) { $nombre = $sug }
+        $rem = Invoke-Remediation -Description ("Crear la cola de la impresora Bluetooth en " + $com + " como '" + $nombre + "'") `
+            -Type 'printer.install_bt' -Target $nombre -Before 'sin cola' -After $com -Necesaria $true -Fix {
+                $puertoW = $com + ':'
+                $hay = $false
+                try { $hay = [bool](Get-PrinterPort -Name $puertoW -ErrorAction SilentlyContinue) } catch {}
+                if (-not $hay) { Add-PrinterPort -Name $puertoW -ErrorAction Stop }
+                $r = New-FudoPrinterQueue -PortName $puertoW -Name $nombre
+                if (-not [bool]$r.ok) { throw [string]$r.nota }
+                [string]$r.nota
+            }
+        if (-not $rem.applied) {
+            Add-Check -Id 'bt.cola' -Layer 1 -Name ('No se pudo crear la cola de la impresora Bluetooth (' + $com + ')') -Status $(if ([string]$rem.note -match '^error') { 'fail' } else { 'warn' }) -RootCauseCandidate $true -Plane 'os' `
+                -Evidence @{ com = $com; nota = [string]$rem.note } `
+                -Recommendation ([string]$rem.note + '. Si el fabricante tiene driver para Windows, instalarlo y elegir el puerto ' + $com + ' al agregar la impresora.')
+            return
+        }
+        $cola = $nombre
+        Add-Check -Id 'bt.cola' -Layer 1 -Name ("Cola de la impresora Bluetooth creada: '" + $cola + "' en " + $com) -Status 'fixed' -Plane 'os' `
+            -Evidence @{ com = $com; cola = $cola; adoptada = $false } -ActionTaken ([string]$rem.note) -Reversible $true `
+            -Recommendation ("Quedo instalada como '" + $cola + "'. Falta darla de alta en Fudo (Administracion > Impresoras) con ese nombre y asignarle la cocina o area.")
+    }
+    if (-not $TestPrint -or $DryRun) {
+        Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Prueba fisica de impresion' -Status 'skipped' -Evidence @{ skipReason = $(if ($DryRun) { 'dry_run' } else { 'testprint_off' }); herramienta = 'Bluetooth' }
+        return
+    }
+    $enviado = $false
+    $err = ''
+    try { $enviado = [bool](Send-TicketPruebaACola -Cola $cola) } catch { $err = $_.Exception.Message }
+    if (-not $enviado) {
+        Add-Check -Id 'hw.testprint' -Layer 4 -Name ("No se pudo mandar el ticket de prueba a '" + $cola + "'") -Status 'fail' -RootCauseCandidate $true -Plane 'os' `
+            -Evidence @{ cola = $cola; com = $com; sent = $false; error = $err; herramienta = 'Bluetooth' } `
+            -Recommendation 'Windows rechazo el ticket. Revisar que la cola exista y que el servicio de impresion este andando.'
+        return
+    }
+    $drain = Wait-QueueDrain -Printer $cola -TimeoutMs 15000
+    if ([bool]$drain.quedoEnCola) {
+        Add-Check -Id 'hw.testprint' -Layer 4 -Name 'El ticket quedo en la cola: la impresora Bluetooth no lo recibio' -Status 'fail' -RootCauseCandidate $true -Plane 'hardware' `
+            -Evidence @{ cola = $cola; com = $com; sent = $true; quedoEnCola = $true; herramienta = 'Bluetooth' } `
+            -Recommendation ('La computadora no logro conectarse con la impresora por ' + $com + '. Revisar que este encendida y cerca, y que no este conectada a otro equipo (un celular, otra PC): ' +
+                             'una impresora Bluetooth atiende a uno solo. Si sigue, quitarla en Configuracion > Bluetooth, volver a vincularla y elegir otra vez esta herramienta.')
+        return
+    }
+    $salio = Confirm-PaperCameOut -Printer $cola
+    Add-CheckPruebaHerramienta -Salio $salio -Donde ($cola + ' por Bluetooth, ' + $com) -Evidence @{ cola = $cola; com = $com; sent = $true } `
+        -SiNoSale 'Si la impresora tiene la luz de Bluetooth apagada o titilando, no esta conectada.'
+}
+
 function Test-Layer2-Queue {
     param($Printer, $Wmi)
     if ($null -eq $Printer) { return }
@@ -7315,7 +7842,11 @@ function Test-Layer2-Queue {
         # (reversible; lo mismo que se hace con una impresora offline) lo saca casi siempre.
         $spoolerReiniciado = $false
         $trasSpooler = $null
-        if ($rem.applied -and $rebote -gt 0 -and $rebote -le 2 -and $rebote -ge $antes -and $rebote -le $despues) {
+        # v3.43 (bitacora 05/10-11/10): la condicion pedia ademas que la cola NO hubiera bajado
+        # (rebote >= antes). Una cola de 2 que quedaba en 1 se daba por reparada sin reiniciar
+        # nada, y en dos corridas el ticket de prueba quedo trabado detras de ese trabajo. Lo que
+        # importa es lo que queda, no cuanto bajo: cuando el reinicio corrio, vacio 4 de 5.
+        if ($rem.applied -and $rebote -gt 0 -and $rebote -le 2 -and $rebote -le $despues) {
             $remSp = Invoke-Remediation -Description ("Reiniciar el servicio de impresion: quedo un trabajo que no se borra en '" + $Printer.Name + "'") `
                 -Type 'spooler.restart' -Target 'Spooler' -Before ([string]$rebote + ' jobs') -After '0 jobs' -Fix {
                     Restart-Service -Name 'Spooler' -Force -ErrorAction Stop
@@ -7361,13 +7892,15 @@ function Test-Layer2-Queue {
         $purgaVacia = ([bool]$rem.applied -and -not $bajo)
         # Uno o dos trabajos que no se van ni reiniciando el servicio no son "algo que regenera
         # trabajos": es la impresora o su puerto que no los recibe.
-        $trabajoQueNoSeBorra = ($purgaVacia -and $final -le 2 -and $final -le $despues)
+        # v3.43: tambien cuando la cola bajo: si al final queda 1 o 2 que no se van, la cola no
+        # esta reparada, por mucho que haya bajado de 2 a 1.
+        $trabajoQueNoSeBorra = ([bool]$rem.applied -and $final -gt 0 -and $final -le 2 -and $final -le $despues)
         $antesTxt = $(if ($spoolerReiniciado) { $rem.note + '; ' + $remSp.note } else { $rem.note })
         Add-Check -Id 'queue.health' -Layer 2 `
             -Name $(if ($trabajoQueNoSeBorra) { 'Un trabajo no se borra de la cola: la impresora o su puerto no lo recibe' }
                     elseif ($purgaVacia) { 'La cola se limpio y no bajo: sigue trabada' }
                     else { 'Cola de impresion trabada' }) `
-            -Status $(if ($purgaVacia) { 'fail' } elseif ($rem.applied) { 'fixed' } else { 'warn' }) -RootCauseCandidate $true `
+            -Status $(if ($purgaVacia -or $trabajoQueNoSeBorra) { 'fail' } elseif ($rem.applied) { 'fixed' } else { 'warn' }) -RootCauseCandidate $true `
             -Evidence @{ jobs = @($jobs).Count; stuck = @($stuck).Count; statuses = @($jobs | ForEach-Object { [string]$_.JobStatus })
                          antes = $antes; despues = $despues; rebote = $rebote; final = $final; bajo = [bool]$bajo
                          spoolerReiniciado = [bool]$spoolerReiniciado
@@ -9359,6 +9892,14 @@ function Resolve-Diagnosis {
             })
     }
 
+    # v3.43: una herramienta de soporte sin nada roto no es 'No concluyente': hizo lo suyo, y
+    # la causa es lo que encontro ("Ninguna cola tiene trabajos esperando"). Nunca de un check en
+    # 'fixed': si reparo algo, sigue siendo 'falta confirmar que la comanda sale'.
+    if (-not $resolved -and -not $rootCause -and @($ordered).Count -eq 0 -and @($fixed).Count -eq 0 -and $script:ModosHerramienta -contains [string]$script:RunMode) {
+        $hechoH = @($checks | Where-Object { [string]$_.recommendation }) | Select-Object -Last 1
+        if (-not $hechoH) { $hechoH = @($checks | Where-Object { $_.status -ne 'skipped' }) | Select-Object -Last 1 }
+        if ($hechoH) { $rootCause = [string]$hechoH.name; $rootCheckId = [string]$hechoH.id; $confidence = 'medium' }
+    }
     if (-not $resolved -and -not $rootCause) {
         if (@($ordered).Count -gt 0) {
             $rootCause = $ordered[0].name
@@ -9509,6 +10050,19 @@ function Get-NextActions {
                 do         = $(if ($e.hint) { [string]$e.hint } else { 'Adjuntar el JSON completo al escalamiento a Soporte Producto.' })
                 owner      = 'soporte'
                 articleRef = ''
+            }
+        }
+    }
+    # v3.43: una herramienta de soporte no "concluye" un diagnostico: hizo lo suyo. Lo que sigue
+    # es lo que dijo su hallazgo, no "reintentar con -PrinterName", que no tiene nada que ver.
+    if (@($out).Count -eq 0 -and -not $Diag.resolved -and $script:ModosHerramienta -contains [string]$script:RunMode) {
+        $hecho = @($script:Checks | Where-Object { [string]$_.recommendation }) | Select-Object -Last 1
+        if ($hecho) {
+            $out += [ordered]@{
+                priority = 1; checkId = [string]$hecho.id; layer = [int]$hecho.layer; status = [string]$hecho.status
+                what = [string]$hecho.name
+                do   = ([string]$hecho.recommendation + $(if ([string]$hecho.recommendation -match 'revision completa') { '' } else { ' Si con esto no alcanza, usar la revision completa.' }))
+                owner = 'asesor'; articleRef = [string]$hecho.articleRef
             }
         }
     }
@@ -9740,7 +10294,9 @@ function Build-HumanSummary {
     Add-Line $bar
     Add-Line ("  FUDO PRINT DOCTOR   v$($script:SchemaVersion)   PC: $env:COMPUTERNAME" +
               $(if ($CaseId) { "   Caso: $CaseId" } else { '' }))
-    Add-Line ("  Revisado: " + $(switch ([string]$script:RunMode) { 'USB' { 'solo USB' } 'Red' { 'solo red' } default { 'USB y red' } }) +
+    Add-Line ("  Revisado: " + $(switch ([string]$script:RunMode) { 'USB' { 'solo USB' } 'Red' { 'solo red' } 'Nativa' { 'solo la App Nativa' }
+                                                                  'Cola' { 'herramienta: limpiar colas' } 'BuscarRed' { 'herramienta: buscar en la red' }
+                                                                  'Bluetooth' { 'herramienta: Bluetooth' } default { 'USB y red' } }) +
               "   Interfaz: $DetectedInterface" +
               "   " + $(if ($DryRun) { 'solo diagnostico (-DryRun)' } elseif ($AutoFix) { 'diagnostico + reparacion' } else { 'solo diagnostico' }))
     Add-Line $bar
@@ -9791,7 +10347,9 @@ function Build-HumanSummary {
     }
     $desc = @()
     if ($script:Diagnostics.Contains('descartadosNoImpresora')) { $desc = @($script:Diagnostics['descartadosNoImpresora']) }
-    if (-not $modoRed) {
+    # v3.43: una herramienta o el modo Nativa no miran el hardware: decir 'Windows no ve hardware
+    # conectado' seria afirmar algo que nadie reviso.
+    if (-not $modoRed -and $script:ModosPuntuales -notcontains [string]$script:RunMode) {
     Add-Line ''
     Add-Line ("  HARDWARE DE IMPRESION CONECTADO: " + @($conn).Count)
     if (@($conn).Count -eq 0) {
@@ -10096,6 +10654,9 @@ function Test-CaseIdValido {
     # se cruza con ninguna conversacion y la corrida se pierde para medir: es lo mismo que no
     # cargarlo, pero parece cargado.
     if ($id -match '^(\d)\1{14}$') { return '' }
+    # v3.43: 6 corridas de una PC llegaron con 123456789123456. Mismo caso: una escalera de
+    # digitos no es una conversacion.
+    if ($id -match '123456789|987654321') { return '' }
     return $id
 }
 
@@ -10222,7 +10783,10 @@ function Invoke-FudoPrintDoctor {
 
     if (Test-IsInteractiveConsole) {
         Write-Host ''
-        Write-Host $(if ($script:RunMode -eq 'Nativa') { '  Revisando solo la App Nativa de Fudo...' } else { ('  Revisando la cadena de impresion (' + $(switch ($script:RunMode) { 'USB' { 'solo USB' } 'Red' { 'solo red' } default { 'USB y red' } }) + ')...') }) -ForegroundColor Cyan
+        Write-Host $(if ($script:RunMode -eq 'Nativa') { '  Revisando solo la App Nativa de Fudo...' }
+                     elseif ($script:RunMode -eq 'Cola') { '  Limpiando colas de impresion...' }
+                     elseif ($script:RunMode -eq 'BuscarRed') { '  Buscando impresoras en la red...' }
+                     elseif ($script:RunMode -eq 'Bluetooth') { '  Buscando impresoras Bluetooth...' } else { ('  Revisando la cadena de impresion (' + $(switch ($script:RunMode) { 'USB' { 'solo USB' } 'Red' { 'solo red' } default { 'USB y red' } }) + ')...') }) -ForegroundColor Cyan
         Write-Host ''
     }
 
@@ -10292,7 +10856,18 @@ function Invoke-FudoPrintDoctor {
             $script:StepTotal = [int]$script:StepIndex + 10
         }
     }
-    if ($envOk -and $script:RunMode -ne 'Nativa') {
+    # v3.43: las herramientas de soporte hacen una sola cosa y nada mas: ni colas ajenas, ni
+    # puertos, ni la App Nativa, ni prueba de papel sobre algo que no se eligio.
+    if ($envOk -and $script:ModosHerramienta -contains [string]$script:RunMode) {
+        $script:StepTotal = 2
+        switch ([string]$script:RunMode) {
+            'Cola'      { $null = Invoke-Step -Name 'herramienta.colas' -Body { Invoke-HerramientaColas } }
+            'BuscarRed' { $null = Invoke-Step -Name 'herramienta.buscarRed' -Body { Invoke-HerramientaBuscarRed } }
+            'Bluetooth' { $null = Invoke-Step -Name 'herramienta.bluetooth' -Body { Invoke-HerramientaBluetooth } }
+        }
+        $null = Invoke-Step -Name 'ui.inventario' -Body { Push-UiInventario }
+    }
+    if ($envOk -and $script:ModosPuntuales -notcontains [string]$script:RunMode) {
         # v3.32: lo mas rapido primero. Ver Invoke-PurgaTemprana.
         $null = Invoke-Step -Name 'layer0.quickQueue' -Body { Invoke-PurgaTemprana }
         # v3.32: la App Nativa (capa 0b) se revisa DESPUES de la prueba de papel, ver mas abajo.
@@ -10312,7 +10887,7 @@ function Invoke-FudoPrintDoctor {
     if ($script:AbortByMode) {
         Write-DoctorLog -Level 'INFO' -Message ("Corte por modo " + $script:RunMode + ": no hay impresoras de ese tipo y no se pidio revisar las otras")
     }
-    if ($envOk -and -not $script:AbortByMode -and $script:RunMode -ne 'Nativa') {
+    if ($envOk -and -not $script:AbortByMode -and $script:ModosPuntuales -notcontains [string]$script:RunMode) {
         $wmi = Invoke-Step -Name 'layer1.printerState' -Body { Test-Layer1-PrinterState -Printer $printer }
         if ($script:ReconnectedPort -and $printer) {
             $refrescada = Invoke-Step -Name 'layer1.refresh' -Body { Get-Printer -Name ([string]$printer.Name) -ErrorAction SilentlyContinue }
@@ -10446,7 +11021,7 @@ function Invoke-FudoPrintDoctor {
     # que las propias del motor no entren en el conteo, y antes de decidir la causa raiz.
     # El chequeo de comandas encoladas se corre aca por lo mismo: si el motor purgo la cola
     # trabada, ya no tiene que bloquear el cierre.
-    if ($envOk -and -not $script:AbortByMode -and $script:RunMode -ne 'Nativa') {
+    if ($envOk -and -not $script:AbortByMode -and $script:ModosPuntuales -notcontains [string]$script:RunMode) {
         $null = Invoke-Step -Name 'final.rescan'      -Body { Update-PrintInventory }
         $null = Invoke-Step -Name 'final.otherQueues' -Body { Test-Layer2-OtherQueuesBacklog -Printer $printer }
         # El informe otra vez, ya con lo reparado: el puerto reasignado, la cola recreada, la
@@ -15251,6 +15826,13 @@ public class FudoFakeEndpoint {
     Assert-Eq 'S146 en el self-test no se toca la consola' $false (Disable-ConsoleQuickEdit)
     $main146 = (Get-Command Invoke-FudoPrintDoctor).ScriptBlock.ToString()
     Assert-Eq 'S146 se apaga la edicion rapida antes del primer paso' $true ([bool]($main146.IndexOf('Disable-ConsoleQuickEdit') -ge 0 -and $main146.IndexOf('Disable-ConsoleQuickEdit') -lt $main146.IndexOf("Name 'layer0.environment'")))
+    # v3.43: y antes de abrir la ventana, que es cuando la consola invita a hacer clic en ella.
+    $fuente146 = [System.IO.File]::ReadAllText($PSCommandPath)
+    # LastIndexOf: el arranque esta al final del archivo, y este mismo escenario cita el texto.
+    $iArranque146 = $fuente146.LastIndexOf('$script:UiTimeout = [int]$UiTimeoutSec')
+    $iQe146 = $fuente146.IndexOf('Disable-ConsoleQuickEdit)', $iArranque146)
+    $iUi146 = $fuente146.IndexOf('Start-DoctorUi -Puerto $UiPort', $iArranque146)
+    Assert-Eq 'S146 la edicion rapida se apaga antes de abrir la ventana' $true ([bool]($iArranque146 -ge 0 -and $iQe146 -gt $iArranque146 -and $iQe146 -lt $iUi146))
     Reset-Mocks
     Reset-State
 
@@ -15304,9 +15886,9 @@ public class FudoFakeEndpoint {
     # El flujo: en modo Nativa no se tocan impresoras, y si se sigue, la Nativa no se repite.
     $m147 = (Get-Command Invoke-FudoPrintDoctor).ScriptBlock.ToString()
     Assert-Eq 'S147 el modo Nativa revisa solo la Nativa y pregunta que sigue' $true ([bool]($m147 -match "(?s)RunMode -eq 'Nativa'\).*layer0b\.soloNativa.*Request-SeguirConImpresoras"))
-    Assert-Eq 'S147 las impresoras no corren en modo Nativa' $true ([bool]($m147 -match "RunMode -ne 'Nativa'\) \{\s*# v3\.32: lo mas rapido primero"))
+    Assert-Eq 'S147 las impresoras no corren en modo Nativa' $true ([bool](($script:ModosPuntuales -contains 'Nativa') -and ($m147 -match "ModosPuntuales -notcontains \[string\]\`$script:RunMode\) \{\s*# v3\.32: lo mas rapido primero")))
     Assert-Eq 'S147 si se sigue, la Nativa no se revisa dos veces' $true ([bool]($m147 -match "if \(-not \`$script:NativaRevisada\) \{\s*\`$null = Invoke-Step -Name 'layer0b\.nativeApp'"))
-    Assert-Eq 'S147 ni los pasos finales que leen colas' $true ([bool]($m147 -match "AbortByMode -and \`$script:RunMode -ne 'Nativa'\) \{\s*\`$null = Invoke-Step -Name 'final\.rescan'"))
+    Assert-Eq 'S147 ni los pasos finales que leen colas' $true ([bool]($m147 -match "AbortByMode -and \`$script:ModosPuntuales -notcontains \[string\]\`$script:RunMode\) \{\s*\`$null = Invoke-Step -Name 'final\.rescan'"))
     # Los textos del menu van por la interfaz, con el sugerido ya escrito.
     $script:nombre147 = 'COCINA'
     Assert-Eq 'S147 el nombre de la impresora se pide en la interfaz' 'COCINA' (Read-DoctorTexto -Id 'nombreImpresora' -Titulo 'x' -Sugerido 'FUDO-TEST-USB001' -Prompt 'x')
@@ -15539,6 +16121,332 @@ public class FudoFakeEndpoint {
     Reset-State
     Reset-Mocks
 
+    # -----------------------------------------------------------------------
+    # Escenario 153 (v3.43, bitacora 05/10-11/10).
+    #
+    # (a) La descarga de la Nativa cortada a mitad de camino se daba por buena: 7 corridas
+    # llegaron con 1,4 a 87 MB de 107 y ok = $true, y despues el mensaje culpaba a la firma.
+    $v153 = Get-VeredictoDescarga -Bytes (40MB) -Esperado (107MB)
+    Assert-Eq 'S153a una descarga incompleta no sale ok' $false ([bool]$v153.ok)
+    Assert-Eq 'S153a se marca como cortada' $true ([bool]$v153.cortada)
+    Assert-Eq 'S153a y dice cuanto llego de cuanto' $true ([bool]([string]$v153.error -match 'se corto en 40 de 107 MB'))
+    Assert-Eq 'S153a no habla de la firma' $false ([bool]([string]$v153.error -match 'firma'))
+    Assert-Eq 'S153a la completa sale ok' $true ([bool](Get-VeredictoDescarga -Bytes (107MB) -Esperado (107MB)).ok)
+    Assert-Eq 'S153a sin tamano declarado, alcanza con que haya bajado algo' $true ([bool](Get-VeredictoDescarga -Bytes (5MB) -Esperado 0).ok)
+    $v153e = Get-VeredictoDescarga -Bytes (5MB) -Esperado 0 -ErrorFin 'Se termino la conexion'
+    Assert-Eq 'S153a un error al terminar tambien es una descarga cortada' $true ([bool](-not $v153e.ok -and $v153e.cortada))
+    Assert-Eq 'S153a el plazo vencido sigue ganando' $true ([bool]([string](Get-VeredictoDescarga -Bytes (5MB) -Esperado (107MB) -ErrorPrevio 'la descarga no termino en 300 segundos').error -match 'no termino'))
+    # Y quien la llama reintenta una vez antes de rendirse.
+    Reset-State
+    $script:bajadas153 = 0
+    function Get-FileWithProgress { param($Url, $Destino, $TimeoutSec, $Que)
+        $script:bajadas153++
+        if ($script:bajadas153 -eq 1) { return @{ ok = $false; bytes = 40MB; esperado = 107MB; segundos = 1; cortada = $true; error = 'la descarga se corto en 40 de 107 MB' } }
+        return @{ ok = $false; bytes = 60MB; esperado = 107MB; segundos = 1; cortada = $true; error = 'la descarga se corto en 60 de 107 MB' } }
+    function Write-StepDetail { param($Texto) }
+    function Remove-Item { param($Path, [switch]$Force, $ErrorAction) }
+    # El tramo corre con $SelfTest apagado: nada de lo que hay antes de la descarga puede tocar la PC.
+    function Add-MpPreference { param($ExclusionPath, $ExclusionProcess, $ErrorAction) }
+    $selfTest153 = $SelfTest
+    $SelfTest = $false
+    $tiro153 = ''
+    try { $null = Invoke-FudoNativeDownload -Url 'https://x/y.exe' } catch { $tiro153 = [string]$_.Exception.Message }
+    $SelfTest = $selfTest153
+    Assert-Eq 'S153a se reintenta una vez' 2 ([int]$script:bajadas153)
+    Assert-Eq 'S153a y se registra' 1 ([int]$script:Diagnostics['nativaDescarga'].reintentos)
+    Assert-Eq 'S153a el error dice que se corto' $true ([bool]($tiro153 -match 'se corto'))
+    Assert-Eq 'S153a y no culpa a la firma' $false ([bool]($tiro153 -match 'firma'))
+    Microsoft.PowerShell.Management\Remove-Item Function:\Get-FileWithProgress -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item Function:\Write-StepDetail -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item Function:\Remove-Item -ErrorAction SilentlyContinue
+    Microsoft.PowerShell.Management\Remove-Item Function:\Add-MpPreference -ErrorAction SilentlyContinue
+    Reset-Mocks
+
+    # (b) La cola que baja de 2 a 1 quedaba reparada sin reiniciar el servicio, y el ticket de
+    # prueba se trababa detras del trabajo que quedo.
+    Reset-State
+    $script:Diagnostics['colas'] = @([ordered]@{ nombre='CAJA'; puerto='USB001'; esDePrueba=$false; puertoVivo=$true })
+    function Confirm-Irreversible { param($Description, $Impact) $true }
+    function Remove-PrintJob { param($ErrorAction) }
+    function Start-Sleep { param($Seconds, $Milliseconds) }
+    $script:sp153 = 0
+    function Restart-Service { param($Name, [switch]$Force, $ErrorAction) $script:sp153++ }
+    $script:j153 = 0
+    function Get-PrintJob { param($PrinterName, $ErrorAction)
+        $n = [int]$script:lect153[[Math]::Min($script:j153, @($script:lect153).Count - 1)]
+        $script:j153++
+        @(1..([Math]::Max(1, $n)) | Where-Object { $n -gt 0 } | ForEach-Object { [pscustomobject]@{ JobStatus='Error'; SubmittedTime=(Get-Date).AddMinutes(-30) } })
+    }
+    # Lecturas: inicial, limpieza, inmediata, rebote, despues del reinicio.
+    $script:lect153 = @(2, 2, 1, 1, 0); $script:j153 = 0
+    Test-Layer2-Queue -Printer ([pscustomobject]@{ Name='CAJA' }) -Wmi $null
+    Assert-Eq 'S153b de 2 a 1: se reinicia el servicio igual' 1 ([int]$script:sp153)
+    Assert-Eq 'S153b y si se fue, queda reparada' 'fixed' ([string](Get-CheckById 'queue.health').status)
+    Reset-State
+    $script:Diagnostics['colas'] = @([ordered]@{ nombre='CAJA'; puerto='USB001'; esDePrueba=$false; puertoVivo=$true })
+    $script:sp153 = 0
+    $script:lect153 = @(2, 2, 1, 1, 1); $script:j153 = 0
+    Test-Layer2-Queue -Printer ([pscustomobject]@{ Name='CAJA' }) -Wmi $null
+    $c153 = Get-CheckById 'queue.health'
+    Assert-Eq 'S153b si queda 1 aunque haya bajado, no esta reparada' 'fail' ([string]$c153.status)
+    Assert-Eq 'S153b y dice que un trabajo no se borra' $true ([bool]([string]$c153.name -match 'no se borra'))
+    # Una cola que se vacia sigue como antes: sin reiniciar nada.
+    Reset-State
+    $script:Diagnostics['colas'] = @([ordered]@{ nombre='CAJA'; puerto='USB001'; esDePrueba=$false; puertoVivo=$true })
+    $script:sp153 = 0
+    $script:lect153 = @(2, 2, 0, 0); $script:j153 = 0
+    Test-Layer2-Queue -Printer ([pscustomobject]@{ Name='CAJA' }) -Wmi $null
+    Assert-Eq 'S153b la que se vacia no reinicia nada' 0 ([int]$script:sp153)
+    Assert-Eq 'S153b y queda reparada' 'fixed' ([string](Get-CheckById 'queue.health').status)
+    Reset-Mocks
+    Reset-State
+
+    # (c) Un caseId de escalera: 6 corridas de una PC con 123456789123456.
+    Assert-Eq 'S153c una escalera de digitos no es un caso' '' (Test-CaseIdValido -Texto '123456789123456')
+    Assert-Eq 'S153c ni al reves' '' (Test-CaseIdValido -Texto '987654321987654')
+    Assert-Eq 'S153c uno real sigue sirviendo' '215476332917740' (Test-CaseIdValido -Texto '215476332917740')
+
+    # -----------------------------------------------------------------------
+    # Escenario 154 (v3.43, canal del 09 al 12/10): las herramientas de soporte.
+    # "Si solo queres borrar colas, ejecutar doctor sigue siendo mas lento"; "pensarlo como un
+    # toolkit"; en modo Red sin cola en Windows no se buscaba nada; impresoras Bluetooth.
+    #
+    # (a) Como se elige: primero el uso, despues la herramienta. Y nada de esto sin humano.
+    Reset-State
+    Reset-Mocks
+    $script:ModoElegido = ''; $script:PerfilElegido = ''
+    function Test-UiWeb { $true }
+    function Test-HayHumano { $true }
+    $script:preg154 = @(); $script:opc154 = @()
+    function Request-UiAnswer { param($Id, $Titulo, $Texto, $Texto2, $Opciones, $Clase, $Extra, $TimeoutSec, $ErrorPrevio, [switch]$SoloAsesor)
+        $script:preg154 += [string]$Id
+        if ($Id -eq 'perfil') { return $script:perfil154 }
+        if ($Id -eq 'herramienta') { $script:opc154 = @($Opciones | ForEach-Object { [string]$_.v }); return $script:herr154 }
+        if ($Id -eq 'modo') { return 'USB' }
+        $null }
+    $script:perfil154 = 'Soporte'; $script:herr154 = 'Cola'
+    Assert-Eq 'S154a soporte: se elige la herramienta' 'Cola' (Resolve-RunMode)
+    Assert-Eq 'S154a se ofrecen todas' $true ([bool]((@('Cola','Nativa','USB','Red','BuscarRed','Bluetooth') | Where-Object { @($script:opc154) -notcontains $_ }).Count -eq 0))
+    Assert-Eq 'S154a y no se pregunta como esta conectada' $false (@($script:preg154) -contains 'modo')
+    $script:preg154 = @()
+    Assert-Eq 'S154a en la vuelta siguiente no se vuelve a preguntar' 'Cola' (Resolve-RunMode)
+    Assert-Eq 'S154a ni una pregunta' 0 (@($script:preg154).Count)
+    $null = Invoke-MenuAction -Op 'R'
+    Assert-Eq 'S154a despues de una herramienta, revisar todo es la revision completa' 'Ambos' (Resolve-RunMode)
+    $script:herr154 = 'Bluetooth'
+    $null = Invoke-MenuAction -Op 'H'
+    Assert-Eq 'S154a elegir otra herramienta vuelve a la lista' 'Bluetooth' (Resolve-RunMode)
+    $script:ModoElegido = ''; $script:PerfilElegido = ''; $script:perfil154 = 'Completo'
+    Assert-Eq 'S154a revision completa: la pregunta de siempre' 'USB' (Resolve-RunMode)
+    $script:ModoElegido = ''; $script:PerfilElegido = ''; $script:perfil154 = $null
+    Assert-Eq 'S154a sin respuesta, revision completa' 'USB' (Resolve-RunMode)
+    $modo154 = $Modo
+    $Modo = 'Soporte'
+    $script:ModoElegido = ''; $script:PerfilElegido = ''; $script:preg154 = @(); $script:herr154 = 'BuscarRed'
+    Assert-Eq 'S154a -Modo Soporte va directo a la lista' 'BuscarRed' (Resolve-RunMode)
+    Assert-Eq 'S154a sin preguntar el uso' $false (@($script:preg154) -contains 'perfil')
+    $Modo = $modo154
+    function Test-UiWeb { $false }
+    function Test-HayHumano { $false }
+    $script:ModoElegido = ''; $script:PerfilElegido = ''; $script:preg154 = @()
+    Assert-Eq 'S154a sin humano: la revision completa de siempre' 'Ambos' (Resolve-RunMode)
+    Assert-Eq 'S154a sin preguntar nada' 0 (@($script:preg154).Count)
+    Assert-Eq 'S154a el menu ofrece elegir una herramienta' $true (@(Get-MenuOptions | ForEach-Object { [string]$_.k }) -contains 'H')
+    Assert-Eq 'S154a y la interfaz la muestra' $true (@(Get-MenuCatalogo | ForEach-Object { [string]$_.k }) -contains 'H')
+    $m154 = (Get-Command Invoke-FudoPrintDoctor).ScriptBlock.ToString()
+    Assert-Eq 'S154a una herramienta no recorre la cadena de impresion' $true ([bool](@($script:ModosHerramienta | Where-Object { $script:ModosPuntuales -notcontains $_ }).Count -eq 0))
+    Assert-Eq 'S154a y corre su paso' $true ([bool]($m154 -match "herramienta\.colas" -and $m154 -match "herramienta\.buscarRed" -and $m154 -match "herramienta\.bluetooth"))
+    $script:ModoElegido = ''; $script:PerfilElegido = ''
+    Reset-Mocks
+
+    # (b) Limpiar colas: solo las que tienen trabajos, las que se elijan, y se mide.
+    function Prepare-Colas154 {
+        Reset-State
+        $script:RunMode = 'Cola'
+        $script:conf154 = 0; $script:sp154 = 0; $script:limpiadas154 = @(); $script:opc154 = @()
+    }
+    function Test-UiWeb { $true }
+    function Test-HayHumano { $true }
+    function Get-Printer { param($Name, $ErrorAction)
+        @($script:colas154 | ForEach-Object { [pscustomobject]@{ Name = $_[0]; PortName = $_[1]; JobCount = $_[2]; DriverName = 'Generic / Text Only' } }) }
+    function Request-UiAnswer { param($Id, $Titulo, $Texto, $Texto2, $Opciones, $Clase, $Extra, $TimeoutSec, $ErrorPrevio, [switch]$SoloAsesor)
+        if ($Id -eq 'colasElegir') { $script:opc154 = @($Opciones | ForEach-Object { [string]$_.v + '=' + [string]$_.l }); return $script:resp154 }
+        $null }
+    function Confirm-Irreversible { param($Description, $Impact) $script:conf154++; $true }
+    function Clear-ColasTrabadas { param($Candidatas, $Colas) $script:limpiadas154 = @($Candidatas | ForEach-Object { [string]$_.nombre }); 'limpiadas' }
+    function Start-Sleep { param($Seconds, $Milliseconds) }
+    function Get-ConteoCola { param($Nombre, [switch]$Masiva) [int]$script:conteo154[$Nombre] }
+    function Restart-Service { param($Name, [switch]$Force, $ErrorAction) $script:sp154++ }
+    function Get-PrintJob { param($PrinterName, $ErrorAction)
+        $n = [int]$script:tras154[$PrinterName]
+        @(1..([Math]::Max(1, $n)) | Where-Object { $n -gt 0 } | ForEach-Object { [pscustomobject]@{ JobStatus = 'Eliminando' } }) }
+    $script:colas154 = @(@('COCINA', 'USB001', 12), @('BARRA', 'IP_192.168.0.60', 1), @('CAJA', 'USB002', 0))
+    Prepare-Colas154
+    $script:resp154 = 'todos'; $script:conteo154 = @{ COCINA = 0; BARRA = 0 }
+    Invoke-HerramientaColas
+    $c154 = Get-CheckById 'queue.health'
+    Assert-Eq 'S154b se ofrecen solo las que tienen trabajos' $false ([bool](@($script:opc154) -match 'CAJA'))
+    Assert-Eq 'S154b con la opcion de todas' $true ([bool](@($script:opc154) -match '^todos='))
+    Assert-Eq 'S154b se limpian las dos' 'COCINA,BARRA' (@($script:limpiadas154) -join ',')
+    Assert-Eq 'S154b y se confirma igual: es irreversible' 1 ([int]$script:conf154)
+    Assert-Eq 'S154b vacias: reparada' 'fixed' ([string]$c154.status)
+    Assert-Eq 'S154b sin reiniciar nada' 0 ([int]$script:sp154)
+    Assert-Eq 'S154b limpiar no es resolver' $false ([bool](Resolve-Diagnosis).resolved)
+    Prepare-Colas154
+    $script:resp154 = '1'; $script:conteo154 = @{ COCINA = 0 }
+    Invoke-HerramientaColas
+    Assert-Eq 'S154b eligiendo una, se limpia solo esa' 'COCINA' (@($script:limpiadas154) -join ',')
+    Prepare-Colas154
+    $script:resp154 = 'no'
+    Invoke-HerramientaColas
+    Assert-Eq 'S154b eligiendo ninguna, no se limpia nada' 0 (@($script:limpiadas154).Count)
+    Assert-Eq 'S154b y queda a la vista' 'warn' ([string](Get-CheckById 'queue.health').status)
+    Prepare-Colas154
+    $script:resp154 = 'todos'; $script:conteo154 = @{ COCINA = 0; BARRA = 1 }; $script:tras154 = @{ BARRA = 0 }
+    Invoke-HerramientaColas
+    Assert-Eq 'S154b uno que no se borra: se reinicia el servicio' 1 ([int]$script:sp154)
+    Assert-Eq 'S154b y si se fue, reparada' 'fixed' ([string](Get-CheckById 'queue.health').status)
+    Prepare-Colas154
+    $script:resp154 = 'todos'; $script:conteo154 = @{ COCINA = 0; BARRA = 1 }; $script:tras154 = @{ BARRA = 1 }
+    Invoke-HerramientaColas
+    $c154e = Get-CheckById 'queue.health'
+    Assert-Eq 'S154b si ni reiniciando se va, no esta reparada' 'fail' ([string]$c154e.status)
+    Assert-Eq 'S154b y dice cual quedo' $true ([bool]([string]$c154e.name -match "BARRA"))
+    # La coma: sin ella, PowerShell aplana el array de un solo elemento.
+    $script:colas154 = @(, @('CAJA', 'USB002', 0))
+    Prepare-Colas154
+    $script:opc154 = @('sin preguntar')
+    Invoke-HerramientaColas
+    Assert-Eq 'S154b sin trabajos en ninguna: no hay nada que limpiar' 'ok' ([string](Get-CheckById 'queue.health').status)
+    Assert-Eq 'S154b y no se pregunta nada' 'sin preguntar' (@($script:opc154) -join ',')
+    Reset-Mocks
+
+    # (c) Buscar impresoras en la red, aunque no esten instaladas en Windows.
+    Reset-State
+    $script:RunMode = 'BuscarRed'
+    function Test-UiWeb { $true }
+    function Test-HayHumano { $true }
+    function Get-LocalSubnetPrefixes { @('192.168.0') }
+    function Find-NetworkPrinters { param($Prefix, $TcpPort, $WaitMs)
+        @([ordered]@{ ip = '192.168.0.50'; puerto = 9100; tipo = 'impresora termica (responde ESC/POS)' },
+          [ordered]@{ ip = '192.168.0.60'; puerto = 9100; tipo = 'impresora termica (responde ESC/POS)' }) }
+    function Get-InstalledNetworkPrinters { @([ordered]@{ ip = '192.168.0.60'; puertoTcp = 9100; puertoWindows = 'IP_192.168.0.60'; colas = @('BARRA') }) }
+    $script:opc154 = @(); $script:creada154 = ''
+    function Request-UiAnswer { param($Id, $Titulo, $Texto, $Texto2, $Opciones, $Clase, $Extra, $TimeoutSec, $ErrorPrevio, [switch]$SoloAsesor)
+        if ($Id -eq 'redInstalar') { $script:opc154 = @($Opciones | ForEach-Object { [string]$_.l }); return '1' }
+        if ($Id -eq 'papel') { return 'si' }
+        $null }
+    function New-NetworkPrinter { param($Ip, $TcpPort, $Name) $script:creada154 = [string]$Name; [string]$Name }
+    function Send-EscPosOverTcp { param($Ip, $TcpPort) $true }
+    Invoke-HerramientaBuscarRed
+    Assert-Eq 'S154c encuentra las dos' 'ok' ([string](Get-CheckById 'red.busqueda').status)
+    Assert-Eq 'S154c y dice cual ya tiene cola' $true ([bool]([string](Get-CheckById 'red.busqueda').recommendation -match "cola 'BARRA'"))
+    Assert-Eq 'S154c ofrece instalar solo la que no tiene cola' '192.168.0.50:9100' (@($script:opc154 | Where-Object { $_ -match '^\d' }) -join ',')
+    Assert-Eq 'S154c la instala con el nombre sugerido' 'FUDO-192-168-0-50' $script:creada154
+    Assert-Eq 'S154c queda instalada' 'fixed' ([string](Get-CheckById 'red.instalada').status)
+    Assert-Eq 'S154c con el papel confirmado' 'ok' ([string](Get-CheckById 'hw.testprint').status)
+    Assert-Eq 'S154c y recien ahi se resuelve' $true ([bool](Resolve-Diagnosis).resolved)
+    Reset-State
+    $script:RunMode = 'BuscarRed'
+    function Find-NetworkPrinters { param($Prefix, $TcpPort, $WaitMs) @() }
+    Invoke-HerramientaBuscarRed
+    Assert-Eq 'S154c si no contesta nada, lo dice' 'warn' ([string](Get-CheckById 'red.busqueda').status)
+    Assert-Eq 'S154c y como sacar la IP' $true ([bool]([string](Get-CheckById 'red.busqueda').recommendation -match 'FEED'))
+    Reset-Mocks
+
+    # (d) Bluetooth. Primero, que puertos se usan: solo los SALIENTES (con la direccion del
+    # dispositivo). El entrante es para que otro equipo se conecte a esta PC.
+    Reset-State
+    function Get-CimInstance { param($ClassName, $Filter, $ErrorAction)
+        @([pscustomobject]@{ DeviceID = 'BTHENUM\{00001101-0000-1000-8000-00805F9B34FB}_LOCALMFG&0002\7&2D2B1C1B&0&001B10A1B2C3_C00000000'; Name = 'Vinculo serie estandar a traves de Bluetooth (COM5)' },
+          [pscustomobject]@{ DeviceID = 'BTHENUM\{00001101-0000-1000-8000-00805F9B34FB}_LOCALMFG&0000\7&2D2B1C1B&0&000000000000_00000000'; Name = 'Vinculo serie estandar a traves de Bluetooth (COM6)' },
+          [pscustomobject]@{ DeviceID = 'BTHENUM\DEV_001B10A1B2C3\7&3A1C2B&0&BLUETOOTHDEVICE_001B10A1B2C3'; Name = 'MTP-II' }) }
+    function Get-Printer { param($Name, $ErrorAction) @() }
+    $bt154 = @(Get-BluetoothPrinterPorts)
+    Assert-Eq 'S154d un solo puerto: el saliente' 1 (@($bt154).Count)
+    Assert-Eq 'S154d el COM5' 'COM5' ([string]@($bt154)[0].com)
+    Assert-Eq 'S154d con el nombre del dispositivo' 'MTP-II' ([string]@($bt154)[0].nombre)
+    Reset-Mocks
+
+    function Prepare-Bt154 {
+        Reset-State
+        $script:RunMode = 'Bluetooth'
+        $script:puerto154 = ''; $script:cola154 = $null; $script:envio154 = ''; $script:preg154 = @()
+    }
+    function Test-UiWeb { $true }
+    function Test-HayHumano { $true }
+    function Get-PrinterPort { param($Name, $ErrorAction) $null }
+    function Add-PrinterPort { param($Name, $ErrorAction) $script:puerto154 = [string]$Name }
+    function New-FudoPrinterQueue { param($PortName, $PreferDriver, $Name) $script:cola154 = @{ p = [string]$PortName; n = [string]$Name }; @{ ok = $true; name = $Name; driver = 'Generic / Text Only'; nota = 'cola creada' } }
+    function Send-TicketPruebaACola { param($Cola) $script:envio154 = [string]$Cola; $true }
+    function Wait-QueueDrain { param($Printer, $DocMatch, $TimeoutMs) @{ quedoEnCola = [bool]$script:quedo154; bloqueadoPor = 0; esperaMs = 1 } }
+    function Request-UiAnswer { param($Id, $Titulo, $Texto, $Texto2, $Opciones, $Clase, $Extra, $TimeoutSec, $ErrorPrevio, [switch]$SoloAsesor)
+        $script:preg154 += [string]$Id
+        if ($Id -eq 'papel') { return 'si' }
+        if ($Id -eq 'btElegir') { return $script:btResp154 }
+        $null }
+    $script:bt154 = @([ordered]@{ com = 'COM5'; mac = '001B10A1B2C3'; nombre = 'MTP-II'; colas = @() })
+    function Get-BluetoothPrinterPorts { @($script:bt154) }
+    Prepare-Bt154
+    $script:quedo154 = $false
+    $script:btResp154 = '1'
+    Invoke-HerramientaBluetooth
+    Assert-Eq 'S154d aunque haya uno solo, se elige a mano' $true (@($script:preg154) -contains 'btElegir')
+    Assert-Eq 'S154d se crea el puerto de Windows' 'COM5:' $script:puerto154
+    Assert-Eq 'S154d y la cola en ese puerto' 'COM5:' ([string]$script:cola154.p)
+    Assert-Eq 'S154d con un nombre que dice que es Bluetooth' 'FUDO-BT-MTPII' ([string]$script:cola154.n)
+    Assert-Eq 'S154d la cola queda creada' 'fixed' ([string](Get-CheckById 'bt.cola').status)
+    Assert-Eq 'S154d el ticket va a esa cola' 'FUDO-BT-MTPII' $script:envio154
+    Assert-Eq 'S154d con el papel confirmado: ok' 'ok' ([string](Get-CheckById 'hw.testprint').status)
+    Assert-Eq 'S154d y se resuelve' $true ([bool](Resolve-Diagnosis).resolved)
+    Prepare-Bt154
+    $script:quedo154 = $true
+    Invoke-HerramientaBluetooth
+    Assert-Eq 'S154d si el ticket no sale de la cola, falla' 'fail' ([string](Get-CheckById 'hw.testprint').status)
+    Assert-Eq 'S154d sin preguntar por el papel' $false (@($script:preg154) -contains 'papel')
+    Assert-Eq 'S154d y dice que la PC no se conecto' $true ([bool]([string](Get-CheckById 'hw.testprint').recommendation -match 'otro equipo'))
+    $script:quedo154 = $false
+    $script:bt154 = @([ordered]@{ com = 'COM5'; mac = '001B10A1B2C3'; nombre = 'MTP-II'; colas = @('COMANDERA') })
+    Prepare-Bt154
+    Invoke-HerramientaBluetooth
+    Assert-Eq 'S154d si ya tiene cola, se adopta' 'ok' ([string](Get-CheckById 'bt.cola').status)
+    Assert-Eq 'S154d sin crear nada' $null $script:cola154
+    Assert-Eq 'S154d y se prueba esa' 'COMANDERA' $script:envio154
+    $script:bt154 = @([ordered]@{ com = 'COM5'; mac = '001B10A1B2C3'; nombre = 'MTP-II'; colas = @() },
+                      [ordered]@{ com = 'COM8'; mac = 'A0B1C2D3E4F5'; nombre = 'Celular'; colas = @() })
+    $script:btResp154 = 'no'
+    Prepare-Bt154
+    Invoke-HerramientaBluetooth
+    Assert-Eq 'S154d con varios, se elige a mano' $true (@($script:preg154) -contains 'btElegir')
+    Assert-Eq 'S154d y si no se elige ninguno, no se toca nada' $null $script:cola154
+    Assert-Eq 'S154d ni se manda nada' '' $script:envio154
+    # Sin nadie que elija (modo agente): se lista y no se toca nada. En la PC de desarrollo el
+    # unico puerto serie Bluetooth era de unos auriculares.
+    $script:bt154 = @([ordered]@{ com = 'COM3'; mac = 'CCF826816A16'; nombre = 'Buds2'; colas = @() })
+    Prepare-Bt154
+    function Test-HayHumano { $false }
+    function Test-UiWeb { $false }
+    Invoke-HerramientaBluetooth
+    Assert-Eq 'S154d sin humano no se crea ninguna cola' $null $script:cola154
+    Assert-Eq 'S154d ni se manda nada' '' $script:envio154
+    $d154 = Resolve-Diagnosis
+    Assert-Eq 'S154d y la causa dice por que' $true ([bool]([string]$d154.rootCause -match 'elija'))
+    Assert-Eq 'S154d y lo que sigue no es reintentar con -PrinterName' $false ([bool](@(Get-NextActions -Diag $d154 | ForEach-Object { [string]$_.do }) -match 'PrinterName'))
+    function Test-HayHumano { $true }
+    function Test-UiWeb { $true }
+    $script:bt154 = @()
+    Prepare-Bt154
+    Invoke-HerramientaBluetooth
+    Assert-Eq 'S154d sin ninguna vinculada, lo dice' 'fail' ([string](Get-CheckById 'bt.vinculada').status)
+    Assert-Eq 'S154d y como vincularla' $true ([bool]([string](Get-CheckById 'bt.vinculada').recommendation -match 'Agregar dispositivo'))
+    $tiro154 = $false
+    Microsoft.PowerShell.Management\Remove-Item Function:\Send-TicketPruebaACola -ErrorAction SilentlyContinue
+    try { $null = Send-TicketPruebaACola -Cola 'x' } catch { $tiro154 = $true }
+    Assert-Eq 'S154d el self-test no imprime nada' $true $tiro154
+    $script:RunMode = 'Ambos'
+    Reset-Mocks
+    Reset-State
+
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)
     # Salida explicita en los dos casos: si el script termina con 'return', $LASTEXITCODE
     # queda sin definir y cualquier automatizacion lo interpreta como fallo.
@@ -15583,6 +16491,8 @@ function Get-MenuOptions {
     <# Opciones disponibles segun lo que se encontro. Las letras son estables. #>
     $ops = @()
     $ops += [ordered]@{ k = 'R'; t = 'Volver a revisar todo' }
+    # v3.43: las herramientas de soporte, tambien despues de una revision completa.
+    $ops += [ordered]@{ k = 'H'; t = 'Elegir una herramienta (limpiar colas, buscar en la red, Bluetooth...)' }
 
     $hayDesconectada = @($script:Checks | Where-Object { $_.id -in @('printer.disconnected','hw.disconnected') -and $_.status -eq 'fail' }).Count -gt 0
     if ($hayDesconectada) { $ops += [ordered]@{ k = 'U'; t = 'Esperar a que conectes/desconectes el USB y revisar de nuevo' } }
@@ -15812,6 +16722,9 @@ function Get-MenuCatalogo {
       El motivo se resuelve arriba, cruzando con lo que devolvio Get-MenuOptions.
     #>
     return @(
+        [ordered]@{ k = 'H'; t = 'Elegir otra herramienta'
+                    d = 'Limpiar colas, buscar impresoras en la red, Bluetooth, la App Nativa: cada una hace solo eso.'
+                    na = '' }
         [ordered]@{ k = 'T'; t = 'Imprimir un ticket de prueba'
                     d = 'Manda un ESC/POS directo al hardware, salteando Fudo y el driver. Es la forma de separar un problema de impresora de uno de configuracion.'
                     na = '' }
@@ -15954,7 +16867,18 @@ function Invoke-MenuAction {
     param([string]$Op)
 
     switch ($Op) {
-        'R' { return $true }
+        'R' {
+            # v3.43: despues de una herramienta, "revisar todo" es la revision completa, no
+            # volver a correr la misma herramienta.
+            if ($script:ModosHerramienta -contains [string]$script:ModoElegido) { $script:ModoElegido = 'Ambos' }
+            return $true
+        }
+
+        'H' {
+            $script:PerfilElegido = 'Soporte'
+            $script:ModoElegido = ''
+            return $true
+        }
 
         'U' {
             $script:ForceWaitReconnect = $true
@@ -17058,37 +17982,90 @@ function Get-FileWithProgress {
     try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
     $wc = $null
+    $esperado = [long]0
+    $errorFin = ''
+    # v3.43: el evento de fin es el unico lugar donde WebClient dice que la descarga fallo a
+    # mitad de camino. Sin leerlo, una conexion cortada se veia igual que una terminada.
+    $sid = 'FpdDescarga-' + [guid]::NewGuid().ToString('N')
+    $conEvento = $false
     try {
         $wc = New-Object Net.WebClient
+        try { $null = Register-ObjectEvent -InputObject $wc -EventName DownloadFileCompleted -SourceIdentifier $sid -ErrorAction Stop; $conEvento = $true } catch {}
         $wc.DownloadFileAsync([Uri]$Url, $Destino)
         $limite = (Get-Date).AddSeconds($TimeoutSec)
         $ultimo = -1
         while ($wc.IsBusy -and ((Get-Date) -lt $limite)) {
             Start-Sleep -Milliseconds 800
+            if ($esperado -le 0) { try { $esperado = [long]$wc.ResponseHeaders['Content-Length'] } catch {} }
             $mb = 0
             try { $mb = [int]([math]::Floor((Get-Item $Destino -ErrorAction Stop).Length / 1MB)) } catch {}
             if ($mb -ne $ultimo) {
                 $ultimo = $mb
-                Write-StepDetail ('descargando ' + $Que + ': ' + $mb + ' MB')
+                Write-StepDetail ('descargando ' + $Que + ': ' + $mb + ' MB' + $(if ($esperado -gt 0) { ' de ' + [int]([math]::Ceiling($esperado / 1MB)) } else { '' }))
             }
         }
         if ($wc.IsBusy) {
             try { $wc.CancelAsync() } catch {}
             $r.error = ('la descarga no termino en ' + $TimeoutSec + ' segundos y se corto')
         }
+        if ($esperado -le 0) { try { $esperado = [long]$wc.ResponseHeaders['Content-Length'] } catch {} }
+        if ($conEvento) {
+            try {
+                $ev = @(Get-Event -SourceIdentifier $sid -ErrorAction Stop) | Select-Object -First 1
+                if ($ev -and $ev.SourceEventArgs) {
+                    $exFin = $ev.SourceEventArgs.Error
+                    if ($exFin) {
+                        $errorFin = [string]$exFin.Message
+                        try { if ($exFin.InnerException) { $errorFin = [string]$exFin.InnerException.Message } } catch {}
+                    }
+                }
+            } catch {}
+        }
     } catch {
         $r.error = $_.Exception.Message
     } finally {
+        if ($conEvento) {
+            try { Unregister-Event -SourceIdentifier $sid -ErrorAction SilentlyContinue } catch {}
+            try { Remove-Event -SourceIdentifier $sid -ErrorAction SilentlyContinue } catch {}
+        }
         if ($wc) { try { $wc.Dispose() } catch {} }
     }
 
     try { $r.bytes = [long](Get-Item $Destino -ErrorAction Stop).Length } catch { $r.bytes = 0 }
     $r.segundos = [int]((Get-Date) - $t0).TotalSeconds
-    # Sin error declarado y con bytes suficientes, la descarga sirvio. El tamano exacto lo
-    # valida quien llama: aca solo sabemos si bajo algo o no bajo nada.
-    if (-not $r.error -and $r.bytes -gt 0) { $r.ok = $true }
-    if (-not $r.error -and $r.bytes -le 0) { $r.error = 'no se descargo nada (sin conexion, o la direccion no respondio)' }
+    $r['esperado'] = [long]$esperado
+    $v = Get-VeredictoDescarga -Bytes $r.bytes -Esperado $esperado -ErrorFin $errorFin -ErrorPrevio ([string]$r.error)
+    $r.ok = [bool]$v.ok
+    $r.error = [string]$v.error
+    $r['cortada'] = [bool]$v.cortada
     return $r
+}
+
+function Get-VeredictoDescarga {
+    <#
+      v3.43 (bitacora 05/10-11/10): la Nativa 0.0.40 pesa 107 MB y en 7 corridas de 3 PCs
+      llegaron de 1,4 a 87 MB con ok = $true. Se daba por buena cualquier descarga que trajera
+      algun byte; despues la firma frenaba el archivo incompleto y el mensaje culpaba a la
+      firma, que no tenia nada que ver. Las descargas completas instalaron 98 de 99.
+      Una descarga sirve si no hubo error y trajo todo lo que el servidor dijo que mandaba.
+      Si el servidor no dijo el tamano, alcanza con que haya traido algo (como antes).
+      Devuelve @{ ok; error; cortada }.
+    #>
+    param([long]$Bytes, [long]$Esperado = 0, [string]$ErrorFin = '', [string]$ErrorPrevio = '')
+    $mbB = [math]::Round($Bytes / 1MB, 1)
+    $mbE = [math]::Round($Esperado / 1MB, 1)
+    if ($ErrorPrevio) { return @{ ok = $false; error = $ErrorPrevio; cortada = $false } }
+    if ($Bytes -le 0) { return @{ ok = $false; error = 'no se descargo nada (sin conexion, o la direccion no respondio)'; cortada = $false } }
+    if ($Esperado -gt 0 -and $Bytes -lt $Esperado) {
+        return @{ ok = $false; cortada = $true
+                  error = ('la descarga se corto en ' + $mbB + ' de ' + $mbE + ' MB' + $(if ($ErrorFin) { ' (' + $ErrorFin + ')' } else { '' }) +
+                           ': la conexion de esta PC se interrumpio a mitad de camino') }
+    }
+    if ($ErrorFin) {
+        return @{ ok = $false; cortada = $true
+                  error = ('la descarga se corto en ' + $mbB + ' MB (' + $ErrorFin + ')') }
+    }
+    return @{ ok = $true; error = ''; cortada = $false }
 }
 
 function Test-FudoInstallerSignature {
@@ -17187,14 +18164,27 @@ function Invoke-FudoNativeDownload {
     if ($SelfTest) { throw 'self-test: el motor no descarga nada (mockear Get-NativeInstallerUrl o Invoke-Remediation)' }
     $esMsi = ([string]$url -match '(?i)\.msi(\?|$)')
     $destino = Join-Path $env:TEMP ('FudoNativa-' + (Get-Date).ToString('yyyyMMddHHmmss') + $(if ($esMsi) { '.msi' } else { '.exe' }))
-    Write-StepDetail 'descargando el instalador de la App Nativa (58 MB)'
+    Write-StepDetail 'descargando el instalador de la App Nativa'
     $bajada = Get-FileWithProgress -Url $url -Destino $destino -TimeoutSec 300 -Que 'la App Nativa'
+    # v3.43: una descarga cortada a mitad de camino se reintenta una vez, desde cero. Las
+    # cortadas de la telemetria eran de conexiones que se caen, no de un archivo roto.
+    $reintentos = 0
+    if (-not [bool]$bajada.ok -and [bool]$bajada.cortada) {
+        $reintentos = 1
+        $primerError = [string]$bajada.error
+        Write-StepDetail ('la descarga se corto; reintentando una vez')
+        try { Remove-Item $destino -Force -ErrorAction SilentlyContinue } catch {}
+        $bajada = Get-FileWithProgress -Url $url -Destino $destino -TimeoutSec 300 -Que 'la App Nativa'
+        if (-not [bool]$bajada.ok) { $bajada.error = ([string]$bajada.error + ' (y antes, ' + $primerError + ')') }
+    }
     $script:Diagnostics['nativaDescarga'] = [ordered]@{
         url = [string]$url; bytes = [long]$bajada.bytes; segundos = [int]$bajada.segundos
-        ok = [bool]$bajada.ok; error = [string]$bajada.error }
+        ok = [bool]$bajada.ok; error = [string]$bajada.error
+        esperado = [long]$bajada.esperado; cortada = [bool]$bajada.cortada; reintentos = $reintentos }
     if (-not [bool]$bajada.ok) {
+        if ([bool]$bajada.cortada) { try { Remove-Item $destino -Force -ErrorAction SilentlyContinue } catch {} }
         throw ('no se pudo descargar el instalador de la App Nativa: ' + [string]$bajada.error +
-               '. Pasarlo a mano y dejarlo al lado de FudoPrintDoctor.cmd.')
+               '. Probar de nuevo con mejor conexion, o pasarlo a mano y dejarlo al lado de FudoPrintDoctor.cmd.')
     }
     $notas += ('descarga: ' + [int]([long]$bajada.bytes / 1MB) + ' MB en ' + [int]$bajada.segundos + 's')
     # El antivirus se lleva el instalador MIENTRAS se descarga: en la telemetria hay 14
@@ -18164,13 +19154,19 @@ try {
     Set-Idioma -Idioma (Resolve-Idioma -Pedido $Idioma)
     if ($script:IdiomaActivo -ne 'es') { Enable-ConsolaLocal }
     $script:UiTimeout = [int]$UiTimeoutSec
+    # v3.43 (bitacora 05/10-11/10 y un video de un asesor del 10/10): la ventana cargaba con el
+    # caso y el equipo y la lista quedaba vacia minutos, hasta que alguien daba Enter en la
+    # consola. La edicion rapida se apagaba recien al empezar la revision, y antes de eso la
+    # consola invita a copiar la direccion de la ventana: un clic ahi la congelaba en la
+    # siguiente linea que escribia. Se apaga antes de escribir nada.
+    try { $script:Diagnostics['consolaSinEdicionRapida'] = [bool](Disable-ConsoleQuickEdit) } catch {}
     if ($Ui -eq 'web' -and -not $Quiet -and -not $Json) {
         $script:UiModo = 'web'
         if (Start-DoctorUi -Puerto $UiPort) {
             [Console]::Error.WriteLine('')
             [Console]::Error.WriteLine('  La interfaz se abrio en el navegador de esta PC:')
             [Console]::Error.WriteLine('    ' + $script:UiUrl)
-            [Console]::Error.WriteLine('  Si no se abrio sola, pega esa direccion. Esta ventana puede quedar de fondo,')
+            [Console]::Error.WriteLine('  Si no se abrio sola, escribi esa direccion en el navegador. Esta ventana puede quedar de fondo,')
             [Console]::Error.WriteLine('  pero NO hay que cerrarla: el diagnostico corre aca.')
             [Console]::Error.WriteLine('')
             # v3.40: que una ventana en blanco no cueste 15 minutos (ver Confirm-UiCargo).
@@ -18238,6 +19234,7 @@ try {
                 $notaUi = [string]$script:UltimaAccionNota
                 $motivoUi = switch ([string]$op) {
                     'R' { 'Revisando todo de nuevo.' }
+                    'H' { 'Elegir otra herramienta.' }
                     'U' { 'Se espero la reconexion del USB. Revisando de nuevo para ver como quedo.' }
                     'I' { 'Se instalo la impresora conectada. Revisando de nuevo para confirmar que quedo bien.' }
                     'L' { 'Se limpio la cola. Revisando de nuevo para ver si ahora imprime.' }

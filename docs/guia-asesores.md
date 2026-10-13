@@ -16,6 +16,30 @@ aplica sola.
 Si Windows muestra "Windows protegió tu PC" al abrir el `.cmd`: *Más información* → *Ejecutar
 de todas formas*. Es porque el archivo viene de internet, no porque tenga algo raro.
 
+## Revisión completa o una herramienta
+
+Lo primero que pregunta es cómo lo querés usar:
+
+- **Revisión completa**: para cuando no sabés qué tiene la PC. Revisa toda la cadena y arregla
+  lo que encuentra. Es lo de siempre.
+- **Elegir una herramienta**: para cuando ya sabés qué hay que hacer. Cada una hace solo eso:
+  - **Limpiar colas de impresión**: te muestra las colas que tienen trabajos esperando, elegís
+    cuáles (o todas) y las limpia. Si queda uno que no se borra, reinicia el servicio de
+    impresión.
+  - **Revisar la App Nativa y la extensión.**
+  - **Revisar las impresoras USB** o **las de red** (las que ya están instaladas en Windows).
+  - **Buscar impresoras en la red**: para las que se usan cargando la IP en Fudo y no están
+    instaladas en Windows. Lista lo que contesta, te dice cuáles ya tienen cola y, si querés,
+    instala una y manda un ticket de prueba.
+  - **Impresora Bluetooth**: lista los dispositivos Bluetooth vinculados que tienen puerto COM,
+    elegís cuál es la impresora, le crea la cola y manda un ticket de prueba. **Ojo:** aparecen
+    también celulares y auriculares; elegí solo la impresora. Si no aparece, primero hay que
+    vincularla desde Configuración > Bluetooth y dispositivos (PIN 0000 o 1234). Las de bajo
+    consumo (BLE) no crean puerto COM y esta herramienta no las ve.
+
+Al terminar cualquier herramienta, desde el menú podés elegir otra o pasar a la revisión
+completa.
+
 ## Cómo leer el resumen
 
 Mientras corre vas viendo cada etapa con su resultado, así que no te quedás esperando en la nada:
@@ -125,7 +149,9 @@ Artículos: [áreas y cocinas](https://soporte.fu.do/es/articles/11730815) ·
 Cuando termina, el script no se cierra: te ofrece un menú. Eso sirve para el ida y vuelta típico
 con el cliente sin volver a arrancar todo:
 
-- **R** — revisar de nuevo, después de que el cliente hizo algo.
+- **R** — revisar de nuevo, después de que el cliente hizo algo. Si venías de una herramienta,
+  hace la revisión completa.
+- **H** — elegir una herramienta (limpiar colas, buscar en la red, Bluetooth, la App Nativa).
 - **U** — le pedís al cliente que desenchufe y vuelva a enchufar el USB, y el script detecta el
   puerto nuevo solo.
 - **I** — instalar la impresora que está conectada pero no tiene cola en Windows.

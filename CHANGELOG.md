@@ -2,6 +2,69 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.43] - 2026-10-13
+
+**Revisión completa o una herramienta.** Pedido del canal del 09 al 12/10: "si solo querés borrar
+las colas de impresión, ejecutar el doctor sigue siendo más lento, además hace todo el proceso", y
+"pensarlo como un toolkit más que como un agente que haga todo". Ahora lo primero que pregunta es
+cómo se va a usar:
+
+- **Revisión completa**: lo de siempre, para cuando no se sabe qué tiene la PC.
+- **Elegir una herramienta**: cada una hace una sola cosa y nada más. Limpiar colas de impresión
+  (las que tengan trabajos, eligiendo cuáles), revisar la App Nativa, revisar USB, revisar red,
+  **buscar impresoras en la red** y **Bluetooth**. Las de revisar son los modos que ya existían.
+
+Las dos nuevas:
+
+- **Buscar impresoras en la red.** Un asesor lo marcó el 09/10: las impresoras de red casi nunca
+  están instaladas en Windows, se usan cargando la IP en Fudo, y en modo Red sin una cola de red
+  el motor cortaba sin buscar nada (11 corridas en una semana, en 9 PCs). Ahora lista lo que
+  contesta en el puerto de impresión, dice cuáles ya tienen cola y, si se quiere, instala una y
+  manda un ticket de prueba.
+- **Impresora Bluetooth.** Dos asesores lo pidieron el 11/10. Una impresora Bluetooth clásica se
+  vincula como "puerto serie sobre Bluetooth" y Windows le crea dos puertos COM; se usa el
+  saliente (el entrante es para que otro equipo se conecte a la PC). Se elige el dispositivo, se
+  le crea la cola en ese puerto (o se adopta la que tenga) y se manda un ticket de prueba que
+  tiene que confirmar una persona. **Siempre se elige a mano, aunque haya uno solo**: en la PC
+  donde se desarrolló, el único puerto serie Bluetooth era de unos auriculares. Windows no
+  distingue una impresora de cualquier otro dispositivo con puerto serie, y mandarle bytes a otra
+  cosa puede trabarla. Sin nadie que elija (modo agente) solo se lista. **No se probó contra una
+  impresora Bluetooth real.**
+
+Las herramientas son modos de corrida, como "Solo la App Nativa": el resultado, la pantalla, la
+telemetría (`modo`: `Cola`, `BuscarRed`, `Bluetooth`) y el menú del final andan igual. Nunca dan
+el caso por resuelto sin que alguien vea salir el papel: limpiar una cola es una reparación, no un
+cierre. Desde el menú del final se puede elegir otra herramienta (opción **H**, también después de
+una revisión completa), y "revisar todo" después de una herramienta hace la revisión completa.
+`-Modo Soporte` va directo a la lista; `-Modo Cola|BuscarRed|Bluetooth` corre una herramienta.
+
+**Además, cuatro cosas que el motor hacía mal, de la bitácora del 05/10 al 11/10 y de un video de
+un asesor.**
+
+- **La ventana se quedaba con la lista vacía hasta que alguien daba Enter en la consola.** Tres
+  capturas de un asesor y dos casos de otro, todos en 3.41, y un video del 10/10: la ventana
+  carga con el caso y el equipo, y "Qué estamos revisando" queda en blanco minutos. La edición
+  rápida de la consola (el clic que congela el programa, ver 3.36) se apagaba recién al
+  empezar la revisión, y antes de eso la consola invita a copiar la dirección de la ventana: un
+  clic ahí la congelaba. Ahora se apaga antes de escribir nada, y la consola dice que la
+  dirección se *escriba* en el navegador.
+- **Una descarga de la App Nativa cortada a mitad de camino se daba por buena.** La 0.0.40 pesa
+  107 MB, y en 7 corridas de 3 PCs llegaron entre 1,4 y 87 MB con la descarga marcada como
+  exitosa. Después la verificación de firma frenaba el archivo incompleto —bien— y el mensaje
+  le echaba la culpa a la firma, que no tenía nada que ver. Las descargas completas instalaron
+  98 de 99. Ahora se compara contra el tamaño que anuncia el servidor y se lee el error con el
+  que terminó la descarga; si se cortó, se reintenta una vez desde cero, y si vuelve a cortarse
+  se dice "se cortó en X de 107 MB". El texto ya no dice "58 MB" fijo: muestra cuánto va de
+  cuánto. Viaja en `diagnostics.nativaDescarga` (`esperado`, `cortada`, `reintentos`).
+- **Una cola que bajaba de 2 a 1 trabajos quedaba reparada sin reiniciar el servicio de
+  impresión.** La 3.40 reinicia el servicio cuando queda un trabajo que no se borra, pero solo
+  si la cola *no había bajado*. En 6 corridas bajó de 2 a 1, quedó en `fixed`, y en dos el
+  ticket de prueba se trabó detrás del trabajo que quedó. Cuando el reinicio sí corrió, vació
+  la cola en 4 de 5. Ahora decide lo que queda, no cuánto bajó: si al final queda 1 o 2 que no
+  se van ni reiniciando, la cola no está reparada y la causa apunta a la impresora o su puerto.
+- **`123456789123456` pasaba como ID de caso.** 6 corridas de una PC llegaron así. Igual que el
+  `111111111111111` de la 3.31: parece cargado y no se cruza con ninguna conversación.
+
 ## [3.42] - 2026-10-08
 
 **Ahora se puede medir el éxito de cada acción, y saber cuándo se corrió una que no hacía
