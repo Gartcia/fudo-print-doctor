@@ -522,7 +522,7 @@ $script:Producto    = 'Fudo'
 $script:PrefijoCola = 'FUDO-'
 $script:NombreCola  = 'Impresora Fudo'
 $script:ReglasTexto = @()
-$script:SchemaVersion = '3.43'
+$script:SchemaVersion = '3.44'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -2935,6 +2935,40 @@ function Confirm-PaperCameOut {
     return $null
 }
 
+function Clear-PrinterWorkOffline {
+    <#
+      v3.44: saca la marca "Usar impresora sin conexion" de una cola. Devuelve $true si despues
+      de sacarla Windows ya no la tiene puesta, $false si sigue.
+      Antes esto no funcionaba en ningun lado. La limpieza previa a probar puertos llamaba a
+      Set-Printer -WorkOffline, un parametro que Set-Printer NO tiene: tiraba error y el
+      try/catch lo tapaba. Y la capa 1 hacia Resume y reiniciaba el servicio de impresion, que
+      no tocan esa marca, y daba el chequeo por reparado sin volver a mirar. La marca es una
+      propiedad escribible de Win32_Printer (hace falta administrador, como todo el motor).
+      Con la marca puesta Windows retiene los trabajos en la cola: el ticket de prueba nunca
+      sale, y la prueba de puertos descartaba el puerto bueno.
+    #>
+    param([string]$Nombre)
+    $filtro = "Name='" + ($Nombre -replace "'","''") + "'"
+    $p = Get-CimInstance Win32_Printer -Filter $filtro -ErrorAction Stop
+    if (-not [bool]$p.WorkOffline) { return $true }
+    $errCim = ''
+    try { Set-CimInstance -InputObject $p -Property @{ WorkOffline = $false } -ErrorAction Stop } catch { $errCim = [string]$_.Exception.Message }
+    $despues = Get-CimInstance Win32_Printer -Filter $filtro -ErrorAction Stop
+    if (-not [bool]$despues.WorkOffline) { return $true }
+    # Segundo intento por WMI clasico (PowerShell 5.1), por si CIM no escribe en esa PC.
+    if (Get-Command Get-WmiObject -ErrorAction SilentlyContinue) {
+        try {
+            $w = Get-WmiObject Win32_Printer -Filter $filtro -ErrorAction Stop
+            $w.WorkOffline = $false
+            $null = $w.Put()
+        } catch { if (-not $errCim) { $errCim = [string]$_.Exception.Message } }
+        $despues = Get-CimInstance Win32_Printer -Filter $filtro -ErrorAction Stop
+        if (-not [bool]$despues.WorkOffline) { return $true }
+    }
+    if ($errCim) { Write-DoctorLog -Level 'WARN' -Message ("No se pudo sacar 'Usar impresora sin conexion' de '" + $Nombre + "': " + $errCim) }
+    return $false
+}
+
 function Unblock-QueueForTest {
     <#
       Antes de probar puertos hay que dejar la cola en condiciones de imprimir.
@@ -2954,7 +2988,9 @@ function Unblock-QueueForTest {
         try { $offline = [bool](Get-CimInstance Win32_Printer -Filter ("Name='" + ($nombre -replace "'","''") + "'") -ErrorAction SilentlyContinue).WorkOffline } catch {}
     }
     if ($offline) {
-        try { Set-Printer -Name $nombre -WorkOffline $false -ErrorAction Stop; $hechos += 'se quito la marca offline' } catch {}
+        $sacada = $false
+        try { $sacada = Clear-PrinterWorkOffline -Nombre $nombre } catch {}
+        if ($sacada) { $hechos += 'se quito la marca offline' }
     }
     # 2) cola pausada
     # v3.15: aca se llamaba a Resume-PrintQueue, que NO EXISTE en Windows (el modulo
@@ -6896,6 +6932,25 @@ function Invoke-ReconnectFlow {
     return @{ recovered = $false; note = ($notas -join ' | ') + ' | ' + [string]$rec.note; port = $puerto }
 }
 
+function Get-LivePortsSinCola {
+    <#
+      v3.44: puertos USB con un dispositivo presente que no usa ninguna otra cola del cliente
+      (las del motor no cuentan). Es a donde se fue la impresora si su cola apunta a un puerto
+      muerto.
+    #>
+    param($Printer)
+    $live = @()
+    if ($script:Diagnostics.Contains('livePorts')) { $live = @($script:Diagnostics['livePorts'] | Where-Object { [string]$_ -match '^(?i)USB\d+' }) }
+    if (@($live).Count -eq 0) { return @() }
+    $ocupados = @()
+    try {
+        $ocupados = @(Get-Printer -ErrorAction SilentlyContinue | Where-Object {
+                        [string]$_.Name -ne [string]$Printer.Name -and [string]$_.Name -notmatch $script:TestPrinterRx
+                     } | ForEach-Object { [string]$_.PortName })
+    } catch {}
+    return @($live | Where-Object { $ocupados -notcontains [string]$_ -and [string]$_ -ne [string]$Printer.PortName })
+}
+
 function Test-Layer1-PrinterState {
     param($Printer)
     if ($null -eq $Printer) { return }
@@ -6925,7 +6980,17 @@ function Test-Layer1-PrinterState {
         if ($script:Diagnostics.Contains('impresorasDesconectadas')) { $conocida = @($script:Diagnostics['impresorasDesconectadas']) }
 
         # La solucion real suele ser reconectar el USB: si hay alguien ahi, lo acompanamos.
-        $flow = Invoke-ReconnectFlow -Printer $Printer
+        # v3.44 (canal, 18/10): salvo que la impresora YA este en otro puerto USB que no usa
+        # ninguna otra cola. Pedir que la reenchufen ahi no sirve -vuelve al mismo puerto y la
+        # espera no la ve- y la capa de puertos reapunta la cola sola un paso despues.
+        $vivosLibres = @(Get-LivePortsSinCola -Printer $Printer)
+        if (([string]$Printer.PortName -match '^(?i)USB\d+') -and @($vivosLibres).Count -gt 0) {
+            $flow = @{ recovered = $false; port = ''
+                       note = ('no se pidio reconectar: hay una impresora conectada en ' + (@($vivosLibres) -join ', ') + ' sin cola, se prueba ese puerto') }
+            $script:Diagnostics['reconexionSalteada'] = @($vivosLibres)
+        } else {
+            $flow = Invoke-ReconnectFlow -Printer $Printer
+        }
         if ($flow.recovered) {
             Add-Check -Id 'printer.disconnected' -Layer 1 -Name "Impresora '$($Printer.Name)' recuperada tras reconectar el USB" `
                 -Status 'fixed' -RootCauseCandidate $true -Plane 'hardware' `
@@ -6953,18 +7018,23 @@ function Test-Layer1-PrinterState {
 
     # 1.1 Impresora en 'Usar impresora sin conexion' / offline
     if ($workOffline) {
+        # v3.44: antes se hacia Resume + reinicio del servicio, que no sacan la marca, y el
+        # chequeo quedaba 'fixed' sin volver a mirar. Ahora se saca la marca y se verifica; si
+        # Windows la mantiene, el arreglo cuenta como fallido y el chequeo queda en warn.
         $rem = Invoke-Remediation -Description 'Quitar modo offline (Usar impresora sin conexion) + reactivar' -Type 'printer.online' -Target $Printer.Name `
             -Before 'WorkOffline=True' -After 'WorkOffline=False' -Fix {
-                # Resume por WMI + restart spooler suele reactivar el device
                 try { $null = Invoke-CimMethod -InputObject $wmi -MethodName 'Resume' -ErrorAction SilentlyContinue } catch {}
-                Restart-Service -Name 'Spooler' -Force -ErrorAction SilentlyContinue
-                Start-Sleep -Milliseconds 800
-                $after = Get-CimInstance Win32_Printer -Filter "Name='$($Printer.Name -replace "'","''")'"
-                "WorkOffline ahora = $($after.WorkOffline)"
+                if (-not (Clear-PrinterWorkOffline -Nombre ([string]$Printer.Name))) {
+                    throw "Windows mantuvo la marca 'Usar impresora sin conexion'"
+                }
+                'WorkOffline ahora = False'
             }
-        Add-Check -Id 'printer.offline' -Layer 1 -Name 'Impresora marcada offline / pausada' -Status $(if($rem.applied){'fixed'}else{'warn'}) -RootCauseCandidate $true `
-            -Evidence @{ workOffline = $workOffline } -ActionTaken $rem.note `
-            -Recommendation 'El estado offline hace que los trabajos queden en cola sin imprimir.'
+        Add-Check -Id 'printer.offline' -Layer 1 -Name $(if ($rem.applied) { "Se saco 'Usar impresora sin conexion' de '" + [string]$Printer.Name + "'" } else { "La impresora '" + [string]$Printer.Name + "' esta en 'Usar impresora sin conexion'" }) `
+            -Status $(if($rem.applied){'fixed'}else{'warn'}) -RootCauseCandidate $true `
+            -Evidence @{ workOffline = $workOffline; sacada = [bool]$rem.applied } -ActionTaken $rem.note `
+            -Recommendation $(if ($rem.applied) { 'Con esa marca Windows retiene las comandas en la cola sin mandarlas a la impresora.' } else {
+                'Con esa marca Windows retiene las comandas en la cola sin mandarlas a la impresora, y el motor no pudo sacarla. ' +
+                "A mano: Configuracion > Bluetooth y dispositivos > Impresoras y escaneres > '" + [string]$Printer.Name + "' > Abrir cola de impresion > menu Impresora > destildar 'Usar impresora sin conexion'." })
     } else {
         Add-Check -Id 'printer.offline' -Layer 1 -Name 'Impresora en linea (no offline)' -Status 'ok' -Evidence @{ workOffline = $false }
     }
@@ -9754,6 +9824,16 @@ function Resolve-Diagnosis {
             if (-not $esViejo) { return $true }
             $puerto = ''
             try { $puerto = [string]$_.evidence.port } catch {}
+            # v3.44 (bitacora 12/10-18/10): evidence.port es el puerto VIEJO. Si la reparacion
+            # mudo la cola a otro puerto, el viejo sigue vacio y la causa vieja ganaba: 3 corridas
+            # dijeron "desconectada" despues de reapuntar la cola a un puerto con la impresora.
+            $nomCola = ''
+            try { $nomCola = [string]$_.evidence.printer } catch {}
+            if ($nomCola) {
+                $puertoActual = ''
+                try { $puertoActual = [string](Get-Printer -Name $nomCola -ErrorAction Stop).PortName } catch {}
+                if ($puertoActual -and $puertoActual -ne $puerto -and (Test-PortHasLiveDevice -PortName $puertoActual)) { return $false }
+            }
             -not (Test-PortHasLiveDevice -PortName $puerto)
         })
     }
@@ -10113,6 +10193,10 @@ $script:CategoryByCheckId = @{
     'fudo.configProbable'       = 'fudo_config'
     'engine.inconclusive'       = 'unknown'
     'engine.fatal'              = 'engine_error'
+    # v3.44 (bitacora 12/10-18/10): "la Nativa esta bien, el problema no esta ahi" caia en el
+    # regex 'Nativa' y se contaba como nativa.install, la categoria n.1 del resumen.
+    'nativa.sinProblemas'       = 'ok.nativa_sin_problemas'
+    'printer.offline'           = 'os.printer_state'
 }
 function Get-Category {
     param($Diag)
@@ -16445,6 +16529,76 @@ public class FudoFakeEndpoint {
     Assert-Eq 'S154d el self-test no imprime nada' $true $tiro154
     $script:RunMode = 'Ambos'
     Reset-Mocks
+    Reset-State
+
+    # Escenario 155 (v3.44, bitacora 12/10-18/10 y pedido de Gaston del 19/10).
+    #
+    # (a) "Usar impresora sin conexion" no se sacaba nunca: Set-Printer no tiene -WorkOffline
+    # y la capa 1 daba 'fixed' sin volver a mirar.
+    $script:off155 = $true
+    $script:pegada155 = $false
+    function Get-CimInstance { param($ClassName, $Filter, $ErrorAction) [pscustomobject]@{ Name='CAJA'; WorkOffline=$script:off155; PrinterState=0; PrinterStatus=3 } }
+    function Set-CimInstance { param($InputObject, $Property, $ErrorAction) if (-not $script:pegada155) { $script:off155 = [bool]$Property.WorkOffline } }
+    function Get-WmiObject { param($Class, $Filter, $ErrorAction) $o = [pscustomobject]@{ WorkOffline = $script:off155 }; $o | Add-Member -MemberType ScriptMethod -Name Put -Value { } ; $o }
+    function Invoke-CimMethod { param($InputObject, $MethodName, $ErrorAction) }
+    function Write-DoctorLog { param($Level, $Message) }
+    Assert-Eq 'S155a la marca se saca y se verifica' $true ([bool](Clear-PrinterWorkOffline -Nombre 'CAJA'))
+    Assert-Eq 'S155a y queda sacada' $false ([bool]$script:off155)
+    Assert-Eq 'S155a Set-Printer sigue sin tener -WorkOffline (por eso no se usa)' $false ([bool]((Get-Command Set-Printer -ErrorAction SilentlyContinue) -and (Get-Command Set-Printer).Parameters.ContainsKey('WorkOffline')))
+    Reset-State
+    $script:PresentIdsOk = $true
+    $script:Diagnostics['livePorts'] = @('USB001'); $script:Diagnostics['hwDeviceCount'] = 1
+    $script:off155 = $true
+    Test-Layer1-PrinterState -Printer ([pscustomobject]@{ Name='CAJA'; DriverName='POS-80'; PortName='USB001' }) | Out-Null
+    Assert-Eq 'S155a la capa 1 la saca y da fixed' 'fixed' ([string](Get-CheckById 'printer.offline').status)
+    Reset-State
+    $script:PresentIdsOk = $true
+    $script:Diagnostics['livePorts'] = @('USB001'); $script:Diagnostics['hwDeviceCount'] = 1
+    $script:off155 = $true; $script:pegada155 = $true
+    Test-Layer1-PrinterState -Printer ([pscustomobject]@{ Name='CAJA'; DriverName='POS-80'; PortName='USB001' }) | Out-Null
+    Assert-Eq 'S155a si Windows la mantiene, no se da por reparada' 'warn' ([string](Get-CheckById 'printer.offline').status)
+    Assert-Eq 'S155a y dice como sacarla a mano' $true ([bool]([string](Get-CheckById 'printer.offline').recommendation -match 'destildar'))
+    Assert-Eq 'S155a y el arreglo cuenta como fallido' 'error' ([string](@($script:AccionesDetalle | Where-Object { $_.tipo -eq 'printer.online' -or $_.type -eq 'printer.online' })[0].resultado))
+    function Get-Printer { param($Name, $ErrorAction) [pscustomobject]@{ Name='CAJA'; WorkOffline=$null; Paused=$false } }
+    $script:pegada155 = $false; $script:off155 = $true
+    $h155 = @(Unblock-QueueForTest -Printer ([pscustomobject]@{ Name='CAJA'; PortName='USB002' }))
+    Assert-Eq 'S155a la limpieza antes de probar puertos tambien la saca' $true ([bool](($h155 -join ';') -match 'offline') -and -not $script:off155)
+    Reset-Mocks
+
+    # (b) Cola en un puerto muerto con la impresora ya en otro puerto libre: no se pide reconectar.
+    Reset-State
+    $script:PresentIdsOk = $true
+    $script:Diagnostics['livePorts'] = @('USB002'); $script:Diagnostics['hwDeviceCount'] = 1
+    $script:reco155 = 0
+    function Invoke-ReconnectFlow { param($Printer) $script:reco155++; @{ recovered = $false; note = ''; port = '' } }
+    function Get-CimInstance { param($ClassName, $Filter, $ErrorAction) [pscustomobject]@{ Name='COCINA'; WorkOffline=$true; PrinterState=0 } }
+    function Get-Printer { param($Name, $ErrorAction) @([pscustomobject]@{ Name='COCINA'; PortName='USB001' }) }
+    Test-Layer1-PrinterState -Printer ([pscustomobject]@{ Name='COCINA'; DriverName='POS-80'; PortName='USB001' }) | Out-Null
+    Assert-Eq 'S155b no pide reenchufar si la impresora ya esta en otro puerto libre' 0 ([int]$script:reco155)
+    Assert-Eq 'S155b y dice en cual' $true ([bool]([string](Get-CheckById 'printer.disconnected').recommendation -match 'USB002'))
+    Reset-State
+    $script:PresentIdsOk = $true
+    $script:Diagnostics['livePorts'] = @('USB002'); $script:Diagnostics['hwDeviceCount'] = 1
+    function Get-Printer { param($Name, $ErrorAction) @([pscustomobject]@{ Name='COCINA'; PortName='USB001' }, [pscustomobject]@{ Name='CAJA'; PortName='USB002' }) }
+    Test-Layer1-PrinterState -Printer ([pscustomobject]@{ Name='COCINA'; DriverName='POS-80'; PortName='USB001' }) | Out-Null
+    Assert-Eq 'S155b si ese puerto lo usa otra cola, se sigue pidiendo reconectar' 1 ([int]$script:reco155)
+    Reset-Mocks
+
+    # (c) "Desconectada" como causa despues de reapuntar la cola a un puerto vivo.
+    Reset-State
+    $script:PresentIdsOk = $true
+    $script:Diagnostics['livePorts'] = @('USB002'); $script:Diagnostics['hwDeviceCount'] = 1
+    function Get-Printer { param($Name, $ErrorAction) [pscustomobject]@{ Name='COCINA'; PortName='USB002' } }
+    Add-Check -Id 'printer.disconnected' -Layer 1 -Name "La impresora 'COCINA' esta desconectada (puerto USB004 sin dispositivo)" `
+        -Status 'fail' -RootCauseCandidate $true -Plane 'hardware' -Evidence @{ printer = 'COCINA'; port = 'USB004' }
+    Add-Check -Id 'conn.usb' -Layer 3 -Name 'Puerto USB reasignado a USB002' -Status 'fixed' -RootCauseCandidate $true -Plane 'os'
+    $d155 = Resolve-Diagnosis
+    Assert-Eq 'S155c la causa no es "desconectada" si la cola ya se mudo a un puerto vivo' $false ([bool]([string]$d155.rootCause -match 'esta desconectada'))
+    Reset-Mocks
+
+    # (d) Categorias que caian en el regex del texto.
+    Assert-Eq 'S155d la Nativa sin problemas no cuenta como nativa.install' 'ok.nativa_sin_problemas' (Get-Category -Diag @{ resolved = $false; rootCauseCheckId = 'nativa.sinProblemas'; rootCause = 'La App Nativa esta instalada y registrada en el navegador: el problema no esta ahi.' })
+    Assert-Eq 'S155d offline por id' 'os.printer_state' (Get-Category -Diag @{ resolved = $false; rootCauseCheckId = 'printer.offline'; rootCause = "La impresora 'CAJA' esta en 'Usar impresora sin conexion'" })
     Reset-State
 
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)

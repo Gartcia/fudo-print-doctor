@@ -2,6 +2,42 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.44] - 2026-10-19
+
+**"Usar impresora sin conexión" no se sacaba nunca.** Gastón preguntó el 19/10 qué hacía el motor
+con esa marca, a raíz del caso de un asesor del 18/10 (la cola apuntaba a un puerto vacío y la
+impresora figuraba "sin conexión"). Al revisarlo apareció que no la sacaba en ningún lado:
+
+- La revisión normal hacía "reanudar" y reiniciaba el servicio de impresión. Ninguna de las dos
+  cosas toca esa marca, y el chequeo quedaba como **reparado sin volver a mirar**.
+- La limpieza que se hace antes de probar puertos usaba una opción de Windows que no existe para
+  eso. Fallaba siempre y el error quedaba tapado. Con la marca puesta, Windows retiene el ticket
+  de prueba en la cola, así que **el motor descartaba el puerto bueno** porque "no salió nada".
+  Puede explicar parte de las 12 corridas de la semana con la cola en un puerto muerto y la
+  impresora presente en otro, todas escaladas (falta cruzarlo con `workOffline` en la planilla).
+
+Ahora la marca se saca de la forma que Windows sí acepta y **se verifica**. Si Windows la mantiene,
+el arreglo cuenta como fallido, el chequeo queda en advertencia y dice cómo sacarla a mano.
+**No se probó contra una impresora real:** desde una sesión sin administrador Windows niega el
+cambio. El motor corre como administrador, pero falta verlo en una PC con la marca puesta.
+
+**Además, de la bitácora del 12/10 al 18/10:**
+
+- **No se pide reenchufar si la impresora ya está en otro puerto.** Caso de un asesor del 18/10: la
+  cola apuntaba a USB001 vacío y la impresora estaba en USB002, sin cola. El motor pedía
+  desenchufar y volver a enchufar y esperaba 2 minutos sin poder cortarlo. La impresora volvía a
+  USB002, y la espera solo reconoce un puerto *nuevo*. Si hay un puerto USB con una impresora
+  presente que no usa ninguna otra cola, ahora se saltea la reconexión y la revisión de puertos
+  reapunta la cola sola un paso después. La espera en sí (aceptar el mismo puerto, botón para
+  cortarla) queda pendiente: sin hardware no se puede probar.
+- **"Desconectada" como causa después de haber mudado la cola a un puerto con la impresora.** Tres
+  corridas. El descarte de la causa vieja miraba el puerto *viejo*, que sigue vacío. Ahora mira
+  el puerto actual de la cola.
+- **"La App Nativa está bien, el problema no está ahí" se contaba como problema de la Nativa.** Seis
+  corridas en la semana y 15 desde la 3.39, en la categoría número 1 del resumen. Ahora tiene
+  categoría propia, `ok.nativa_sin_problemas`. Las filas viejas de la planilla no se corrigen
+  desde acá.
+
 ## [3.43] - 2026-10-13
 
 **Revisión completa o una herramienta.** Pedido del canal del 09 al 12/10: "si solo querés borrar
