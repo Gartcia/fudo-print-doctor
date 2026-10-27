@@ -2,6 +2,44 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.45] - 2026-10-27
+
+**La extensión de Fudo ya no se empuja en las cuentas que no la usan.** Producto avisó el 22 y el
+23/10 que Print Doctor estaba instalando la extensión en cuentas nuevas. Esas cuentas imprimen sin
+ella ("v2") y después hay que migrarlas. Tenía razón: si faltaba la extensión, el motor lo marcaba
+como falla y causa raíz en **cualquier** cuenta y ofrecía abrir la tienda de Chrome para agregarla.
+El hallazgo pasó de 8 corridas antes del 23/09 a 79 después, entre 10 y 19 por semana.
+
+El motor no puede saber solo qué tipo de cuenta es, porque no ve la cuenta. Ahora **le pregunta al
+asesor** cuántos pasos tiene el asistente de instalar impresora en la cuenta del cliente:
+
+- **3 pasos** (Extensión, App Nativa, Impresora): la cuenta usa la extensión ("v1"). Todo sigue
+  como antes: si falta, es falla y se ofrece agregarla.
+- **2 pasos** (App Nativa, Impresora): no la usa ("v2"). Que falte está bien y no se ofrece nada.
+  Si está puesta, se avisa sin tocarla: hubo cuentas v2 que solo imprimieron después de
+  agregarla (canal, 21/10).
+- **No sé**: se avisa cómo revisarlo, pero no es causa raíz y la extensión no se empuja.
+
+La pregunta aparece una sola vez por corrida, y solo cuando cambia algo: si falta la extensión o si
+hay que instalar o actualizar la Nativa. Sin nadie del otro lado queda en "no sé". La respuesta
+viaja en la telemetría (`cuentaFudo`), así que se puede medir cuántas cuentas de cada tipo pasan.
+
+**Cada tipo de cuenta tiene su App Nativa.** El equipo de la Nativa confirmó el 27/10 que las v1
+van con la 0.0.41 (el link de siempre) y las v2 con la 0.0.43, que se actualiza sola. Se verificó
+bajando los dos instaladores: los dos están firmados por Fudo y traen esas versiones. Ahora el
+motor baja la que corresponde. Con "no sé" baja la 0.0.41, que según el mismo equipo funciona con
+extensión y sin ella. En una v2, un instalador que haya en la PC ya no le gana a la descarga,
+porque los que circulan son de la Nativa de las v1. El link de la 0.0.43 lleva la versión en la
+ruta: cuando salga otra hay que cambiarlo en el motor.
+
+**Se sacó la pregunta de qué versión de la Nativa instalar.** Lo reportó un asesor el 22/10:
+eligió la 0.0.19, la única que había en la PC, y el motor igual descargó e instaló la 0.0.41.
+Desde la 3.31 un instalador viejo solo se usa si la descarga falla, así que la pregunta no
+cambiaba nada y demoraba. Para forzar una versión sigue existiendo `-NativeInstallerPath`.
+
+**Pendiente:** la reinstalación limpia de la Nativa (cerrar el navegador y la Nativa vieja antes
+de desinstalar). Es lo que resolvió un caso de N2 del 22/10 y todavía se hace a mano.
+
 ## [3.44] - 2026-10-19
 
 **"Usar impresora sin conexión" no se sacaba nunca.** Gastón preguntó el 19/10 qué hacía el motor

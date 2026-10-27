@@ -455,6 +455,9 @@ param(
     [string]$NativeInstallerUrl = '',
     [string]$NativeInstallerPath = '',
     [string]$NativeInstallerArgs = '',
+    # v3.45: tipo de cuenta de Fudo -v1 (con extension), v2 (sin extension) o nose-. Vacio = se
+    # le pregunta al asesor cuando hace falta (ver Get-TipoCuentaFudo).
+    [string]$CuentaFudo = '',
     [switch]$InstallNetworkPrinter,
     [string]$NewPrinterName = '',
     [switch]$NoMenu,
@@ -522,7 +525,7 @@ $script:Producto    = 'Fudo'
 $script:PrefijoCola = 'FUDO-'
 $script:NombreCola  = 'Impresora Fudo'
 $script:ReglasTexto = @()
-$script:SchemaVersion = '3.44'
+$script:SchemaVersion = '3.45'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -1540,6 +1543,13 @@ $script:AutoJsonPath = ''
 # corridas: el camino de instalacion existia y se frenaba por no tener a donde ir a buscarla.
 $script:NativeInstallerUrlWin8   = 'https://fu.do/downloads/fudo_native_app_win_8_and_up.exe'
 $script:NativeInstallerUrlLegacy = 'https://fu.do/downloads/fudo_native_app_win.msi'
+# v3.45: las cuentas v2 (sin extension) van con otra Nativa, la 0.0.43, que se actualiza sola.
+# Lo confirmo el equipo de la Nativa el 27/10: v1 -> el link de arriba (hoy la 0.0.41), v2 ->
+# este. Este link lleva la version en la ruta: cuando salga otra hay que cambiarlo aca.
+$script:NativeInstallerUrlV2 = 'https://fu.do/downloads/auto-update/win/builds/fudo_native_extension_0.0.43.exe'
+# 'v1', 'v2', 'nose', o '' si todavia no se pregunto. Ver Get-TipoCuentaFudo. No se llama
+# $script:CuentaFudo a proposito: ese es el parametro, y asignarlo lo borraria (ver S148).
+$script:TipoCuentaFudo = ''
 # Override manual (-NativeInstallerUrl). Vacio = se resuelve segun el Windows de la PC.
 # v3.38: no se inicializa aca: es el parametro, y asignarlo lo borraba (ver S148).
 $script:ForceWaitReconnect = $false
@@ -4674,10 +4684,41 @@ function Test-Layer0b-NativeApp {
                     -Evidence @{ skipReason = 'sin_navegador'; ids = @($ext.ids) } `
                     -Recommendation 'No se encontraron perfiles de Chrome, Edge ni Chromium en esta cuenta de Windows, asi que no se puede saber si la extension de Fudo esta puesta. Revisarlo a mano en el navegador que use el cliente.'
             } elseif ([bool]$ext.instalada) {
-                Add-Check -Id 'fudo.extension' -Layer 0 -Name 'Extension de Fudo instalada en el navegador' -Status 'ok' `
+                # v3.45: con la extension puesta no se pregunta el tipo de cuenta. Si ya se sabe
+                # que es v2, se avisa sin tocarla: hay cuentas v2 que solo imprimieron despues de
+                # agregarla (canal 21/10), y con ella el navegador retiene la Nativa, asi que una
+                # desinstalacion deja corriendo la vieja (N2, 22/10).
+                if ([string]$script:TipoCuentaFudo -eq 'v2') {
+                    Add-Check -Id 'fudo.extension' -Layer 0 -Name 'La extension de Fudo esta puesta en una cuenta que no la usa (v2)' -Status 'warn' `
+                        -RootCauseCandidate $false -Plane 'fudo_config' `
+                        -Evidence @{ id = [string]$ext.encontrada; navegador = [string]$ext.navegador
+                                     perfil = [string]$ext.perfil; perfilesVistos = [int]$ext.perfilesVistos; cuentaFudo = 'v2' } `
+                        -Recommendation ('Esta cuenta imprime sin extension (v2) y la extension igual esta en el navegador. Si las comandas salen, dejarla como esta. ' +
+                                         'Si hay que reinstalar la App Nativa, cerrar el navegador antes de desinstalarla: con la extension puesta el navegador la mantiene abierta y queda corriendo la version vieja.')
+                } else {
+                    Add-Check -Id 'fudo.extension' -Layer 0 -Name 'Extension de Fudo instalada en el navegador' -Status 'ok' `
+                        -RootCauseCandidate $false -Plane 'fudo_config' `
+                        -Evidence @{ id = [string]$ext.encontrada; navegador = [string]$ext.navegador
+                                     perfil = [string]$ext.perfil; perfilesVistos = [int]$ext.perfilesVistos
+                                     cuentaFudo = [string]$script:TipoCuentaFudo }
+                }
+            } elseif ((Get-TipoCuentaFudo -Motivo 'falta la extension') -eq 'v2') {
+                # v3.45: que falte la extension solo es un problema en las cuentas que la usan (v1).
+                # Hasta la 3.44 era fail y causa raiz en todas, y el motor ofrecia agregarla
+                # tambien en las v2, que producto despues tiene que migrar (canal del 23/10: 79
+                # corridas con este hallazgo desde el 23/09).
+                Add-Check -Id 'fudo.extension' -Layer 0 -Name 'Cuenta sin extension (v2): la extension de Fudo no hace falta' -Status 'ok' `
+                    -RootCauseCandidate $false -Informativo $true -Plane 'fudo_config' `
+                    -Evidence @{ ids = @($ext.ids); perfilesVistos = [int]$ext.perfilesVistos; cuentaFudo = 'v2' }
+            } elseif ([string]$script:TipoCuentaFudo -ne 'v1') {
+                Add-Check -Id 'fudo.extension' -Layer 0 -Name 'No se sabe si esta cuenta usa la extension de Fudo' -Status 'warn' `
                     -RootCauseCandidate $false -Plane 'fudo_config' `
-                    -Evidence @{ id = [string]$ext.encontrada; navegador = [string]$ext.navegador
-                                 perfil = [string]$ext.perfil; perfilesVistos = [int]$ext.perfilesVistos }
+                    -Evidence @{ ids = @($ext.ids); perfilesVistos = [int]$ext.perfilesVistos
+                                 navegadoresConHost = @($nmh.navegadores); cuentaFudo = 'nose' } `
+                    -ArticleRef 'https://soporte.fu.do/es/articles/16419361' `
+                    -Recommendation ('La extension de Fudo no esta en el navegador, y solo la usan algunas cuentas. Mirar el asistente de instalar impresora en la cuenta del cliente: ' +
+                                     'si tiene 3 pasos (Extension, App Nativa, Impresora), agregarla desde ' + [string]$script:FudoExtensionUrl + ' y recargar la pestana de Fudo. ' +
+                                     'Si tiene 2 pasos, no agregarla: esa cuenta no la usa.')
             } else {
                 # Mismo criterio que arriba: se afirma con evidencia. Si la Nativa esta registrada
                 # para un navegador Chromium, es que Fudo corre ahi, y que falte la extension es
@@ -4693,7 +4734,8 @@ function Test-Layer0b-NativeApp {
                     -Recommendation ('La App Nativa esta instalada pero la extension de Fudo no aparece en ninguno de los ' + [int]$ext.perfilesVistos +
                                      ' perfil(es) de navegador de esta cuenta. Sin la extension nadie le habla a la Nativa y la comanda no sale, ' +
                                      'por mas que todo lo demas este bien. Agregarla desde ' + [string]$script:FudoExtensionUrl +
-                                     ' y recargar la pestana de Fudo. Un asesor confirmo que agregandola la Nativa levanta sola.')
+                                     ' y recargar la pestana de Fudo. Un asesor confirmo que agregandola la Nativa levanta sola. ' +
+                                     'Esta cuenta usa la extension: el asistente de instalar impresora tiene 3 pasos.')
                 # v3.31: en vez de solo explicarlo, ofrecer abrir la pagina (ver Open-FudoExtensionPage).
                 if ($AutoFix -and -not $DryRun) {
                     $abrir = Open-FudoExtensionPage -Ids @($nmh.extensionIds)
@@ -11741,6 +11783,9 @@ function Invoke-SelfTest {
         $script:Errors  = New-Object System.Collections.ArrayList
         $script:Diagnostics = [ordered]@{}
         $script:AbortByMode = $false
+        # v3.45: los escenarios anteriores estan escritos para una cuenta con extension, que era
+        # el unico comportamiento. Los del escenario 156 ponen el tipo de cuenta explicito.
+        $script:TipoCuentaFudo = 'v1'
     }
 
     # Foto de las funciones que existen ANTES de que el self-test defina un solo mock: todo lo
@@ -14368,29 +14413,16 @@ public class FudoFakeEndpoint {
     Assert-Eq 'S101 sin consola elige la firmada' '0.0.37' ([string]$s101.version)
     Assert-Eq 'S101 y no cuenta como eleccion de una persona' $false ([bool]$s101.elegidoPorPersona)
 
-    # Con consola, el asesor elige la 0.0.33 y confirma que baja de version.
+    # v3.45: con consola tampoco se pregunta (ver escenario 156). Se usa la recomendada, y eso
+    # NO habilita bajar de version.
     function Test-IsInteractiveConsole { $true }
     function Suspend-LiveStatus { }
-    $script:r101 = @('2', 's')
     $script:i101 = 0
-    function Read-DoctorLine { param($Prompt) $v = $script:r101[$script:i101]; $script:i101++; $v }
-    $s101b = Select-LocalNativeInstaller -Instalada '0.0.37'
-    Assert-Eq 'S101b el asesor puede elegir la mas vieja' '0.0.33' ([string]$s101b.version)
-    Assert-Eq 'S101b y queda marcado que lo eligio una persona' $true ([bool]$s101b.elegidoPorPersona)
-
-    # Si no confirma, no se instala nada.
-    $script:r101 = @('2', 'n')
-    $script:i101 = 0
-    $s101c = Select-LocalNativeInstaller -Instalada '0.0.37'
-    Assert-Eq 'S101c sin confirmar no se instala nada' '' ([string]$s101c.ruta)
-    Assert-Eq 'S101c y el motivo lo dice' $true ([bool]([string]$s101c.motivo -match 'no confirmo'))
-
-    # Enter = la recomendada, y eso NO habilita bajar de version.
-    $script:r101 = @('')
-    $script:i101 = 0
+    function Read-DoctorLine { param($Prompt) $script:i101++; '2' }
     $s101d = Select-LocalNativeInstaller -Instalada '0.0.37'
-    Assert-Eq 'S101d Enter deja la recomendada' '0.0.37' ([string]$s101d.version)
-    Assert-Eq 'S101d y sigue sin ser eleccion de una persona' $false ([bool]$s101d.elegidoPorPersona)
+    Assert-Eq 'S101d con consola tampoco se pregunta' 0 ([int]$script:i101)
+    Assert-Eq 'S101d se usa la recomendada' '0.0.37' ([string]$s101d.version)
+    Assert-Eq 'S101d y no es eleccion de una persona' $false ([bool]$s101d.elegidoPorPersona)
 
     # Sin instaladores no se inventa nada: se pide el archivo.
     function Get-LocalNativeInstallers { @() }
@@ -15128,7 +15160,7 @@ public class FudoFakeEndpoint {
     $script:Diagnostics['nativaDescarga'] = [ordered]@{ firmaOk = $true; bytes = 1 }
     $script:Diagnostics['modoImpresionProtegido'] = [ordered]@{ activo = $false; origen = '' }
     $x134 = Get-TelemetryDiagnosticsExtra
-    Assert-Eq 'S134 viajan las cinco claves (y las de los escenarios 135, 141, 143, 144 y 151)' 'nativaDescarga,eleccionImpresora,eleccionPuerto,modoImpresionProtegido,usbSinEnumerar,extensionAbierta,purgaTemprana,uiApertura,uiCarga,colasSinRespuesta,consolaSinEdicionRapida,despuesNativa,limpiezaSpooler,tiempos,hardware' (@($x134.Keys) -join ',')
+    Assert-Eq 'S134 viajan las cinco claves (y las de los escenarios 135, 141, 143, 144 y 151)' 'nativaDescarga,eleccionImpresora,eleccionPuerto,modoImpresionProtegido,usbSinEnumerar,extensionAbierta,purgaTemprana,uiApertura,uiCarga,colasSinRespuesta,consolaSinEdicionRapida,despuesNativa,limpiezaSpooler,cuentaFudo,tiempos,hardware' (@($x134.Keys) -join ',')
     Assert-Eq 'S134 con su contenido' $true ([bool]$x134['nativaDescarga'].firmaOk)
     Assert-Eq 'S134 Send-Telemetry las pone en el payload' $true ([bool]((Get-Command Send-Telemetry).ScriptBlock.ToString() -match 'Get-TelemetryDiagnosticsExtra'))
     Reset-State
@@ -16601,6 +16633,144 @@ public class FudoFakeEndpoint {
     Assert-Eq 'S155d offline por id' 'os.printer_state' (Get-Category -Diag @{ resolved = $false; rootCauseCheckId = 'printer.offline'; rootCause = "La impresora 'CAJA' esta en 'Usar impresora sin conexion'" })
     Reset-State
 
+    # Escenario 156 (v3.45, canal del 22 y 23/10 y la Nativa por tipo de cuenta del 27/10): la
+    # extension solo hace falta en las cuentas v1 (asistente de 3 pasos). Hasta la 3.44 el motor
+    # la daba por causa raiz y ofrecia agregarla en cualquier cuenta, y producto despues tiene que
+    # migrar las v2 que quedaron con extension. Y cada tipo de cuenta tiene su Nativa.
+    Reset-State
+    Reset-Mocks
+    function Suspend-LiveStatus { }
+    function Find-FudoNativeInstall {
+        [ordered]@{ paths=@('C:\Users\x\AppData\Local\Fudo'); regInfo=@([ordered]@{ version='0.0.41'; esPwa=$false })
+                    exe='C:\Users\x\AppData\Local\Fudo\fudo_native_extension.exe'
+                    manifests=@(); carpeta='C:\Users\x\AppData\Local\Fudo'
+                    enDisco=$true; soloRegistro=$false; pwa=$false }
+    }
+    function Get-AntivirusState { [ordered]@{ defender=$null; thirdParty=@(); realTime=$null; fudoThreats=@() } }
+    function Get-NativaVersionState { param($Install) [ordered]@{ version='0.0.41'; firmada=$true; confiable=$true } }
+    function Get-Process { param($ErrorAction) @() }
+    function Get-LocalRunHistory { [ordered]@{ ultimaCausa='' } }
+    function Get-SesionInteractiva { [ordered]@{ usuarioMotor='ana'; usuarioSesion='ana'; otroPerfil=$false } }
+    function Get-NativeMessagingState {
+        [ordered]@{ registrado=$true; navegadores=@('Chrome'); manifest='m.json'
+                    exeDelManifest='C:\Users\x\AppData\Local\Fudo\fudo_native_extension.exe'; exeExiste=$true
+                    extensionIds=@('npcjljaedonmjndbliillcmkhidejhmb'); pendientes=@() }
+    }
+    function Get-FudoExtensionState { param($Ids) [ordered]@{ instalada=$false; ids=@($Ids); encontrada=''
+                                                              navegador=''; perfil=''; perfilesVistos=2 } }
+    $script:abrio156 = 0
+    function Open-FudoExtensionPage { param($Ids) $script:abrio156++; @{ abierta=$false; agregada=$false; motivo='mock' } }
+    function Test-HayHumano { $true }
+    function Test-UiWeb { $true }
+    $script:resp156 = 'v2'
+    $script:preg156 = @()
+    function Request-UiAnswer { param($Id, $Titulo, $Texto, $Texto2, $Opciones, $Clase, $Extra, $TimeoutSec, $ErrorPrevio, [switch]$SoloAsesor)
+        $script:preg156 += $Id; $script:resp156 }
+
+    # (a) Cuenta v2 sin la extension: esta bien, no se ofrece nada.
+    $script:TipoCuentaFudo = ''
+    Test-Layer0b-NativeApp
+    $e156 = Get-CheckById 'fudo.extension'
+    Assert-Eq 'S156a se pregunta el tipo de cuenta' 'cuentaFudo' (@($script:preg156) -join ',')
+    Assert-Eq 'S156a en una v2 que falte la extension no es falla' 'ok' ([string]$e156.status)
+    Assert-Eq 'S156a ni causa raiz' $false ([bool]$e156.rootCauseCandidate)
+    Assert-Eq 'S156a ni se ofrece agregarla' 0 ([int]$script:abrio156)
+    Assert-Eq 'S156a y queda en la telemetria' 'v2' ([string](Get-TelemetryDiagnosticsExtra)['cuentaFudo'].tipo)
+    # Se pregunta una sola vez por corrida.
+    Test-Layer0b-NativeApp
+    Assert-Eq 'S156a no se vuelve a preguntar' 1 (@($script:preg156).Count)
+
+    # (b) Cuenta v1: como siempre, falla y se ofrece agregarla.
+    Reset-State
+    $script:TipoCuentaFudo = ''; $script:preg156 = @(); $script:resp156 = 'v1'
+    Test-Layer0b-NativeApp
+    $e156b = Get-CheckById 'fudo.extension'
+    Assert-Eq 'S156b en una v1 falta la extension es falla' 'fail' ([string]$e156b.status)
+    Assert-Eq 'S156b y causa raiz' $true ([bool]$e156b.rootCauseCandidate)
+    Assert-Eq 'S156b y se ofrece agregarla' 1 ([int]$script:abrio156)
+
+    # (c) No se sabe: se avisa como revisarlo, pero no es causa raiz ni se empuja la extension.
+    Reset-State
+    $script:TipoCuentaFudo = ''; $script:preg156 = @(); $script:resp156 = 'nose'; $script:abrio156 = 0
+    Test-Layer0b-NativeApp
+    $e156c = Get-CheckById 'fudo.extension'
+    Assert-Eq 'S156c sin saber la cuenta queda en warn' 'warn' ([string]$e156c.status)
+    Assert-Eq 'S156c no es causa raiz' $false ([bool]$e156c.rootCauseCandidate)
+    Assert-Eq 'S156c no se ofrece agregarla' 0 ([int]$script:abrio156)
+    Assert-Eq 'S156c y explica como saberlo' $true ([bool]([string]$e156c.recommendation -match '3 pasos'))
+    # Sin nadie a quien preguntarle es lo mismo que no saber.
+    Reset-State
+    $script:TipoCuentaFudo = ''; $script:preg156 = @()
+    function Test-HayHumano { $false }
+    Test-Layer0b-NativeApp
+    Assert-Eq 'S156c en modo agente no se pregunta' 0 (@($script:preg156).Count)
+    Assert-Eq 'S156c y queda como no se' 'nose' ([string]$script:Diagnostics['cuentaFudo'].tipo)
+    Assert-Eq 'S156c sin afirmar nada sobre la extension' 'warn' ([string](Get-CheckById 'fudo.extension').status)
+    function Test-HayHumano { $true }
+
+    # (d) Cuenta v2 CON la extension puesta: se avisa, sin tocarla.
+    Reset-State
+    $script:TipoCuentaFudo = 'v2'; $script:preg156 = @()
+    function Get-FudoExtensionState { param($Ids) [ordered]@{ instalada=$true; ids=@($Ids); encontrada='npcjljaedonmjndbliillcmkhidejhmb'
+                                                              navegador='Chrome'; perfil='Default'; perfilesVistos=1 } }
+    Test-Layer0b-NativeApp
+    $e156d = Get-CheckById 'fudo.extension'
+    Assert-Eq 'S156d extension en una v2 es aviso' 'warn' ([string]$e156d.status)
+    Assert-Eq 'S156d y dice que se cierre el navegador antes de reinstalar' $true ([bool]([string]$e156d.recommendation -match 'cerrar el navegador'))
+    # Con la extension puesta y la cuenta sin saber, no se pregunta: no cambia nada.
+    Reset-State
+    $script:TipoCuentaFudo = ''
+    Test-Layer0b-NativeApp
+    Assert-Eq 'S156d con la extension puesta no se pregunta la cuenta' 0 (@($script:preg156).Count)
+    Assert-Eq 'S156d y sigue en ok' 'ok' ([string](Get-CheckById 'fudo.extension').status)
+
+    # (e) La Nativa: v2 baja la suya, v1 y no se bajan la de siempre. Windows 7 sigue con el .msi.
+    function Test-EsWindowsViejo { $false }
+    $script:TipoCuentaFudo = 'v2'
+    $u156 = Get-NativeInstallerUrl
+    if ([Environment]::OSVersion.Version -ge [version]'6.2') {
+        Assert-Eq 'S156e una v2 baja la Nativa de las v2' ([string]$script:NativeInstallerUrlV2) $u156
+        $script:TipoCuentaFudo = 'v1'
+        Assert-Eq 'S156e una v1 baja la de siempre' ([string]$script:NativeInstallerUrlWin8) (Get-NativeInstallerUrl)
+        $script:TipoCuentaFudo = 'nose'
+        Assert-Eq 'S156e sin saber, la de siempre (anda con y sin extension)' ([string]$script:NativeInstallerUrlWin8) (Get-NativeInstallerUrl)
+    }
+    Assert-Eq 'S156e el link de las v2 es una descarga publica de fu.do' $true ([bool]([string]$script:NativeInstallerUrlV2 -match '^https://fu\.do/downloads/'))
+    # El parametro -CuentaFudo evita la pregunta.
+    $script:TipoCuentaFudo = ''; $script:preg156 = @()
+    $CuentaFudo = ' V2 '
+    Assert-Eq 'S156e el parametro decide sin preguntar' 'v2' (Get-TipoCuentaFudo)
+    Assert-Eq 'S156e y no se pregunto nada' 0 (@($script:preg156).Count)
+    $CuentaFudo = ''
+
+    # (f) En una v2, un instalador en la PC no le gana a la descarga de su Nativa.
+    Reset-State
+    $script:TipoCuentaFudo = ''; $script:preg156 = @(); $script:resp156 = 'v2'
+    function Write-StepDetail { param($Texto) }
+    function Start-Sleep { param($Seconds, $Milliseconds) }
+    function Test-IsInteractiveConsole { $false }
+    function Find-FudoNativeInstall { [ordered]@{ paths=@(); regInfo=@(); exe=''; manifests=@(); carpeta=''; enDisco=$false; soloRegistro=$false; pwa=$false } }
+    function Get-NativeInstallerUrl { if ([string]$script:TipoCuentaFudo -eq 'v2') { 'https://ejemplo.invalid/v2.exe' } else { 'https://ejemplo.invalid/v1.exe' } }
+    function Get-LocalNativeInstallers { @([ordered]@{ ruta='C:\kit\FudoNativa.msi'; version='0.0.41'; esMsi=$true; fecha=(Get-Date) }) }
+    $script:tipos156 = @(); $script:url156 = ''
+    function Invoke-Remediation {
+        param([string]$Description, [scriptblock]$Fix, [string]$Type, [string]$Target, [string]$Before = '', [string]$After = '', [bool]$Reversible = $true, [string]$Impact = '')
+        $script:tipos156 += $Type; $script:url156 = [string]$url
+        if ($Type -eq 'nativa.install') { $script:Diagnostics['nativaInstall'] = [ordered]@{ intento = $true; quedoInstalada = $true; motivo = 'mock' } }
+        @{ applied = $true; note = 'mock' }
+    }
+    $null = Install-FudoNative
+    Assert-Eq 'S156f instalar la Nativa pregunta el tipo de cuenta' 'cuentaFudo' (@($script:preg156) -join ',')
+    Assert-Eq 'S156f en una v2 se descarga aunque haya un instalador vigente en la PC' 'nativa.install' (@($script:tipos156) -join ',')
+    Assert-Eq 'S156f y es la Nativa de las v2' 'https://ejemplo.invalid/v2.exe' ([string]$script:url156)
+    # En una v1 ese mismo instalador se sigue usando, como antes.
+    Reset-State
+    $script:TipoCuentaFudo = ''; $script:resp156 = 'v1'; $script:tipos156 = @()
+    $null = Install-FudoNative
+    Assert-Eq 'S156f en una v1 el instalador vigente de la PC se usa' 'nativa.install_local' (@($script:tipos156) -join ',')
+    Reset-Mocks
+    Reset-State
+
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)
     # Salida explicita en los dos casos: si el script termina con 'return', $LASTEXITCODE
     # queda sin definir y cualquier automatizacion lo interpreta como fallo.
@@ -16739,7 +16909,7 @@ $script:TextosLocal = @{
         d = 'Son dos cosas separadas que tienen que verse entre si. Si el enlace falta o quedo mal, lo corregimos y despues hay que recargar Fudo en el navegador.' }
     'fudo.extension' = @{
         t = 'Hay que revisar la extension de Fudo en el navegador'
-        d = 'Es la que conecta la pagina de Fudo con la impresora. Si falta, se instala desde la tienda de Chrome y despues hay que reabrir Fudo.' }
+        d = 'En algunas cuentas es la que conecta la pagina de Fudo con la impresora. Si la cuenta la usa y falta, se instala desde la tienda de Chrome y despues hay que reabrir Fudo.' }
     'hw.deviceConnected' = @{
         t = 'Windows no ve ninguna impresora conectada'
         d = 'Revisar que la impresora este encendida (luz fija, no titilando), que el cable USB este firme de los dos lados y, si esta en un hub o alargue, probar enchufandola directo a la computadora.' }
@@ -17790,6 +17960,7 @@ function Update-FudoNativeFromLocal {
     # declara version, o es anterior a la recomendada- se descarga la vigente. SOLO por la .exe
     # (Windows 8 en adelante), que es la que trae la recomendada: la .msi de Windows 7 no dice
     # que version trae (en campo se reporto la 0.0.18), y bajarla podria reinstalar la misma.
+    if (-not $NativeInstallerUrl) { [void](Get-TipoCuentaFudo -Motivo 'actualizar la App Nativa') }
     $url = $NativeInstallerUrl
     if (-not $url) { $url = $script:NativeInstallerUrl }
     if (-not $url) { $url = Get-NativeInstallerUrl }
@@ -17915,8 +18086,11 @@ function Select-LocalNativeInstaller {
         -NativeInstallerPath  -> ese, y cuenta como eleccion explicita de una persona
         ninguno disponible    -> no se inventa nada: se pide el .msi
         uno solo              -> ese
-        varios + consola      -> se listan con su version y elige el asesor (Enter = recomendada)
-        varios sin consola    -> la recomendada, igual que hasta ahora
+        varios                -> la recomendada
+      v3.45: ya no se le pregunta al asesor cual. Un asesor (22/10) eligio la 0.0.19, que era la
+      unica de la PC, y el motor igual descargo e instalo la 0.0.41: desde la 3.31 un instalador
+      anterior a la recomendada solo se usa si la descarga falla, asi que la pregunta no
+      cambiaba nada y demoraba. Para forzar una version queda -NativeInstallerPath.
       La recomendada es la version mas alta que ademas este firmada; si ninguna llega a la
       firmada, la mas alta.
       Bajar de version NUNCA pasa solo: solo si una persona lo elige y lo confirma en pantalla.
@@ -17952,115 +18126,9 @@ function Select-LocalNativeInstaller {
                   elegidoPorPersona = $false; candidatos = @($cands)
                   motivo = 'es el unico instalador que hay en la PC' }
     }
-    if (-not (Test-IsInteractiveConsole)) {
-        return @{ ruta = [string]$reco.ruta; version = [string]$reco.version
-                  elegidoPorPersona = $false; candidatos = @($cands)
-                  motivo = 'sin consola: se uso la version recomendada' }
-    }
-
-    Suspend-LiveStatus
-    Write-Host ''
-    if (Test-UiWeb) {
-        # Las mismas etiquetas que en consola (recomendada / firmada / SIN firmar / mas vieja
-        # que la instalada), pero como opciones elegibles en vez de un numero a escribir.
-        $opsN = @()
-        foreach ($c in @($cands)) {
-            $etq = @()
-            if ([string]$c.ruta -eq [string]$reco.ruta) { $etq += 'recomendada' }
-            $vcN = $null
-            try { $vcN = [version]$c.version } catch {}
-            if ($null -ne $vcN) {
-                try { if ($vcN -lt [version]$script:NativaVersionFirmada) { $etq += 'SIN firmar' } else { $etq += 'firmada' } } catch {}
-            }
-            if ($Instalada -and $c.version) {
-                try { if ([version]$c.version -lt [version]$Instalada) { $etq += ('mas vieja que la instalada v' + $Instalada) } } catch {}
-            }
-            $opsN += @{
-                v = [string]$c.ruta
-                l = $(if ($c.version) { 'v' + [string]$c.version } else { '(no declara version)' }) +
-                    $(if (@($etq).Count -gt 0) { '  [' + (@($etq) -join ' / ') + ']' } else { '' })
-                detalle = [string]$c.ruta
-                principal = ([string]$c.ruta -eq [string]$reco.ruta)
-            }
-        }
-        $rN = Request-UiAnswer -Id 'nativaVersion' -Clase 'modo' -SoloAsesor `
-            -Titulo 'Cual version de la App Nativa instalamos?' `
-            -Texto ('Hay mas de un instalador en esta PC. Desde la v' + $script:NativaVersionFirmada +
-                    ' la Nativa esta firmada: el antivirus deja de bloquearla y no hace falta ' +
-                    'ninguna exclusion.') `
-            -Texto2 ('Bajar de version tiene sentido solo si el antivirus de este cliente bloquea ' +
-                     'la firmada. Si no, no.') `
-            -Opciones $opsN
-        if ($rN) {
-            $elegidoN = @($cands | Where-Object { [string]$_.ruta -eq [string]$rN }) | Select-Object -First 1
-            if ($elegidoN) {
-                return @{ ruta = [string]$elegidoN.ruta; version = [string]$elegidoN.version
-                          elegidoPorPersona = ([string]$elegidoN.ruta -ne [string]$reco.ruta)
-                          candidatos = @($cands); motivo = 'lo eligio el asesor en la interfaz' }
-            }
-        }
-        return @{ ruta = [string]$reco.ruta; version = [string]$reco.version
-                  elegidoPorPersona = $false; candidatos = @($cands)
-                  motivo = 'se uso la recomendada' }
-    }
-    Write-Host '  Hay mas de un instalador de la App Nativa en esta PC:' -ForegroundColor Cyan
-    $i = 0
-    foreach ($c in @($cands)) {
-        $i++
-        $etiquetas = @()
-        if ([string]$c.ruta -eq [string]$reco.ruta) { $etiquetas += 'recomendada' }
-        $vc = $null
-        try { $vc = [version]$c.version } catch {}
-        if ($null -ne $vc) {
-            try { if ($vc -lt [version]$script:NativaVersionFirmada) { $etiquetas += 'SIN firmar' } else { $etiquetas += 'firmada' } } catch {}
-        }
-        if ($Instalada -and $c.version) {
-            try { if ([version]$c.version -lt [version]$Instalada) { $etiquetas += ('mas vieja que la instalada v' + $Instalada) } } catch {}
-        }
-        Write-Host ("    $i) " + $(if ($c.version) { 'v' + [string]$c.version } else { '(no declara version)' }) +
-                    $(if (@($etiquetas).Count -gt 0) { '  [' + (@($etiquetas) -join ' / ') + ']' } else { '' }))
-        Write-Host ("       " + [string]$c.ruta) -ForegroundColor DarkGray
-    }
-    Write-Host ''
-    $ans = Read-DoctorLine -Prompt ('  Cual instalar? (numero, o Enter para la recomendada' + $(if ($reco.version) { ' v' + [string]$reco.version } else { '' }) + ')')
-    $elegido = $reco
-    $porPersona = $false
-    if ($null -ne $ans) {
-        $t = ([string]$ans).Trim()
-        if ($t) {
-            $n = 0
-            if ([int]::TryParse($t, [ref]$n) -and $n -ge 1 -and $n -le @($cands).Count) {
-                $elegido = @($cands)[$n - 1]
-                $porPersona = $true
-            } else {
-                Write-Host '  No entendi la respuesta: se usa la recomendada.' -ForegroundColor Yellow
-            }
-        }
-    }
-    # Bajar de version es una decision, no un accidente: se confirma aparte y se dice que implica.
-    if ($porPersona -and $Instalada -and $elegido.version) {
-        $baja = $false
-        try { $baja = ([version]$elegido.version -lt [version]$Instalada) } catch {}
-        if ($baja) {
-            Write-Host ''
-            Write-Host ("  OJO: vas a instalar la v" + [string]$elegido.version + " sobre la v" + [string]$Instalada + ', o sea BAJAR de version.') -ForegroundColor Yellow
-            $sinFirmar = $false
-            try { $sinFirmar = ([version]$elegido.version -lt [version]$script:NativaVersionFirmada) } catch {}
-            if ($sinFirmar) {
-                Write-Host ("  Esa version es anterior a la v" + [string]$script:NativaVersionFirmada + ', que es la primera firmada: Windows Defender puede volver a ponerla en cuarentena.') -ForegroundColor Yellow
-                Write-Host '  Tiene sentido si el antivirus de este cliente bloquea la firmada; si no, no.' -ForegroundColor Yellow
-            }
-            $ok = Read-DoctorLine -Prompt '  Seguro? (s = si / cualquier otra tecla = no)'
-            if (([string]$ok).Trim().ToLower() -ne 's') {
-                Write-Host '  No se instalo nada.' -ForegroundColor Yellow
-                return @{ ruta = ''; version = ''; elegidoPorPersona = $false; candidatos = @($cands)
-                          motivo = 'el asesor no confirmo bajar de version' }
-            }
-        }
-    }
-    return @{ ruta = [string]$elegido.ruta; version = [string]$elegido.version
-              elegidoPorPersona = [bool]$porPersona; candidatos = @($cands)
-              motivo = $(if ($porPersona) { 'lo eligio el asesor en pantalla' } else { 'se uso la version recomendada' }) }
+    return @{ ruta = [string]$reco.ruta; version = [string]$reco.version
+              elegidoPorPersona = $false; candidatos = @($cands)
+              motivo = 'se uso la version recomendada' }
 }
 
 function Test-LauncherFreshness {
@@ -18099,15 +18167,70 @@ function Test-LauncherFreshness {
     return [bool]$viejo
 }
 
+function Get-TipoCuentaFudo {
+    <#
+      v3.45: la cuenta de Fudo de este cliente imprime con la extension del navegador (v1) o sin
+      ella (v2)? El motor no lo puede saber solo: corre en la PC del cliente y no ve la cuenta.
+      El asesor lo ve en segundos en el asistente de instalar impresora de Fudo: 3 pasos
+      (extension, App Nativa, impresora) es v1; 2 pasos (App Nativa, impresora) es v2.
+      Hace falta por dos cosas que hasta la 3.44 se hacian igual en todas las cuentas:
+       - la extension: el motor la daba por causa raiz y ofrecia agregarla tambien en las v2,
+         que no la usan y que despues producto tiene que migrar (canal del 22 y 23/10);
+       - la Nativa: las v1 van con la 0.0.41 y las v2 con la 0.0.43.
+      Se pregunta una sola vez por corrida, y solo cuando cambia algo: falta la extension, o hay
+      que instalar o actualizar la Nativa. Sin nadie a quien preguntarle queda 'nose', que es lo
+      prudente: la 0.0.41 anda en los dos canales y la extension no se empuja.
+      Devuelve 'v1', 'v2' o 'nose'.
+    #>
+    param([string]$Motivo = '')
+    if ([string]$script:TipoCuentaFudo) { return [string]$script:TipoCuentaFudo }
+    $tipo = 'nose'
+    $origen = ''
+    $param = ([string]$CuentaFudo).Trim().ToLower()
+    if ($param -in @('v1', 'v2', 'nose')) { $tipo = $param; $origen = 'parametro' }
+    elseif (-not (Test-HayHumano)) { $origen = 'sin nadie a quien preguntarle' }
+    elseif (Test-UiWeb) {
+        $r = Request-UiAnswer -Id 'cuentaFudo' -Clase 'modo' -SoloAsesor `
+            -Titulo 'En Fudo, cuantos pasos tiene el asistente de instalar impresora?' `
+            -Texto ('Mirarlo en la cuenta del cliente. 3 pasos (Extension, App Nativa, Impresora): la cuenta usa la extension. ' +
+                    '2 pasos (App Nativa, Impresora): no la usa.') `
+            -Texto2 'Con eso se elige que App Nativa instalar y si hace falta la extension. Si no lo podes ver, elegi "No se": la extension no se toca.' `
+            -Opciones @(
+                @{ v = 'v2'; l = '2 pasos (sin extension)' },
+                @{ v = 'v1'; l = '3 pasos (con extension)' },
+                @{ v = 'nose'; l = 'No se / no lo puedo ver' })
+        if ([string]$r -in @('v1', 'v2', 'nose')) { $tipo = [string]$r }
+        $origen = $(if ($null -eq $r) { 'no se contesto' } else { 'asesor' })
+    } else {
+        Suspend-LiveStatus
+        [Console]::Error.WriteLine('')
+        [Console]::Error.WriteLine('  En la cuenta del cliente, cuantos pasos tiene el asistente de instalar impresora de Fudo?')
+        [Console]::Error.WriteLine('    3 pasos (Extension, App Nativa, Impresora) = la cuenta usa la extension')
+        [Console]::Error.WriteLine('    2 pasos (App Nativa, Impresora)            = no la usa')
+        $ans = Read-DoctorLine -Prompt '  (2 / 3 / Enter = no se)'
+        $a = ([string]$ans).Trim()
+        if ($a -eq '2') { $tipo = 'v2' } elseif ($a -eq '3') { $tipo = 'v1' }
+        $origen = $(if ($null -eq $ans) { 'no se contesto' } else { 'asesor' })
+    }
+    $script:TipoCuentaFudo = $tipo
+    $script:Diagnostics['cuentaFudo'] = [ordered]@{ tipo = $tipo; origen = $origen; motivo = $Motivo }
+    return $tipo
+}
+
 function Get-NativeInstallerUrl {
     <#
       De donde bajar la App Nativa segun el Windows de esta PC. Windows 8 (6.2) en adelante va
       por .exe; 7, Vista y XP siguen con el .msi, que es lo que publica fu.do para esas PCs.
       Windows 7 no es teorico en este parque: hay casos reportados en el canal.
+      v3.45: en Windows 8 en adelante, las cuentas v2 van con su propia Nativa. No pregunta: usa
+      lo que ya se sepa (ver Get-TipoCuentaFudo), porque tambien se la llama para describir.
     #>
     try {
         $v = [Environment]::OSVersion.Version
-        if ($v -and ($v -ge [version]'6.2')) { return [string]$script:NativeInstallerUrlWin8 }
+        if ($v -and ($v -ge [version]'6.2')) {
+            if ([string]$script:TipoCuentaFudo -eq 'v2') { return [string]$script:NativeInstallerUrlV2 }
+            return [string]$script:NativeInstallerUrlWin8
+        }
         return [string]$script:NativeInstallerUrlLegacy
     } catch { return [string]$script:NativeInstallerUrlWin8 }
 }
@@ -18406,6 +18529,8 @@ function Install-FudoNative {
       -SinDescarga: usar solo lo que hay en la PC (es el respaldo cuando la descarga fallo).
     #>
     param([switch]$SinDescarga)
+    # v3.45: que Nativa corresponde depende de si la cuenta usa la extension (v1) o no (v2).
+    if (-not $SinDescarga -and -not $NativeInstallerUrl) { [void](Get-TipoCuentaFudo -Motivo 'instalar la App Nativa') }
     $url = $NativeInstallerUrl
     if (-not $url) { $url = $script:NativeInstallerUrl }
     if (-not $url) { $url = Get-NativeInstallerUrl }
@@ -18433,12 +18558,19 @@ function Install-FudoNative {
     # Ahora un local anterior a la recomendada solo se usa si la descarga falla. Si una PERSONA
     # lo eligio (menu o -NativeInstallerPath), se respeta: puede ser el caso del antivirus de
     # terceros que solo aguanta una version vieja.
+    # v3.45: en una cuenta v2 el instalador de la PC tampoco le gana a la descarga: los que
+    # circulan son de la Nativa de las v1, y la de las v2 es otra.
     $localDescartado = ''
+    $esV2 = ([string]$script:TipoCuentaFudo -eq 'v2')
     if ($local -and $url -and -not $SinDescarga -and -not [bool]$eleccion.elegidoPorPersona -and
-        (Test-InstaladorLocalViejo -Version ([string]$eleccion.version))) {
-        $localDescartado = [string]$eleccion.version
+        ($esV2 -or (Test-InstaladorLocalViejo -Version ([string]$eleccion.version)))) {
+        $localDescartado = $(if ([string]$eleccion.version) { [string]$eleccion.version } else { 'sin version' })
         Write-Host ''
-        Write-Host ("  Hay un instalador en la PC (v$localDescartado), pero es anterior a la v$((Get-NativaVersionRecomendada)): se descarga la vigente.") -ForegroundColor Cyan
+        if ($esV2) {
+            Write-Host '  Hay un instalador en la PC, pero esta cuenta es sin extension (v2) y usa otra App Nativa: se descarga esa.' -ForegroundColor Cyan
+        } else {
+            Write-Host ("  Hay un instalador en la PC (v$localDescartado), pero es anterior a la v$((Get-NativaVersionRecomendada)): se descarga la vigente.") -ForegroundColor Cyan
+        }
         Write-Host '  Si la descarga falla, se usa el de la PC.' -ForegroundColor DarkGray
         $local = ''
     }
@@ -18630,7 +18762,7 @@ function Install-FudoNative {
         $quedoDesc = $false
         try { if ($script:Diagnostics.Contains('nativaInstall')) { $quedoDesc = [bool]$script:Diagnostics['nativaInstall'].quedoInstalada } } catch {}
         if (-not $quedoDesc) {
-            Write-Host ("  La descarga no dejo la Nativa instalada: se prueba con el instalador de la PC (v$localDescartado).") -ForegroundColor Yellow
+            Write-Host ("  La descarga no dejo la Nativa instalada: se prueba con el instalador de la PC (" + $(if ($localDescartado -eq 'sin version') { 'no declara version' } else { "v$localDescartado" }) + ').') -ForegroundColor Yellow
             $resLocal = Install-FudoNative -SinDescarga
             try {
                 if ($script:Diagnostics.Contains('nativaInstall')) {
@@ -18871,7 +19003,7 @@ function Get-TelemetryDiagnosticsExtra {
       pueda ver las claves sin mandar nada.
     #>
     $out = [ordered]@{}
-    foreach ($k in @('nativaDescarga', 'eleccionImpresora', 'eleccionPuerto', 'modoImpresionProtegido', 'usbSinEnumerar', 'extensionAbierta', 'purgaTemprana', 'uiApertura', 'uiCarga', 'colasSinRespuesta', 'consolaSinEdicionRapida', 'despuesNativa', 'limpiezaSpooler')) {
+    foreach ($k in @('nativaDescarga', 'eleccionImpresora', 'eleccionPuerto', 'modoImpresionProtegido', 'usbSinEnumerar', 'extensionAbierta', 'purgaTemprana', 'uiApertura', 'uiCarga', 'colasSinRespuesta', 'consolaSinEdicionRapida', 'despuesNativa', 'limpiezaSpooler', 'cuentaFudo')) {
         $out[$k] = $(if ($script:Diagnostics.Contains($k)) { $script:Diagnostics[$k] } else { $null })
     }
     # v3.32: cuanto tardo cada paso (ver StepTimes).
