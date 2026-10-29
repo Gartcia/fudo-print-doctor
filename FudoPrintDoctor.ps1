@@ -416,7 +416,7 @@ CHANGELOG
 [CmdletBinding()]
 param(
     [string]$PrinterName,
-    [ValidateSet('auto','USB','Red','Ambos','Nativa','Soporte','Cola','BuscarRed','Bluetooth')]
+    [ValidateSet('auto','USB','Red','Ambos','Nativa','Soporte','Cola','BuscarRed','Bluetooth','Identificar')]
     [string]$Modo = 'auto',
     # v3.38: idioma de lo que ve el cliente. 'auto' = portugues si la PC es de Brasil.
     [ValidateSet('auto','es','pt-BR')]
@@ -525,7 +525,7 @@ $script:Producto    = 'Fudo'
 $script:PrefijoCola = 'FUDO-'
 $script:NombreCola  = 'Impresora Fudo'
 $script:ReglasTexto = @()
-$script:SchemaVersion = '3.46'
+$script:SchemaVersion = '3.47'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -537,9 +537,9 @@ $script:ModoElegido = ''
 # agente que haga todo". Dos formas de usarlo: la revision completa de siempre, o elegir una
 # herramienta que hace una sola cosa. Las herramientas son modos de corrida como 'Nativa': asi
 # el resultado, la telemetria y el menu del final funcionan igual sin duplicar nada.
-$script:ModosHerramienta = @('Cola', 'BuscarRed', 'Bluetooth')
+$script:ModosHerramienta = @('Cola', 'BuscarRed', 'Bluetooth', 'Identificar')
 # Modos que NO recorren la cadena de impresion (colas, puertos, prueba de papel por capas).
-$script:ModosPuntuales = @('Nativa', 'Cola', 'BuscarRed', 'Bluetooth')
+$script:ModosPuntuales = @('Nativa', 'Cola', 'BuscarRed', 'Bluetooth', 'Identificar')
 # 'Completo' o 'Soporte'. Sobrevive a Reset-RunState, igual que ModoElegido.
 $script:PerfilElegido = ''
 # v3.37: la App Nativa ya se reviso en esta corrida (modo "Solo la App Nativa").
@@ -564,6 +564,11 @@ $script:UiPregSeq  = 0       # numero de PREGUNTA; ver Request-UiAnswer
 # nada en pantalla, aunque la gestion haya corrido.
 $script:UltimaAccionNota = ''
 $script:UiTimeout  = 900
+# v3.47 (canal, Facundo): las preguntas que se pueden saltear -abrir la extension, el tipo de
+# cuenta, que hacemos despues de la Nativa, el aviso de copia sin reporte- esperan esto y no los
+# 15 minutos de UiTimeout. Con nadie mirando, cinco corridas quedaron 15 minutos quietas en una
+# pregunta que no frenaba nada.
+$script:UiTimeoutOpcional = 120
 # v3.40: cuanto se espera a que la ventana del diagnostico pida su primera actualizacion antes
 # de reabrirla, y despues antes de pasar a la consola. Ver Confirm-UiCargo.
 $script:UiPrimerPollSec = 20
@@ -579,7 +584,11 @@ $script:NativaVersionFirmada = '0.0.37'
 # archivos de Fudo y TODAS son de modelo estadistico (terminan en !ml), incluida una del
 # 20/09 sobre una PC con la 0.0.37 puesta. Tres asesores reportaron lo mismo en el canal. La
 # 0.0.38 es la primera que el campo reporta estable, asi que es la que el motor pide y ofrece.
-$script:NativaVersionRecomendada = '0.0.38'
+# v3.47: subio a la 0.0.41, que es la que se descarga para las cuentas v1 desde la 3.45 (las v2
+# van con la 0.0.43, ver Get-NativaVersionRecomendada). Con la 0.0.38 como vara, un instalador
+# 0.0.38 a 0.0.40 olvidado en la PC pasaba por vigente y le ganaba a la descarga.
+$script:NativaVersionRecomendada = '0.0.41'
+$script:NativaVersionRecomendadaV2 = '0.0.43'
 # v3.32: en Windows 7, Vista y XP la que corresponde es la 0.0.18 (.msi): lo confirmaron dos
 # personas de soporte por separado (N2 el 25/09 y un asesor el 28/09). Recomendarle la 0.0.38 a
 # esas PCs mandaba al asesor a buscar una version que ahi no se usa.
@@ -1569,6 +1578,7 @@ $script:StepPlan = [ordered]@{
     'layer4.hardwarePrint'      = 'Prueba de impresion'
     'layer0b.nativeApp'         = 'App Nativa de Fudo y antivirus'
     'layer0b.soloNativa'        = 'App Nativa de Fudo y antivirus'
+    'layer0b.nativaRapida'      = 'App Nativa de Fudo'
     'layer5.fudoConfig'         = 'Configuracion de Fudo'
     'final.rescan'              = 'Estado final de las impresoras'
     'final.otherQueues'         = 'Comandas encoladas'
@@ -1839,6 +1849,8 @@ function Request-UiAnswer {
           [string]$ErrorPrevio = '', [switch]$SoloAsesor)
     if (-not (Test-UiWeb)) { return $null }
     if ($TimeoutSec -le 0) { $TimeoutSec = [int]$script:UiTimeout }
+    # v3.47: una pregunta con limite propio nunca espera mas que el de la corrida (-UiTimeoutSec).
+    if ([int]$script:UiTimeout -gt 0 -and $TimeoutSec -gt [int]$script:UiTimeout) { $TimeoutSec = [int]$script:UiTimeout }
 
     # 'seq' hace que dos preguntas consecutivas NUNCA sean identicas.
     # De donde sale: el ID de conversacion se pide hasta cinco veces, y a partir del segundo
@@ -2727,6 +2739,7 @@ function Get-HerramientasSoporte {
         @{ v = 'USB';       l = 'Revisar las impresoras USB';           detalle = 'Colas, puertos USB y prueba de papel' },
         @{ v = 'Red';       l = 'Revisar las impresoras de red';        detalle = 'Las que ya estan instaladas en Windows con su IP' },
         @{ v = 'BuscarRed'; l = 'Buscar impresoras en la red';          detalle = 'Para las que no estan en Windows: las encuentra por IP y, si queres, instala una' },
+        @{ v = 'Identificar'; l = 'Identificar impresoras';             detalle = 'Manda a cada impresora un ticket con el nombre de su cola, para saber cual es cual' },
         @{ v = 'Bluetooth'; l = 'Impresora Bluetooth';                  detalle = 'Busca las vinculadas a esta computadora, crea su cola y manda un ticket de prueba' }
     )
 }
@@ -2774,7 +2787,7 @@ function Request-SeguirConImpresoras {
     $sugiereCerrar = (@($fallas).Count -eq 0 -and @($reparadas).Count -gt 0)
     $r = $null
     if (Test-UiWeb) {
-        $r = Request-UiAnswer -Id 'despuesNativa' -Clase 'modo' -SoloAsesor `
+        $r = Request-UiAnswer -Id 'despuesNativa' -Clase 'modo' -SoloAsesor -TimeoutSec $script:UiTimeoutOpcional `
             -Titulo 'Que hacemos ahora?' -Texto $resumen `
             -Texto2 'Si el cliente ya puede imprimir desde Fudo, el caso esta cerrado. Si no, seguimos con las impresoras.' `
             -Opciones @(
@@ -2913,9 +2926,16 @@ function Confirm-PaperCameOut {
           USB-paralelo sin impresora del otro lado, papel al reves).
       Por eso, si hay consola, se pregunta. Devuelve $true / $false / $null (no se pudo).
     #>
-    param([string]$Printer)
+    param([string]$Printer, [switch]$OfrecerOtra)
     if (-not (Test-HayHumano)) { return $null }
     if (Test-UiWeb) {
+        $ops = @(
+            @{ v = 'si';   l = 'Salio, lo tengo en la mano'; principal = $true },
+            @{ v = 'no';   l = 'No salio nada' })
+        # v3.47 (canal, Fernando): con las colas cruzadas el ticket sale, pero en OTRA impresora,
+        # y la prueba se daba por buena. Devuelve 'otra' en ese caso (el ticket dice su cola).
+        if ($OfrecerOtra) { $ops += @{ v = 'otra'; l = 'Salio en otra impresora'; detalle = 'El ticket dice el nombre de la cola' } }
+        $ops += @{ v = 'nose'; l = 'No la puedo ver ahora' }
         # La leccion de la 3.10: si le preguntas a un humano, la pregunta tiene que poder
         # contestarse bien. Por eso la interfaz manda tambien QUE tiene que estar mirando.
         $r = Request-UiAnswer -Id 'papel' -Clase 'papel' `
@@ -2926,11 +2946,9 @@ function Confirm-PaperCameOut {
             -Texto2 ('El ticket sale con avance de papel antes del corte, asi que tiene que asomar ' +
                      'fuera de la impresora. Si ves papel en blanco, el rollo esta al reves.') `
             -Extra @{ impresora = $Printer } `
-            -Opciones @(
-                @{ v = 'si';   l = 'Salio, lo tengo en la mano'; principal = $true },
-                @{ v = 'no';   l = 'No salio nada' },
-                @{ v = 'nose'; l = 'No la puedo ver ahora' })
+            -Opciones $ops
         if ($r -eq 'si') { return $true }
+        if ($r -eq 'otra') { return 'otra' }
         if ($r -eq 'no') { return $false }
         return $null
     }
@@ -2938,8 +2956,10 @@ function Confirm-PaperCameOut {
     Write-Host ''
     Write-Host ("  Mira la impresora: salio el ticket de prueba de '" + $Printer + "'?") -ForegroundColor Cyan
     $ans = ''
-    $ans = Read-DoctorLine -Prompt '  (s = salio / n = no salio / Enter = no puedo verla ahora)'
+    $ans = Read-DoctorLine -Prompt $(if ($OfrecerOtra) { '  (s = salio / n = no salio / o = salio en otra impresora / Enter = no puedo verla ahora)' }
+                                     else { '  (s = salio / n = no salio / Enter = no puedo verla ahora)' })
     if ($null -eq $ans) { return $null }
+    if ($OfrecerOtra -and $ans -match '(?i)^\s*o\s*$') { return 'otra' }
     if ($ans -match '(?i)^\s*(s|si|y|yes|1)\s*$') { return $true }
     if ($ans -match '(?i)^\s*(n|no|0)\s*$')       { return $false }
     return $null
@@ -3241,8 +3261,20 @@ public class FudoRawPrinter {
     Add-Type -TypeDefinition $code -Language CSharp
 }
 
+function ConvertTo-TextoTicket {
+    <# Texto para la termica: sin tildes ni nada fuera de ASCII (la pagina 437 no tiene todo). #>
+    param([string]$Texto)
+    if (-not $Texto) { return '' }
+    $sb = New-Object System.Text.StringBuilder
+    foreach ($ch in $Texto.Normalize([Text.NormalizationForm]::FormD).ToCharArray()) {
+        if ([Globalization.CharUnicodeInfo]::GetUnicodeCategory($ch) -eq [Globalization.UnicodeCategory]::NonSpacingMark) { continue }
+        if ([int]$ch -ge 32 -and [int]$ch -lt 127) { [void]$sb.Append($ch) } else { [void]$sb.Append('?') }
+    }
+    return $sb.ToString()
+}
+
 function Get-EscPosTestTicket {
-    param([string]$Caption = '')
+    param([string]$Caption = '', [string]$Cola = '', [string]$Puerto = '')
     if (-not $Caption) { $Caption = Get-TicketCaption 'base' }
     # ESC @ init, texto, feed, corte parcial (GS V)
     $ESC = [char]27; $GS = [char]29
@@ -3261,6 +3293,12 @@ function Get-EscPosTestTicket {
         [void]$sb.Append("Prueba de impresion`n")
         [void]$sb.Append((Get-Date).ToString('yyyy-MM-dd HH:mm:ss') + "`n")
         [void]$sb.Append("Si lees esto, el hardware imprime OK`n")
+    }
+    # v3.47 (canal, Fernando): con las colas cruzadas la prueba "salia bien" en la impresora
+    # equivocada. El ticket dice de que cola salio, para compararlo con lo que tiene cada area.
+    if ($Cola) {
+        [void]$sb.Append("`n" + $(if ($script:IdiomaActivo -eq 'pt-BR') { 'Fila: ' } else { 'Cola: ' }) + (ConvertTo-TextoTicket $Cola) + "`n")
+        if ($Puerto) { [void]$sb.Append($(if ($script:IdiomaActivo -eq 'pt-BR') { 'Porta: ' } else { 'Puerto: ' }) + (ConvertTo-TextoTicket $Puerto) + "`n") }
     }
     # OJO: en una termica el cabezal esta a 1-2 cm del cortador. Con pocos saltos de linea el
     # texto recien impreso queda RETENIDO adentro del mecanismo: sale un pedazo de papel en
@@ -3942,13 +3980,18 @@ function Get-SesionInteractiva {
       El Chrome del cliente no se entera de nada.
     #>
     $out = [ordered]@{ usuarioMotor = [string]$env:USERNAME; usuarioSesion = ''; otroPerfil = $false }
+    # v3.47: con limite de tiempo (ver Invoke-ConLimite). Con WMI trabado la corrida quedaba
+    # quieta aca, antes de la primera pregunta sobre la extension, sin nada en pantalla.
     try {
-        $ex = @(Get-CimInstance -ClassName Win32_Process -Filter "Name='explorer.exe'" -ErrorAction Stop)
-        foreach ($p in @($ex)) {
-            $o = $null
-            try { $o = Invoke-CimMethod -InputObject $p -MethodName 'GetOwner' -ErrorAction Stop } catch {}
-            if ($o -and $o.User) { $out.usuarioSesion = [string]$o.User; break }
+        $lim = Invoke-ConLimite -TimeoutSec 10 -Script {
+            foreach ($p in @(Get-CimInstance -ClassName Win32_Process -Filter "Name='explorer.exe'" -ErrorAction Stop)) {
+                $o = $null
+                try { $o = Invoke-CimMethod -InputObject $p -MethodName 'GetOwner' -ErrorAction Stop } catch {}
+                if ($o -and $o.User) { [string]$o.User; break }
+            }
         }
+        $u = @(@($lim.valor) | Where-Object { $_ }) | Select-Object -First 1
+        if ($u) { $out.usuarioSesion = [string]$u }
     } catch {}
     if ($out.usuarioSesion -and $out.usuarioMotor) {
         $out.otroPerfil = [bool]($out.usuarioSesion -ne $out.usuarioMotor)
@@ -4077,6 +4120,7 @@ function Open-FudoExtensionPage {
     }
     $elegido = $null
     $si = $false
+    $nadieContesto = $false
     if (Test-UiWeb) {
         $ops = @()
         if (@($navs).Count -gt 0) {
@@ -4087,7 +4131,8 @@ function Open-FudoExtensionPage {
             }
         } else { $ops += @{ v = 'si'; l = 'Si, abrirla'; principal = $true } }
         $ops += @{ v = 'no'; l = 'No, la agrego yo' }
-        $r = Request-UiAnswer -Id 'abrirExtension' -Clase 'modo' -SoloAsesor -Titulo $pregunta -Texto $detalle -Opciones $ops
+        $r = Request-UiAnswer -Id 'abrirExtension' -Clase 'modo' -SoloAsesor -TimeoutSec $script:UiTimeoutOpcional -Titulo $pregunta -Texto $detalle -Opciones $ops
+        $nadieContesto = ($null -eq $r)
         if ($r -eq 'si') { $si = $true }
         elseif ([string]$r -like 'nav:*') {
             $nomR = ([string]$r).Substring(4)
@@ -4102,6 +4147,7 @@ function Open-FudoExtensionPage {
         if (@($navs).Count -gt 1) {
             $letras = @($navs | ForEach-Object { ([string]$_.nombre).Substring(0, 1).ToLower() + ' = en ' + [string]$_.nombre }) -join ' / '
             $ans = Read-DoctorLine -Prompt ('  ' + $pregunta + ' (' + $letras + ' / cualquier otra tecla = no)')
+            $nadieContesto = ($null -eq $ans)
             $a = ([string]$ans).Trim().ToLower()
             # 's' sigue valiendo: es el primero (Chrome).
             if ($a -match '^(s|si|y|yes)$') { $elegido = $navs[0] }
@@ -4109,11 +4155,14 @@ function Open-FudoExtensionPage {
             $si = ($null -ne $elegido)
         } else {
             $ans = Read-DoctorLine -Prompt ('  ' + $pregunta + ' (s = si / cualquier otra tecla = no)')
+            $nadieContesto = ($null -eq $ans)
             $si = ($null -ne $ans -and [string]$ans -match '(?i)^\s*(s|si|y|yes)\s*$')
             if ($si -and @($navs).Count -eq 1) { $elegido = $navs[0] }
         }
     }
-    if (-not $si) { $out.motivo = 'el asesor prefirio no abrirla'; return $out }
+    # v3.47: sin respuesta no es "prefirio no abrirla": la pregunta vencio con nadie mirando, y
+    # la telemetria lo contaba como una decision del asesor.
+    if (-not $si) { $out.motivo = $(if ($nadieContesto) { 'nadie contesto la pregunta' } else { 'el asesor prefirio no abrirla' }); return $out }
     try {
         if ($elegido) {
             Start-UrlEnNavegador -Exe ([string]$elegido.exe) -Url ([string]$script:FudoExtensionUrl)
@@ -4129,7 +4178,7 @@ function Open-FudoExtensionPage {
     for ($i = 1; $i -le 3; $i++) {
         $listo = $false
         if (Test-UiWeb) {
-            $r2 = Request-UiAnswer -Id ('extensionAgregada' + $i) -Clase 'modo' -SoloAsesor `
+            $r2 = Request-UiAnswer -Id ('extensionAgregada' + $i) -Clase 'modo' -SoloAsesor -TimeoutSec $script:UiTimeoutOpcional `
                 -Titulo 'Ya se agrego la extension?' `
                 -Texto $(if ($i -gt 1) { 'Todavia no aparece' + $enNav + '. Revisar que se haya tocado "Agregar a Chrome" y que sea el perfil que usa el cliente.' } else { 'Cuando aparezca el aviso de que se agrego, seguimos.' }) `
                 -Opciones @(@{ v = 'si'; l = 'Ya esta, revisar'; principal = $true }, @{ v = 'no'; l = 'Seguir sin esperar' })
@@ -4289,6 +4338,57 @@ function Register-FudoNativeHost {
               registrado = [bool]$despues.registrado; estado = $despues
               navegadores = @($despues.navegadores); nota = [string]$rem.note
               lanzado = [bool]$salida.lanzado; motivo = [string]$motivo }
+}
+
+function Test-NativaRapida {
+    <#
+      v3.47 (canal, Facundo): en las herramientas de impresoras USB y de red, la revision completa
+      de la Nativa -antivirus, extension, instalar o actualizar- tardaba mas de un minuto y no era
+      lo que se pidio. Sacarla del todo dejaba "USB OK" en casos donde la causa era la Nativa.
+      Aca se mira rapido y sin tocar nada: si esta en disco y que version tiene. Si salio el papel
+      -la impresora anda- la Nativa pasa a ser sospechosa y se pregunta si se revisa a fondo. Sin
+      respuesta, queda la lectura rapida.
+    #>
+    $install = Find-FudoNativeInstall
+    $ver = ''
+    try { $ver = [string](Get-NativaVersionState -Install $install).version } catch {}
+    $enDisco = [bool]$install.enDisco
+    $script:Diagnostics['nativaRapida'] = [ordered]@{ enDisco = $enDisco; version = $ver; ubicacion = [string]$install.ubicacion; aFondo = $false }
+    $papel = (@($script:Checks | Where-Object { [string]$_.id -eq 'hw.testprint' -and [string]$_.status -eq 'ok' }).Count -gt 0)
+    $resumen = $(if (-not $enDisco) { 'La App Nativa no aparece en disco.' }
+                 elseif ($ver) { 'La App Nativa esta instalada (v' + $ver + ').' } else { 'La App Nativa esta instalada.' })
+    if ($papel -and (Test-HayHumano)) {
+        $r = $null
+        if (Test-UiWeb) {
+            $r = Request-UiAnswer -Id 'revisarNativa' -Clase 'modo' -SoloAsesor -TimeoutSec $script:UiTimeoutOpcional `
+                -Titulo 'Salio el papel. Revisamos tambien la App Nativa?' `
+                -Texto ($resumen + ' Si la impresora imprime y la comanda de Fudo igual no sale, el problema suele estar en la App Nativa.') `
+                -Opciones @(
+                    @{ v = 'si'; l = 'Si, revisarla'; detalle = 'Antivirus, extension, y la instala o actualiza si hace falta'; principal = $true },
+                    @{ v = 'no'; l = 'No, terminar aca' })
+        } else {
+            Suspend-LiveStatus
+            Write-Host ''
+            Write-Host ('  ' + $resumen) -ForegroundColor Cyan
+            $ans = Read-DoctorLine -Prompt '  Salio el papel. Revisamos tambien la App Nativa? (s = si / Enter = terminar aca)'
+            if ($null -ne $ans -and [string]$ans -match '(?i)^\s*(s|si|y|yes)\s*$') { $r = 'si' }
+        }
+        if ($r -eq 'si') {
+            $script:Diagnostics['nativaRapida']['aFondo'] = $true
+            Test-Layer0b-NativeApp
+            $script:NativaRevisada = $true
+            return
+        }
+    }
+    # Id propio y no nativa.installed: esta lectura no mira lo que mira la revision completa, y
+    # mezclarlas ensuciaria lo que la telemetria cuenta como "Nativa no instalada".
+    Add-Check -Id 'nativa.rapida' -Layer 0 `
+        -Name $(if ($enDisco) { 'App Nativa de Fudo instalada' + $(if ($ver) { " (v$ver)" } else { '' }) + ': no se reviso a fondo' }
+                else { 'App Nativa de Fudo: no aparece en disco (no se reviso a fondo)' }) `
+        -Status 'warn' -RootCauseCandidate ([bool](-not $enDisco -and $papel)) -Informativo $enDisco -Plane 'fudo_config' `
+        -Evidence @{ enDisco = $enDisco; version = $ver; ubicacion = [string]$install.ubicacion; papel = [bool]$papel } `
+        -Recommendation $(if ($enDisco) { 'Se miro solo que este en disco: no se revisaron el antivirus ni la extension. Si la impresora anda y la comanda no sale, usar la herramienta "Revisar la App Nativa y la extension".' }
+                          else { 'Sin la App Nativa, Fudo no puede mandar comandas. Se miro rapido porque se eligio revisar impresoras: usar la herramienta "Revisar la App Nativa y la extension", que la instala.' })
 }
 
 function Test-Layer0b-NativeApp {
@@ -4460,7 +4560,7 @@ function Test-Layer0b-NativeApp {
                                  intentoUpdate = [string]$up.motivo; instalador = [string]$up.instalador
                                  versionInstalador = [string]$up.versionInstalador } `
                     -ArticleRef 'https://soporte.fu.do/es/articles/16419361' `
-                    -Recommendation ("Esta PC tiene la Nativa v$($verState.version). La version vigente es la v$((Get-NativaVersionRecomendada)), " +
+                    -Recommendation ("Esta PC tiene la Nativa v$($verState.version). Imprime igual: no es lo que impide que salga la comanda. La version vigente es la v$((Get-NativaVersionRecomendada)), " +
                                      'que es la que mejor se porta con Windows Defender. Con antivirus de terceros no alcanza: hay casos de Avast comiendose la v0.0.38 igual. ' +
                                      'Estar firmada (desde la v' + $script:NativaVersionFirmada + ') reduce los bloqueos ' +
                                      'pero no los elimina, asi que subir de version es la solucion de fondo: evita tener que agregar exclusiones en cada PC. ' +
@@ -7003,7 +7103,7 @@ function Invoke-ReconnectFlow {
         $notas += "cola reasignada a $puerto"
         Start-Sleep -Milliseconds 800
         Initialize-RawPrinterHelper
-        $ticket = [System.Text.Encoding]::GetEncoding(437).GetBytes((Get-EscPosTestTicket -Caption (Get-TicketCaption 'reconexion')))
+        $ticket = [System.Text.Encoding]::GetEncoding(437).GetBytes((Get-EscPosTestTicket -Caption (Get-TicketCaption 'reconexion') -Cola ([string]$Printer.Name) -Puerto $puerto))
         if ([FudoRawPrinter]::SendBytes([string]$Printer.Name, $ticket)) {
             Start-Sleep -Milliseconds 1800
             $pend = @()
@@ -7684,12 +7784,18 @@ function Invoke-HerramientaBuscarRed {
     $script:Diagnostics['impresorasRedInstaladas'] = @($inst)
     $redes = (@($prefijos | Select-Object -First 3 | ForEach-Object { $_ + '.x' }) -join ', ')
     if (@($enc).Count -eq 0) {
-        Add-Check -Id 'red.busqueda' -Layer 3 -Name ('No se encontro ninguna impresora en la red (' + $redes + ')') -Status 'warn' -RootCauseCandidate $true -Plane 'hardware' `
+        # v3.47: antes de cortar, se busca en las otras redes: la comandera con la IP de fabrica en
+        # un local que reparte otra (Test-ForeignSubnetPrinters, con permiso). Es el grupo de casos
+        # peor resuelto. Si aparece ahi, ese hallazgo trae los pasos y este deja de ser la causa.
+        $enOtra = $false
+        try { $enOtra = [bool](Test-ForeignSubnetPrinters -TcpPort $Port) } catch {}
+        Add-Check -Id 'red.busqueda' -Layer 3 -Name ('No se encontro ninguna impresora en la red (' + $redes + ')') -Status 'warn' -RootCauseCandidate (-not $enOtra) -Plane 'hardware' `
             -Evidence @{ prefijos = @($prefijos); puerto = $Port } `
             -ArticleRef 'https://soporte.fu.do/es/articles/11730816' `
             -Recommendation ('Nada contesto en el puerto ' + $Port + ' en ' + $redes + '. Revisar que la impresora este encendida y con el cable de red puesto. ' +
                              'Para saber su IP: apagarla, mantener FEED apretado y encenderla (imprime su configuracion). ' +
-                             'Si la IP es de otra red que la de esta computadora, hay que cambiarle la IP a la impresora o conectarla a la misma red.')
+                             'Si la IP es de otra red que la de esta computadora, hay que cambiarle la IP a la impresora o conectarla a la misma red.' +
+                             $(if ($enOtra) { ' Aparecio una en otra red: ver el paso siguiente.' } else { '' }))
         return
     }
     $filas = @()
@@ -7747,12 +7853,71 @@ function Invoke-HerramientaBuscarRed {
         -SiNoSale 'Si la luz esta en rojo o titilando, es la impresora.'
 }
 
+function Invoke-HerramientaIdentificar {
+    <#
+      v3.47 (canal, Fernando): "area mal asignada" es el grupo de casos con mas mensajes por caso:
+      la comanda de la cocina sale en la barra. Desde la PC no se puede saber que impresora fisica
+      es cada cola; desde el local si, si cada ticket dice de que cola salio. Manda a cada cola un
+      ticket con su nombre en letra grande y su puerto, y nada mas: no limpia, no cambia puertos.
+    #>
+    $lista = Invoke-ConLimite -Script { @(Get-Printer -ErrorAction Stop) } -TimeoutSec 15
+    if ([bool]$lista.timeout) { Add-ColaSinRespuesta -Nombre '(la lista de impresoras de Windows)' -TimeoutSec 15; return }
+    $colas = @()
+    foreach ($p in @($lista.valor | Where-Object { $_ })) {
+        if ((Test-IsVirtualPrinter $p).isVirtual) { continue }
+        if ([string]$p.Name -match $script:TestPrinterRx) { continue }
+        if ([string]$p.Name -like '\\*') { continue }
+        $colas += $p
+    }
+    if (@($colas).Count -eq 0) {
+        Add-Check -Id 'printer.identificar' -Layer 1 -Name 'No hay impresoras en Windows para identificar' -Status 'warn' -RootCauseCandidate $true -Plane 'os' `
+            -Evidence @{ colas = @(); herramienta = $true } `
+            -Recommendation 'Windows no tiene ninguna impresora de tickets instalada. Si es de red, usar "Buscar impresoras en la red"; si es USB, "Revisar las impresoras USB".'
+        return
+    }
+    $res = @()
+    foreach ($p in @($colas)) {
+        $nom = [string]$p.Name
+        $pto = [string]$p.PortName
+        Write-StepDetail ("mandando el ticket de '" + $nom + "'")
+        $ok = $false
+        $err = ''
+        try { $ok = [bool](Send-TicketIdentificacion -Cola $nom -Puerto $pto) } catch { $err = [string]$_.Exception.Message }
+        $res += [ordered]@{ cola = $nom; puerto = $pto; enviado = [bool]$ok; error = $err }
+    }
+    $script:Diagnostics['identificarImpresoras'] = @($res)
+    $enviados = @($res | Where-Object { $_.enviado })
+    $fallidos = @($res | Where-Object { -not $_.enviado })
+    $listaTxt = (@($res | ForEach-Object { "'" + [string]$_.cola + "' (" + [string]$_.puerto + ')' }) -join ', ')
+    Set-StepNote ('tickets enviados: ' + @($enviados).Count)
+    Add-Check -Id 'printer.identificar' -Layer 1 -Name ('Ticket con su nombre enviado a ' + @($enviados).Count + ' de ' + @($res).Count + ' impresoras') `
+        -Status $(if (@($fallidos).Count -gt 0) { 'warn' } else { 'ok' }) -Plane 'os' `
+        -Evidence @{ colas = @($res); herramienta = $true } `
+        -Recommendation ('Cada ticket dice en letra grande el nombre de su cola: ' + $listaTxt + '. ' +
+                         'Juntarlos en el local y anotar donde salio cada uno (cocina, barra, caja). ' +
+                         'Despues comparar con la impresora que tiene cada area en Fudo (Administracion > Impresoras): si la comanda de la cocina sale en la barra, el area apunta a la cola que esta en la barra. ' +
+                         'Una cola que no saco ningun ticket apunta a un puerto sin impresora.' +
+                         $(if (@($fallidos).Count -gt 0) { ' No se pudo mandar a: ' + (@($fallidos | ForEach-Object { "'" + [string]$_.cola + "'" }) -join ', ') + '.' } else { '' }))
+}
+
+function Send-TicketIdentificacion {
+    <# El ticket de "Identificar impresoras": el nombre de la cola como titulo. Aislado para poder mockearlo. #>
+    param([string]$Cola, [string]$Puerto = '')
+    if ($SelfTest) { throw 'self-test: el motor no imprime nada (mockear Send-TicketIdentificacion)' }
+    Initialize-RawPrinterHelper
+    $titulo = ConvertTo-TextoTicket $Cola
+    # Letra doble: en una termica de 80 mm entran 24 caracteres por renglon.
+    if ($titulo.Length -gt 24) { $titulo = $titulo.Substring(0, 24) }
+    $bytes = [System.Text.Encoding]::GetEncoding(437).GetBytes((Get-EscPosTestTicket -Caption $titulo -Cola $Cola -Puerto $Puerto))
+    return [bool]([FudoRawPrinter]::SendBytes($Cola, $bytes))
+}
+
 function Send-TicketPruebaACola {
     <# El ticket de prueba ESC/POS, crudo, a una cola de Windows. Aislado para poder mockearlo. #>
     param([string]$Cola)
     if ($SelfTest) { throw 'self-test: el motor no imprime nada (mockear Send-TicketPruebaACola)' }
     Initialize-RawPrinterHelper
-    $bytes = [System.Text.Encoding]::GetEncoding(437).GetBytes((Get-EscPosTestTicket -Caption (Get-TicketCaption 'manual')))
+    $bytes = [System.Text.Encoding]::GetEncoding(437).GetBytes((Get-EscPosTestTicket -Caption (Get-TicketCaption 'manual') -Cola $Cola))
     return [bool]([FudoRawPrinter]::SendBytes($Cola, $bytes))
 }
 
@@ -8430,7 +8595,46 @@ function Get-DetectedInterface {
     # WSD: la cola es de red aunque no tenga IP en el nombre del puerto (Windows la descubrio
     # sola por la red). Tratarla como USB hacia que la capa 3 dijera 'Puerto USB OK'.
     if ($puertoCola -match '(?i)^WSD-' -or $puertoCola -match '(?i)^\{?[0-9a-f]{8}-[0-9a-f]{4}-') { return 'WSD' }
+    # v3.47 (canal, Ivan): un puerto TCP/IP con nombre propio ("COCINA_RED") no coincide con nada
+    # de lo de arriba y se trataba como USB. Manda la IP que Windows tiene anotada en el puerto.
+    if (Get-PuertoIp -Puerto $puertoCola) { return 'Ethernet' }
     return 'USB'
+}
+
+function Get-PuertoIp {
+    <#
+      v3.47: la IP a la que apunta un puerto de Windows, leida del puerto y no de su nombre. Un
+      puerto TCP/IP se puede llamar como quiera; la IP de verdad es la que Windows tiene anotada
+      (PrinterHostAddress). Si no se puede leer, la que haya en el nombre. '' si no hay ninguna.
+    #>
+    param([string]$Puerto)
+    if (-not $Puerto) { return '' }
+    $ipNombre = ''
+    if ($Puerto -match '(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})') { $ipNombre = $Matches[1] }
+    $h = ''
+    try {
+        $lim = Invoke-ConLimite -TimeoutSec 5 -Argumentos @($Puerto) -Script {
+            param($n)
+            @(Get-PrinterPort -Name $n -ErrorAction Stop) | Where-Object { [string]$_.Name -eq $n } |
+                Select-Object -First 1 | ForEach-Object { [string]$_.PrinterHostAddress }
+        }
+        $h = '' + (@(@($lim.valor) | Where-Object { $_ }) | Select-Object -First 1)
+    } catch {}
+    if ($h -and $h.Trim()) { return $h.Trim() }
+    return $ipNombre
+}
+
+function Split-IpsDeOtrasColas {
+    <#
+      v3.47 (canal, Ivan): de las IPs que contestaron en el puerto de impresion, cuales ya son de
+      OTRA cola de Windows. Con dos comanderas de red, la otra salia como "probable nueva IP" de
+      esta. Devuelve @{ libres; deOtras }.
+    #>
+    param([string[]]$Ips = @(), [string]$IpPropia = '')
+    $usadas = @()
+    try { $usadas = @(Get-InstalledNetworkPrinters | Where-Object { [string]$_.ip -and [string]$_.ip -ne $IpPropia } | ForEach-Object { [string]$_.ip }) } catch {}
+    return @{ libres  = @($Ips | Where-Object { $_ -and $usadas -notcontains [string]$_ })
+              deOtras = @($Ips | Where-Object { $_ -and $usadas -contains [string]$_ }) }
 }
 
 function Repair-QueueRecreate {
@@ -8463,7 +8667,7 @@ function Repair-QueueRecreate {
     Write-StepDetail "probando en que puerto responde '$nombre'"
     try {
         Initialize-RawPrinterHelper
-        $ticket = [System.Text.Encoding]::GetEncoding(437).GetBytes((Get-EscPosTestTicket -Caption (Get-TicketCaption 'puerto')))
+        $ticket = [System.Text.Encoding]::GetEncoding(437).GetBytes((Get-EscPosTestTicket -Caption (Get-TicketCaption 'puerto') -Cola $nombre))
         foreach ($cp in @($CandidatePorts)) {
             $tmp = ''
             $paso = [ordered]@{ puerto = $cp; colaCreada = $false; envioOk = $false
@@ -8743,7 +8947,7 @@ function Test-Layer3-UsbPort {
     $rem = Invoke-Remediation -Description "Reasignar puerto USB probando candidatos: $($candidatePorts -join ', ')" -Type 'printer.setport' -Target $Printer.Name `
         -Before $currentPort -After '(a determinar)' -Fix {
             Initialize-RawPrinterHelper
-            $ticket = [System.Text.Encoding]::GetEncoding(437).GetBytes((Get-EscPosTestTicket -Caption (Get-TicketCaption 'usb')))
+            $ticket = [System.Text.Encoding]::GetEncoding(437).GetBytes((Get-EscPosTestTicket -Caption (Get-TicketCaption 'usb') -Cola ([string]$Printer.Name)))
             $chosen = $null
             foreach ($cp in $candidatePorts) {
                 try {
@@ -9414,8 +9618,8 @@ function Test-Layer3-Network {
     param($Printer)
     $ip = $PrinterIp
     if (-not $ip -and $Printer) {
-        $pn = [string]$Printer.PortName
-        if ($pn -match '(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})') { $ip = $Matches[1] }
+        # v3.47: la IP anotada en el puerto, no la del nombre (ver Get-PuertoIp).
+        $ip = Get-PuertoIp -Puerto ([string]$Printer.PortName)
     }
     if (-not $ip) {
         # Sin IP conocida: barremos la red para ver si hay alguna impresora esperando.
@@ -9522,14 +9726,22 @@ function Test-Layer3-Network {
         }
     } catch {}
     $script:Diagnostics['discovered9100'] = $discovered
+    $sep = Split-IpsDeOtrasColas -Ips @($discovered) -IpPropia ([string]$ip)
+    $yaUsadas = @($sep.deOtras)
+    $discovered = @($sep.libres)
+    $script:Diagnostics['discovered9100DeOtrasColas'] = @($yaUsadas)
 
     $rec = if (@($discovered).Count -eq 1) {
         "Se detecto un unico host con 9100 abierto ($($discovered[0])). Probable nueva IP de la impresora (DHCP). Actualizar en Fudo: Administracion > Impresoras > editar IP, puerto 9100."
     } elseif (@($discovered).Count -gt 1) {
         "Hosts con 9100 abierto: $($discovered -join ', '). Confirmar por self-test cual corresponde y actualizar la IP en Fudo."
+    } elseif (@($yaUsadas).Count -gt 0) {
+        "En la subred solo contestaron impresoras que ya tienen su propia cola en Windows ($($yaUsadas -join ', ')): esta no aparece. Revisar cable/switch, luces del puerto Ethernet, y el self-test de la impresora (FEED al encender) para leer su IP."
     } else {
         "Sin hosts con 9100 en la subred. Revisar cable/switch, luces del puerto Ethernet (verde+naranja), self-test (FEED al encender) para leer IP ADDRESS, y luz roja = falla HW (a tecnico)."
     }
+
+    if (@($yaUsadas).Count -gt 0 -and @($discovered).Count -gt 0) { $rec += " No se cuentan $($yaUsadas -join ', '): ya son de otra impresora instalada en Windows." }
 
     Add-Check -Id 'conn.net' -Layer 3 -Name "Impresora de red inalcanzable (${ip}:${Port})" -Status 'fail' -RootCauseCandidate $true `
         -Plane 'fudo_config' `
@@ -9679,7 +9891,7 @@ function Test-Layer4-HardwarePrint {
         try {
             Write-StepDetail "enviando ticket de prueba a '$($Printer.Name)'"
             Initialize-RawPrinterHelper
-            $bytes = [System.Text.Encoding]::GetEncoding(437).GetBytes((Get-EscPosTestTicket -Caption (Get-TicketCaption 'hw')))
+            $bytes = [System.Text.Encoding]::GetEncoding(437).GetBytes((Get-EscPosTestTicket -Caption (Get-TicketCaption 'hw') -Cola ([string]$Printer.Name) -Puerto ([string]$Printer.PortName)))
             $ok = [FudoRawPrinter]::SendBytes($Printer.Name, $bytes)
 
             # WritePrinter OK solo significa "el spooler lo acepto". Si el trabajo sigue en la
@@ -9723,8 +9935,16 @@ function Test-Layer4-HardwarePrint {
             # spooler lo da por impreso en cuanto el device acepta los bytes. Sin rollo,
             # con la tapa abierta o con un adaptador USB-paralelo sin impresora del otro
             # lado, la cola queda limpia y no se imprimio nada. Preguntamos.
-            $salio = Confirm-PaperCameOut -Printer $Printer.Name
+            $salio = Confirm-PaperCameOut -Printer $Printer.Name -OfrecerOtra
             $script:Diagnostics['ticketConfirmado'] = $salio
+            if ([string]$salio -eq 'otra') {
+                Add-Check -Id 'hw.testprint' -Layer 4 -Name ("El ticket de prueba de '" + $Printer.Name + "' salio en otra impresora: las colas estan cruzadas") -Status 'fail' -RootCauseCandidate $true `
+                    -Plane 'fudo_config' -Evidence @{ printer = $Printer.Name; port = [string]$Printer.PortName; sent = $true; quedoEnCola = $false; salioEnOtra = $true } `
+                    -Recommendation ("La cola '" + $Printer.Name + "' (puerto " + [string]$Printer.PortName + ') imprime, pero en otra impresora del local: por eso la comanda de un area sale en el lugar equivocado. ' +
+                                     'Usar la herramienta "Identificar impresoras", que manda a cada cola un ticket con su nombre, para ver cual es cual. ' +
+                                     'Despues corregir en Fudo (Administracion > Impresoras) que cola usa cada area, o cambiar los cables para que cada cola quede en su impresora.')
+                return
+            }
             if ($salio -eq $false) {
                 Add-Check -Id 'hw.testprint' -Layer 4 -Name 'La impresora recibio el ticket de prueba pero no salio papel' -Status 'fail' -RootCauseCandidate $true `
                     -Plane 'hardware' -Evidence @{ printer = $Printer.Name; sent = $true; quedoEnCola = $false; confirmadoPorHumano = $false } `
@@ -10471,7 +10691,7 @@ function Build-HumanSummary {
               $(if ($CaseId) { "   Caso: $CaseId" } else { '' }))
     Add-Line ("  Revisado: " + $(switch ([string]$script:RunMode) { 'USB' { 'solo USB' } 'Red' { 'solo red' } 'Nativa' { 'solo la App Nativa' }
                                                                   'Cola' { 'herramienta: limpiar colas' } 'BuscarRed' { 'herramienta: buscar en la red' }
-                                                                  'Bluetooth' { 'herramienta: Bluetooth' } default { 'USB y red' } }) +
+                                                                  'Bluetooth' { 'herramienta: Bluetooth' } 'Identificar' { 'herramienta: identificar impresoras' } default { 'USB y red' } }) +
               "   Interfaz: $DetectedInterface" +
               "   " + $(if ($DryRun) { 'solo diagnostico (-DryRun)' } elseif ($AutoFix) { 'diagnostico + reparacion' } else { 'solo diagnostico' }))
     Add-Line $bar
@@ -10961,7 +11181,8 @@ function Invoke-FudoPrintDoctor {
         Write-Host $(if ($script:RunMode -eq 'Nativa') { '  Revisando solo la App Nativa de Fudo...' }
                      elseif ($script:RunMode -eq 'Cola') { '  Limpiando colas de impresion...' }
                      elseif ($script:RunMode -eq 'BuscarRed') { '  Buscando impresoras en la red...' }
-                     elseif ($script:RunMode -eq 'Bluetooth') { '  Buscando impresoras Bluetooth...' } else { ('  Revisando la cadena de impresion (' + $(switch ($script:RunMode) { 'USB' { 'solo USB' } 'Red' { 'solo red' } default { 'USB y red' } }) + ')...') }) -ForegroundColor Cyan
+                     elseif ($script:RunMode -eq 'Bluetooth') { '  Buscando impresoras Bluetooth...' }
+                     elseif ($script:RunMode -eq 'Identificar') { '  Mandando un ticket a cada impresora...' } else { ('  Revisando la cadena de impresion (' + $(switch ($script:RunMode) { 'USB' { 'solo USB' } 'Red' { 'solo red' } default { 'USB y red' } }) + ')...') }) -ForegroundColor Cyan
         Write-Host ''
     }
 
@@ -11039,6 +11260,7 @@ function Invoke-FudoPrintDoctor {
             'Cola'      { $null = Invoke-Step -Name 'herramienta.colas' -Body { Invoke-HerramientaColas } }
             'BuscarRed' { $null = Invoke-Step -Name 'herramienta.buscarRed' -Body { Invoke-HerramientaBuscarRed } }
             'Bluetooth' { $null = Invoke-Step -Name 'herramienta.bluetooth' -Body { Invoke-HerramientaBluetooth } }
+            'Identificar' { $null = Invoke-Step -Name 'herramienta.identificar' -Body { Invoke-HerramientaIdentificar } }
         }
         $null = Invoke-Step -Name 'ui.inventario' -Body { Push-UiInventario }
     }
@@ -11087,7 +11309,14 @@ function Invoke-FudoPrintDoctor {
         # de prioridad no (Resolve-Diagnosis ordena por capa, no por cuando se registro).
         # v3.37: si ya se reviso en el modo "Solo la App Nativa", no se repite.
         if (-not $script:NativaRevisada) {
-            $null = Invoke-Step -Name 'layer0b.nativeApp' -Body { Test-Layer0b-NativeApp }
+            # v3.47 (canal, Facundo): en "Revisar las impresoras USB / de red" la Nativa completa
+            # -antivirus, extension, instalar- sumaba mas de un minuto a algo que no se pidio. Se
+            # mira rapido y se revisa a fondo solo si el asesor lo pide (ver Test-NativaRapida).
+            if (@('USB', 'Red') -contains [string]$script:RunMode) {
+                $null = Invoke-Step -Name 'layer0b.nativaRapida' -Body { Test-NativaRapida }
+            } else {
+                $null = Invoke-Step -Name 'layer0b.nativeApp' -Body { Test-Layer0b-NativeApp }
+            }
         }
         $null = Invoke-Step -Name 'layer5.fudoConfig' -Body { Test-Layer5-FudoConfig -DetectedInterface $detectedInterface }
     }
@@ -14126,11 +14355,11 @@ public class FudoFakeEndpoint {
                           regInfo=@([ordered]@{ name='Fudo'; version='1.0'; esPwa=$true },
                                     [ordered]@{ name='Fudo Nativa'; version='0.0.37'; esPwa=$false }) })
     Assert-Eq 'S96 con las dos, gana la Nativa de verdad' '0.0.37' ([string]$v96b.version)
-    # Y el instalador AHORA si se ejecuta.
+    # Y el instalador AHORA si se ejecuta. (v3.47: en la vigente; uno viejo ya no le gana a la descarga.)
     Reset-State
     function Find-LocalNativeInstaller { 'C:\kit\NATIVA FUDO.msi' }
-    function Get-LocalNativeInstallers { @([ordered]@{ ruta='C:\kit\NATIVA FUDO.msi'; version='0.0.37'; esMsi=$true; fecha=(Get-Date) }) }
-    function Get-MsiProductVersion { param($Path) '0.0.37' }
+    function Get-LocalNativeInstallers { @([ordered]@{ ruta='C:\kit\NATIVA FUDO.msi'; version='0.0.41'; esMsi=$true; fecha=(Get-Date) }) }
+    function Get-MsiProductVersion { param($Path) '0.0.41' }
     function Get-NativaVersionState { param($Install) [ordered]@{ version='1.0'; firmada=$true; confiable=$false } }
     function Add-MpPreference { param($ExclusionPath, $ExclusionProcess, $ErrorAction) }
     function Get-Process { param($ErrorAction) @() }
@@ -15159,7 +15388,7 @@ public class FudoFakeEndpoint {
     $null = Install-FudoNative
     Assert-Eq 'S134 con un instalador local viejo se descarga la vigente' 'nativa.install' (@($script:tipos134) -join ',')
     Assert-Eq 'S134 y queda anotado cual se descarto' '0.0.31' ([string]$script:Diagnostics['nativaInstall'].localDescartado)
-    # Si la descarga no deja la Nativa instalada, el local es el respaldo.
+    # Si la descarga no deja la Nativa instalada, el local viejo ya NO es el respaldo (v3.47).
     Reset-State
     $script:tipos134 = @()
     function Invoke-Remediation {
@@ -15168,12 +15397,12 @@ public class FudoFakeEndpoint {
         @{ applied = $false; note = 'mock: fallo' }
     }
     $null = Install-FudoNative
-    Assert-Eq 'S134 si la descarga falla se usa el local' 'nativa.install,nativa.install_local' (@($script:tipos134) -join ',')
+    Assert-Eq 'S134 si la descarga falla NO se vuelve al local viejo' 'nativa.install' (@($script:tipos134) -join ',')
     Assert-Eq 'S134 y queda dicho que la descarga fallo' $true ([bool]$script:Diagnostics['nativaInstall'].descargaFallida)
     # Un local en la vigente, o sin version declarada (.exe), se sigue usando sin descargar.
     Reset-State
     $script:tipos134 = @()
-    function Get-LocalNativeInstallers { @([ordered]@{ ruta='C:\kit\FudoNativa.msi'; version='0.0.38'; esMsi=$true; fecha=(Get-Date) }) }
+    function Get-LocalNativeInstallers { @([ordered]@{ ruta='C:\kit\FudoNativa.msi'; version='0.0.41'; esMsi=$true; fecha=(Get-Date) }) }
     $null = Install-FudoNative
     Assert-Eq 'S134 un local en la vigente se usa sin descargar' 'nativa.install_local' (@($script:tipos134) -join ',')
     Reset-State
@@ -15307,7 +15536,7 @@ public class FudoFakeEndpoint {
         $sale = $true
         if ($script:ok136.ContainsKey($Type)) { $sale = [bool]$script:ok136[$Type] }
         if ($sale) {
-            if ($Type -eq 'nativa.update_download') { $script:verPost136 = '0.0.38' } else { $script:verPost136 = $script:verLocal136 }
+            if ($Type -eq 'nativa.update_download') { $script:verPost136 = '0.0.41' } else { $script:verPost136 = $script:verLocal136 }
             return @{ applied = $true; note = 'mock' }
         }
         @{ applied = $false; note = 'error: no se pudo descargar (mock)' }
@@ -15320,19 +15549,19 @@ public class FudoFakeEndpoint {
     $u136 = Update-FudoNativeFromLocal -Instalada '0.0.18'
     Assert-Eq 'S136 sin instalador local se actualiza descargando' 'nativa.update_download' (@($script:tipos136) -join ',')
     Assert-Eq 'S136 y queda verificado que subio' $true ([bool]$u136.subio)
-    Assert-Eq 'S136 a la vigente' '0.0.38' ([string]$u136.versionDespues)
+    Assert-Eq 'S136 a la vigente' '0.0.41' ([string]$u136.versionDespues)
     Assert-Eq 'S136 y se sabe que fue por descarga' $true ([bool]$u136.descargada)
     # Con un local viejo (anterior a la recomendada) tambien se descarga.
     $script:tipos136 = @(); $script:verPost136 = '0.0.18'
     $script:local136 = 'C:\kit\viejo.msi'; $script:verLocal136 = '0.0.31'
     $null = Update-FudoNativeFromLocal -Instalada '0.0.18'
     Assert-Eq 'S136 con un local viejo se descarga la vigente' 'nativa.update_download' (@($script:tipos136) -join ',')
-    # Si la descarga falla, el local es el respaldo.
+    # Si la descarga falla, el local viejo ya NO es el respaldo (v3.47): se dice de donde bajarla.
     $script:tipos136 = @(); $script:verPost136 = '0.0.18'
     $script:ok136 = @{ 'nativa.update_download' = $false }
     $u136c = Update-FudoNativeFromLocal -Instalada '0.0.18'
-    Assert-Eq 'S136 si la descarga falla se usa el local' 'nativa.update_download,nativa.update_local' (@($script:tipos136) -join ',')
-    Assert-Eq 'S136 y el local igual sube la version' '0.0.31' ([string]$u136c.versionDespues)
+    Assert-Eq 'S136 si la descarga falla NO se vuelve al local viejo' 'nativa.update_download' (@($script:tipos136) -join ',')
+    Assert-Eq 'S136 y dice de donde bajarla' $true ([bool]([string]$u136c.porQueNo -match 'Bajarla a mano desde https://'))
     # Sin local y con la descarga fallando, queda a la vista por que no.
     $script:tipos136 = @(); $script:verPost136 = '0.0.18'
     $script:local136 = ''; $script:verLocal136 = ''
@@ -15343,7 +15572,7 @@ public class FudoFakeEndpoint {
     $script:ok136 = @{}
     # Un local en la vigente se sigue usando sin descargar.
     $script:tipos136 = @(); $script:verPost136 = '0.0.18'
-    $script:local136 = 'C:\kit\vigente.msi'; $script:verLocal136 = '0.0.38'
+    $script:local136 = 'C:\kit\vigente.msi'; $script:verLocal136 = '0.0.41'
     $null = Update-FudoNativeFromLocal -Instalada '0.0.18'
     Assert-Eq 'S136 un local en la vigente se usa sin descargar' 'nativa.update_local' (@($script:tipos136) -join ',')
     # Con la .msi de Windows 7 no se descarga: no se sabe que version trae.
@@ -15355,7 +15584,7 @@ public class FudoFakeEndpoint {
     # Con la vigente ya instalada no se descarga nada.
     function Get-NativeInstallerUrl { 'https://ejemplo.invalid/fudo_native_app.exe' }
     $script:tipos136 = @()
-    $null = Update-FudoNativeFromLocal -Instalada '0.0.38'
+    $null = Update-FudoNativeFromLocal -Instalada '0.0.41'
     Assert-Eq 'S136 con la vigente instalada no se descarga nada' '' (@($script:tipos136) -join ',')
     # La funcion de descarga comun tambien se niega en el self-test.
     $e136 = ''
@@ -16052,7 +16281,7 @@ public class FudoFakeEndpoint {
     $m147 = (Get-Command Invoke-FudoPrintDoctor).ScriptBlock.ToString()
     Assert-Eq 'S147 el modo Nativa revisa solo la Nativa y pregunta que sigue' $true ([bool]($m147 -match "(?s)RunMode -eq 'Nativa'\).*layer0b\.soloNativa.*Request-SeguirConImpresoras"))
     Assert-Eq 'S147 las impresoras no corren en modo Nativa' $true ([bool](($script:ModosPuntuales -contains 'Nativa') -and ($m147 -match "ModosPuntuales -notcontains \[string\]\`$script:RunMode\) \{\s*# v3\.32: lo mas rapido primero")))
-    Assert-Eq 'S147 si se sigue, la Nativa no se revisa dos veces' $true ([bool]($m147 -match "if \(-not \`$script:NativaRevisada\) \{\s*\`$null = Invoke-Step -Name 'layer0b\.nativeApp'"))
+    Assert-Eq 'S147 si se sigue, la Nativa no se revisa dos veces' $true ([bool]($m147 -match "if \(-not \`$script:NativaRevisada\) \{[\s\S]{0,700}?\`$null = Invoke-Step -Name 'layer0b\.nativeApp'"))
     Assert-Eq 'S147 ni los pasos finales que leen colas' $true ([bool]($m147 -match "AbortByMode -and \`$script:ModosPuntuales -notcontains \[string\]\`$script:RunMode\) \{\s*\`$null = Invoke-Step -Name 'final\.rescan'"))
     # Los textos del menu van por la interfaz, con el sugerido ya escrito.
     $script:nombre147 = 'COCINA'
@@ -16514,6 +16743,7 @@ public class FudoFakeEndpoint {
     Reset-State
     $script:RunMode = 'BuscarRed'
     function Find-NetworkPrinters { param($Prefix, $TcpPort, $WaitMs) @() }
+    function Test-ForeignSubnetPrinters { param($TcpPort, $MaxSubredes) $false }
     Invoke-HerramientaBuscarRed
     Assert-Eq 'S154c si no contesta nada, lo dice' 'warn' ([string](Get-CheckById 'red.busqueda').status)
     Assert-Eq 'S154c y como sacar la IP' $true ([bool]([string](Get-CheckById 'red.busqueda').recommendation -match 'FEED'))
@@ -16863,6 +17093,152 @@ public class FudoFakeEndpoint {
     Assert-Eq 'S157 con las dos, gana la del perfil' 'perfil' ([string]$f157c.origen)
     Assert-Eq 'S157 la carpeta de la app del navegador no se mira' '' ([string]$f157d.exe)
     Assert-Eq 'S157 la carpeta del registro si, aunque venga entre comillas' (Join-Path $tmp157 'otra\fudo_native_extension.exe') ([string]$f157e.exe)
+
+    # S158 (v3.47): lo que pidieron los asesores en el canal (Facundo, Franco, Ivan, Fernando).
+    # (a) Las preguntas que se pueden saltear esperan 2 minutos, y sin respuesta no es "prefirio".
+    Reset-State
+    Reset-Mocks
+    function Test-HayHumano { $true }
+    function Test-UiWeb { $true }
+    function Get-SesionInteractiva { [ordered]@{ usuarioMotor='ana'; usuarioSesion='ana'; otroPerfil=$false } }
+    function Get-NavegadoresParaExtension { @() }
+    $script:to158 = @{}
+    function Request-UiAnswer { param($Id, $Titulo, $Texto, $Texto2, $Opciones, $Clase, $Extra, $TimeoutSec, $ErrorPrevio, [switch]$SoloAsesor)
+        $script:to158[[string]$Id] = [int]$TimeoutSec; $null }
+    $o158 = Open-FudoExtensionPage
+    Assert-Eq 'S158a abrir la extension espera 2 minutos, no 15' 120 ([int]$script:to158['abrirExtension'])
+    Assert-Eq 'S158a y sin respuesta no dice que el asesor prefirio no abrirla' 'nadie contesto la pregunta' ([string]$o158.motivo)
+    $script:TipoCuentaFudo = ''
+    $null = Get-TipoCuentaFudo
+    $script:TipoCuentaFudo = ''
+    Assert-Eq 'S158a el tipo de cuenta tambien' 120 ([int]$script:to158['cuentaFudo'])
+    $null = Request-SeguirConImpresoras
+    Assert-Eq 'S158a y que hacemos despues de la Nativa' 120 ([int]$script:to158['despuesNativa'])
+    Reset-Mocks
+
+    # (b) Descargas: se corta cuando deja de avanzar, y eso se reintenta.
+    $v158 = Get-VeredictoDescarga -Bytes (40MB) -Esperado (107MB) -ErrorPrevio 'la descarga no avanzo en 60 segundos y se corto'
+    Assert-Eq 'S158b una descarga trabada a mitad de camino se reintenta' $true ([bool]$v158.cortada)
+    Assert-Eq 'S158b una que no bajo nada, no' $false ([bool](Get-VeredictoDescarga -Bytes 0 -Esperado (107MB) -ErrorPrevio 'la descarga no avanzo en 60 segundos y se corto').cortada)
+    function Start-Sleep { param($Seconds, $Milliseconds) }
+    function Write-StepDetail { param($Texto) }
+    function New-Object { param($TypeName, $ArgumentList)
+        [pscustomobject]@{ IsBusy = $true } |
+            Add-Member -MemberType ScriptMethod -Name DownloadFileAsync -Value { param($u, $d) } -PassThru |
+            Add-Member -MemberType ScriptMethod -Name CancelAsync -Value { } -PassThru |
+            Add-Member -MemberType ScriptMethod -Name Dispose -Value { } -PassThru }
+    function Get-Item { param($Path, $ErrorAction) [pscustomobject]@{ Length = [long]5MB } }
+    $d158 = Get-FileWithProgress -Url 'https://x/y.exe' -Destino 'C:\tmp\y.exe' -TimeoutSec 30 -SinAvanceSec 1 -Que 'la App Nativa'
+    Assert-Eq 'S158b una descarga quieta se corta sin esperar el tope' $true ([bool]([string]$d158.error -match 'no avanzo en 1 segundos'))
+    Assert-Eq 'S158b y queda para reintentar' $true ([bool]$d158.cortada)
+    Reset-Mocks
+
+    # (c) La version que se recomienda es la que se descarga.
+    function Test-EsWindowsViejo { $false }
+    $script:TipoCuentaFudo = ''
+    Assert-Eq 'S158c la recomendada es la de las cuentas v1' '0.0.41' (Get-NativaVersionRecomendada)
+    Assert-Eq 'S158c un instalador 0.0.38 olvidado ya no pasa por vigente' $true ([bool](Test-InstaladorLocalViejo -Version '0.0.38'))
+    $script:TipoCuentaFudo = 'v2'
+    Assert-Eq 'S158c y para las v2, la de las v2' '0.0.43' (Get-NativaVersionRecomendada)
+    $script:TipoCuentaFudo = ''
+    Reset-Mocks
+
+    # (d) Red: manda la IP anotada en el puerto, y la IP de otra cola no es "la nueva IP".
+    function Get-PrinterPort { param($Name, $ErrorAction)
+        @([pscustomobject]@{ Name = 'COCINA_RED'; PrinterHostAddress = '192.168.0.80' }, [pscustomobject]@{ Name = 'USB001'; PrinterHostAddress = '' }) }
+    Assert-Eq 'S158d un puerto de red con nombre propio es Ethernet' 'Ethernet' (Get-DetectedInterface -Printer ([pscustomobject]@{ Name = 'COCINA'; PortName = 'COCINA_RED' }))
+    Assert-Eq 'S158d y la IP sale del puerto, no del nombre' '192.168.0.80' (Get-PuertoIp -Puerto 'COCINA_RED')
+    Assert-Eq 'S158d un USB sigue siendo USB' 'USB' (Get-DetectedInterface -Printer ([pscustomobject]@{ Name = 'CAJA'; PortName = 'USB001' }))
+    Assert-Eq 'S158d un puerto que Windows no conoce tampoco cambia' 'USB' (Get-DetectedInterface -Printer ([pscustomobject]@{ Name = 'X'; PortName = 'COM1:' }))
+    function Get-InstalledNetworkPrinters { @([ordered]@{ ip = '192.168.0.60'; colas = @('BARRA') }, [ordered]@{ ip = '192.168.0.50'; colas = @('COCINA') }) }
+    $s158 = Split-IpsDeOtrasColas -Ips @('192.168.0.60', '192.168.0.77') -IpPropia '192.168.0.50'
+    Assert-Eq 'S158d la IP de otra cola no es candidata' '192.168.0.77' (@($s158.libres) -join ',')
+    Assert-Eq 'S158d y queda anotada aparte' '192.168.0.60' (@($s158.deOtras) -join ',')
+    Reset-Mocks
+
+    # (e) El ticket dice de que cola salio, y se puede contestar que salio en otra impresora.
+    $t158 = Get-EscPosTestTicket -Caption (Get-TicketCaption 'hw') -Cola ('Cocina ' + [char]0x00D1 + 'and' + [char]0x00FA) -Puerto 'USB001'
+    Assert-Eq 'S158e el ticket dice de que cola salio, sin tildes' $true ([bool]($t158 -match 'Cola: Cocina Nandu' -and $t158 -match 'Puerto: USB001'))
+    function Test-HayHumano { $true }
+    function Test-UiWeb { $true }
+    $script:ops158 = @()
+    function Request-UiAnswer { param($Id, $Titulo, $Texto, $Texto2, $Opciones, $Clase, $Extra, $TimeoutSec, $ErrorPrevio, [switch]$SoloAsesor)
+        if ($Id -eq 'papel') { $script:ops158 = @($Opciones | ForEach-Object { [string]$_.v }); return 'otra' }
+        $null }
+    Assert-Eq 'S158e se puede contestar que salio en otra' 'otra' ([string](Confirm-PaperCameOut -Printer 'COCINA' -OfrecerOtra))
+    Assert-Eq 'S158e la opcion esta' $true (@($script:ops158) -contains 'otra')
+    $null = Confirm-PaperCameOut -Printer 'COCINA'
+    Assert-Eq 'S158e sin pedirla no se ofrece' $false (@($script:ops158) -contains 'otra')
+    Assert-Eq 'S158e la prueba de papel la ofrece' $true ([bool]((Get-Command Test-Layer4-HardwarePrint).ScriptBlock.ToString() -match 'Confirm-PaperCameOut -Printer \$Printer\.Name -OfrecerOtra'))
+    Reset-Mocks
+
+    # (f) En USB / Red la Nativa se mira rapido, y a fondo solo si salio el papel y se pide.
+    Reset-State
+    function Find-FudoNativeInstall { [ordered]@{ enDisco = $true; exe = 'C:\x\fudo_native_extension.exe'; ubicacion = 'perfil'; regInfo = @() } }
+    function Get-NativaVersionState { param($Install) @{ version = '0.0.41'; firmada = $true } }
+    function Test-HayHumano { $true }
+    function Test-UiWeb { $true }
+    $script:afondo158 = 0
+    function Test-Layer0b-NativeApp { $script:afondo158++ }
+    $script:preg158 = @(); $script:resp158 = 'si'
+    function Request-UiAnswer { param($Id, $Titulo, $Texto, $Texto2, $Opciones, $Clase, $Extra, $TimeoutSec, $ErrorPrevio, [switch]$SoloAsesor)
+        $script:preg158 += [string]$Id
+        if ($Id -eq 'revisarNativa') { return $script:resp158 }
+        $null }
+    Test-NativaRapida
+    Assert-Eq 'S158f sin papel no se pregunta' 0 (@($script:preg158).Count)
+    Assert-Eq 'S158f ni se revisa a fondo' 0 ([int]$script:afondo158)
+    Assert-Eq 'S158f queda la lectura rapida, con la version' $true ([bool]([string](Get-CheckById 'nativa.rapida').name -match '0\.0\.41'))
+    Reset-State
+    Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Salio el papel' -Status 'ok' -Plane 'hardware'
+    Test-NativaRapida
+    Assert-Eq 'S158f con papel se pregunta' 'revisarNativa' (@($script:preg158) -join ',')
+    Assert-Eq 'S158f y con el si se revisa a fondo' 1 ([int]$script:afondo158)
+    Assert-Eq 'S158f sin la lectura rapida encima' $true ([bool]($null -eq (Get-CheckById 'nativa.rapida')))
+    Reset-State
+    Add-Check -Id 'hw.testprint' -Layer 4 -Name 'Salio el papel' -Status 'ok' -Plane 'hardware'
+    $script:resp158 = $null
+    Test-NativaRapida
+    Assert-Eq 'S158f sin respuesta no se revisa a fondo' 1 ([int]$script:afondo158)
+    $m158 = (Get-Command Invoke-FudoPrintDoctor).ScriptBlock.ToString()
+    Assert-Eq 'S158f en USB y Red corre la lectura rapida' $true ([bool]($m158 -match "layer0b\.nativaRapida"))
+    Reset-Mocks
+
+    # (g) Identificar impresoras: un ticket con su nombre a cada cola real.
+    Reset-State
+    $script:RunMode = 'Identificar'
+    function Get-Printer { param($Name, $ErrorAction)
+        @([pscustomobject]@{ Name = 'COCINA'; PortName = 'USB001'; DriverName = 'Generic / Text Only' },
+          [pscustomobject]@{ Name = 'BARRA'; PortName = 'IP_192.168.0.60'; DriverName = 'Generic / Text Only' },
+          [pscustomobject]@{ Name = 'Microsoft Print to PDF'; PortName = 'PORTPROMPT:'; DriverName = 'Microsoft Print To PDF' }) }
+    $script:tk158 = @()
+    function Send-TicketIdentificacion { param($Cola, $Puerto) $script:tk158 += ([string]$Cola + '@' + [string]$Puerto); ([string]$Cola -ne 'BARRA') }
+    Invoke-HerramientaIdentificar
+    Assert-Eq 'S158g se manda un ticket a cada impresora real' 'COCINA@USB001,BARRA@IP_192.168.0.60' (@($script:tk158) -join ',')
+    $c158 = Get-CheckById 'printer.identificar'
+    Assert-Eq 'S158g y dice a cual no se pudo' $true ([bool]([string]$c158.recommendation -match "No se pudo mandar a: 'BARRA'"))
+    Assert-Eq 'S158g queda a la vista' 'warn' ([string]$c158.status)
+    Assert-Eq 'S158g es una herramienta' $true ([bool](($script:ModosHerramienta -contains 'Identificar') -and ($script:ModosPuntuales -contains 'Identificar')))
+    Assert-Eq 'S158g y se ofrece' $true (@(Get-HerramientasSoporte | ForEach-Object { [string]$_.v }) -contains 'Identificar')
+    Assert-Eq 'S158g y corre su paso' $true ([bool]($m158 -match "herramienta\.identificar"))
+    $script:RunMode = 'Ambos'
+    Reset-Mocks
+
+    # (h) Buscar en la red: si no aparece nada, se sigue buscando en las otras redes.
+    Reset-State
+    $script:RunMode = 'BuscarRed'
+    function Test-UiWeb { $true }
+    function Test-HayHumano { $true }
+    function Get-LocalSubnetPrefixes { @('192.168.0') }
+    function Find-NetworkPrinters { param($Prefix, $TcpPort, $WaitMs) @() }
+    function Get-InstalledNetworkPrinters { @() }
+    $script:fs158 = 0
+    function Test-ForeignSubnetPrinters { param($TcpPort, $MaxSubredes) $script:fs158++; $true }
+    Invoke-HerramientaBuscarRed
+    Assert-Eq 'S158h sin nada en esta red se busca en las otras' 1 ([int]$script:fs158)
+    Assert-Eq 'S158h y si aparece alla, esta deja de ser la causa' $false ([bool](Get-CheckById 'red.busqueda').rootCauseCandidate)
+    $script:RunMode = 'Ambos'
+    Reset-Mocks
 
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)
     # Salida explicita en los dos casos: si el script termina con 'return', $LASTEXITCODE
@@ -17527,7 +17903,7 @@ function Invoke-MenuAction {
             if (-not $nombre) { Write-Host '  No hay impresora objetivo para probar.' -ForegroundColor Yellow; return $false }
             try {
                 Initialize-RawPrinterHelper
-                $bytes = [System.Text.Encoding]::GetEncoding(437).GetBytes((Get-EscPosTestTicket -Caption (Get-TicketCaption 'manual')))
+                $bytes = [System.Text.Encoding]::GetEncoding(437).GetBytes((Get-EscPosTestTicket -Caption (Get-TicketCaption 'manual') -Cola $nombre))
                 $ok = [FudoRawPrinter]::SendBytes($nombre, $bytes)
                 if (-not $ok) { Write-Host '  No se pudo enviar el ticket (el spooler lo rechazo).' -ForegroundColor Red; return $false }
                 Write-Host '  Enviado. Esperando que salga de la cola...' -ForegroundColor DarkGray
@@ -17540,8 +17916,11 @@ function Invoke-MenuAction {
                     return $false
                 }
                 # Salio de la cola != salio papel. Preguntamos siempre: es la unica verificacion real.
-                $salio = Confirm-PaperCameOut -Printer $nombre
-                if ($salio -eq $true) {
+                $salio = Confirm-PaperCameOut -Printer $nombre -OfrecerOtra
+                if ([string]$salio -eq 'otra') {
+                    Write-Host '  Salio en otra impresora: esta cola apunta a otra impresora del local.' -ForegroundColor Yellow
+                    Write-Host '  Usar la herramienta "Identificar impresoras" para ver cual es cual.' -ForegroundColor DarkGray
+                } elseif ($salio -eq $true) {
                     Write-Host '  Confirmado: el hardware imprime. Si la comanda no sale, el problema es la config de Fudo (area/cocina/sala/categorias).' -ForegroundColor Green
                 } elseif ($salio -eq $false) {
                     Write-Host '  El spooler lo dio por impreso pero no salio papel: no es Windows ni la cola.' -ForegroundColor Red
@@ -17817,7 +18196,7 @@ function Confirm-TelemetriaConfigurada {
     $texto2 = ('Pedi el FudoPrintDoctor.cmd interno en #fudo-print-doctor y reemplaza el que tenes en tu carpeta. ' +
                'Se arregla una vez y sirve para todos los casos.')
     if (Test-UiWeb) {
-        $null = Request-UiAnswer -Id 'sinTelemetria' -Clase 'confirm' -SoloAsesor -Titulo $titulo -Texto $texto -Texto2 $texto2 `
+        $null = Request-UiAnswer -Id 'sinTelemetria' -Clase 'confirm' -SoloAsesor -TimeoutSec $script:UiTimeoutOpcional -Titulo $titulo -Texto $texto -Texto2 $texto2 `
             -Opciones @(@{ v = 'si'; l = 'Entendido, seguir'; principal = $true })
         return $true
     }
@@ -18068,13 +18447,15 @@ function Update-FudoNativeFromLocal {
     $urlEsExe = [bool]($url -and -not ([string]$url -match '(?i)\.msi(\?|$)'))
     $localNoSirve = ((-not $inst) -or (-not $verInst) -or (Test-InstaladorLocalViejo -Version $verInst))
     if ($urlEsExe -and $localNoSirve) {
-        $decD = Test-NativaNecesitaUpdate -Instalada $Instalada -Disponible $script:NativaVersionRecomendada
+        $decD = Test-NativaNecesitaUpdate -Instalada $Instalada -Disponible (Get-NativaVersionRecomendada)
         if ($decD.actualizar) {
             $porDescarga = Update-FudoNativeByDownload -Instalada $Instalada -Url $url -Motivo ([string]$decD.motivo)
-            # El local es el respaldo: solo si la descarga no subio la version y el local es mas
-            # nuevo que lo instalado (si no, Test-NativaNecesitaUpdate lo va a frenar abajo).
-            if ([bool]$porDescarga.subio -or -not $inst) { return $porDescarga }
-            Write-Host ("  La descarga no actualizo la Nativa: se prueba con el instalador de la PC (v$verInst).") -ForegroundColor Yellow
+            # v3.47: el local ya NO es el respaldo. Llegar aca quiere decir que es viejo o que no dice
+            # su version, y reinstalarlo cuando la descarga fallo no dejo la Nativa al dia ninguna vez.
+            if (-not [bool]$porDescarga.subio -and [string]$porDescarga.porQueNo) {
+                $porDescarga.porQueNo = ([string]$porDescarga.porQueNo + '. Bajarla a mano desde ' + [string]$url + ' y ejecutarla en esta PC')
+            }
+            return $porDescarga
         }
     }
     if (-not $inst) { return @{ aplicado = $false; subio = $false; intento = $false; motivo = 'no hay instalador de la Nativa en la PC' } }
@@ -18142,8 +18523,8 @@ function Update-FudoNativeByDownload {
     $salida = @{ code = $null }
     $huellaAntesU = $null
     try { $huellaAntesU = Get-NativaExeHuella -Install (Find-FudoNativeInstall) } catch {}
-    $rem = Invoke-Remediation -Description ('Actualizar la App Nativa a la ' + $script:NativaVersionRecomendada + ' descargando la vigente') `
-        -Type 'nativa.update_download' -Target 'FudoNativa' -Before $Instalada -After $script:NativaVersionRecomendada -Reversible $true -Fix {
+    $rem = Invoke-Remediation -Description ('Actualizar la App Nativa a la ' + (Get-NativaVersionRecomendada) + ' descargando la vigente') `
+        -Type 'nativa.update_download' -Target 'FudoNativa' -Before $Instalada -After (Get-NativaVersionRecomendada) -Reversible $true -Fix {
             $dl = Invoke-FudoNativeDownload -Url $Url
             $salida.code = $dl.code
             (@($dl.notas) -join ' | ')
@@ -18154,7 +18535,7 @@ function Update-FudoNativeByDownload {
     $trasU = $null
     if ($rem.applied) {
         # v3.32: esperar al registro, igual que al instalar (ver Get-NativaVersionTrasInstalar).
-        $trasU = Get-NativaVersionTrasInstalar -HuellaAntes $huellaAntesU -Esperada $script:NativaVersionRecomendada
+        $trasU = Get-NativaVersionTrasInstalar -HuellaAntes $huellaAntesU -Esperada (Get-NativaVersionRecomendada)
         $verDespues = [string]$trasU.version
     }
     $subio = $false
@@ -18170,7 +18551,7 @@ function Update-FudoNativeByDownload {
         )
     }
     return @{ aplicado = [bool]$rem.applied; subio = [bool]$subio; intento = [bool]$corrio; nota = [string]$rem.note
-              instalador = ('descarga: ' + [string]$Url); versionInstalador = [string]$script:NativaVersionRecomendada
+              instalador = ('descarga: ' + [string]$Url); versionInstalador = [string](Get-NativaVersionRecomendada)
               versionDespues = $verDespues; exitCode = $salida.code; porQueNo = $porQueNo; quedaSinFirmar = $false
               nativaCorriendo = $false; cerrados = @(); descargada = $true; motivo = $Motivo }
 }
@@ -18291,7 +18672,7 @@ function Get-TipoCuentaFudo {
     if ($param -in @('v1', 'v2', 'nose')) { $tipo = $param; $origen = 'parametro' }
     elseif (-not (Test-HayHumano)) { $origen = 'sin nadie a quien preguntarle' }
     elseif (Test-UiWeb) {
-        $r = Request-UiAnswer -Id 'cuentaFudo' -Clase 'modo' -SoloAsesor `
+        $r = Request-UiAnswer -Id 'cuentaFudo' -Clase 'modo' -SoloAsesor -TimeoutSec $script:UiTimeoutOpcional `
             -Titulo 'En Fudo, cuantos pasos tiene el asistente de instalar impresora?' `
             -Texto ('Mirarlo en la cuenta del cliente. 3 pasos (Extension, App Nativa, Impresora): la cuenta usa la extension. ' +
                     '2 pasos (App Nativa, Impresora): no la usa.') `
@@ -18353,7 +18734,7 @@ function Get-FileWithProgress {
 
       Devuelve @{ ok; bytes; segundos; error }.
     #>
-    param([string]$Url, [string]$Destino, [int]$TimeoutSec = 300, [string]$Que = 'el archivo')
+    param([string]$Url, [string]$Destino, [int]$TimeoutSec = 900, [string]$Que = 'el archivo', [int]$SinAvanceSec = 60)
 
     $r = [ordered]@{ ok = $false; bytes = 0; segundos = 0; error = '' }
     $t0 = Get-Date
@@ -18372,11 +18753,20 @@ function Get-FileWithProgress {
         $wc.DownloadFileAsync([Uri]$Url, $Destino)
         $limite = (Get-Date).AddSeconds($TimeoutSec)
         $ultimo = -1
+        # v3.47 (canal, Franco): el corte era por reloj -300 segundos- aunque la descarga siguiera
+        # avanzando, y una conexion lenta perdia los 107 MB cuando estaban por llegar. Ahora se corta
+        # cuando deja de avanzar (SinAvanceSec sin un byte nuevo); el reloj queda solo como tope.
+        $bytesAvance = [long]-1
+        $ultAvance = Get-Date
+        $trabada = $false
         while ($wc.IsBusy -and ((Get-Date) -lt $limite)) {
             Start-Sleep -Milliseconds 800
             if ($esperado -le 0) { try { $esperado = [long]$wc.ResponseHeaders['Content-Length'] } catch {} }
-            $mb = 0
-            try { $mb = [int]([math]::Floor((Get-Item $Destino -ErrorAction Stop).Length / 1MB)) } catch {}
+            $len = [long]0
+            try { $len = [long](Get-Item $Destino -ErrorAction Stop).Length } catch {}
+            if ($len -gt $bytesAvance) { $bytesAvance = $len; $ultAvance = Get-Date }
+            elseif (((Get-Date) - $ultAvance).TotalSeconds -ge $SinAvanceSec) { $trabada = $true; break }
+            $mb = [int]([math]::Floor($len / 1MB))
             if ($mb -ne $ultimo) {
                 $ultimo = $mb
                 Write-StepDetail ('descargando ' + $Que + ': ' + $mb + ' MB' + $(if ($esperado -gt 0) { ' de ' + [int]([math]::Ceiling($esperado / 1MB)) } else { '' }))
@@ -18384,7 +18774,8 @@ function Get-FileWithProgress {
         }
         if ($wc.IsBusy) {
             try { $wc.CancelAsync() } catch {}
-            $r.error = ('la descarga no termino en ' + $TimeoutSec + ' segundos y se corto')
+            $r.error = $(if ($trabada) { 'la descarga no avanzo en ' + $SinAvanceSec + ' segundos y se corto' }
+                         else { 'la descarga no termino en ' + $TimeoutSec + ' segundos y se corto' })
         }
         if ($esperado -le 0) { try { $esperado = [long]$wc.ResponseHeaders['Content-Length'] } catch {} }
         if ($conEvento) {
@@ -18432,7 +18823,8 @@ function Get-VeredictoDescarga {
     param([long]$Bytes, [long]$Esperado = 0, [string]$ErrorFin = '', [string]$ErrorPrevio = '')
     $mbB = [math]::Round($Bytes / 1MB, 1)
     $mbE = [math]::Round($Esperado / 1MB, 1)
-    if ($ErrorPrevio) { return @{ ok = $false; error = $ErrorPrevio; cortada = $false } }
+    # v3.47: una descarga que dejo de avanzar a mitad de camino se reintenta, igual que una cortada.
+    if ($ErrorPrevio) { return @{ ok = $false; error = $ErrorPrevio; cortada = [bool]($Bytes -gt 0 -and $ErrorPrevio -match 'no avanzo') } }
     if ($Bytes -le 0) { return @{ ok = $false; error = 'no se descargo nada (sin conexion, o la direccion no respondio)'; cortada = $false } }
     if ($Esperado -gt 0 -and $Bytes -lt $Esperado) {
         return @{ ok = $false; cortada = $true
@@ -18543,7 +18935,7 @@ function Invoke-FudoNativeDownload {
     $esMsi = ([string]$url -match '(?i)\.msi(\?|$)')
     $destino = Join-Path $env:TEMP ('FudoNativa-' + (Get-Date).ToString('yyyyMMddHHmmss') + $(if ($esMsi) { '.msi' } else { '.exe' }))
     Write-StepDetail 'descargando el instalador de la App Nativa'
-    $bajada = Get-FileWithProgress -Url $url -Destino $destino -TimeoutSec 300 -Que 'la App Nativa'
+    $bajada = Get-FileWithProgress -Url $url -Destino $destino -TimeoutSec 900 -Que 'la App Nativa'
     # v3.43: una descarga cortada a mitad de camino se reintenta una vez, desde cero. Las
     # cortadas de la telemetria eran de conexiones que se caen, no de un archivo roto.
     $reintentos = 0
@@ -18552,7 +18944,7 @@ function Invoke-FudoNativeDownload {
         $primerError = [string]$bajada.error
         Write-StepDetail ('la descarga se corto; reintentando una vez')
         try { Remove-Item $destino -Force -ErrorAction SilentlyContinue } catch {}
-        $bajada = Get-FileWithProgress -Url $url -Destino $destino -TimeoutSec 300 -Que 'la App Nativa'
+        $bajada = Get-FileWithProgress -Url $url -Destino $destino -TimeoutSec 900 -Que 'la App Nativa'
         if (-not [bool]$bajada.ok) { $bajada.error = ([string]$bajada.error + ' (y antes, ' + $primerError + ')') }
     }
     $script:Diagnostics['nativaDescarga'] = [ordered]@{
@@ -18562,7 +18954,7 @@ function Invoke-FudoNativeDownload {
     if (-not [bool]$bajada.ok) {
         if ([bool]$bajada.cortada) { try { Remove-Item $destino -Force -ErrorAction SilentlyContinue } catch {} }
         throw ('no se pudo descargar el instalador de la App Nativa: ' + [string]$bajada.error +
-               '. Probar de nuevo con mejor conexion, o pasarlo a mano y dejarlo al lado de FudoPrintDoctor.cmd.')
+               '. Probar de nuevo con mejor conexion, o bajarla a mano desde ' + [string]$url + ' y ejecutarla en esta PC.')
     }
     $notas += ('descarga: ' + [int]([long]$bajada.bytes / 1MB) + ' MB en ' + [int]$bajada.segundos + 's')
     # El antivirus se lleva el instalador MIENTRAS se descarga: en la telemetria hay 14
@@ -18608,6 +19000,7 @@ function Test-EsWindowsViejo {
 function Get-NativaVersionRecomendada {
     <# v3.32: la version de la Nativa que corresponde a ESTA PC (ver NativaVersionWindowsViejo). #>
     if (Test-EsWindowsViejo) { return [string]$script:NativaVersionWindowsViejo }
+    if ([string]$script:TipoCuentaFudo -eq 'v2') { return [string]$script:NativaVersionRecomendadaV2 }
     return [string]$script:NativaVersionRecomendada
 }
 
@@ -18819,7 +19212,7 @@ function Install-FudoNative {
             motivo = 'la descarga no llego a instalar la Nativa' }
     }
     $huellaAntes = Get-NativaExeHuella -Install $instAntes
-    $esperadaDescarga = $(if ([string]$url -match '(?i)\.msi(\?|$)') { '' } else { $script:NativaVersionRecomendada })
+    $esperadaDescarga = $(if ([string]$url -match '(?i)\.msi(\?|$)') { '' } else { (Get-NativaVersionRecomendada) })
     $resDescarga = (Invoke-Remediation -Description 'Descargar e instalar la App Nativa de Fudo' -Type 'nativa.install' -Target 'FudoNativa' `
         -Before 'no instalada' -After 'instalada' -Reversible $true -Fix {
             # v3.31: los pasos 1 a 4 viven en Invoke-FudoNativeDownload, que usa tambien la
@@ -18863,15 +19256,18 @@ function Install-FudoNative {
         $quedoDesc = $false
         try { if ($script:Diagnostics.Contains('nativaInstall')) { $quedoDesc = [bool]$script:Diagnostics['nativaInstall'].quedoInstalada } } catch {}
         if (-not $quedoDesc) {
-            Write-Host ("  La descarga no dejo la Nativa instalada: se prueba con el instalador de la PC (" + $(if ($localDescartado -eq 'sin version') { 'no declara version' } else { "v$localDescartado" }) + ').') -ForegroundColor Yellow
-            $resLocal = Install-FudoNative -SinDescarga
+            # v3.47 (canal, Franco): volver al instalador viejo de la PC cuando la descarga fallaba no
+            # dejo la Nativa funcionando ninguna de las 8 veces de la telemetria: era una version que
+            # el antivirus ya se habia comido. Ahora se corta y se dice de donde bajarla.
+            Write-Host ("  La descarga no dejo la Nativa instalada. El instalador que hay en la PC (" + $(if ($localDescartado -eq 'sin version') { 'no declara version' } else { "v$localDescartado" }) + ') no se usa: es una version vieja.') -ForegroundColor Yellow
+            Write-Host ('  Bajarla a mano desde ' + [string]$url + ' y ejecutarla en esta PC, o volver a correr con mejor conexion.') -ForegroundColor Yellow
             try {
                 if ($script:Diagnostics.Contains('nativaInstall')) {
                     $script:Diagnostics['nativaInstall']['descargaFallida'] = $true
                     $script:Diagnostics['nativaInstall']['localDescartado'] = $localDescartado
                 }
             } catch {}
-            return $resLocal
+            return $resDescarga
         }
         try { $script:Diagnostics['nativaInstall']['localDescartado'] = $localDescartado } catch {}
     }

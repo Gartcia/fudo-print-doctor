@@ -2,6 +2,58 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.47] - 2026-10-29
+
+Lo que pidieron los asesores en el canal, revisado contra el código y la telemetría.
+
+**Menos tiempo esperando una pregunta que nadie mira.** Facundo: corridas que quedaban 15
+minutos quietas. Eran las preguntas que se pueden saltear (abrir la página de la extensión, si ya
+se agregó, el tipo de cuenta, qué hacemos después de la Nativa, el aviso de copia sin reporte):
+todas esperaban 900 segundos. Ahora esperan 2 minutos. Cuando vence la de la extensión, la
+telemetría dice "nadie contestó la pregunta" y no "el asesor prefirió no abrirla", que contaba como
+decisión algo que nadie decidió. Leer quién está usando la PC (WMI) también tiene límite de tiempo.
+
+**Descargas de la Nativa que se cortaban por reloj.** Franco: con una conexión lenta, la descarga
+de 107 MB se cortaba a los 300 segundos aunque siguiera avanzando, y ese corte no se reintentaba.
+Ahora se corta cuando deja de avanzar (60 segundos sin un byte nuevo), con 15 minutos de tope. Un
+corte así se reintenta una vez, igual que una conexión caída.
+
+**Si la descarga falla, ya no se instala el instalador viejo de la PC.** Ese respaldo no dejó la
+Nativa funcionando ninguna de las 8 veces de la telemetría: era la misma versión que el antivirus
+ya se había comido. Ahora el motor corta y dice de dónde bajarla a mano. Si una persona eligió un
+instalador (`-NativeInstallerPath`), se sigue respetando.
+
+**La versión recomendada de la Nativa era la 0.0.38.** Desde la 3.45 se descarga la 0.0.41 (v1)
+o la 0.0.43 (v2), pero la vara seguía en 0.0.38: un instalador 0.0.38 a 0.0.40 olvidado en la PC
+pasaba por vigente y le ganaba a la descarga. Ahora la recomendada es la que se descarga, según el
+tipo de cuenta. El aviso de Nativa vieja (anterior a la 0.0.37) aclara que imprime igual (Iván
+Ruquet: "dan error pero imprimen").
+
+**Colas de red con nombre propio.** Iván: un puerto TCP/IP llamado, por ejemplo, "COCINA_RED" se
+trataba como USB, porque la interfaz y la IP se sacaban del nombre del puerto. Ahora se lee la IP
+que Windows tiene anotada en el puerto. Y cuando la impresora no contesta y se busca su "probable
+nueva IP", ya no se proponen las IPs de otras colas instaladas: con dos comanderas de red, la otra
+salía como candidata.
+
+**Colas cruzadas: la prueba "salía bien" en la impresora equivocada.** Fernando: el grupo "área mal
+asignada" es el de más mensajes por caso. El ticket de prueba ahora dice de qué cola salió y por
+qué puerto, y a "¿salió el ticket?" se le suma la respuesta "Salió en otra impresora", que queda
+como causa con los pasos para corregirlo.
+
+**Herramienta nueva: "Identificar impresoras".** Manda a cada impresora de Windows un ticket con el
+nombre de su cola en letra grande. Juntando los tickets en el local se ve cuál es cuál y se compara
+con lo que tiene cada área en Fudo. No limpia ni cambia nada.
+
+**"Revisar las impresoras USB / de red" ya no revisa la Nativa entera.** Facundo: la revisión
+completa de la Nativa (antivirus, extensión, instalar) sumaba más de un minuto a algo que no se
+pidió. Ahora se mira rápido si está y qué versión tiene. Si salió el papel, que es cuando la Nativa
+pasa a ser sospechosa, se pregunta "¿Revisamos también la App Nativa?". Queda en la telemetría
+como `nativa.rapida`, aparte de `nativa.installed`, para no mezclar las cuentas de "no instalada".
+
+**"Buscar impresoras en la red" no corta cuando no encuentra nada.** Sigue con la búsqueda en otras
+redes (la comandera con IP de fábrica en un local que reparte otra), con el mismo permiso de
+siempre. Es el grupo de casos peor resuelto (red del local, 38%).
+
 ## [3.46] - 2026-10-29
 
 **La App Nativa vieja figuraba como "no instalada".** Lo detectó Producto el 29/10 revisando a
