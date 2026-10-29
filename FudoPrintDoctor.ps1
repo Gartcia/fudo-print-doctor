@@ -525,7 +525,7 @@ $script:Producto    = 'Fudo'
 $script:PrefijoCola = 'FUDO-'
 $script:NombreCola  = 'Impresora Fudo'
 $script:ReglasTexto = @()
-$script:SchemaVersion = '3.45'
+$script:SchemaVersion = '3.46'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -3415,6 +3415,53 @@ function Get-FudoDataDirs {
     return @($d | Where-Object { $_ })
 }
 
+function Get-FudoNativeExeDirs {
+    <#
+      v3.46: donde puede estar el ejecutable de la Nativa, en orden de preferencia. Hasta la 3.45
+      se miraba solo %LOCALAPPDATA%\Fudo y %APPDATA%\Fudo, que es donde instala la .exe por
+      usuario. Hasta la 0.0.34 la Nativa venia en un .msi por maquina que la deja en
+      C:\Program Files (x86)\Fudo, y en esas PCs el motor decia "NO instalada (figura en el
+      registro pero no esta en disco)", culpaba al antivirus y la ponia como causa raiz, cuando
+      la Nativa estaba y el problema era otro. Lo detecto Producto el 29/10 revisando a mano los
+      casos de "la Nativa no esta instalada".
+      El perfil va primero: si hay dos, la .exe por usuario es la nueva y la que usa el navegador.
+    #>
+    param($RegInfo = @(), [string]$ExeDelManifest = '')
+    $d = @()
+    foreach ($c in @(Get-FudoDataDirs)) { $d += [ordered]@{ ruta = [string]$c; origen = 'perfil' } }
+    foreach ($pf in @(${env:ProgramFiles(x86)}, ${env:ProgramFiles})) {
+        if ($pf) { $d += [ordered]@{ ruta = (Join-Path $pf 'Fudo'); origen = 'programFiles' } }
+    }
+    foreach ($ri in @($RegInfo)) {
+        try {
+            if (-not $ri -or [bool]$ri.esPwa) { continue }
+            $loc = ([string]$ri.location).Trim().Trim('"').TrimEnd('\')
+            if ($loc) { $d += [ordered]@{ ruta = $loc; origen = 'registro' } }
+        } catch {}
+    }
+    if ($ExeDelManifest) {
+        try { $d += [ordered]@{ ruta = [string](Split-Path -Parent $ExeDelManifest); origen = 'manifest' } } catch {}
+    }
+    return @($d)
+}
+
+function Find-FudoNativeExe {
+    <# El primer fudo_native_extension que aparezca en las carpetas de Get-FudoNativeExeDirs. #>
+    param($Dirs = @())
+    foreach ($x in @($Dirs)) {
+        $c = ''
+        try { $c = [string]$x.ruta } catch {}
+        if (-not $c) { continue }
+        try { if (-not (Test-Path -LiteralPath $c)) { continue } } catch { continue }
+        try {
+            $hit = @(Get-ChildItem -LiteralPath $c -Filter 'fudo_native_extension*' -File -ErrorAction SilentlyContinue |
+                     Where-Object { $_.Extension -match '(?i)^(\.exe)?$' } | Select-Object -First 1)
+            if (@($hit).Count -gt 0) { return [ordered]@{ exe = [string]@($hit)[0].FullName; origen = [string]$x.origen } }
+        } catch {}
+    }
+    return [ordered]@{ exe = ''; origen = '' }
+}
+
 function Find-FudoNativeInstall {
     <#
       v3.19: hasta la 3.18 alcanzaba con una carpeta que matcheara 'Fudo*' o una entrada de
@@ -3425,7 +3472,8 @@ function Find-FudoNativeInstall {
       .msi para "no degradar" algo que ni siquiera era la Nativa: en esas PCs el motor no iba a
       instalar la Nativa nunca, por mas que el asesor trajera el instalador.
       El registro tambien queda huerfano cuando el antivirus se lleva los archivos.
-      La unica senal que no miente son los archivos: fudo_native_extension en %LOCALAPPDATA%\Fudo.
+      La unica senal que no miente son los archivos: fudo_native_extension en %LOCALAPPDATA%\Fudo,
+      o en Program Files si es el .msi viejo (v3.46, ver Get-FudoNativeExeDirs).
     #>
     Write-StepDetail 'buscando la instalacion de la App Nativa'
     $paths = @()
@@ -3465,24 +3513,24 @@ function Find-FudoNativeInstall {
     # Los archivos reales de la Nativa. El ejecutable es el que manda. Los manifests de native
     # messaging sirven para el registro del host, pero se reescriben en cada reinstalacion y el
     # binario no, asi que fechar la instalacion por los .json tambien miente.
-    $exe = ''
     $manifests = @()
     $carpeta = ''
     foreach ($c in @(Get-FudoDataDirs)) {
         try { if (-not (Test-Path $c)) { continue } } catch { continue }
         if (-not $carpeta) { $carpeta = $c }
-        if (-not $exe) {
-            try {
-                $hit = @(Get-ChildItem -Path $c -Filter 'fudo_native_extension*' -File -ErrorAction SilentlyContinue |
-                         Where-Object { $_.Extension -match '(?i)^(\.exe)?$' } | Select-Object -First 1)
-                if (@($hit).Count -gt 0) { $exe = [string]@($hit)[0].FullName }
-            } catch {}
-        }
         foreach ($m in @('do.fu.native_extension_chrome.json','do.fu.native_extension_firefox.json')) {
             $mp = Join-Path $c $m
             try { if (Test-Path $mp) { $manifests += $mp } } catch {}
         }
     }
+    $exeDelManifest = ''
+    try { $exeDelManifest = [string](Get-NativeMessagingState).exeDelManifest } catch {}
+    $hallado = Find-FudoNativeExe -Dirs (Get-FudoNativeExeDirs -RegInfo $regInfo -ExeDelManifest $exeDelManifest)
+    $exe = [string]$hallado.exe
+    $ubicacion = [string]$hallado.origen
+    # La carpeta es la que se recomienda excluir en el antivirus: si el ejecutable esta fuera
+    # del perfil, es la suya.
+    if ($exe -and $ubicacion -ne 'perfil') { try { $carpeta = [string](Split-Path -Parent $exe) } catch {} }
     # v3.31: que entrada del registro corresponde al ejecutable que hay en disco. Con dos Nativas
     # anotadas (un .msi viejo por maquina y la .exe nueva por usuario) es la unica forma de saber
     # cual de las dos versiones es la que de verdad esta instalada. Se resuelve aca y viaja como
@@ -3504,6 +3552,7 @@ function Find-FudoNativeInstall {
         paths        = @($paths | Where-Object { $_ } | Select-Object -Unique)
         regInfo      = $regInfo
         exe          = [string]$exe
+        ubicacion    = $ubicacion
         manifests    = @($manifests)
         carpeta      = [string]$carpeta
         enDisco      = [bool]$exe
@@ -4310,7 +4359,7 @@ function Test-Layer0b-NativeApp {
         Add-Check -Id 'nativa.installed' -Layer 0 -Name $(if($procRunning){'App Nativa de Fudo instalada y corriendo'}else{'App Nativa de Fudo instalada (no corre ahora: arranca con Fudo)'}) `
             -Status $(if($procRunning){'ok'}else{'warn'}) `
             -RootCauseCandidate $false -Informativo $true `
-            -Evidence @{ paths = $install.paths; reg = $install.regInfo; running = $procRunning } `
+            -Evidence @{ paths = $install.paths; reg = $install.regInfo; running = $procRunning; ubicacion = [string]$install.ubicacion } `
             -Recommendation $(if($procRunning){''}else{'Esta instalada y no corriendo. Es lo esperado si Fudo no esta abierto en el navegador: la levanta el navegador cuando hace falta. Si Fudo SI esta abierto en esta PC y aun asi no corre, revisar bloqueo del antivirus.'})
 
         # v3.31: dos Nativas anotadas en Windows (caso de un asesor del 26/09: 0.0.18 y 0.0.38,
@@ -16771,6 +16820,50 @@ public class FudoFakeEndpoint {
     Reset-Mocks
     Reset-State
 
+    # S157 (v3.46): la Nativa del .msi viejo (0.0.34 o anterior) vive en Program Files (x86)\Fudo.
+    # Producto encontro el 29/10 casos marcados "NO instalada" donde la Nativa estaba ahi.
+    $env157 = @{ la = $env:LOCALAPPDATA; ad = $env:APPDATA; pf = $env:ProgramFiles; pf86 = ${env:ProgramFiles(x86)} }
+    $tmp157 = Join-Path ([IO.Path]::GetTempPath()) ('fpd157-' + [guid]::NewGuid().ToString('N'))
+    $f157 = $null; $f157b = $null; $f157c = $null; $f157d = $null; $i157 = $null
+    try {
+        foreach ($sub in @('perfil\local', 'perfil\roaming', 'pf', 'pf86\Fudo', 'otra')) {
+            $null = New-Item -ItemType Directory -Force -Path (Join-Path $tmp157 $sub)
+        }
+        $env:LOCALAPPDATA = (Join-Path $tmp157 'perfil\local')
+        $env:APPDATA = (Join-Path $tmp157 'perfil\roaming')
+        $env:ProgramFiles = (Join-Path $tmp157 'pf')
+        ${env:ProgramFiles(x86)} = (Join-Path $tmp157 'pf86')
+        # (a) sin nada en ningun lado
+        $f157 = Find-FudoNativeExe -Dirs (Get-FudoNativeExeDirs)
+        # (b) solo el .msi viejo en Program Files (x86)
+        Set-Content -LiteralPath (Join-Path $tmp157 'pf86\Fudo\fudo_native_extension.exe') -Value 'x'
+        $f157b = Find-FudoNativeExe -Dirs (Get-FudoNativeExeDirs)
+        $i157 = Find-FudoNativeInstall
+        # (c) y ademas la .exe por usuario: gana la del perfil
+        $null = New-Item -ItemType Directory -Force -Path (Join-Path $tmp157 'perfil\local\Fudo')
+        Set-Content -LiteralPath (Join-Path $tmp157 'perfil\local\Fudo\fudo_native_extension.exe') -Value 'xx'
+        $f157c = Find-FudoNativeExe -Dirs (Get-FudoNativeExeDirs)
+        # (d) una carpeta que solo conoce el registro; la app del navegador no cuenta
+        Set-Content -LiteralPath (Join-Path $tmp157 'otra\fudo_native_extension.exe') -Value 'x'
+        $f157d = Find-FudoNativeExe -Dirs @(Get-FudoNativeExeDirs -RegInfo @(
+                     [ordered]@{ location = (Join-Path $tmp157 'otra'); esPwa = $true }) | Where-Object { $_.origen -eq 'registro' })
+        $f157e = Find-FudoNativeExe -Dirs @(Get-FudoNativeExeDirs -RegInfo @(
+                     [ordered]@{ location = ('"' + (Join-Path $tmp157 'otra') + '\"'); esPwa = $false }) | Where-Object { $_.origen -eq 'registro' })
+    } finally {
+        $env:LOCALAPPDATA = $env157.la; $env:APPDATA = $env157.ad
+        $env:ProgramFiles = $env157.pf; ${env:ProgramFiles(x86)} = $env157.pf86
+        Remove-Item -LiteralPath $tmp157 -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Assert-Eq 'S157 sin Nativa en ningun lado no encuentra nada' '' ([string]$f157.exe)
+    Assert-Eq 'S157 la Nativa del .msi viejo en Program Files (x86) se encuentra' (Join-Path $tmp157 'pf86\Fudo\fudo_native_extension.exe') ([string]$f157b.exe)
+    Assert-Eq 'S157 y se sabe que esta en Program Files' 'programFiles' ([string]$f157b.origen)
+    Assert-Eq 'S157 con eso la Nativa cuenta como instalada' $true ([bool]$i157.enDisco)
+    Assert-Eq 'S157 y no como solo registro' $false ([bool]$i157.soloRegistro)
+    Assert-Eq 'S157 la carpeta a excluir es la de Program Files' (Join-Path $tmp157 'pf86\Fudo') ([string]$i157.carpeta)
+    Assert-Eq 'S157 con las dos, gana la del perfil' 'perfil' ([string]$f157c.origen)
+    Assert-Eq 'S157 la carpeta de la app del navegador no se mira' '' ([string]$f157d.exe)
+    Assert-Eq 'S157 la carpeta del registro si, aunque venga entre comillas' (Join-Path $tmp157 'otra\fudo_native_extension.exe') ([string]$f157e.exe)
+
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)
     # Salida explicita en los dos casos: si el script termina con 'return', $LASTEXITCODE
     # queda sin definir y cualquier automatizacion lo interpreta como fallo.
@@ -17912,6 +18005,11 @@ function Invoke-NativeInstallerFile {
         # la 3.24 no molestaba porque el motor no instalaba solo y lo que llegaba era .msi.
         # La regla del proyecto aplicada a la espera: lo que importa no es que el instalador
         # termine, es que la Nativa QUEDE EN DISCO. En cuanto aparece, se sigue.
+        # v3.46: no alcanza con que haya un ejecutable en disco, tiene que ser uno NUEVO. Con el
+        # .msi viejo en Program Files ya hay uno antes de empezar, y el motor dejaba de esperar
+        # en el primer vistazo.
+        $huellaPrevia = @{ existe = $false; tam = 0; fecha = '' }
+        try { $huellaPrevia = Get-NativaExeHuella -Install (Find-FudoNativeInstall) } catch {}
         $pr = $(if ($ExtraArgs) { Start-Process -FilePath $Path -ArgumentList $ExtraArgs -PassThru -ErrorAction Stop }
                 else            { Start-Process -FilePath $Path -PassThru -ErrorAction Stop })
         $limite = (Get-Date).AddSeconds($TimeoutSec)
@@ -17920,7 +18018,10 @@ function Invoke-NativeInstallerFile {
             try { $salio = [bool]$pr.HasExited } catch { $salio = $true }
             if ($salio) { break }
             $ya = $false
-            try { $ya = [bool](Find-FudoNativeInstall).enDisco } catch {}
+            try {
+                $h = Get-NativaExeHuella -Install (Find-FudoNativeInstall)
+                $ya = [bool]$h.existe -and ((-not [bool]$huellaPrevia.existe) -or ([long]$h.tam -ne [long]$huellaPrevia.tam) -or ([string]$h.fecha -ne [string]$huellaPrevia.fecha))
+            } catch {}
             if ($ya) {
                 # Quedo instalada y el instalador sigue abierto (tipicamente porque levanto la
                 # app). No hay nada mas que esperar y no hay que matarle nada al cliente.

@@ -2,6 +2,30 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.46] - 2026-10-29
+
+**La App Nativa vieja figuraba como "no instalada".** Lo detectó Producto el 29/10 revisando a
+mano los 314 casos de "la Nativa no está instalada": en muchos el problema real era otro (puerto
+USB, red del local, áreas mal asignadas, la impresora en sí). Hasta la 0.0.34 la Nativa venía en
+un `.msi` que la instala en `C:\Program Files (x86)\Fudo`, y el motor buscaba el ejecutable
+solo en `%LOCALAPPDATA%\Fudo` y `%APPDATA%\Fudo`. En esas PCs no lo encontraba, decía "NO
+instalada (figura en el registro pero no está en disco)", le echaba la culpa al antivirus y la
+ponía como causa raíz, tapando el problema de verdad. Después instalaba la nueva encima.
+
+Ahora el ejecutable se busca también en `Program Files (x86)\Fudo`, `Program Files\Fudo`, en la
+carpeta que anota el registro de Windows (salvo la de la app del navegador) y en la que apunta el
+registro del navegador. Si hay dos, gana la del perfil del usuario, que es la nueva. Una Nativa
+0.0.34 encontrada así ya no es "no instalada": entra por el camino de "instalada pero vieja / sin
+firmar", que es el diagnóstico correcto. Dónde se encontró viaja en la telemetría
+(`ubicacion`: perfil, programFiles, registro o manifest) y la carpeta que se recomienda excluir
+en el antivirus pasa a ser la del ejecutable.
+
+Al instalar, el motor ahora espera a que el ejecutable **cambie**, no a que exista: con el `.msi`
+viejo en Program Files ya existía antes de empezar y dejaba de esperar en el primer vistazo.
+
+Las corridas viejas siguen diciendo "NO instalada". Para separarlas en la planilla: `soloRegistro`
+en true y la entrada del registro con la ubicación en Program Files.
+
 ## [3.45] - 2026-10-27
 
 **La extensión de Fudo ya no se empuja en las cuentas que no la usan.** Producto avisó el 22 y el
