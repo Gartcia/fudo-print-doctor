@@ -569,6 +569,8 @@ $script:UiTimeout  = 900
 # 15 minutos de UiTimeout. Con nadie mirando, cinco corridas quedaron 15 minutos quietas en una
 # pregunta que no frenaba nada.
 $script:UiTimeoutOpcional = 120
+# v3.47: una persona eligio "Dar por cerrado el caso" (ver Request-SeguirConImpresoras).
+$script:CerrarCaso = $false
 # v3.40: cuanto se espera a que la ventana del diagnostico pida su primera actualizacion antes
 # de reabrirla, y despues antes de pasar a la consola. Ver Confirm-UiCargo.
 $script:UiPrimerPollSec = 20
@@ -2785,7 +2787,14 @@ function Request-SeguirConImpresoras {
                  elseif (@($reparadas).Count -gt 0) { 'Listo: ' + (@($reparadas | ForEach-Object { [string]$_.name }) -join '; ') + '.' }
                  else { 'La App Nativa esta instalada y registrada en el navegador: el problema no parece estar ahi.' })
     $sugiereCerrar = (@($fallas).Count -eq 0 -and @($reparadas).Count -gt 0)
+    # v3.47: algo de la Nativa que quedo para mirar (una version vieja que no se pudo subir) no
+    # puede salir como "el problema no parece estar ahi".
+    $avisos = @($script:Checks | Where-Object { $_.status -eq 'warn' -and [string]$_.id -eq 'nativa.sinFirmar' })
+    if (@($fallas).Count -eq 0 -and @($reparadas).Count -eq 0 -and @($avisos).Count -gt 0) {
+        $resumen = ('Quedo algo para mirar: ' + [string]@($avisos)[0].name + '.')
+    }
     $r = $null
+    $eligioCerrar = $false
     if (Test-UiWeb) {
         $r = Request-UiAnswer -Id 'despuesNativa' -Clase 'modo' -SoloAsesor -TimeoutSec $script:UiTimeoutOpcional `
             -Titulo 'Que hacemos ahora?' -Texto $resumen `
@@ -2793,14 +2802,20 @@ function Request-SeguirConImpresoras {
             -Opciones @(
                 @{ v = 'impresoras'; l = 'Seguir revisando las impresoras'; detalle = 'Colas, puertos y prueba de papel'; principal = (-not $sugiereCerrar) },
                 @{ v = 'cerrar'; l = 'Dar por cerrado el caso'; detalle = 'Terminar aca'; principal = $sugiereCerrar })
+        $eligioCerrar = ([string]$r -eq 'cerrar')
     } else {
         Write-Host ''
         Write-Host ('  ' + $resumen) -ForegroundColor $(if (@($fallas).Count -gt 0) { 'Yellow' } else { 'Green' })
         $ans = Read-DoctorLine -Prompt '  Seguimos con las impresoras? (s = si / Enter = dar por cerrado el caso)'
         if ($null -ne $ans -and [string]$ans -match '(?i)^\s*(s|si|y|yes)\s*$') { $r = 'impresoras' } else { $r = 'cerrar' }
+        $eligioCerrar = ($null -ne $ans -and $r -eq 'cerrar')
     }
     $sigue = ([string]$r -eq 'impresoras')
     $script:Diagnostics['despuesNativa'] = $(if ($sigue) { 'impresoras' } else { 'cerrar' })
+    # v3.47 (canal, Mari, 02/11): "Dar por cerrado el caso" no cerraba nada. Despues venia el menu
+    # final, con el mismo titulo "Que hacemos ahora?", y parecia que el clic no habia andado. Si
+    # una persona eligio cerrar, se termina sin menu. Si la pregunta vencio, el menu sigue.
+    $script:CerrarCaso = [bool]$eligioCerrar
     return $sigue
 }
 
@@ -4498,10 +4513,21 @@ function Test-Layer0b-NativeApp {
         if ((Test-EsWindowsViejo) -and [string]$verState.version) {
             try { $winViejoOk = ([version][string]$verState.version -ge [version](Get-NativaVersionRecomendada)) } catch {}
         }
+        # v3.47 (canal, Mari, 02/11): una Nativa 0.0.38 salia "OK" por estar firmada, y Fudo daba
+        # "la revision de tus impresoras tardo demasiado" hasta instalarle la ultima. Estar firmada
+        # alcanzaba para el antivirus, no para imprimir: una firmada anterior a la recomendada va
+        # por el mismo camino que una sin firmar (se descarga e instala la vigente).
+        $viejaFirmada = $false
+        if (-not $winViejoOk -and $verState.firmada -eq $true -and [string]$verState.version -and -not (Test-EsWindowsViejo)) {
+            # El piso es la 0.0.41 tambien en las cuentas v2: anda en los dos canales (ver Get-TipoCuentaFudo),
+            # y compararla con la 0.0.43 obligaria a preguntar el tipo de cuenta para nada.
+            try { $viejaFirmada = ([version][string]$verState.version -lt [version]$script:NativaVersionRecomendada) } catch {}
+        }
+        $script:Diagnostics['nativaViejaFirmada'] = [bool]$viejaFirmada
         if ($winViejoOk) {
             Add-Check -Id 'nativa.sinFirmar' -Layer 0 -Name ("App Nativa v$($verState.version): la version que corresponde a este Windows") -Status 'ok' -Plane 'fudo_config' `
                 -Evidence @{ version = $verState.version; recomendadaParaEsteWindows = (Get-NativaVersionRecomendada); windowsViejo = $true }
-        } elseif ($verState.firmada -eq $false) {
+        } elseif ($verState.firmada -eq $false -or $viejaFirmada) {
             # v3.14: hasta la 3.13 esto solo AVISABA. Con la Nativa 0.0.18 en 10 de 24 corridas
             # del 03/09 y solo 6 en la 0.0.37, avisar no alcanzaba: si hay un instalador en la
             # PC (al lado del script, tipicamente el .msi de la version vigente) y declara una
@@ -4560,7 +4586,8 @@ function Test-Layer0b-NativeApp {
                                  intentoUpdate = [string]$up.motivo; instalador = [string]$up.instalador
                                  versionInstalador = [string]$up.versionInstalador } `
                     -ArticleRef 'https://soporte.fu.do/es/articles/16419361' `
-                    -Recommendation ("Esta PC tiene la Nativa v$($verState.version). Imprime igual: no es lo que impide que salga la comanda. La version vigente es la v$((Get-NativaVersionRecomendada)), " +
+                    -Recommendation ("Esta PC tiene la Nativa v$($verState.version). La version vigente es la v$((Get-NativaVersionRecomendada)), " +
+                                     $(if ($viejaFirmada) { 'y con versiones anteriores Fudo puede quedarse sin ver las impresoras ("la revision de tus impresoras tardo demasiado"), aunque esten firmadas. ' } else { '' }) +
                                      'que es la que mejor se porta con Windows Defender. Con antivirus de terceros no alcanza: hay casos de Avast comiendose la v0.0.38 igual. ' +
                                      'Estar firmada (desde la v' + $script:NativaVersionFirmada + ') reduce los bloqueos ' +
                                      'pero no los elimina, asi que subir de version es la solucion de fondo: evita tener que agregar exclusiones en cada PC. ' +
@@ -14243,7 +14270,7 @@ public class FudoFakeEndpoint {
     Reset-State
     function Find-FudoNativeInstall { [ordered]@{ paths=@('C:\x'); regInfo=@([ordered]@{ version='0.0.37'; esPwa=$false })
                                                   exe='C:\x\fudo_native_extension.exe'; enDisco=$true } }
-    function Get-NativaVersionState { param($Install) [ordered]@{ version='0.0.37'; firmada=$true; confiable=$true } }
+    function Get-NativaVersionState { param($Install) [ordered]@{ version='0.0.41'; firmada=$true; confiable=$true } }
     function Get-LocalNativeInstallers { @([ordered]@{ ruta='C:\kit\FudoNativa.msi'; version='0.0.18'; esMsi=$true; fecha=(Get-Date) }) }
     function Get-MsiProductVersion { param($Path) '0.0.18' }
     $script:llamoInstalador93 = $false
@@ -14385,7 +14412,7 @@ public class FudoFakeEndpoint {
                     enDisco=$true; soloRegistro=$false; pwa=$false }
     }
     function Get-AntivirusState { [ordered]@{ defender=$null; thirdParty=@(); realTime=$null; fudoThreats=@() } }
-    function Get-NativaVersionState { param($Install) [ordered]@{ version='0.0.37'; firmada=$true; confiable=$true } }
+    function Get-NativaVersionState { param($Install) [ordered]@{ version='0.0.41'; firmada=$true; confiable=$true } }
     function Get-Process { param($ErrorAction) @() }
     function Get-SesionInteractiva { [ordered]@{ usuarioMotor='ana'; usuarioSesion='ana'; otroPerfil=$false } }
     function Get-NativeMessagingState {
@@ -14430,7 +14457,7 @@ public class FudoFakeEndpoint {
                     enDisco=$true; soloRegistro=$false; pwa=$false }
     }
     function Get-AntivirusState { [ordered]@{ defender=$null; thirdParty=@(); realTime=$null; fudoThreats=@() } }
-    function Get-NativaVersionState { param($Install) [ordered]@{ version='0.0.37'; firmada=$true; confiable=$true } }
+    function Get-NativaVersionState { param($Install) [ordered]@{ version='0.0.41'; firmada=$true; confiable=$true } }
     function Get-Process { param($ErrorAction) @() }
     function Get-SesionInteractiva { [ordered]@{ usuarioMotor='ana'; usuarioSesion='ana'; otroPerfil=$false } }
     function Get-FudoExtensionState { param($Ids) [ordered]@{ instalada=$true; ids=@($Ids); encontrada='npcjljaedonmjndbliillcmkhidejhmb'
@@ -14525,7 +14552,7 @@ public class FudoFakeEndpoint {
     function Get-AntivirusState {
         [ordered]@{ defender = $null; thirdParty = @('Avast Antivirus'); realTime = $null; fudoThreats = @() }
     }
-    function Get-NativaVersionState { param($Install) [ordered]@{ version='0.0.37'; firmada=$true; confiable=$true } }
+    function Get-NativaVersionState { param($Install) [ordered]@{ version='0.0.41'; firmada=$true; confiable=$true } }
     function Get-Process { param($ErrorAction) @() }
     function Get-SesionInteractiva { [ordered]@{ usuarioMotor='ana'; usuarioSesion='ana'; otroPerfil=$false } }
     function Get-NativeMessagingState {
@@ -14585,7 +14612,7 @@ public class FudoFakeEndpoint {
                     manifests=@(); carpeta='C:\Users\x\AppData\Local\Fudo'
                     enDisco=$hay; soloRegistro=(-not $hay); pwa=$false }
     }
-    function Get-NativaVersionState { param($Install) [ordered]@{ version='0.0.37'; firmada=$true; confiable=[bool]$Install.enDisco } }
+    function Get-NativaVersionState { param($Install) [ordered]@{ version='0.0.41'; firmada=$true; confiable=[bool]$Install.enDisco } }
     $r103 = Install-FudoNative
     Assert-Eq 'S103 con el producto anotado y sin archivos, se repara' $true ([bool]$script:reparo103)
     Assert-Eq 'S103 y la instalacion queda verificada' $true ([bool]$r103.applied)
@@ -14628,7 +14655,7 @@ public class FudoFakeEndpoint {
                     exe=''; manifests=@('do.fu.native_extension_chrome.json','do.fu.native_extension_firefox.json')
                     carpeta='C:\Users\x\AppData\Local\Fudo'; enDisco=$false; soloRegistro=$true; pwa=$false }
     }
-    function Get-NativaVersionState { param($Install) [ordered]@{ version='0.0.37'; firmada=$true; confiable=$false } }
+    function Get-NativaVersionState { param($Install) [ordered]@{ version='0.0.41'; firmada=$true; confiable=$false } }
     function Get-Process { param($ErrorAction) @() }
     function Start-Sleep { param($Seconds, $Milliseconds) }
     function Get-ChildItem { param($Path, $Recurse, $Filter, $ErrorAction, $Directory, $File) @() }
@@ -14722,7 +14749,7 @@ public class FudoFakeEndpoint {
         [ordered]@{ paths=@('C:\Users\x\AppData\Local\Fudo'); regInfo=@([ordered]@{ version='0.0.37'; esPwa=$false })
                     exe='C:\Users\x\AppData\Local\Fudo\fudo_native_extension.exe'; enDisco=$true; soloRegistro=$false; pwa=$false }
     }
-    function Get-NativaVersionState { param($Install) [ordered]@{ version='0.0.37'; firmada=$true; confiable=$true } }
+    function Get-NativaVersionState { param($Install) [ordered]@{ version='0.0.41'; firmada=$true; confiable=$true } }
     function Add-MpPreference { param($ExclusionPath, $ExclusionProcess, $ErrorAction) }
     function Get-Process { param($ErrorAction) @() }
     function Start-Sleep { param($Seconds, $Milliseconds) }
@@ -15351,19 +15378,22 @@ public class FudoFakeEndpoint {
                                                               navegador='Chrome'; perfil='Default'; perfilesVistos=1 } }
     function Get-LocalRunHistory { [ordered]@{ ultimaCausa='' } }
     function Find-FudoNativeInstall { $script:inst134 }
+    # v3.47: la 0.0.38 ahora se intenta actualizar; aca no interesa como sale eso.
+    function Update-FudoNativeFromLocal { param($Instalada, $Corriendo) @{ aplicado = $false; subio = $false; intento = $false; motivo = 'mock' } }
     Test-Layer0b-NativeApp
     $d134 = Get-CheckById 'nativa.duplicada'
     Assert-Eq 'S134 dos Nativas anotadas se informan' $true ([bool]($null -ne $d134))
     Assert-Eq 'S134 dice cual esta en uso y cual sobra' $true ([bool]([string]$d134.name -match '0\.0\.38' -and [string]$d134.name -match '0\.0\.18'))
     Assert-Eq 'S134 no compite como causa raiz' $false ([bool]$d134.rootCauseCandidate)
     Assert-Eq 'S134 no manda a desinstalar solo la vieja' $true ([bool]([string]$d134.recommendation -match 'No desinstalar solo la vieja'))
-    Assert-Eq 'S134 y ya no se le pide subir a la vigente a quien la tiene' 'ok' ([string](Get-CheckById 'nativa.sinFirmar').status)
+    # v3.47 (Mari, 02/11): la 0.0.38 firmada ya no es la vigente. Se avisa, no queda en ok.
+    Assert-Eq 'S134 una 0.0.38 firmada ya no pasa por vigente' 'warn' ([string](Get-CheckById 'nativa.sinFirmar').status)
     # Con una sola no aparece.
     Reset-State
     function Find-FudoNativeInstall {
         [ordered]@{ paths=@('C:\Users\x\AppData\Local\Fudo'); manifests=@(); exe='C:\Users\x\AppData\Local\Fudo\fudo_native_extension.exe'
                     carpeta='C:\Users\x\AppData\Local\Fudo'; enDisco=$true; soloRegistro=$false; pwa=$false
-                    regInfo=@([ordered]@{ version='0.0.38'; location=''; esPwa=$false }) }
+                    regInfo=@([ordered]@{ version='0.0.41'; location=''; esPwa=$false }) }
     }
     Test-Layer0b-NativeApp
     Assert-Eq 'S134 con una sola Nativa no hay aviso de duplicada' $true ([bool]($null -eq (Get-CheckById 'nativa.duplicada')))
@@ -15498,7 +15528,7 @@ public class FudoFakeEndpoint {
     function Find-FudoNativeInstall {
         [ordered]@{ paths=@('C:\Users\x\AppData\Local\Fudo'); manifests=@(); exe='C:\Users\x\AppData\Local\Fudo\fudo_native_extension.exe'
                     carpeta='C:\Users\x\AppData\Local\Fudo'; enDisco=$true; soloRegistro=$false; pwa=$false
-                    regInfo=@([ordered]@{ version='0.0.38'; location=''; esPwa=$false }) }
+                    regInfo=@([ordered]@{ version='0.0.41'; location=''; esPwa=$false }) }
     }
     Test-Layer0b-NativeApp
     $e135 = Get-CheckById 'fudo.extension'
@@ -16274,6 +16304,7 @@ public class FudoFakeEndpoint {
     $script:resp147 = 'cerrar'
     Assert-Eq 'S147 o dar el caso por cerrado' $false (Request-SeguirConImpresoras)
     Assert-Eq 'S147 y queda anotado' 'cerrar' ([string]$script:Diagnostics['despuesNativa'])
+    Assert-Eq 'S147 y elegir cerrar cierra: no hay menu despues (v3.47, Mari)' $true ([bool]$script:CerrarCaso)
     function Test-HayHumano { $false }
     Assert-Eq 'S147 en modo agente se cierra' $false (Request-SeguirConImpresoras)
     function Test-HayHumano { $true }
@@ -17222,6 +17253,67 @@ public class FudoFakeEndpoint {
     Assert-Eq 'S158g y se ofrece' $true (@(Get-HerramientasSoporte | ForEach-Object { [string]$_.v }) -contains 'Identificar')
     Assert-Eq 'S158g y corre su paso' $true ([bool]($m158 -match "herramienta\.identificar"))
     $script:RunMode = 'Ambos'
+    Reset-Mocks
+
+    # (i) Mari, 02/11: "Dar por cerrado el caso" cierra, y una Nativa firmada vieja se actualiza.
+    Reset-State
+    function Test-HayHumano { $true }
+    function Test-UiWeb { $true }
+    $script:resp158i = $null
+    function Request-UiAnswer { param($Id, $Titulo, $Texto, $Texto2, $Opciones, $Clase, $Extra, $TimeoutSec, $ErrorPrevio, [switch]$SoloAsesor)
+        if ($Id -eq 'despuesNativa') { return $script:resp158i }
+        $null }
+    $script:CerrarCaso = $false
+    $null = Request-SeguirConImpresoras
+    Assert-Eq 'S158i si la pregunta vence, el menu sigue' $false ([bool]$script:CerrarCaso)
+    $script:resp158i = 'cerrar'
+    $null = Request-SeguirConImpresoras
+    Assert-Eq 'S158i si alguien eligio cerrar, se cierra' $true ([bool]$script:CerrarCaso)
+    $script:resp158i = 'impresoras'
+    $null = Request-SeguirConImpresoras
+    Assert-Eq 'S158i y si eligio seguir, no' $false ([bool]$script:CerrarCaso)
+    $mFin158 = [System.IO.File]::ReadAllText($PSCommandPath)
+    Assert-Eq 'S158i el menu final no aparece despues de cerrar' $true ([bool]($mFin158 -match 'Test-HayHumano\) -and -not \[bool\]\$script:CerrarCaso\)'))
+    Reset-State
+    Add-Check -Id 'nativa.sinFirmar' -Layer 0 -Name 'NO se pudo actualizar la App Nativa: sigue en la v0.0.38' -Status 'warn' -Plane 'fudo_config'
+    $script:resp158i = $null
+    $script:txt158i = ''
+    function Request-UiAnswer { param($Id, $Titulo, $Texto, $Texto2, $Opciones, $Clase, $Extra, $TimeoutSec, $ErrorPrevio, [switch]$SoloAsesor)
+        if ($Id -eq 'despuesNativa') { $script:txt158i = [string]$Texto }
+        $null }
+    $null = Request-SeguirConImpresoras
+    Assert-Eq 'S158i con la Nativa vieja sin subir no dice que el problema no esta ahi' $true ([bool]($script:txt158i -match 'Quedo algo para mirar' -and $script:txt158i -match '0\.0\.38'))
+    $script:CerrarCaso = $false
+    Reset-Mocks
+    Reset-State
+    function Test-EsWindowsViejo { $false }
+    function Get-AntivirusState { [ordered]@{ defender = $null; thirdParty = @(); realTime = $null; fudoThreats = @() } }
+    function Get-Process { param($ErrorAction) @() }
+    function Get-SesionInteractiva { [ordered]@{ usuarioMotor='ana'; usuarioSesion='ana'; otroPerfil=$false } }
+    function Get-NativeMessagingState {
+        [ordered]@{ registrado=$true; navegadores=@('Chrome'); manifest='m.json'
+                    exeDelManifest='C:\x\fudo_native_extension.exe'; exeExiste=$true
+                    extensionIds=@('npcjljaedonmjndbliillcmkhidejhmb'); pendientes=@() } }
+    function Get-FudoExtensionState { param($Ids) [ordered]@{ instalada=$true; ids=@($Ids); encontrada='npcjljaedonmjndbliillcmkhidejhmb'
+                                                              navegador='Chrome'; perfil='Default'; perfilesVistos=1 } }
+    function Get-LocalRunHistory { [ordered]@{ ultimaCausa='' } }
+    function Find-FudoNativeInstall { [ordered]@{ paths=@('C:\x'); exe='C:\x\fudo_native_extension.exe'; enDisco=$true; soloRegistro=$false; pwa=$false
+                                                  regInfo=@([ordered]@{ name='Fudo Nativa'; version=$script:ver158i; location='C:\x'; esPwa=$false }) } }
+    $script:upd158i = @()
+    function Update-FudoNativeFromLocal { param($Instalada, $Corriendo) $script:upd158i += [string]$Instalada
+        @{ aplicado = $true; subio = $true; intento = $true; versionDespues = '0.0.41'; descargada = $true; nota = 'mock'; instalador = 'descarga' } }
+    $script:TipoCuentaFudo = 'v1'
+    $script:ver158i = '0.0.38'
+    Test-Layer0b-NativeApp
+    Assert-Eq 'S158i una 0.0.38 firmada se actualiza' '0.0.38' (@($script:upd158i) -join ',')
+    Assert-Eq 'S158i y queda reparada' 'fixed' ([string](Get-CheckById 'nativa.sinFirmar').status)
+    Reset-State
+    $script:upd158i = @()
+    $script:ver158i = '0.0.41'
+    Test-Layer0b-NativeApp
+    Assert-Eq 'S158i la vigente no se toca' 0 (@($script:upd158i).Count)
+    Assert-Eq 'S158i y queda ok' 'ok' ([string](Get-CheckById 'nativa.sinFirmar').status)
+    $script:TipoCuentaFudo = ''
     Reset-Mocks
 
     # (h) Buscar en la red: si no aparece nada, se sigue buscando en las otras redes.
@@ -19983,7 +20075,7 @@ try {
     # Test-HayHumano y no Test-IsInteractiveConsole: con la interfaz web la salida de esta
     # ventana esta redirigida y no hay consola que pintar, pero hay una persona del otro lado
     # esperando para elegir. Con la condicion vieja el menu no aparecia nunca en modo web.
-    if (-not $NoMenu -and (Test-HayHumano)) {
+    if (-not $NoMenu -and (Test-HayHumano) -and -not [bool]$script:CerrarCaso) {
         while ($true) {
             $op = Show-DoctorMenu
             if ($op -eq 'S') { break }
@@ -20031,6 +20123,7 @@ try {
                 Reset-RunState
                 $final = Invoke-FudoPrintDoctor
                 Write-DoctorResult -Obj $final
+                if ([bool]$script:CerrarCaso) { break }
             }
         }
     }

@@ -26,8 +26,19 @@ instalador (`-NativeInstallerPath`), se sigue respetando.
 **La versión recomendada de la Nativa era la 0.0.38.** Desde la 3.45 se descarga la 0.0.41 (v1)
 o la 0.0.43 (v2), pero la vara seguía en 0.0.38: un instalador 0.0.38 a 0.0.40 olvidado en la PC
 pasaba por vigente y le ganaba a la descarga. Ahora la recomendada es la que se descarga, según el
-tipo de cuenta. El aviso de Nativa vieja (anterior a la 0.0.37) aclara que imprime igual (Iván
-Ruquet: "dan error pero imprimen").
+tipo de cuenta.
+
+**Una Nativa firmada pero vieja salía "OK".** Mari (02/11): cuentas con la 0.0.38 no imprimían
+desde Fudo ("la revisión de tus impresoras tardó demasiado") y el motor la marcaba OK porque
+estaba firmada. Instalando la última quedaba andando. Estar firmada alcanzaba para el antivirus,
+no para imprimir. Ahora una Nativa anterior a la 0.0.41 se actualiza igual que una sin firmar
+(descargando la vigente), en los dos tipos de cuenta. Si no se puede actualizar, el cierre del
+modo Nativa ya no dice "el problema no parece estar ahí": dice qué quedó para mirar.
+
+**"Dar por cerrado el caso" no cerraba.** Mari: después de elegirlo aparecía el menu final, con
+el mismo título "¿Qué hacemos ahora?", y parecía que el clic no había funcionado. Si una persona
+elige cerrar, el motor termina sin menú y la ventana se cierra. Si la pregunta vence sin respuesta,
+el menú sigue apareciendo.
 
 **Colas de red con nombre propio.** Iván: un puerto TCP/IP llamado, por ejemplo, "COCINA_RED" se
 trataba como USB, porque la interfaz y la IP se sacaban del nombre del puerto. Ahora se lee la IP
