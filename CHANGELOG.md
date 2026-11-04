@@ -2,6 +2,29 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.48] - 2026-11-04
+
+**Cómo se conecta Fudo con la App Nativa, y qué mirar cuando no se conecta.** Producto respondió
+(04/11) lo que el motor no sabía. Desde la 0.0.35, la Nativa atiende a Fudo por websocket (ws, sin
+TLS) en el primer puerto libre entre 9093 y 9102, y solo en 127.0.0.1. Antes de la 0.0.35 hablaba
+únicamente con la extensión. Su instalación no crea reglas de firewall, y deja un log por día en
+`%TMP%\fudo` más un `crash.log` cuando se muere antes de arrancar.
+
+Esto descarta la hipótesis del firewall que se venía arrastrando: Windows no filtra el tráfico
+dentro de la misma PC (127.0.0.1), así que no hay regla que revisar. Lo que sí puede pasar, y
+ahora la revisión de la Nativa lo mira (solo lee, no cierra nada):
+
+- **Los diez puertos ocupados por otros programas.** La Nativa no tiene dónde atender. Es causa,
+  y dice qué programa tiene cada puerto.
+- **La Nativa abierta y sin atender en ningún puerto.** Arrancó a medias. Se avisa con las
+  últimas líneas de error de su log.
+- **Un `crash.log` de los últimos 7 días.** Se cayó al arrancar. Se avisa con lo último que dice.
+
+Cuando todo está bien, queda anotado en qué puerto atiende. Del log viaja un resumen, no el log:
+cuántas líneas `[error]` tiene el último día y las últimas cinco, recortadas y con los JWT y el
+usuario de Windows tapados. Las líneas `[info]` que listan impresoras con estado "ERROR" no se
+cuentan: son ruido (se vio en los logs reales de una Nativa 0.0.41).
+
 ## [3.47] - 2026-10-29
 
 Lo que pidieron los asesores en el canal, revisado contra el código y la telemetría.

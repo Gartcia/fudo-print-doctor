@@ -525,7 +525,7 @@ $script:Producto    = 'Fudo'
 $script:PrefijoCola = 'FUDO-'
 $script:NombreCola  = 'Impresora Fudo'
 $script:ReglasTexto = @()
-$script:SchemaVersion = '3.47'
+$script:SchemaVersion = '3.48'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -571,6 +571,12 @@ $script:UiTimeout  = 900
 $script:UiTimeoutOpcional = 120
 # v3.47: una persona eligio "Dar por cerrado el caso" (ver Request-SeguirConImpresoras).
 $script:CerrarCaso = $false
+# v3.48 (Producto, 04/11): desde la 0.0.35 la Nativa atiende a Fudo por websocket (ws, sin TLS)
+# en el primer puerto libre entre estos dos, y solo en 127.0.0.1. Antes de la 0.0.35 hablaba
+# unicamente con la extension por Native Messaging.
+$script:NativaPuertoDesde = 9093
+$script:NativaPuertoHasta = 9102
+$script:NativaVersionWebsocket = '0.0.35'
 # v3.40: cuanto se espera a que la ventana del diagnostico pida su primera actualizacion antes
 # de reabrirla, y despues antes de pasar a la consola. Ver Confirm-UiCargo.
 $script:UiPrimerPollSec = 20
@@ -4355,6 +4361,164 @@ function Register-FudoNativeHost {
               lanzado = [bool]$salida.lanzado; motivo = [string]$motivo }
 }
 
+function Get-PuertosNativa {
+    <#
+      v3.48: quien escucha en los puertos de la Nativa (9093-9102). Devuelve una fila por puerto
+      ocupado: puerto, direccion, pid, proceso. Con limite de tiempo (ver Invoke-ConLimite). El
+      self-test no lee la PC: sin mock devuelve vacio, para no depender de la maquina donde corre.
+      Si Windows no contesta a tiempo deja $script:PuertosNativaSinRespuesta en $true: una lista
+      vacia es "todos libres", y PowerShell no distingue una lista vacia de nada al devolverla.
+    #>
+    $script:PuertosNativaSinRespuesta = $false
+    if ($SelfTest) { return @() }
+    $desde = [int]$script:NativaPuertoDesde
+    $hasta = [int]$script:NativaPuertoHasta
+    $lim = Invoke-ConLimite -TimeoutSec 10 -Argumentos @($desde, $hasta) -Script {
+        param($d, $h)
+        @(Get-NetTCPConnection -State Listen -ErrorAction Stop | Where-Object { $_.LocalPort -ge $d -and $_.LocalPort -le $h }) | ForEach-Object {
+            $n = ''
+            try { $n = [string](Get-Process -Id $_.OwningProcess -ErrorAction Stop).ProcessName } catch {}
+            [pscustomobject]@{ puerto = [int]$_.LocalPort; direccion = [string]$_.LocalAddress; pid = [int]$_.OwningProcess; proceso = $n }
+        }
+    }
+    if ([bool]$lim.timeout) { $script:PuertosNativaSinRespuesta = $true; return @() }
+    return @($lim.valor | Where-Object { $_ })
+}
+
+function Get-NativaLogCarpetas {
+    <# v3.48: donde deja sus logs la Nativa: %TMP%\fudo del usuario. Sin mock, vacio en el self-test. #>
+    if ($SelfTest) { return @() }
+    $c = @()
+    foreach ($t in @($env:TEMP, $env:TMP)) { if ($t) { $c += (Join-Path $t 'fudo') } }
+    if ($env:LOCALAPPDATA) { $c += (Join-Path $env:LOCALAPPDATA 'Temp\fudo') }
+    return @($c | Select-Object -Unique)
+}
+
+function Get-NativaLogResumen {
+    <#
+      v3.48 (Producto, 04/11): la Nativa escribe un log por dia (AAAA-MM-DD.log, hasta 1 MB, cinco
+      como mucho) y un crash.log cuando muere antes de arrancar, en %TMP%\fudo. Hasta ahora nadie
+      lo miraba: el asesor no sabe que existe y el motor no lo leia.
+      Devuelve un resumen, no el log: cuantas lineas de error tiene el ultimo dia y las ultimas
+      cinco, recortadas y con los JWT tapados (la Nativa los recibe de Fudo y no pueden viajar en
+      la telemetria). @{ carpeta; ultimoLog; fechaLog; errores; lineas; crash; crashFecha; crashLineas }
+    #>
+    param([string[]]$Carpetas = @())
+    $r = [ordered]@{ carpeta = ''; ultimoLog = ''; fechaLog = ''; errores = 0; lineas = @()
+                     crash = $false; crashFecha = ''; crashReciente = $false; crashLineas = @() }
+    $limpiar = {
+        param($l)
+        $t = ([string]$l) -replace 'eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*', '<jwt>'
+        $t = $t -replace '(?i)(token|authorization|bearer)([=:\s"]+)[^\s",}]+', '$1$2<oculto>'
+        # Las rutas traen el usuario de Windows del cliente: tampoco viaja.
+        $t = $t -replace '(?i)([a-z]:\\Users\\)[^\\\s"]+', '$1<usuario>'
+        $t = ConvertTo-TextoTicket $t
+        if ($t.Length -gt 200) { $t = $t.Substring(0, 200) }
+        $t
+    }
+    foreach ($c in @($Carpetas | Where-Object { $_ })) {
+        $logs = @()
+        try { $logs = @(Get-ChildItem -LiteralPath $c -Filter '*.log' -File -ErrorAction Stop) } catch { continue }
+        if (@($logs).Count -eq 0) { continue }
+        $r.carpeta = ([string]$c) -replace '(?i)([a-z]:\\Users\\)[^\\]+', '$1<usuario>'
+        $diarios = @($logs | Where-Object { $_.Name -match '^\d{4}-\d{2}-\d{2}\.log$' } | Sort-Object Name -Descending)
+        if (@($diarios).Count -gt 0) {
+            $u = @($diarios)[0]
+            $r.ultimoLog = [string]$u.Name
+            $r.fechaLog = $u.LastWriteTime.ToString('yyyy-MM-dd HH:mm')
+            $lin = @()
+            try { $lin = @(Get-Content -LiteralPath $u.FullName -Tail 400 -ErrorAction Stop) } catch {}
+            # El nivel va entre corchetes ("2026-10-30T14:03:35Z [error] ..."). No alcanza con buscar
+            # "error" en la linea: las [info] que listan impresoras traen "status":["ERROR"] y son ruido.
+            $err = @($lin | Where-Object { [string]$_ -match '(?i)^\S+\s+\[(error|fatal)\]' })
+            $r.errores = @($err).Count
+            $r.lineas = @(@($err | Select-Object -Last 5) | ForEach-Object { & $limpiar $_ })
+        }
+        $cr = @($logs | Where-Object { $_.Name -ieq 'crash.log' }) | Select-Object -First 1
+        if ($cr) {
+            $r.crash = $true
+            $r.crashFecha = $cr.LastWriteTime.ToString('yyyy-MM-dd HH:mm')
+            $r.crashReciente = ($cr.LastWriteTime -gt (Get-Date).AddDays(-7))
+            $cl = @()
+            try { $cl = @(Get-Content -LiteralPath $cr.FullName -Tail 5 -ErrorAction Stop) } catch {}
+            $r.crashLineas = @($cl | Where-Object { $_ } | ForEach-Object { & $limpiar $_ })
+        }
+        break
+    }
+    return $r
+}
+
+function Test-NativaEscucha {
+    <#
+      v3.48 (Producto, 04/11): como se conecta Fudo con la Nativa, desde la 0.0.35. La Nativa
+      atiende por websocket en el primer puerto libre entre 9093 y 9102, solo en 127.0.0.1.
+      Lo que deja afuera: el firewall. Windows no filtra el trafico dentro de la misma PC
+      (127.0.0.1), asi que no hay regla que revisar; la hipotesis de "el firewall bloquea la
+      Nativa" no tiene por donde pasar. Lo que si puede pasar:
+       - los diez puertos ocupados por otros programas: la Nativa no tiene donde atender;
+       - la Nativa abierta y sin atender en ningun puerto: arranco mal (el log lo dice);
+       - un crash.log reciente: se cae al arrancar.
+      Solo lee: no cierra programas ni libera puertos.
+    #>
+    param([string]$Version = '', [bool]$Corriendo = $false)
+    $usaWs = $true
+    if ($Version) { try { $usaWs = ([version]$Version -ge [version]$script:NativaVersionWebsocket) } catch {} }
+    $log = Get-NativaLogResumen -Carpetas @(Get-NativaLogCarpetas)
+    $evLog = [ordered]@{ carpeta = [string]$log.carpeta; ultimoLog = [string]$log.ultimoLog; fechaLog = [string]$log.fechaLog
+                         errores = [int]$log.errores; lineas = @($log.lineas); crash = [bool]$log.crash
+                         crashFecha = [string]$log.crashFecha; crashLineas = @($log.crashLineas) }
+    if ([bool]$log.crashReciente) {
+        Add-Check -Id 'nativa.crash' -Layer 0 -Name ('La App Nativa se cayo al arrancar (crash.log del ' + [string]$log.crashFecha + ')') `
+            -Status 'warn' -RootCauseCandidate $false -Plane 'fudo_config' -Evidence @{ log = $evLog } `
+            -Recommendation ('La Nativa dejo un crash.log en ' + [string]$log.carpeta + ': se murio antes de terminar de arrancar. ' +
+                             'Si Fudo no ve las impresoras, reinstalarla (la herramienta "Revisar la App Nativa y la extension" lo hace) y mandar ese archivo en #fudo-print-doctor.' +
+                             $(if (@($log.crashLineas).Count -gt 0) { ' Lo ultimo que dice: ' + (@($log.crashLineas) -join ' / ') } else { '' }))
+    }
+    if (-not $usaWs) { return }
+
+    $desde = [int]$script:NativaPuertoDesde
+    $hasta = [int]$script:NativaPuertoHasta
+    $script:PuertosNativaSinRespuesta = $false
+    $ocup = @(Get-PuertosNativa)
+    if ([bool]$script:PuertosNativaSinRespuesta) {
+        Add-Check -Id 'nativa.escucha' -Layer 0 -Name 'No se pudo leer en que puerto atiende la App Nativa' -Status 'skipped' -Plane 'os' `
+            -Evidence @{ motivo = 'Windows no contesto la lista de puertos a tiempo'; log = $evLog }
+        return
+    }
+    $esNativa = { param($o) ([string]$o.proceso -like ('*' + $FudoAppProcess + '*')) -or ([string]$o.proceso -like '*fudo_native*') }
+    $deNativa = @($ocup | Where-Object { & $esNativa $_ })
+    $deOtros = @($ocup | Where-Object { -not (& $esNativa $_) })
+    $puertosOtros = @($deOtros | ForEach-Object { [int]$_.puerto } | Select-Object -Unique)
+    $total = $hasta - $desde + 1
+    $txtOtros = (@($deOtros | Sort-Object puerto | ForEach-Object { [string]$_.puerto + ' (' + $(if ([string]$_.proceso) { [string]$_.proceso } else { 'pid ' + [string]$_.pid }) + ')' }) -join ', ')
+    $ev = @{ desde = $desde; hasta = $hasta; nativa = @($deNativa); otros = @($deOtros); corriendo = $Corriendo; version = $Version; log = $evLog }
+
+    if (@($deNativa).Count -gt 0) {
+        $p = @($deNativa)[0]
+        Add-Check -Id 'nativa.escucha' -Layer 0 -Name ('La App Nativa atiende a Fudo en el puerto ' + [string]$p.puerto) -Status 'ok' `
+            -Informativo $true -Plane 'fudo_config' -Evidence $ev
+        return
+    }
+    if (@($puertosOtros).Count -ge $total) {
+        Add-Check -Id 'nativa.escucha' -Layer 0 -Name ('Los puertos de la App Nativa (' + $desde + ' a ' + $hasta + ') estan todos ocupados por otros programas') `
+            -Status 'fail' -RootCauseCandidate $true -Plane 'os' -Evidence $ev `
+            -Recommendation ('La Nativa necesita un puerto libre entre ' + $desde + ' y ' + $hasta + ' para que Fudo le hable, y estan todos tomados: ' + $txtOtros + '. ' +
+                             'Cerrar esos programas (o reiniciar la PC) y abrir Fudo de nuevo. Si vuelven a ocuparlos al arrancar, avisar en #fudo-print-doctor con esta lista.')
+        return
+    }
+    if ($Corriendo) {
+        Add-Check -Id 'nativa.escucha' -Layer 0 -Name 'La App Nativa esta abierta pero no atiende a Fudo en ningun puerto' -Status 'warn' `
+            -RootCauseCandidate $false -Plane 'fudo_config' -Evidence $ev `
+            -Recommendation ('El proceso de la Nativa esta corriendo y no escucha entre ' + $desde + ' y ' + $hasta + ': arranco a medias. ' +
+                             'Cerrarla desde el Administrador de tareas y abrir Fudo de nuevo; si sigue igual, reinstalarla.' +
+                             $(if ([int]$log.errores -gt 0) { ' Su log de hoy tiene ' + [int]$log.errores + ' linea(s) de error: ' + (@($log.lineas) -join ' / ') } else { '' }))
+        return
+    }
+    Add-Check -Id 'nativa.escucha' -Layer 0 -Name ('Puertos de la App Nativa libres: ' + ($total - @($puertosOtros).Count) + ' de ' + $total) -Status 'ok' `
+        -Informativo $true -Plane 'os' -Evidence $ev `
+        -Recommendation $(if (@($puertosOtros).Count -gt 0) { 'Ocupados por otros programas: ' + $txtOtros + '. Mientras quede alguno libre, la Nativa usa ese.' } else { '' })
+}
+
 function Test-NativaRapida {
     <#
       v3.47 (canal, Facundo): en las herramientas de impresoras USB y de red, la revision completa
@@ -4598,6 +4762,13 @@ function Test-Layer0b-NativeApp {
             Add-Check -Id 'nativa.sinFirmar' -Layer 0 -Name ("App Nativa v$($verState.version): version firmada") -Status 'ok' -Plane 'fudo_config' `
                 -Evidence @{ version = $verState.version; versionFirmada = $script:NativaVersionFirmada }
         }
+    }
+
+    # 0b.1c v3.48: el puerto donde atiende la Nativa y lo que dejo en su log (ver Test-NativaEscucha).
+    if ($installed) {
+        $verEsc = ''
+        try { $verEsc = [string]$verState.version } catch {}
+        Test-NativaEscucha -Version $verEsc -Corriendo ([bool]$procRunning)
     }
 
     # 0b.2 Amenazas/cuarentena de Defender sobre la Nativa
@@ -17315,6 +17486,64 @@ public class FudoFakeEndpoint {
     Assert-Eq 'S158i y queda ok' 'ok' ([string](Get-CheckById 'nativa.sinFirmar').status)
     $script:TipoCuentaFudo = ''
     Reset-Mocks
+
+    # (j) v3.48 (Producto, 04/11): el puerto de la Nativa (9093-9102, solo 127.0.0.1) y su log.
+    Reset-State
+    Reset-Mocks
+    $script:ocup159 = @()
+    function Get-PuertosNativa { $script:ocup159 }
+    function Get-NativaLogCarpetas { @() }
+    $script:ocup159 = @([pscustomobject]@{ puerto = 9093; direccion = '127.0.0.1'; pid = 10; proceso = 'java' },
+                        [pscustomobject]@{ puerto = 9094; direccion = '127.0.0.1'; pid = 11; proceso = 'fudo_native_extension' })
+    Test-NativaEscucha -Version '0.0.41' -Corriendo $true
+    $e159 = Get-CheckById 'nativa.escucha'
+    Assert-Eq 'S158j la Nativa atendiendo se ve, con su puerto' $true ([bool]([string]$e159.status -eq 'ok' -and [string]$e159.name -match '9094'))
+    Reset-State
+    $script:ocup159 = @(9093..9102 | ForEach-Object { [pscustomobject]@{ puerto = $_; direccion = '127.0.0.1'; pid = 20; proceso = 'otroServidor' } })
+    Test-NativaEscucha -Version '0.0.41' -Corriendo $false
+    $e159b = Get-CheckById 'nativa.escucha'
+    Assert-Eq 'S158j los diez puertos ocupados por otros es causa' 'fail' ([string]$e159b.status)
+    Assert-Eq 'S158j y dice quien los tiene' $true ([bool]([string]$e159b.recommendation -match 'otroServidor'))
+    Reset-State
+    $script:ocup159 = @()
+    Test-NativaEscucha -Version '0.0.41' -Corriendo $true
+    Assert-Eq 'S158j abierta y sin atender en ningun puerto se avisa' 'warn' ([string](Get-CheckById 'nativa.escucha').status)
+    Reset-State
+    Test-NativaEscucha -Version '0.0.41' -Corriendo $false
+    Assert-Eq 'S158j cerrada y con los puertos libres esta bien' 'ok' ([string](Get-CheckById 'nativa.escucha').status)
+    Reset-State
+    $script:ocup159 = @(9093..9102 | ForEach-Object { [pscustomobject]@{ puerto = $_; direccion = '127.0.0.1'; pid = 20; proceso = 'otroServidor' } })
+    Test-NativaEscucha -Version '0.0.34' -Corriendo $true
+    Assert-Eq 'S158j antes de la 0.0.35 no hay puerto que mirar' $true ([bool]($null -eq (Get-CheckById 'nativa.escucha')))
+    # El log: resumen con los JWT tapados, y el crash.log reciente se avisa.
+    $tmp159 = Join-Path ([IO.Path]::GetTempPath()) ('fpd159-' + [guid]::NewGuid().ToString('N'))
+    $r159 = $null
+    try {
+        $null = New-Item -ItemType Directory -Force -Path $tmp159
+        Set-Content -LiteralPath (Join-Path $tmp159 '2026-11-03.log') -Value @('INFO viejo', 'ERROR del dia anterior')
+        Set-Content -LiteralPath (Join-Path $tmp159 '2026-11-04.log') -Value @(
+            '2026-11-04T10:00:00.000Z [info] arranco',
+            '2026-11-04T10:00:01.000Z [info] {"name":"COCINA","status":["ERROR"]}',
+            '2026-11-04T10:00:02.000Z [error] no se pudo validar eyJhbGciOi.eyJzdWIiOjF9.c2lnbmF0dXJh en C:\Users\cinthia\AppData\Local\Fudo',
+            '2026-11-04T10:00:03.000Z [info] listo')
+        Set-Content -LiteralPath (Join-Path $tmp159 'crash.log') -Value @('panic: no se pudo abrir el puerto')
+        $r159 = Get-NativaLogResumen -Carpetas @((Join-Path $tmp159 'no-existe'), $tmp159)
+        Reset-State
+        $script:ocup159 = @()
+        function Get-NativaLogCarpetas { @($tmp159) }
+        Test-NativaEscucha -Version '0.0.41' -Corriendo $false
+    } finally {
+        Remove-Item -LiteralPath $tmp159 -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Assert-Eq 'S158j se lee el log del ultimo dia' '2026-11-04.log' ([string]$r159.ultimoLog)
+    Assert-Eq 'S158j con su linea de error, sin contar las [info] que dicen ERROR' 1 ([int]$r159.errores)
+    Assert-Eq 'S158j y el usuario de Windows no viaja' $true ([bool]((@($r159.lineas) -join ' ') -match 'Users\\<usuario>\\' -and -not ((@($r159.lineas) -join ' ') -match 'cinthia')))
+    Assert-Eq 'S158j y el JWT no viaja' $true ([bool]((@($r159.lineas) -join ' ') -match '<jwt>' -and -not ((@($r159.lineas) -join ' ') -match 'eyJ')))
+    Assert-Eq 'S158j el crash.log se encuentra' $true ([bool]$r159.crash)
+    Assert-Eq 'S158j la carpeta viaja sin el usuario de Windows' $false ([bool]([string]$r159.carpeta -match [regex]::Escape([string]$env:USERNAME + '\')))
+    Assert-Eq 'S158j y si es reciente se avisa' 'warn' ([string](Get-CheckById 'nativa.crash').status)
+    Reset-Mocks
+    Assert-Eq 'S158j sin mock, el self-test no lee la PC' 0 ([int](@(Get-PuertosNativa).Count + @(Get-NativaLogCarpetas).Count))
 
     # (h) Buscar en la red: si no aparece nada, se sigue buscando en las otras redes.
     Reset-State
