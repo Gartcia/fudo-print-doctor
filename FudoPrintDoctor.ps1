@@ -525,7 +525,7 @@ $script:Producto    = 'Fudo'
 $script:PrefijoCola = 'FUDO-'
 $script:NombreCola  = 'Impresora Fudo'
 $script:ReglasTexto = @()
-$script:SchemaVersion = '3.48'
+$script:SchemaVersion = '3.49'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -1586,6 +1586,7 @@ $script:StepPlan = [ordered]@{
     'layer4.hardwarePrint'      = 'Prueba de impresion'
     'layer0b.nativeApp'         = 'App Nativa de Fudo y antivirus'
     'layer0b.soloNativa'        = 'App Nativa de Fudo y antivirus'
+    'layer0.spoolCarpeta'       = 'Carpeta del servicio de impresion'
     'layer0b.nativaRapida'      = 'App Nativa de Fudo'
     'layer5.fudoConfig'         = 'Configuracion de Fudo'
     'final.rescan'              = 'Estado final de las impresoras'
@@ -2795,7 +2796,7 @@ function Request-SeguirConImpresoras {
     $sugiereCerrar = (@($fallas).Count -eq 0 -and @($reparadas).Count -gt 0)
     # v3.47: algo de la Nativa que quedo para mirar (una version vieja que no se pudo subir) no
     # puede salir como "el problema no parece estar ahi".
-    $avisos = @($script:Checks | Where-Object { $_.status -eq 'warn' -and [string]$_.id -eq 'nativa.sinFirmar' })
+    $avisos = @($script:Checks | Where-Object { $_.status -eq 'warn' -and @('nativa.sinFirmar', 'fudo.navegador') -contains [string]$_.id })
     if (@($fallas).Count -eq 0 -and @($reparadas).Count -eq 0 -and @($avisos).Count -gt 0) {
         $resumen = ('Quedo algo para mirar: ' + [string]@($avisos)[0].name + '.')
     }
@@ -3169,6 +3170,7 @@ $script:CheckPorAccion = @{
     'device.rebind'             = 'hw.noPortBound'
     'queue.purge'               = 'queue.health'
     'queue.purge_for_test'      = 'queue.health'
+    'spool.vaciar'              = 'queue.spoolCarpeta'
     'printer.setport'           = 'conn.usb'
     'printer.recreate'          = 'conn.usb'
     'nativa.install'            = 'nativa.installed'
@@ -3962,13 +3964,23 @@ function Get-FudoExtensionState {
         $bases += [ordered]@{ nav = 'Chrome';   ruta = (Join-Path $env:LOCALAPPDATA 'Google\Chrome\User Data') }
         $bases += [ordered]@{ nav = 'Edge';     ruta = (Join-Path $env:LOCALAPPDATA 'Microsoft\Edge\User Data') }
         $bases += [ordered]@{ nav = 'Chromium'; ruta = (Join-Path $env:LOCALAPPDATA 'Chromium\User Data') }
+        # v3.49 (canal, Joel 10/11): el cliente usaba Fudo en Brave y el motor no lo conocia. Brave
+        # y Vivaldi guardan los perfiles igual que Chrome.
+        $bases += [ordered]@{ nav = 'Brave';    ruta = (Join-Path $env:LOCALAPPDATA 'BraveSoftware\Brave-Browser\User Data') }
+        $bases += [ordered]@{ nav = 'Vivaldi';  ruta = (Join-Path $env:LOCALAPPDATA 'Vivaldi\User Data') }
     }
+    # Opera guarda su unico perfil en %APPDATA%, sin carpeta Default: la base es el perfil.
+    if ($env:APPDATA) { $bases += [ordered]@{ nav = 'Opera'; ruta = (Join-Path $env:APPDATA 'Opera Software\Opera Stable'); perfilUnico = $true } }
     foreach ($b in $bases) {
         try { if (-not (Test-Path ([string]$b.ruta))) { continue } } catch { continue }
         $perfiles = @()
         try {
-            $perfiles = @(Get-ChildItem -Path ([string]$b.ruta) -Directory -ErrorAction SilentlyContinue |
-                          Where-Object { $_.Name -eq 'Default' -or $_.Name -like 'Profile *' })
+            if ($b.Contains('perfilUnico')) {
+                $perfiles = @(Get-Item -LiteralPath ([string]$b.ruta) -ErrorAction SilentlyContinue)
+            } else {
+                $perfiles = @(Get-ChildItem -Path ([string]$b.ruta) -Directory -ErrorAction SilentlyContinue |
+                              Where-Object { $_.Name -eq 'Default' -or $_.Name -like 'Profile *' })
+            }
         } catch {}
         foreach ($p in @($perfiles)) {
             $out.perfilesVistos++
@@ -4076,7 +4088,60 @@ function Get-NavegadoresParaExtension {
     $edge = ''
     try { $edge = [string](Find-EdgeExe) } catch {}
     if ($edge) { $out += [ordered]@{ nombre = 'Edge'; exe = $edge } }
+    # v3.49 (canal, Joel 10/11): Brave. La pagina de la tienda de Chrome funciona igual ahi.
+    foreach ($base in @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:LOCALAPPDATA)) {
+        if (-not $base) { continue }
+        $bv = Join-Path $base 'BraveSoftware\Brave-Browser\Application\brave.exe'
+        try { if (Test-Path -LiteralPath $bv) { $out += [ordered]@{ nombre = 'Brave'; exe = [string]$bv }; break } } catch {}
+    }
     return $out
+}
+
+# v3.49: donde el motor sabe mirar la extension de Fudo (ver Get-FudoExtensionState).
+$script:NavegadoresRevisados = @('Chrome', 'Edge', 'Chromium', 'Brave', 'Vivaldi', 'Opera')
+
+function ConvertTo-NombreNavegador {
+    <# v3.49: el ProgId del navegador predeterminado de Windows, a un nombre. #>
+    param([string]$ProgId)
+    switch -Regex ([string]$ProgId) {
+        '^$'               { return '' }
+        '^ChromeHTML'      { return 'Chrome' }
+        '^MSEdge'          { return 'Edge' }
+        '^Brave'           { return 'Brave' }
+        '^Firefox'         { return 'Firefox' }
+        '^Opera'           { return 'Opera' }
+        '^Vivaldi'         { return 'Vivaldi' }
+        '^Chromium'        { return 'Chromium' }
+        '^(IE\.|htmlfile)' { return 'Internet Explorer' }
+        default            { return 'otro' }
+    }
+}
+
+function Get-NavegadorPredeterminado {
+    <#
+      v3.49 (canal, Joel 10/11): que navegador abre los links en esta cuenta de Windows. Lo que
+      el motor dice de la extension y del registro de la Nativa vale para los navegadores que
+      revisa; si el cliente usa otro, "registrada en el navegador" no habla del suyo.
+      El self-test no lee la PC (se mockea).
+    #>
+    if ($SelfTest) { return [ordered]@{ progId = ''; nombre = '' } }
+    $progId = ''
+    try { $progId = [string](Get-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\Shell\Associations\UrlAssociations\https\UserChoice' -Name 'ProgId' -ErrorAction Stop).ProgId } catch {}
+    return [ordered]@{ progId = $progId; nombre = (ConvertTo-NombreNavegador -ProgId $progId) }
+}
+
+function Add-CheckNavegadorPredeterminado {
+    <# v3.49: avisa si el navegador predeterminado es uno donde el motor no mira la extension. #>
+    param($Nav, $Nmh, $Ext)
+    $nombre = ''
+    try { $nombre = [string]$Nav.nombre } catch {}
+    if (-not $nombre -or ($script:NavegadoresRevisados -contains $nombre)) { return }
+    $mostrar = $(if ($nombre -eq 'otro') { 'otro navegador (' + [string]$Nav.progId + ')' } else { $nombre })
+    Add-Check -Id 'fudo.navegador' -Layer 0 -Name ('El navegador predeterminado de esta PC es ' + $mostrar + ', y ahi el diagnostico no mira la extension') `
+        -Status 'warn' -RootCauseCandidate $false -Plane 'fudo_config' `
+        -Evidence @{ progId = [string]$Nav.progId; navegador = $nombre; navegadoresConHost = @($Nmh.navegadores); extensionEn = @($Ext.enNavegadores) } `
+        -Recommendation ('Lo que dice este diagnostico de la extension de Fudo vale para ' + ($script:NavegadoresRevisados -join ', ') + '. ' +
+                         'Si el cliente usa Fudo en ' + $mostrar + ', revisar ahi a mano que la Nativa le liste las impresoras, o abrir Fudo en Chrome.')
 }
 
 function Start-UrlEnNavegador {
@@ -4239,6 +4304,8 @@ function Start-FudoNativeHostProcess {
     #>
     param([string]$Exe, [int]$TimeoutSeg = 8)
     $proc = $null
+    # v3.49: lo que deje en el crash.log mientras esta abierta es nuestro (ver Test-CrashPorMotor).
+    Save-NativaLanzadaPorMotor
     try { $proc = Start-Process -FilePath $Exe -PassThru -WindowStyle Hidden -ErrorAction Stop }
     catch { return @{ lanzado = $false; quedoVivo = $false; error = [string]$_.Exception.Message } }
     if ($null -eq $proc) { return @{ lanzado = $false; quedoVivo = $false; error = 'no se pudo lanzar el proceso' } }
@@ -4394,6 +4461,89 @@ function Get-NativaLogCarpetas {
     return @($c | Select-Object -Unique)
 }
 
+function Select-CrashLineas {
+    <#
+      v3.49 (canal, Federico 10/11): de un crash.log, la linea que dice que fallo y los dos
+      primeros "at ..." que la siguen. Las ultimas lineas de una traza de Node son solo marcos
+      ("at Writable.write ...") y no dicen que paso. Se busca de abajo hacia arriba la ultima
+      linea que no sea un marco y que nombre un error; si no hay, la ultima que no sea un marco.
+      Si aparece el codigo del error (code: 'EPIPE'), va al final.
+    #>
+    param([string[]]$Lineas = @())
+    $ls = @(@($Lineas) | Where-Object { $null -ne $_ -and ([string]$_).Trim() } | ForEach-Object { ([string]$_).Trim() })
+    $n = @($ls).Count
+    if ($n -eq 0) { return @() }
+    $esMarco = { param($l) ([string]$l) -match '^at\s' }
+    $idx = -1
+    for ($i = $n - 1; $i -ge 0; $i--) {
+        $l = [string]$ls[$i]
+        if ((-not (& $esMarco $l)) -and -not ($l -match '^code:') -and ($l -cmatch '(?i:error|exception|panic)|\bE[A-Z]{3,}\b')) { $idx = $i; break }
+    }
+    if ($idx -lt 0) { for ($i = $n - 1; $i -ge 0; $i--) { if (-not (& $esMarco $ls[$i]) -and -not ([string]$ls[$i] -match '^code:')) { $idx = $i; break } } }
+    if ($idx -lt 0) { return @(@($ls) | Select-Object -First 2) }
+    $out = @([string]$ls[$idx])
+    for ($j = $idx + 1; $j -lt $n -and @($out).Count -lt 3; $j++) {
+        if (& $esMarco $ls[$j]) { $out += [string]$ls[$j] } else { break }
+    }
+    $cod = @($ls | Where-Object { [string]$_ -match "code:\s*'[A-Z_]+'" }) | Select-Object -Last 1
+    if ($cod -and @($out) -notcontains [string]$cod) { $out += [string]$cod }
+    return @($out)
+}
+
+function ConvertTo-RutaPegable {
+    <#
+      v3.49 (canal, Federico 10/11): la ruta del crash.log llegaba con <usuario> tapado, y asi no
+      se puede pegar en Windows + R. Con la variable de entorno queda corta, sirve en cualquier
+      PC y no lleva el nombre de la cuenta del cliente.
+    #>
+    param([string]$Ruta)
+    $out = [string]$Ruta
+    foreach ($par in @(@('TEMP', [string]$env:TEMP), @('LOCALAPPDATA', [string]$env:LOCALAPPDATA), @('USERPROFILE', [string]$env:USERPROFILE))) {
+        $v = ([string]$par[1]).TrimEnd('\')
+        if ($v -and $out.StartsWith($v + '\', [StringComparison]::OrdinalIgnoreCase)) { return ('%' + [string]$par[0] + '%' + $out.Substring($v.Length)) }
+    }
+    return ($out -replace '(?i)([a-z]:\\Users\\)[^\\]+', '$1<usuario>')
+}
+
+function Save-NativaLanzadaPorMotor {
+    <#
+      v3.49 (canal, Andres 11/11): cuando el motor ejecuta la Nativa por su cuenta (para
+      registrarla en el navegador), lo anota. La Nativa es un host stdio: abierta sin el navegador
+      del otro lado, se cae al querer contestarle y deja un crash.log ("Writable.write ...
+      sendResponse"). Sin esta marca, la corrida siguiente lo avisaba como una caida de la Nativa.
+    #>
+    if ($SelfTest) { return }
+    try {
+        $k = 'HKCU:\Software\Fudo\PrintDoctor'
+        if (-not (Test-Path $k)) { New-Item -Path $k -Force -ErrorAction Stop | Out-Null }
+        New-ItemProperty -Path $k -Name 'NativaLanzadaPorMotor' -Value ((Get-Date).ToString('o')) -PropertyType String -Force -ErrorAction SilentlyContinue | Out-Null
+    } catch {}
+}
+
+function Get-NativaLanzadaPorMotor {
+    <# v3.49: la ultima vez que el motor ejecuto la Nativa (ver Save-NativaLanzadaPorMotor), o $null. #>
+    if ($SelfTest) { return $null }
+    try {
+        $v = [string](Get-ItemProperty -Path 'HKCU:\Software\Fudo\PrintDoctor' -Name 'NativaLanzadaPorMotor' -ErrorAction Stop).NativaLanzadaPorMotor
+        if ($v) { return [datetime]::Parse($v, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind) }
+    } catch {}
+    return $null
+}
+
+function Test-CrashPorMotor {
+    <#
+      v3.49: el crash.log se escribio mientras el motor estaba tocando la Nativa: abriendola para
+      registrarla, o cerrandola y corriendo el instalador para actualizarla. En la telemetria de
+      Andres (11/11) fue esto ultimo: la corrida de las 17:46 actualizo la 0.0.26 a la 0.0.41, y la
+      de las 17:50 aviso el crash.log de las 17:47 como una caida. Ventana: hasta 10 minutos despues
+      de la marca (el instalador tiene 2 minutos de limite, mas la espera al registro).
+    #>
+    param($Crash, $Lanzada)
+    if ($null -eq $Crash -or $null -eq $Lanzada) { return $false }
+    try { $c = [datetime]$Crash; $l = [datetime]$Lanzada } catch { return $false }
+    return [bool](($c -ge $l.AddSeconds(-5)) -and ($c -le $l.AddMinutes(10)))
+}
+
 function Get-NativaLogResumen {
     <#
       v3.48 (Producto, 04/11): la Nativa escribe un log por dia (AAAA-MM-DD.log, hasta 1 MB, cinco
@@ -4405,7 +4555,7 @@ function Get-NativaLogResumen {
     #>
     param([string[]]$Carpetas = @())
     $r = [ordered]@{ carpeta = ''; ultimoLog = ''; fechaLog = ''; errores = 0; lineas = @()
-                     crash = $false; crashFecha = ''; crashReciente = $false; crashLineas = @() }
+                     crash = $false; crashFecha = ''; crashReciente = $false; crashLineas = @(); crashRuta = ''; crashFechaDt = $null }
     $limpiar = {
         param($l)
         $t = ([string]$l) -replace 'eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*', '<jwt>'
@@ -4439,9 +4589,13 @@ function Get-NativaLogResumen {
             $r.crash = $true
             $r.crashFecha = $cr.LastWriteTime.ToString('yyyy-MM-dd HH:mm')
             $r.crashReciente = ($cr.LastWriteTime -gt (Get-Date).AddDays(-7))
+            $r.crashFechaDt = $cr.LastWriteTime
+            $r.crashRuta = ConvertTo-RutaPegable -Ruta ([string]$cr.FullName)
+            # v3.49 (canal, Federico 10/11): con -Tail 5 quedaban solo los "at ..." de la traza y se
+            # perdia la linea que dice que fallo. Se leen las ultimas 60 y se elige el error.
             $cl = @()
-            try { $cl = @(Get-Content -LiteralPath $cr.FullName -Tail 5 -ErrorAction Stop) } catch {}
-            $r.crashLineas = @($cl | Where-Object { $_ } | ForEach-Object { & $limpiar $_ })
+            try { $cl = @(Get-Content -LiteralPath $cr.FullName -Tail 60 -ErrorAction Stop) } catch {}
+            $r.crashLineas = @(@(Select-CrashLineas -Lineas $cl) | ForEach-Object { & $limpiar $_ })
         }
         break
     }
@@ -4457,24 +4611,29 @@ function Test-NativaEscucha {
       Nativa" no tiene por donde pasar. Lo que si puede pasar:
        - los diez puertos ocupados por otros programas: la Nativa no tiene donde atender;
        - la Nativa abierta y sin atender en ningun puerto: arranco mal (el log lo dice);
-       - un crash.log reciente: se cae al arrancar.
+       - un crash.log reciente: la Nativa se cayo en algun momento.
       Solo lee: no cierra programas ni libera puertos.
+      v3.49 (canal, Federico 10/11 y Andres 11/11): el crash.log salia primero en "Que hacer
+      ahora" como "se cayo al arrancar", aunque la Nativa atendiera en la misma corrida (9 de las
+      10 corridas con nativa.crash de la 3.48). Y lo puede dejar el propio motor, que la ejecuta
+      sin navegador para registrarla. Ahora el aviso se decide despues de mirar el puerto, nunca
+      es una accion, y no dice "al arrancar": la traza de Federico era revisando una impresora.
     #>
     param([string]$Version = '', [bool]$Corriendo = $false)
     $usaWs = $true
     if ($Version) { try { $usaWs = ([version]$Version -ge [version]$script:NativaVersionWebsocket) } catch {} }
     $log = Get-NativaLogResumen -Carpetas @(Get-NativaLogCarpetas)
+    $porMotor = $false
+    if ([bool]$log.crash) { $porMotor = Test-CrashPorMotor -Crash $log.crashFechaDt -Lanzada (Get-NativaLanzadaPorMotor) }
     $evLog = [ordered]@{ carpeta = [string]$log.carpeta; ultimoLog = [string]$log.ultimoLog; fechaLog = [string]$log.fechaLog
                          errores = [int]$log.errores; lineas = @($log.lineas); crash = [bool]$log.crash
-                         crashFecha = [string]$log.crashFecha; crashLineas = @($log.crashLineas) }
-    if ([bool]$log.crashReciente) {
-        Add-Check -Id 'nativa.crash' -Layer 0 -Name ('La App Nativa se cayo al arrancar (crash.log del ' + [string]$log.crashFecha + ')') `
-            -Status 'warn' -RootCauseCandidate $false -Plane 'fudo_config' -Evidence @{ log = $evLog } `
-            -Recommendation ('La Nativa dejo un crash.log en ' + [string]$log.carpeta + ': se murio antes de terminar de arrancar. ' +
-                             'Si Fudo no ve las impresoras, reinstalarla (la herramienta "Revisar la App Nativa y la extension" lo hace) y mandar ese archivo en #fudo-print-doctor.' +
-                             $(if (@($log.crashLineas).Count -gt 0) { ' Lo ultimo que dice: ' + (@($log.crashLineas) -join ' / ') } else { '' }))
-    }
-    if (-not $usaWs) { return }
+                         crashFecha = [string]$log.crashFecha; crashLineas = @($log.crashLineas)
+                         crashRuta = [string]$log.crashRuta; crashPorMotor = [bool]$porMotor; puerto = 0 }
+    # v3.49: viaja en la telemetria (ver Get-TelemetryDiagnosticsExtra). Ya viene recortado y sin
+    # el usuario de Windows ni los JWT.
+    $script:Diagnostics['nativaLog'] = $evLog
+    $script:NativaPuertoAtiende = 0
+    if ($usaWs) { $null = & {
 
     $desde = [int]$script:NativaPuertoDesde
     $hasta = [int]$script:NativaPuertoHasta
@@ -4495,6 +4654,7 @@ function Test-NativaEscucha {
 
     if (@($deNativa).Count -gt 0) {
         $p = @($deNativa)[0]
+        $script:NativaPuertoAtiende = [int]$p.puerto
         Add-Check -Id 'nativa.escucha' -Layer 0 -Name ('La App Nativa atiende a Fudo en el puerto ' + [string]$p.puerto) -Status 'ok' `
             -Informativo $true -Plane 'fudo_config' -Evidence $ev
         return
@@ -4517,6 +4677,28 @@ function Test-NativaEscucha {
     Add-Check -Id 'nativa.escucha' -Layer 0 -Name ('Puertos de la App Nativa libres: ' + ($total - @($puertosOtros).Count) + ' de ' + $total) -Status 'ok' `
         -Informativo $true -Plane 'os' -Evidence $ev `
         -Recommendation $(if (@($puertosOtros).Count -gt 0) { 'Ocupados por otros programas: ' + $txtOtros + '. Mientras quede alguno libre, la Nativa usa ese.' } else { '' })
+    } }
+
+    if (-not [bool]$log.crashReciente) { return }
+    $puerto = [int]$script:NativaPuertoAtiende
+    if ($puerto -gt 0) { $evLog['puerto'] = $puerto }
+    $dice = $(if (@($log.crashLineas).Count -gt 0) { ' Lo que dice: ' + (@($log.crashLineas) -join ' / ') } else { '' })
+    $ruta = $(if ([string]$log.crashRuta) { [string]$log.crashRuta } else { '%TEMP%\fudo\crash.log' })
+    if ($porMotor) {
+        Add-Check -Id 'nativa.crash' -Layer 0 -Name ('La App Nativa dejo un crash.log cuando el diagnostico la abrio para registrarla (' + [string]$log.crashFecha + ')') `
+            -Status 'ok' -RootCauseCandidate $false -Informativo $true -Plane 'fudo_config' -Evidence @{ log = $evLog; causa = 'motor' } `
+            -Recommendation ('No es una caida de la Nativa en uso: el diagnostico la abre sin el navegador del otro lado para registrarla, y al querer contestarle se cierra. No hay nada que hacer por esto.' + $dice)
+    } elseif ($puerto -gt 0) {
+        Add-Check -Id 'nativa.crash' -Layer 0 -Name ('La App Nativa se cayo el ' + [string]$log.crashFecha + '; ahora atiende en el puerto ' + $puerto) `
+            -Status 'warn' -RootCauseCandidate $false -Informativo $true -Plane 'fudo_config' -Evidence @{ log = $evLog } `
+            -Recommendation ('Hoy esta andando: Fudo le puede hablar en el puerto ' + $puerto + ', asi que no hace falta reinstalarla por esto. Si Fudo igual no ve las impresoras, el problema esta en otro lado.' + $dice)
+    } else {
+        Add-Check -Id 'nativa.crash' -Layer 0 -Name ('La App Nativa se cayo (crash.log del ' + [string]$log.crashFecha + ')') `
+            -Status 'warn' -RootCauseCandidate $false -Informativo $true -Plane 'fudo_config' -Evidence @{ log = $evLog } `
+            -Recommendation ('La Nativa dejo un crash.log y ahora no se la ve atendiendo a Fudo (con Fudo cerrado es normal que no atienda). ' +
+                             'Si Fudo no ve las impresoras, reinstalarla: la herramienta "Revisar la App Nativa y la extension" lo hace. ' +
+                             'Para mandarlo a #fudo-print-doctor: Windows + R, pegar ' + $ruta + ', Enter, y copiar lo que dice.' + $dice)
+    }
 }
 
 function Test-NativaRapida {
@@ -4935,6 +5117,10 @@ function Test-Layer0b-NativeApp {
         $avNombres = (@($av.thirdParty) -join ', ')
         $carpetaFudo = [string]$install.carpeta
         if (-not $carpetaFudo) { try { $carpetaFudo = @(Get-FudoDataDirs)[0] } catch {} }
+        # v3.49: si el antivirus no dejo leer el instalador recien bajado, la causa es esa.
+        if ($script:Diagnostics.Contains('nativaBloqueadaPorAV')) {
+            Add-CheckAntivirusBloqueoInstalador -AvNombres ([string]$script:Diagnostics['nativaBloqueadaPorAV']) -Carpeta $carpetaFudo
+        } else {
         Add-Check -Id 'nativa.thirdPartyAV' -Layer 0 `
             -Name $(if (-not $installed) { "Antivirus de terceros ($avNombres) y la App Nativa no esta en disco" }
                     else                 { "Antivirus de terceros presente ($avNombres)" }) `
@@ -4950,6 +5136,7 @@ function Test-Layer0b-NativeApp {
                 } else {
                     "Detectado $avNombres. La App Nativa esta en disco, asi que hoy no la esta bloqueando. Si este cliente se queda sin la Nativa mas adelante, hay que excluirla a mano en $avNombres (la firma digital de la Nativa no le dice nada a un antivirus de terceros): el motor solo puede configurar exclusiones en Windows Defender."
                 })
+        }
     }
 
     # 0b.4 Los dos eslabones que faltaban entre "la Nativa esta instalada" y "Fudo imprime".
@@ -4992,6 +5179,18 @@ function Test-Layer0b-NativeApp {
                 $script:Diagnostics['fudoExtension'] = $ext
             }
             $script:Diagnostics['nativaHostRegistro'] = $reg
+            # v3.49 (bitacora 02/11-10/11): el motivo del registro no viajaba. Esta copia si, sin
+            # las rutas del manifest.
+            $script:Diagnostics['nativaRegistro'] = [ordered]@{ intento = [bool]$reg.intento; aplicado = [bool]$reg.aplicado
+                registrado = [bool]$nmh.registrado; lanzado = [bool]$reg.lanzado; motivo = [string]$reg.motivo
+                navegadores = @($nmh.navegadores); pendientes = @($nmh.pendientes) }
+            # v3.49 (canal, Joel 10/11): el navegador predeterminado.
+            $navPred = $null
+            try { $navPred = Get-NavegadorPredeterminado } catch {}
+            if ($navPred) {
+                $script:Diagnostics['navegadorPredeterminado'] = $navPred
+                Add-CheckNavegadorPredeterminado -Nav $navPred -Nmh $nmh -Ext $ext
+            }
             if ([bool]$nmh.registrado) {
                 Add-Check -Id 'nativa.hostRegistrado' -Layer 0 `
                     -Name $(if ([bool]$reg.aplicado) { 'App Nativa registrada en el navegador por el motor' } else { 'App Nativa registrada en el navegador' }) `
@@ -5026,10 +5225,10 @@ function Test-Layer0b-NativeApp {
             }
             # Extension del navegador
             if ([int]$ext.perfilesVistos -eq 0) {
-                Add-Check -Id 'fudo.extension' -Layer 0 -Name 'No se pudo revisar la extension de Fudo (no se encontro Chrome ni Edge en este perfil)' `
+                Add-Check -Id 'fudo.extension' -Layer 0 -Name 'No se pudo revisar la extension de Fudo (no se encontro Chrome, Edge ni Brave en este perfil)' `
                     -Status 'skipped' -RootCauseCandidate $false -Plane 'fudo_config' `
                     -Evidence @{ skipReason = 'sin_navegador'; ids = @($ext.ids) } `
-                    -Recommendation 'No se encontraron perfiles de Chrome, Edge ni Chromium en esta cuenta de Windows, asi que no se puede saber si la extension de Fudo esta puesta. Revisarlo a mano en el navegador que use el cliente.'
+                    -Recommendation 'No se encontraron perfiles de Chrome, Edge, Brave, Vivaldi, Opera ni Chromium en esta cuenta de Windows, asi que no se puede saber si la extension de Fudo esta puesta. Revisarlo a mano en el navegador que use el cliente.'
             } elseif ([bool]$ext.instalada) {
                 # v3.45: con la extension puesta no se pregunta el tipo de cuenta. Si ya se sabe
                 # que es v2, se avisa sin tocarla: hay cuentas v2 que solo imprimieron despues de
@@ -7589,6 +7788,111 @@ function Clear-ColaDeImpresion {
     return 'Remove-PrintJob'
 }
 
+function Get-CarpetaSpool {
+    <# Donde guarda Windows los trabajos de impresion (puede estar cambiada en el registro). #>
+    $c = Join-Path $env:SystemRoot 'System32\spool\PRINTERS'
+    try {
+        $d = [string](Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Print\Printers' -Name 'DefaultSpoolDirectory' -ErrorAction Stop).DefaultSpoolDirectory
+        if ($d -and (Test-Path -LiteralPath $d)) { $c = $d }
+    } catch {}
+    return $c
+}
+
+function Get-ArchivosSpool {
+    <#
+      v3.49 (canal, Andres 11/11): cuantos trabajos hay en la carpeta del servicio de impresion,
+      contando los archivos y sin preguntarle a Windows. Cada trabajo deja un .SHD y un .SPL.
+      El self-test no lee la PC: devuelve ok = $false (los escenarios lo mockean).
+    #>
+    if ($SelfTest) { return @{ ok = $false; carpeta = ''; trabajos = 0 } }
+    $carpeta = Get-CarpetaSpool
+    try {
+        $shd = @([System.IO.Directory]::GetFiles($carpeta, '*.SHD')).Count
+        $spl = @([System.IO.Directory]::GetFiles($carpeta, '*.SPL')).Count
+        return @{ ok = $true; carpeta = $carpeta; trabajos = [int][Math]::Max($shd, $spl) }
+    } catch { return @{ ok = $false; carpeta = $carpeta; trabajos = 0 } }
+}
+
+function Invoke-SpoolHuerfano {
+    <#
+      v3.49 (canal, Andres Outon 11/11): la carpeta del servicio de impresion tenia miles de
+      trabajos (12804.SPL, FP00007.SHD...) que no aparecian en ninguna impresora de Windows. El
+      motor dijo "Esta PC no tiene ninguna impresora instalada", la App Nativa no arrancaba, y la
+      limpieza de colas no tenia nada que ofrecer: mira los trabajos de cada cola, y ahi no habia
+      ninguno. Andres lo arreglo a mano: detener el servicio, borrar la carpeta y arrancarlo.
+      Eso es Clear-SpoolerCompleto, que ya existia para las colas enormes (3.41).
+      Aca se cuentan los archivos de la carpeta. Si hay muchos mas trabajos ahi que en las colas
+      de Windows (o Windows no contesta la lista), se ofrece vaciarla. Es irreversible: se
+      pregunta, y en modo agente no se hace. Se verifica contando otra vez.
+      TrabajosWindows: la suma de los trabajos que muestran las colas; -1 si no contesto.
+      Devuelve $true si la carpeta estaba tapada (y dejo su chequeo).
+    #>
+    param([int]$TrabajosWindows = 0)
+    $sp = Get-ArchivosSpool
+    if (-not [bool]$sp.ok) { return $false }
+    $enCarpeta = [int]$sp.trabajos
+    $sinMostrar = $(if ($TrabajosWindows -lt 0) { $enCarpeta } else { $enCarpeta - $TrabajosWindows })
+    $script:Diagnostics['spoolCarpeta'] = [ordered]@{ trabajosEnCarpeta = $enCarpeta; trabajosEnColas = $TrabajosWindows; ofrecida = $false; aplicada = $false; despues = -1 }
+    if ($enCarpeta -lt [int]$script:ColaMasiva -or $sinMostrar -lt [int]$script:ColaMasiva) { return $false }
+    $script:Diagnostics['spoolCarpeta']['ofrecida'] = $true
+    $quePasa = $(if ($TrabajosWindows -lt 0) { 'y Windows no contesta la lista de impresoras' }
+                 elseif ($TrabajosWindows -eq 0) { 'que no aparecen en ninguna impresora de Windows' }
+                 else { 'y las impresoras de Windows muestran solo ' + $TrabajosWindows })
+    Write-StepDetail ('la carpeta del servicio de impresion tiene ' + $enCarpeta + ' trabajos ' + $quePasa)
+    $carpeta = [string]$sp.carpeta
+    $rem = Invoke-Remediation -Description ('Vaciar la carpeta del servicio de impresion: ' + $enCarpeta + ' trabajos trabados ' + $quePasa) `
+        -Type 'spool.vaciar' -Target 'spool\PRINTERS' -Before ([string]$enCarpeta + ' trabajos') -After '0 trabajos' -Reversible $false -Necesaria $true `
+        -Impact 'se detiene el servicio de impresion unos segundos y se borran todos los trabajos que esperan, de todas las impresoras; las comandas que hagan falta hay que volver a imprimirlas desde Fudo' -Fix {
+            $r = Clear-SpoolerCompleto -Carpeta $carpeta
+            if (-not [bool]$r.ok) { throw [string]$r.nota }
+            [string]$r.nota
+        }
+    $aMano = ('A mano: detener el servicio "Cola de impresion" (services.msc), borrar los archivos de ' + $carpeta + ' y volver a arrancarlo.')
+    $ev = @{ carpeta = $carpeta; trabajosEnCarpeta = $enCarpeta; trabajosEnColas = $TrabajosWindows; nota = [string]$rem.note }
+    if (-not [bool]$rem.applied) {
+        Add-Check -Id 'queue.spoolCarpeta' -Layer 2 -Name ('La carpeta del servicio de impresion tiene ' + $enCarpeta + ' trabajos trabados ' + $quePasa) `
+            -Status 'warn' -RootCauseCandidate $true -Plane 'os' -Evidence $ev -Reversible $false `
+            -Recommendation ('Con la carpeta asi, Windows puede no listar las impresoras (el diagnostico dice que no hay ninguna instalada) y la App Nativa no arranca. ' +
+                             'No se vacio (' + [string]$rem.note + '). ' + $aMano + ' Las comandas que hagan falta hay que volver a imprimirlas desde Fudo.')
+        return $true
+    }
+    $d = Get-ArchivosSpool
+    $quedan = $(if ([bool]$d.ok) { [int]$d.trabajos } else { -1 })
+    $script:Diagnostics['spoolCarpeta']['aplicada'] = $true
+    $script:Diagnostics['spoolCarpeta']['despues'] = $quedan
+    $ev['despues'] = $quedan
+    $bajo = ($quedan -ge 0 -and $quedan -lt [int]$script:ColaMasiva)
+    Add-Check -Id 'queue.spoolCarpeta' -Layer 2 `
+        -Name $(if ($bajo) { 'Carpeta del servicio de impresion vaciada: ' + $enCarpeta + ' trabajos trabados' }
+                else { 'Se vacio la carpeta del servicio de impresion y siguen ' + $(if ($quedan -ge 0) { [string]$quedan } else { 'sin poder contarse los' }) + ' trabajos' }) `
+        -Status $(if ($bajo) { 'fixed' } else { 'fail' }) -RootCauseCandidate $true -Plane 'os' -Evidence $ev `
+        -ActionTaken ([string]$rem.note) -Reversible $false `
+        -Recommendation $(if ($bajo) {
+                'Se detuvo el servicio de impresion, se borraron los trabajos trabados y se volvio a arrancar. Volver a imprimir desde Fudo las comandas que hagan falta.'
+            } else {
+                'La limpieza no alcanzo. ' + $aMano + ' Si vuelven a aparecer, reiniciar la PC.'
+            })
+    return $true
+}
+
+function Invoke-SpoolHuerfanoSegunWindows {
+    <#
+      v3.49: Invoke-SpoolHuerfano para el modo "Solo la App Nativa", que no lee las colas. Primero
+      la carpeta: si no esta tapada no se le pregunta nada a Windows.
+    #>
+    $sp = Get-ArchivosSpool
+    if (-not [bool]$sp.ok -or [int]$sp.trabajos -lt [int]$script:ColaMasiva) { return $false }
+    $l = Invoke-ConLimite -Script { @(Get-Printer -ErrorAction Stop) } -TimeoutSec 15
+    if ([bool]$l.timeout) { return (Invoke-SpoolHuerfano -TrabajosWindows -1) }
+    $suma = 0
+    foreach ($q in @($l.valor | Where-Object { $_ })) {
+        $j = Get-JobCountDeCola -Cola $q
+        if ($j -lt 0) { return $false }
+        $suma += $j
+    }
+    return (Invoke-SpoolHuerfano -TrabajosWindows $suma)
+}
+
 function Clear-SpoolerCompleto {
     <#
       v3.41 (caso de un asesor del 06/10): dos colas con 56.936 y 55.315 trabajos. El asesor
@@ -7603,13 +7907,7 @@ function Clear-SpoolerCompleto {
       Devuelve @{ ok; nota; borrados }.
     #>
     param([string]$Carpeta = '')
-    if (-not $Carpeta) {
-        $Carpeta = Join-Path $env:SystemRoot 'System32\spool\PRINTERS'
-        try {
-            $d = [string](Get-ItemProperty -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Print\Printers' -Name 'DefaultSpoolDirectory' -ErrorAction Stop).DefaultSpoolDirectory
-            if ($d -and (Test-Path -LiteralPath $d)) { $Carpeta = $d }
-        } catch {}
-    }
+    if (-not $Carpeta) { $Carpeta = Get-CarpetaSpool }
     if (-not (Test-Path -LiteralPath $Carpeta)) { return @{ ok = $false; nota = ('no se encontro la carpeta de trabajos: ' + $Carpeta); borrados = 0 } }
     Write-StepDetail 'deteniendo el servicio de impresion'
     try { Stop-Service -Name 'Spooler' -Force -ErrorAction Stop }
@@ -7701,7 +7999,12 @@ function Invoke-PurgaTemprana {
     # v3.35: con limite de tiempo (ver Invoke-ConLimite). Si ni la lista de impresoras contesta,
     # el servicio de impresion esta trabado: se avisa y se sigue, la capa 0 ya lo va a mirar.
     $lista0 = Invoke-ConLimite -Script { @(Get-Printer -ErrorAction Stop) } -TimeoutSec 15
-    if ([bool]$lista0.timeout) { Add-ColaSinRespuesta -Nombre '(la lista de impresoras de Windows)' -TimeoutSec 15; return }
+    if ([bool]$lista0.timeout) {
+        Add-ColaSinRespuesta -Nombre '(la lista de impresoras de Windows)' -TimeoutSec 15
+        # v3.49: una carpeta del spooler tapada es una de las razones por las que no contesta.
+        $null = Invoke-SpoolHuerfano -TrabajosWindows -1
+        return
+    }
     $todasLasColas = @($lista0.valor | Where-Object { $_ })
     try {
         foreach ($p in @($lista0.valor | Where-Object { $_ })) {
@@ -7731,7 +8034,15 @@ function Invoke-PurgaTemprana {
             $cands += [ordered]@{ nombre = [string]$p.Name; trabajos = @($jobs).Count; minutos = $min }
         }
     } catch { return }
-    if (@($cands).Count -eq 0) { Set-StepNote 'ninguna'; return }
+    if (@($cands).Count -eq 0) {
+        # v3.49 (canal, Andres 11/11): ninguna cola muestra trabajos, pero pueden estar en la
+        # carpeta del spooler sin que Windows los asigne a ninguna (ver Invoke-SpoolHuerfano).
+        $enWindows = 0
+        $sabe = $true
+        foreach ($q in @($todasLasColas)) { $j = Get-JobCountDeCola -Cola $q; if ($j -lt 0) { $sabe = $false } else { $enWindows += $j } }
+        if ($sabe -and (Invoke-SpoolHuerfano -TrabajosWindows $enWindows)) { return }
+        Set-StepNote 'ninguna'; return
+    }
     $lista = (@($cands | ForEach-Object { "'" + [string]$_.nombre + "' (" + [int]$_.trabajos + ' trabajos)' }) -join ', ')
     $rem = Invoke-Remediation -Description ('Limpiar ahora la cola trabada: ' + $lista) -Type 'queue.purge' `
         -Target (@($cands | ForEach-Object { [string]$_.nombre }) -join ', ') `
@@ -7835,7 +8146,11 @@ function Invoke-HerramientaColas {
       trabajos que no se van, se reinicia el servicio de impresion (lo mismo que la capa 2).
     #>
     $lista = Invoke-ConLimite -Script { @(Get-Printer -ErrorAction Stop) } -TimeoutSec 15
-    if ([bool]$lista.timeout) { Add-ColaSinRespuesta -Nombre '(la lista de impresoras de Windows)' -TimeoutSec 15; return }
+    if ([bool]$lista.timeout) {
+        Add-ColaSinRespuesta -Nombre '(la lista de impresoras de Windows)' -TimeoutSec 15
+        $null = Invoke-SpoolHuerfano -TrabajosWindows -1
+        return
+    }
     $todas = @($lista.valor | Where-Object { $_ })
     $conTrabajos = @()
     foreach ($p in $todas) {
@@ -7852,6 +8167,8 @@ function Invoke-HerramientaColas {
     }
     $script:Diagnostics['herramientaColas'] = [ordered]@{ colasRevisadas = @($todas).Count; conTrabajos = @($conTrabajos) }
     if (@($conTrabajos).Count -eq 0) {
+        # v3.49 (canal, Andres 11/11): los trabajos pueden estar en la carpeta y en ninguna cola.
+        if (Invoke-SpoolHuerfano -TrabajosWindows 0) { return }
         Set-StepNote 'ninguna con trabajos'
         Add-Check -Id 'queue.health' -Layer 2 -Name 'Ninguna cola tiene trabajos esperando' -Status 'ok' -Plane 'os' `
             -Evidence @{ colasRevisadas = @($todas).Count; herramienta = $true } `
@@ -10685,6 +11002,7 @@ $script:CategoryByCheckId = @{
     'env.spooler'               = 'os.spooler'
     'queue.health'              = 'os.queue'
     'queue.otherBacklog'        = 'os.queue'
+    'queue.spoolCarpeta'        = 'os.queue'
     'conn.usb'                  = 'os.usb_port'
     'hw.noPortBound'            = 'os.usb_port'
     'conn.net'                  = 'net.ip'
@@ -11444,6 +11762,9 @@ function Invoke-FudoPrintDoctor {
         $script:StepTotal = 2
         $null = Invoke-Step -Name 'layer0b.soloNativa' -Body { Test-Layer0b-NativeApp }
         $script:NativaRevisada = $true
+        # v3.49 (canal, Andres 11/11): corrio en este modo, con la carpeta del spooler tapada, y
+        # la Nativa no arrancaba. Contar la carpeta es leer un directorio; vaciarla se pregunta.
+        if ($AutoFix -and -not $DryRun) { $null = Invoke-Step -Name 'layer0.spoolCarpeta' -Body { Invoke-SpoolHuerfanoSegunWindows } }
         $null = Invoke-Step -Name 'ui.inventario' -Body { Push-UiInventario }
         if (Request-SeguirConImpresoras) {
             $script:RunMode = 'Ambos'
@@ -15639,7 +15960,7 @@ public class FudoFakeEndpoint {
     $script:Diagnostics['nativaDescarga'] = [ordered]@{ firmaOk = $true; bytes = 1 }
     $script:Diagnostics['modoImpresionProtegido'] = [ordered]@{ activo = $false; origen = '' }
     $x134 = Get-TelemetryDiagnosticsExtra
-    Assert-Eq 'S134 viajan las cinco claves (y las de los escenarios 135, 141, 143, 144 y 151)' 'nativaDescarga,eleccionImpresora,eleccionPuerto,modoImpresionProtegido,usbSinEnumerar,extensionAbierta,purgaTemprana,uiApertura,uiCarga,colasSinRespuesta,consolaSinEdicionRapida,despuesNativa,limpiezaSpooler,cuentaFudo,tiempos,hardware' (@($x134.Keys) -join ',')
+    Assert-Eq 'S134 viajan las cinco claves (y las de los escenarios 135, 141, 143, 144 y 151, y 159)' 'nativaDescarga,eleccionImpresora,eleccionPuerto,modoImpresionProtegido,usbSinEnumerar,extensionAbierta,purgaTemprana,uiApertura,uiCarga,colasSinRespuesta,consolaSinEdicionRapida,despuesNativa,limpiezaSpooler,cuentaFudo,nativaLog,nativaRegistro,navegadorPredeterminado,spoolCarpeta,nativaBloqueadaPorAV,tiempos,hardware' (@($x134.Keys) -join ',')
     Assert-Eq 'S134 con su contenido' $true ([bool]$x134['nativaDescarga'].firmaOk)
     Assert-Eq 'S134 Send-Telemetry las pone en el payload' $true ([bool]((Get-Command Send-Telemetry).ScriptBlock.ToString() -match 'Get-TelemetryDiagnosticsExtra'))
     Reset-State
@@ -17561,6 +17882,158 @@ public class FudoFakeEndpoint {
     $script:RunMode = 'Ambos'
     Reset-Mocks
 
+    # -----------------------------------------------------------------------
+    # Escenario 159 (v3.49, bitacora 02/11-10/11 y canal: Federico 10/11, Joel 10/11, Andres 11/11).
+    # (a) El crash.log: la linea del error, no los "at ..." del final.
+    $l159 = @(Select-CrashLineas -Lineas @(
+        'node:internal/process/promises:288',
+        'Error: write EPIPE',
+        '    at afterWriteDispatched (node:internal/stream_base_commons:160:15)',
+        '    at writeGeneric (node:internal/stream_base_commons:151:3)',
+        '    at Socket._writeGeneric (node:net:917:11)',
+        '    at Writable.write (node:internal/streams/writable:508:10)',
+        "  code: 'EPIPE'"))
+    Assert-Eq 'S159a se queda con la linea del error' 'Error: write EPIPE' ([string]$l159[0])
+    Assert-Eq 'S159a mas dos marcos y el codigo' 4 (@($l159).Count)
+    Assert-Eq 'S159a y el codigo va al final' "code: 'EPIPE'" ([string]$l159[3])
+    Assert-Eq 'S159a sin error a la vista, la ultima linea que no es un marco' 'algo raro' ([string]@(Select-CrashLineas -Lineas @('algo raro', '  at x (y.js:1:1)'))[0])
+    Assert-Eq 'S159a vacio no inventa nada' 0 (@(Select-CrashLineas -Lineas @()).Count)
+    if ($env:LOCALAPPDATA) {
+        $rp159 = ConvertTo-RutaPegable -Ruta (Join-Path $env:LOCALAPPDATA 'Temp\fudo\crash.log')
+        Assert-Eq 'S159a la ruta se puede pegar (con la variable de entorno)' $true ([bool]($rp159 -match '^%(TEMP|LOCALAPPDATA)%\\' -and $rp159 -match 'crash\.log$'))
+    }
+    # (b) Quien la tiro: el crash.log escrito con la Nativa abierta por el motor es del motor.
+    $t159 = Get-Date '2026-11-11 17:47:10'
+    Assert-Eq 'S159b crash 20 s despues de que el motor la abrio: es del motor' $true (Test-CrashPorMotor -Crash $t159.AddSeconds(20) -Lanzada $t159)
+    Assert-Eq 'S159b una hora despues ya no' $false (Test-CrashPorMotor -Crash $t159.AddHours(1) -Lanzada $t159)
+    Assert-Eq 'S159b al actualizarla (cerrar + instalador), unos minutos despues: tambien' $true (Test-CrashPorMotor -Crash $t159.AddMinutes(4) -Lanzada $t159)
+    Assert-Eq 'S159b sin marca no se sabe: no es del motor' $false (Test-CrashPorMotor -Crash $t159 -Lanzada $null)
+    # (c) El aviso se decide despues de mirar el puerto, y nunca es una accion.
+    $tmp159c = Join-Path ([IO.Path]::GetTempPath()) ('fpd159c-' + [guid]::NewGuid().ToString('N'))
+    try {
+        $null = New-Item -ItemType Directory -Force -Path $tmp159c
+        Set-Content -LiteralPath (Join-Path $tmp159c 'crash.log') -Value @('Error: read ECONNRESET', '    at SerialPort.close (x.js:1:1)')
+        function Get-NativaLogCarpetas { @($tmp159c) }
+        function Get-PuertosNativa { $script:PuertosNativaSinRespuesta = $false; @([pscustomobject]@{ puerto = 9093; direccion = '127.0.0.1'; pid = 10; proceso = 'fudo_native_extension' }) }
+        function Get-NativaLanzadaPorMotor { $null }
+        Reset-State
+        Test-NativaEscucha -Version '0.0.41' -Corriendo $true
+        $c159 = Get-CheckById 'nativa.crash'
+        Assert-Eq 'S159c con la Nativa atendiendo, el crash es informativo' $true ([bool]$c159.informativo)
+        Assert-Eq 'S159c y dice en que puerto atiende' $true ([bool]([string]$c159.name -match 'ahora atiende en el puerto 9093'))
+        Assert-Eq 'S159c ya no dice "al arrancar"' $false ([bool]([string]$c159.name -match 'al arrancar'))
+        Assert-Eq 'S159c y trae la linea del error' $true ([bool]([string]$c159.recommendation -match 'ECONNRESET'))
+        Assert-Eq 'S159c el resumen del log viaja' 9093 ([int]$script:Diagnostics['nativaLog'].puerto)
+        Reset-State
+        function Get-PuertosNativa { $script:PuertosNativaSinRespuesta = $false; @() }
+        Test-NativaEscucha -Version '0.0.41' -Corriendo $false
+        $c159b = Get-CheckById 'nativa.crash'
+        Assert-Eq 'S159c sin atender sigue para mirar' 'warn' ([string]$c159b.status)
+        Assert-Eq 'S159c pero no en "Que hacer ahora"' $true ([bool]$c159b.informativo)
+        Assert-Eq 'S159c con una ruta que se puede pegar' $true ([bool]([string]$c159b.recommendation -match 'Windows \+ R, pegar %'))
+        Reset-State
+        $script:lz159 = (Get-Item -LiteralPath (Join-Path $tmp159c 'crash.log')).LastWriteTime.AddSeconds(-10)
+        function Get-NativaLanzadaPorMotor { $script:lz159 }
+        Test-NativaEscucha -Version '0.0.41' -Corriendo $false
+        $c159c = Get-CheckById 'nativa.crash'
+        Assert-Eq 'S159c el crash que dejo el motor no es una caida' 'ok' ([string]$c159c.status)
+        Assert-Eq 'S159c y lo dice' $true ([bool]([string]$c159c.name -match 'cuando el diagnostico la abrio'))
+    } finally {
+        Remove-Item -LiteralPath $tmp159c -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Reset-Mocks
+    # (d) Brave y el navegador predeterminado (Joel).
+    Assert-Eq 'S159d Brave se reconoce' 'Brave' (ConvertTo-NombreNavegador -ProgId 'BraveHTML')
+    Assert-Eq 'S159d Firefox tambien' 'Firefox' (ConvertTo-NombreNavegador -ProgId 'FirefoxURL-308046B0AF4A39CB')
+    Assert-Eq 'S159d el self-test no lee el navegador de la PC' '' ([string](Get-NavegadorPredeterminado).nombre)
+    Reset-State
+    Add-CheckNavegadorPredeterminado -Nav ([ordered]@{ progId = 'BraveHTML'; nombre = 'Brave' }) -Nmh @{ navegadores = @('Chrome') } -Ext @{ enNavegadores = @() }
+    Assert-Eq 'S159d con Brave no se avisa: el motor ya lo mira' $true ($null -eq (Get-CheckById 'fudo.navegador'))
+    Add-CheckNavegadorPredeterminado -Nav ([ordered]@{ progId = 'FirefoxURL-1'; nombre = 'Firefox' }) -Nmh @{ navegadores = @('Chrome') } -Ext @{ enNavegadores = @('Chrome') }
+    Assert-Eq 'S159d con Firefox se avisa, sin ser causa' $false ([bool](Get-CheckById 'fudo.navegador').rootCauseCandidate)
+    $tmp159d = Join-Path ([IO.Path]::GetTempPath()) ('fpd159d-' + [guid]::NewGuid().ToString('N'))
+    $la159 = $env:LOCALAPPDATA; $ad159 = $env:APPDATA
+    $id159 = 'abcdefghijklmnopabcdefghijklmnop'
+    try {
+        $null = New-Item -ItemType Directory -Force -Path (Join-Path $tmp159d ('BraveSoftware\Brave-Browser\User Data\Default\Extensions\' + $id159))
+        $null = New-Item -ItemType Directory -Force -Path (Join-Path $tmp159d ('Opera Software\Opera Stable\Extensions\' + $id159))
+        $env:LOCALAPPDATA = $tmp159d; $env:APPDATA = $tmp159d
+        $e159 = Get-FudoExtensionState -Ids @($id159)
+    } finally {
+        $env:LOCALAPPDATA = $la159; $env:APPDATA = $ad159
+        Remove-Item -LiteralPath $tmp159d -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Assert-Eq 'S159d la extension se encuentra en Brave y en Opera' 'Brave,Opera' (@($e159.enNavegadores) -join ',')
+    # (e) Firma ilegible con un antivirus de terceros: la causa es el antivirus.
+    $m159 = Get-MotivoFirmaRechazada -Firma @{ estado = 'no se pudo leer la firma' } -ArchivoSigue $true -Antivirus @('Avast Antivirus')
+    Assert-Eq 'S159e firma ilegible + Avast: es el antivirus' $true ([bool]$m159.porAntivirus)
+    Assert-Eq 'S159e y no manda a bajarla a mano' $false ([bool]([string]$m159.mensaje -match 'Descargarlo a mano'))
+    Assert-Eq 'S159e sin antivirus de terceros, como antes' $false ([bool](Get-MotivoFirmaRechazada -Firma @{ estado = 'no se pudo leer la firma' } -Antivirus @()).porAntivirus)
+    Assert-Eq 'S159e una firma que no es de Fudo no se le achaca al antivirus' $false ([bool](Get-MotivoFirmaRechazada -Firma @{ estado = 'NotSigned' } -Antivirus @('AVG')).porAntivirus)
+    Reset-State
+    Add-Check -Id 'nativa.installed' -Layer 0 -Name 'App Nativa de Fudo NO instalada' -Status 'fail' -RootCauseCandidate $true -Plane 'fudo_config'
+    Add-CheckAntivirusBloqueoInstalador -AvNombres 'Avast Antivirus'
+    $d159 = Resolve-Diagnosis
+    Assert-Eq 'S159e la causa pasa a ser el antivirus' 'nativa.thirdPartyAV' ([string]$d159.rootCauseCheckId)
+    Assert-Eq 'S159e y se cuenta como antivirus_3p' 'nativa.antivirus_3p' (Get-Category -Diag $d159)
+    Assert-Eq 'S159e la Nativa sigue figurando como no instalada' 'fail' ([string](Get-CheckById 'nativa.installed').status)
+    # (f) La carpeta del spooler tapada (Andres): ninguna cola muestra trabajos y la carpeta tiene miles.
+    Reset-State
+    Reset-Mocks
+    function Write-StepDetail { param($Texto) }
+    function Start-Sleep { param($Seconds, $Milliseconds) }
+    function Confirm-Irreversible { param($Description, $Impact) $true }
+    $script:sp159 = 12810
+    function Get-ArchivosSpool { @{ ok = $true; carpeta = 'C:\Windows\System32\spool\PRINTERS'; trabajos = [int]$script:sp159 } }
+    $script:vacio159 = 0
+    function Clear-SpoolerCompleto { param($Carpeta) $script:vacio159++; $script:sp159 = 0; @{ ok = $true; nota = 'spooler vaciado'; borrados = 25620 } }
+    function Get-Printer { param($Name, $ErrorAction) @([pscustomobject]@{ Name = 'Microsoft Print to PDF'; PortName = 'PORTPROMPT:'; DriverName = 'Microsoft Print To PDF'; JobCount = 0 }) }
+    Invoke-PurgaTemprana
+    Assert-Eq 'S159f la carpeta tapada se vacia aunque ninguna cola muestre trabajos' 1 ([int]$script:vacio159)
+    Assert-Eq 'S159f y se verifica contando otra vez' 'fixed' ([string](Get-CheckById 'queue.spoolCarpeta').status)
+    Assert-Eq 'S159f la telemetria lo cuenta' 12810 ([int]$script:Diagnostics['spoolCarpeta'].trabajosEnCarpeta)
+    Reset-State
+    $script:sp159 = 12810; $script:vacio159 = 0
+    function Confirm-Irreversible { param($Description, $Impact) $false }
+    Invoke-PurgaTemprana
+    Assert-Eq 'S159f sin confirmacion no se toca' 0 ([int]$script:vacio159)
+    Assert-Eq 'S159f y queda como causa para mirar' $true ([bool](Get-CheckById 'queue.spoolCarpeta').rootCauseCandidate)
+    Assert-Eq 'S159f se cuenta como cola' 'os.queue' (Get-Category -Diag @{ resolved = $false; rootCauseCheckId = 'queue.spoolCarpeta' })
+    Reset-State
+    $script:sp159 = 10; $script:vacio159 = 0
+    function Confirm-Irreversible { param($Description, $Impact) $true }
+    Invoke-PurgaTemprana
+    Assert-Eq 'S159f con pocos archivos no se ofrece nada' $true (($null -eq (Get-CheckById 'queue.spoolCarpeta')) -and $script:vacio159 -eq 0)
+    Reset-State
+    $script:sp159 = 12810; $script:vacio159 = 0
+    $script:RunMode = 'Cola'
+    function Get-Printer { param($Name, $ErrorAction) @([pscustomobject]@{ Name = 'COCINA'; PortName = 'USB001'; DriverName = 'Generic / Text Only'; JobCount = 0 }) }
+    Invoke-HerramientaColas
+    Assert-Eq 'S159f la herramienta de colas tambien la ve' 1 ([int]$script:vacio159)
+    # Y el modo "Solo la App Nativa", que es el que uso Andres y no lee colas.
+    Reset-State
+    $script:sp159 = 12810; $script:vacio159 = 0
+    $script:RunMode = 'Nativa'
+    function Get-Printer { param($Name, $ErrorAction) @() }
+    $r159h = Invoke-SpoolHuerfanoSegunWindows
+    Assert-Eq 'S159f en modo Nativa tambien se ofrece' $true ([bool]($r159h -and $script:vacio159 -eq 1))
+    Reset-State
+    $script:sp159 = 10; $script:gp159 = 0
+    function Get-Printer { param($Name, $ErrorAction) $script:gp159++; @() }
+    $null = Invoke-SpoolHuerfanoSegunWindows
+    Assert-Eq 'S159f con la carpeta normal ni le pregunta a Windows' 0 ([int]$script:gp159)
+    $script:RunMode = 'Ambos'
+    Reset-Mocks
+    Assert-Eq 'S159f sin mock, el self-test no lee la carpeta del spooler' $false ([bool](Get-ArchivosSpool).ok)
+    # (g) Lo que mide la 3.48/3.49 viaja.
+    Reset-State
+    $script:Diagnostics['nativaLog'] = [ordered]@{ puerto = 9094 }
+    $x159 = Get-TelemetryDiagnosticsExtra
+    Assert-Eq 'S159g nativaLog viaja' 9094 ([int]$x159['nativaLog'].puerto)
+    Assert-Eq 'S159g y el registro de la Nativa, el navegador y la carpeta del spooler tambien' $true ([bool]($x159.Contains('nativaRegistro') -and $x159.Contains('navegadorPredeterminado') -and $x159.Contains('spoolCarpeta')))
+    Reset-Mocks
+    Reset-State
+
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)
     # Salida explicita en los dos casos: si el script termina con 'return', $LASTEXITCODE
     # queda sin definir y cualquier automatizacion lo interpreta como fallo.
@@ -18667,6 +19140,8 @@ function Invoke-NativeInstallerFile {
     $script:InstaladorSigueCorriendo = $false
     $script:CerroNativaParaInstalar = $false
     if (-not $Path) { return $null }
+    # v3.49 (Andres, 11/11): cerrar la Nativa y reemplazarla puede dejar un crash.log. Es nuestro.
+    Save-NativaLanzadaPorMotor
     # Un instalador NO puede reemplazar un ejecutable que esta en uso. Medido en una PC de
     # verdad el 24/09: con la App Nativa corriendo, el instalador devuelve 1603 en cero
     # segundos y no escribe un solo byte; con la app cerrada devuelve 0 en once segundos y
@@ -19168,15 +19643,67 @@ function Test-FudoInstallerSignature {
       Devuelve @{ ok; estado; firmante }.
     #>
     param([string]$Path)
-    $r = [ordered]@{ ok = $false; estado = 'sin verificar'; firmante = '' }
+    $r = [ordered]@{ ok = $false; estado = 'sin verificar'; firmante = ''; error = '' }
     if (-not $Path) { return $r }
     try {
         $sig = Get-AuthenticodeSignature -FilePath $Path -ErrorAction Stop
         $r.estado = [string]$sig.Status
         try { $r.firmante = [string]$sig.SignerCertificate.Subject } catch {}
         $r.ok = (([string]$sig.Status -eq 'Valid') -and ([string]$r.firmante -match '(?i)fudo'))
-    } catch { $r.estado = 'no se pudo leer la firma' }
+    } catch {
+        # v3.49 (bitacora 26/10-10/11): el catch era mudo. Con Avast, AVG o Avira la excepcion es lo
+        # unico que dice que paso.
+        $r.estado = 'no se pudo leer la firma'
+        $e = ([string]$_.Exception.Message) -replace '(?i)([a-z]:\\Users\\)[^\\\s"]+', '$1<usuario>'
+        if ($e.Length -gt 200) { $e = $e.Substring(0, 200) }
+        $r.error = $e
+    }
     return $r
+}
+
+function Get-MotivoFirmaRechazada {
+    <#
+      v3.49 (bitacora 26/10-10/11): 15 corridas en 15 PCs, todas con Avast, AVG o Avira: la
+      descarga termino bien y la firma no se pudo leer. El motor decia "descargarlo a mano desde
+      la web app", que el mismo antivirus se va a comer, y la causa quedaba nativa.install.
+      Si la firma no se pudo leer (o el archivo ya no esta) y hay un antivirus de terceros, el
+      problema es el antivirus. Una firma leida y que no es de Fudo sigue siendo eso.
+      Devuelve @{ porAntivirus; mensaje }.
+    #>
+    param($Firma, [bool]$ArchivoSigue = $true, [string[]]$Antivirus = @())
+    $avs = @(@($Antivirus) | Where-Object { $_ })
+    $estado = ''
+    try { $estado = [string]$Firma.estado } catch {}
+    if ((($estado -eq 'no se pudo leer la firma') -or -not $ArchivoSigue) -and @($avs).Count -gt 0) {
+        $avTxt = (@($avs) -join ', ')
+        return @{ porAntivirus = $true
+                  mensaje = ('el instalador se descargo completo y ' + $avTxt + ' no dejo leerlo (' + $(if ($ArchivoSigue) { $estado } else { 'lo borro' }) + '): NO se ejecuto. ' +
+                             'Bajarlo a mano no sirve, el mismo antivirus se lo va a llevar. Agregar en ' + $avTxt + ' una exclusion para la carpeta temporal (%TEMP%) y para %LOCALAPPDATA%\Fudo, y volver a correr el diagnostico.') }
+    }
+    return @{ porAntivirus = $false
+              mensaje = ('el instalador descargado no tiene firma valida de Fudo (' + $estado + '): NO se ejecuto. Descargarlo a mano desde la web app.') }
+}
+
+function Add-CheckAntivirusBloqueoInstalador {
+    <#
+      v3.49: el antivirus de terceros no dejo leer el instalador recien bajado (ver
+      Get-MotivoFirmaRechazada). Es la causa, no "la Nativa no esta": los hallazgos de la Nativa
+      se quedan como estan pero dejan de competir como causa raiz.
+    #>
+    param([string]$AvNombres, [string]$Carpeta = '')
+    foreach ($idPrevio in @('nativa.installed', 'nativa.sinFirmar')) {
+        $prev = @($script:Checks | Where-Object { [string]$_.id -eq $idPrevio -and @('fail', 'warn') -contains [string]$_.status }) | Select-Object -First 1
+        if ($prev) { [void](Update-CheckFinding -Id $idPrevio -Status ([string]$prev.status) -RootCauseCandidate $false -EvidenceExtra @{ causa = 'nativa.thirdPartyAV' }) }
+    }
+    $dir = $(if ($Carpeta) { $Carpeta } else { '%LOCALAPPDATA%\Fudo' })
+    Add-Check -Id 'nativa.thirdPartyAV' -Layer 0 -Name ($AvNombres + ' no dejo leer el instalador de la App Nativa') `
+        -Status 'fail' -RootCauseCandidate $true -Plane 'hardware' `
+        -Evidence @{ products = @($AvNombres -split ',\s*'); bloqueoInstalador = $true; carpeta = $Carpeta } -Reversible $true `
+        -Recommendation ('El instalador de la Nativa se descargo completo y ' + $AvNombres + ' no dejo leerlo, asi que no se ejecuto. ' +
+                         'Bajarlo a mano no sirve: el mismo antivirus se lo lleva. El motor no puede tocar un antivirus que no sea Windows Defender, asi que va a mano y en este orden: ' +
+                         '1) en ' + $AvNombres + ', agregar una exclusion para la carpeta temporal (%TEMP%) y para ' + $dir + '; ' +
+                         '2) volver a correr el diagnostico, que la descarga e instala; ' +
+                         '3) confirmar que la Nativa quedo en disco.')
 }
 
 function Get-NativaExeHuella {
@@ -19299,8 +19826,18 @@ function Invoke-FudoNativeDownload {
         $script:Diagnostics['nativaDescarga']['firmaOk'] = [bool]$firma.ok
     } catch {}
     if (-not [bool]$firma.ok) {
+        $sigue = $false
+        try { $sigue = [bool](Test-Path -LiteralPath $destino) } catch {}
+        try {
+            $script:Diagnostics['nativaDescarga']['firmaError'] = [string]$firma.error
+            $script:Diagnostics['nativaDescarga']['archivoSigue'] = $sigue
+        } catch {}
         try { Remove-Item $destino -Force -ErrorAction SilentlyContinue } catch {}
-        throw ('el instalador descargado no tiene firma valida de Fudo (' + [string]$firma.estado + '): NO se ejecuto. Descargarlo a mano desde la web app.')
+        $avs = @()
+        if ($script:Diagnostics.Contains('antivirusTerceros')) { $avs = @($script:Diagnostics['antivirusTerceros'] | Where-Object { $_ }) }
+        $m = Get-MotivoFirmaRechazada -Firma $firma -ArchivoSigue $sigue -Antivirus $avs
+        if ([bool]$m.porAntivirus) { $script:Diagnostics['nativaBloqueadaPorAV'] = (@($avs) -join ', ') }
+        throw ([string]$m.mensaje)
     }
     $notas += ('firma verificada (' + [string]$firma.estado + ')')
     # 4) ejecutar. Un .msi no se lanza directo -abriria el asistente en la pantalla del
@@ -19821,7 +20358,7 @@ function Get-TelemetryDiagnosticsExtra {
       pueda ver las claves sin mandar nada.
     #>
     $out = [ordered]@{}
-    foreach ($k in @('nativaDescarga', 'eleccionImpresora', 'eleccionPuerto', 'modoImpresionProtegido', 'usbSinEnumerar', 'extensionAbierta', 'purgaTemprana', 'uiApertura', 'uiCarga', 'colasSinRespuesta', 'consolaSinEdicionRapida', 'despuesNativa', 'limpiezaSpooler', 'cuentaFudo')) {
+    foreach ($k in @('nativaDescarga', 'eleccionImpresora', 'eleccionPuerto', 'modoImpresionProtegido', 'usbSinEnumerar', 'extensionAbierta', 'purgaTemprana', 'uiApertura', 'uiCarga', 'colasSinRespuesta', 'consolaSinEdicionRapida', 'despuesNativa', 'limpiezaSpooler', 'cuentaFudo', 'nativaLog', 'nativaRegistro', 'navegadorPredeterminado', 'spoolCarpeta', 'nativaBloqueadaPorAV')) {
         $out[$k] = $(if ($script:Diagnostics.Contains($k)) { $script:Diagnostics[$k] } else { $null })
     }
     # v3.32: cuanto tardo cada paso (ver StepTimes).

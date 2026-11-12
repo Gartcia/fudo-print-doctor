@@ -2,6 +2,55 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.49] - 2026-11-12
+
+**La carpeta del servicio de impresión llena de trabajos que no son de ninguna cola.** Andrés
+(11/11): Print Doctor dijo "Esta PC no tiene ninguna impresora instalada", la App Nativa no
+arrancaba, y se resolvió a mano deteniendo el servicio de impresión, borrando la carpeta
+`spool\PRINTERS` (miles de `.SHD` y `.SPL`) y volviéndolo a arrancar. El motor ya sabía hacer eso
+desde la 3.41, pero solo cuando una cola mostraba miles de trabajos, y acá ninguna mostraba nada.
+Ahora se cuentan los archivos de esa carpeta. Si tiene 50 trabajos o más que no aparecen en las
+colas, o si Windows no contesta la lista de impresoras, se ofrece vaciarla. Pasa al arrancar la
+revisión, en la herramienta "Limpiar colas" y en "Solo la App Nativa", que es el modo en que
+corrió Andrés y que no mira colas. Es irreversible: se pregunta, no se hace en modo agente, y
+después se vuelve a contar.
+
+**El crash.log de la Nativa ya no es "lo primero que hay que hacer".** Federico (10/11) y Andrés
+(11/11) vieron primero en "Qué hacer ahora" que "la App Nativa se cayó al arrancar", con un
+archivo para mandar que no supieron encontrar. En 9 de las 10 corridas de la 3.48 con ese aviso,
+la Nativa estaba atendiendo a Fudo en esa misma corrida. Y la traza de Federico era de una caída
+revisando una impresora serie, no al arrancar. Ahora el aviso se decide después de mirar el
+puerto, y nunca es una acción:
+
+- si la Nativa atiende, dice "se cayó el <fecha>; ahora atiende en el puerto X";
+- si el crash.log se escribió mientras el propio diagnóstico estaba tocando la Nativa, lo dice
+  así. Es el caso de Andrés: en la telemetría, su primera corrida (17:46) actualizó la 0.0.26 a
+  la 0.0.41 (para eso la cierra y corre el instalador), y la segunda (17:50) avisó el crash.log
+  de las 17:47 como una caída. Desde esta versión el motor anota cuándo la abre, la cierra o la
+  instala, y lo que aparezca en los 10 minutos siguientes es suyo;
+- si no, queda "para mirar", con la ruta que se puede pegar en Windows + R
+  (`%TEMP%\fudo\crash.log`) en vez de una con `<usuario>`.
+
+Del crash.log se lee la línea del error y no las últimas cinco, que eran solo `at ...`.
+
+**Brave, Vivaldi y Opera.** Joel (10/11): el cliente usaba Fudo en Brave y el motor no lo conocía.
+La extensión ahora también se busca en Brave, Vivaldi y Opera, y Brave aparece entre los
+navegadores donde se puede abrir la página de la extensión. Se lee el navegador predeterminado de
+Windows: si es uno donde el motor no mira la extensión (Firefox, por ejemplo), se avisa en vez de
+cerrar con "registrada en el navegador: el problema no está ahí". El registro de la Nativa sigue
+mirándose en las claves de Chrome, Edge y Chromium: falta confirmar en una PC con Brave cuál lee.
+
+**Avast, AVG o Avira no dejan leer el instalador: la causa es el antivirus.** En la bitácora,
+15 corridas en 15 PCs entre la 3.45 y la 3.48. La descarga terminó bien, la firma no se pudo leer
+y el motor decía "descargarlo a mano desde la web app", que el mismo antivirus se come. La causa
+quedaba "Nativa no instalada". Ahora, si la firma no se puede leer (o el archivo desaparece) y
+hay un antivirus de terceros, la causa es `nativa.antivirus_3p` y el texto dice qué excluir y en
+qué orden. El error que tira Windows al leer la firma ya no se pierde.
+
+**Telemetría: viaja lo que la 3.48 medía y no mandaba.** El resumen del log y del crash de la
+Nativa, con su puerto, el motivo del registro de la Nativa en el navegador, el navegador
+predeterminado y el conteo de la carpeta del spooler.
+
 ## [3.48] - 2026-11-04
 
 **Cómo se conecta Fudo con la App Nativa, y qué mirar cuando no se conecta.** Producto respondió
