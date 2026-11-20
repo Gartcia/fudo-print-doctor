@@ -651,6 +651,21 @@ function pregunta(p){
   // Tramite interno del asesor: se marca para que el cliente que esta mirando entienda que
   // no le estan pidiendo nada a el.
   if(p.soloAsesor) box.appendChild(el("div","soloasesor","Paso del asesor"));
+  // v3.51: cuanto falta para que la pregunta venza y el motor siga solo. Una pregunta sin
+  // contestar dejaba la corrida 15 minutos quieta sin que nadie supiera por que.
+  if(window._cdTimer){ clearInterval(window._cdTimer); window._cdTimer=null; }
+  if(p.limiteSeg && p.limiteSeg>0){
+    var cd=el("div",null,""); cd.style.fontSize="12px"; cd.style.opacity="0.7"; cd.style.margin="0 0 6px";
+    box.appendChild(cd);
+    var finCd=Date.now()+p.limiteSeg*1000;
+    var tickCd=function(){
+      var s=Math.max(0,Math.round((finCd-Date.now())/1000));
+      var t=(s>=60)?(Math.floor(s/60)+" min "+(s%60)+" s"):(s+" s");
+      cd.textContent=(IDIOMA==="pt-BR"?"Se ninguem responder, continua sozinho em ":"Si nadie contesta, sigue solo en ")+t;
+      if(s<=0 && window._cdTimer){ clearInterval(window._cdTimer); window._cdTimer=null; }
+    };
+    tickCd(); window._cdTimer=setInterval(tickCd,1000);
+  }
   box.appendChild(el("div","ask-k", p.clase==="papel"
       ? "La pregunta que el motor no puede contestar solo" : "Hace falta que decidas"));
   box.appendChild(el("h3",null,esc(p.titulo)));

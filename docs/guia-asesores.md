@@ -2,27 +2,54 @@
 
 ## Cómo se corre
 
-1. Copiar la carpeta a la PC del cliente (Escritorio o Descargas).
-2. Doble clic en **`FudoPrintDoctor.cmd`**.
-3. Pide permisos de administrador y muestra qué va a hacer. Enter para arrancar.
-4. Leer el bloque **QUE HACER AHORA**.
-5. Para escalar, adjuntar el `resultado.json` que queda al lado del script.
+Casi siempre lo corrés vos, conectado a la PC del cliente por TeamViewer o AnyDesk.
 
-Un solo archivo hace todo: diagnostica y repara en la misma corrida. Lo único que puede llegar a
-preguntarte es si limpiar la cola de impresión cuando hay comandas trabadas, porque eso las
-descarta y hay que volver a imprimirlas desde Fudo. Cualquier otra reparación es reversible y se
-aplica sola.
+1. Usá el **`FudoPrintDoctor.cmd` interno** (el del canal), no el del ZIP público: el público no
+   manda el reporte y la corrida no queda registrada.
+2. Pasalo a la PC del cliente y hacé doble clic. Es lo único que hace falta: el motor se baja
+   solo, siempre en la última versión.
+3. Acepta el permiso de administrador. **Por TeamViewer:** si TeamViewer no se abrió como
+   administrador, el aviso de Windows no lo podés aceptar vos y la pantalla queda en negro hasta
+   que el cliente toca *Sí*. Si nadie lo puede aceptar, Print Doctor sigue igual sin esos
+   permisos: revisa todo, pero algunas reparaciones no las puede hacer.
+4. Se abre una página en el navegador. Lo primero que pide es el **número del caso** (los 15
+   dígitos de la conversación de Intercom, o la dirección completa). Si lo volvés a abrir en la
+   misma PC dentro de las 2 horas, ya viene escrito: Continuar.
+5. Después pregunta **cómo está conectada la impresora que no anda**. Viene marcada la opción que
+   corresponde a esa PC (por ejemplo, USB si no tiene impresoras de red), así que casi siempre es
+   un clic.
+6. Leer **QUE HACER AHORA**. Si termina con cosas por hacer, la ventana negra no se cierra sola.
+
+Si una pregunta queda sin contestar, la página muestra cuánto falta para que siga sola. Después de
+una pregunta sin contestar, las siguientes esperan como mucho un minuto.
+
+Lo único que pregunta antes de hacer es si limpiar la cola de impresión cuando hay comandas
+trabadas, porque eso las descarta y hay que volver a imprimirlas desde Fudo. Se pregunta **una
+vez por revisión**: si decís que sí, vale para el resto. Cualquier otra reparación es reversible y
+se aplica sola.
 
 Si Windows muestra "Windows protegió tu PC" al abrir el `.cmd`: *Más información* → *Ejecutar
 de todas formas*. Es porque el archivo viene de internet, no porque tenga algo raro.
 
+## Impresora de red que no responde: no hace falta Print Doctor
+
+Si la impresora es de red (tiene su IP) y no responde, **Print Doctor no le puede cambiar la IP**.
+Eso se hace con la utilidad de red del fabricante o desde la página web de la impresora. Andá
+directo:
+
+1. Self-test de la impresora (apagarla, mantener FEED, encenderla) para leer la IP que tiene.
+2. Si es otra, cargar esa IP en Fudo (Administración > Impresoras) o devolverle la anterior con la
+   utilidad del fabricante.
+3. Si no imprime ni el self-test, es la impresora: técnico.
+
+Si igual lo corrés en modo Red y la impresora no contesta, Print Doctor te dice esto mismo en
+segundos y no sigue intentando cosas contra esa IP (no le manda tickets ni limpia las comandas
+que la están esperando: salen solas cuando la impresora vuelve a responder).
+
 ## Revisión completa o una herramienta
 
-Lo primero que pregunta es cómo lo querés usar:
-
-- **Revisión completa**: para cuando no sabés qué tiene la PC. Revisa toda la cadena y arregla
-  lo que encuentra. Es lo de siempre.
-- **Elegir una herramienta**: para cuando ya sabés qué hay que hacer. Cada una hace solo eso:
+En la misma pantalla de "cómo está conectada" está **Otras herramientas**, para cuando ya sabés
+qué hay que hacer. Cada una hace solo eso:
   - **Limpiar colas de impresión**: te muestra las colas que tienen trabajos esperando, elegís
     cuáles (o todas) y las limpia. Si queda uno que no se borra, reinicia el servicio de
     impresión.
@@ -139,10 +166,14 @@ Artículos: [áreas y cocinas](https://soporte.fu.do/es/articles/11730815) ·
   desde Fudo. Es la única reparación irreversible.
 - **Cola `FUDO-TEST-*`**: si el motor la creó, queda instalada. Borrarla cuando se instale la
   definitiva: `Remove-Printer -Name "FUDO-TEST-USB001"`.
-- **Impresora de red**: si la IP cambió por DHCP, el motor escanea la subred buscando el
-  puerto 9100 y sugiere la nueva IP, pero **no** la cambia en Fudo. Eso se hace en la web app.
-- **Sin permisos de administrador** algunas reparaciones fallan (spooler, drivers). El launcher
-  `2-*` los pide solo.
+- **Impresora de red**: si la IP cambió, el motor busca en la misma red quién contesta en el
+  puerto 9100 y te lo dice, pero **no** cambia nada: ni en Fudo ni en la impresora. Ver
+  [Impresora de red que no responde](#impresora-de-red-que-no-responde-no-hace-falta-print-doctor).
+- **Sin permisos de administrador** algunas reparaciones fallan (spooler, drivers). El `.cmd` los
+  pide solo; si no se aceptan, sigue sin ellos y te lo avisa.
+- **Volver a revisar** desde el menú (R) es mejor que cerrar y abrir: no vuelve a preguntar el
+  caso ni el modo. Si la revisión da lo mismo que la anterior del mismo caso, te lo dice: otra
+  vuelta no lo va a cambiar, conviene derivar.
 
 ## El menú del final
 

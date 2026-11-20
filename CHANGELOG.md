@@ -2,6 +2,86 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.51] - 2026-11-20
+
+**Menos tiempo del asesor: lo que encontraron diez revisiones de cómo se usa Print Doctor.** El
+20/11 se cruzaron la telemetría (1.828 corridas del 09/10 al 20/11), 40 conversaciones de
+Intercom, los casos con y sin Print Doctor y el canal, y se recorrió el motor como lo usa un
+asesor. La conclusión de fondo: con el mismo asesor, los casos con Print Doctor llevaban 32
+minutos más de manejo y 7 mensajes más. Parte es sesgo (se usa en los casos difíciles), pero
+buena parte era espera muerta, preguntas que el motor podía deducir y vueltas que repetían lo
+mismo. En 38 de los 40 casos lo corre el asesor por TeamViewer, no el cliente.
+
+**Una pregunta sin contestar ya no frena 15 minutos.** 81 corridas quedaron 15 minutos o más
+quietas en una pregunta que nadie contestó: el 24% de todo el tiempo de motor, y muchas
+encadenaban dos esperas (31 minutos). Ahora, si una pregunta vence, las siguientes esperan como
+mucho un minuto, y la página muestra cuánto falta para que siga sola. Viaja `preguntasVencidas`.
+
+**Volver a abrir no vuelve a pedir lo mismo.** El 27% de los casos tiene más de una corrida, y en
+327 de 338 relanzamientos en la misma PC dentro de la hora se volvió a tipear el mismo caso. El
+caso y el modo quedan guardados en la PC: si se reabre dentro de las 2 horas, el caso viene
+escrito y el modo de la vez anterior viene marcado. El "No" a revisar la App Nativa vale para toda
+la sesión.
+
+**No repetir lo que no se sostuvo.** 107 limpiezas de cola repetían una que la revisión anterior
+había dejado bien (en 31 nada había cambiado) y 149 replugs por software volvían a hacer falta en
+la revisión siguiente. Si la revisión anterior del mismo caso ya lo hizo y anduvo, no se repite:
+la limpieza dice que la impresora no está recibiendo (la herramienta del menú sigue limpiando si
+el asesor lo pide) y el replug manda a cambiar el cable o el puerto. Y si la revisión termina con
+la misma causa que la anterior del caso, lo primero que dice es que conviene derivar: los casos
+derivados después de tres o más revisiones llevaron 113 minutos de manejo.
+
+**Una sola pantalla para elegir qué revisar.** "Cómo lo querés usar" quedaba en lo que venía
+marcado en el 83% de las corridas: las herramientas pasan a ser una opción más de "cómo está
+conectada". Y la opción marcada sale de la PC: en 867 de 1.631 corridas la PC tenía solo colas
+USB y venía marcado "las dos". Limpiar la cola se autoriza una vez por revisión (553 sí contra
+25 sin confirmar), no una vez por cola o por capa. Viaja `modoSugerido`.
+
+**Red, recortado.** Print Doctor no puede cambiarle la IP a una impresora (cada marca lo hace con
+su utilidad o su página web), y de 97 corridas con "impresora de red inalcanzable" no se resolvió
+ninguna: el modo Red resolvía el 13% de los casos y era el que más manejo llevaba (86 minutos).
+Ahora se dice rápido y no se insiste:
+
+- La prueba de la IP es una conexión de 1,5 segundos en vez de ping + `Test-NetConnection` (30 a
+  40 segundos contra una IP muerta).
+- El veredicto dice qué hacer afuera de Print Doctor: self-test para leer la IP, cargarla en Fudo
+  o devolverle la anterior con la utilidad del fabricante o su página web. Sin nombrar Delitools.
+- No se manda el ticket de prueba a una IP que no contesta, no se limpian las comandas que la
+  están esperando (21 limpiezas en modo Red tenían esa causa: con la IP corregida iban a salir),
+  e "Identificar impresoras" no le deja un ticket trabado.
+- Buscar en otras subredes queda para la herramienta "Buscar impresoras en la red" (o
+  `-AllowNetProbe $true`): preguntaba, sumaba IPs a la placa y tardaba hasta un minuto y medio.
+- Un puerto TCP/IP con nombre propio ("COCINA_RED") ya cuenta como de red en el modo Red.
+- En modo Red no se toca el USB (el replug corrió en 37 revisiones de modo Red).
+- La guía de asesores dice que con una impresora de red que no responde se va directo a la
+  utilidad del fabricante.
+
+**Arranque, cierre y permisos.**
+
+- La versión publicada se consulta una vez por sesión (eran tres, hasta 37 segundos sin internet).
+- Con `-NoNativaKitCheck` (los dos launchers) ya no se leen enteros los instaladores de Fudo de
+  Descargas y el Escritorio.
+- Sin red, la telemetría no hace un segundo intento de 20 segundos antes de mostrar el resultado.
+- **Defender:** antes de cada descarga de la Nativa se excluían para siempre todo `%TEMP%`, la
+  carpeta de programas del usuario y cualquier `Fudo*.exe`, aunque Defender nunca la hubiera
+  tocado. Ahora se excluye solo el instalador descargado y se saca al terminar; las carpetas, solo
+  si Defender ya le encontró algo a la Nativa en esa PC.
+- **Otra cuenta de Windows:** si el permiso de administrador se aceptó con una cuenta distinta de
+  la del cliente, la Nativa quedaba instalada en esa otra cuenta y la revisión la daba por
+  instalada. Ya no se instala y se dice por qué (`nativaOtroPerfil`).
+- Launcher 10: si se rechaza el permiso de administrador, sigue sin él y lo dice (antes se
+  cerraba sin hacer nada); con cosas por hacer (código 2) la ventana ya no se cierra sola a los 15
+  segundos. Vacíos `FUDO_CASO_URL` y `FUDO_CASO_KEY` al lado de la URL de telemetría.
+
+**Lo verificado mide el efecto.** Reiniciar el servicio de impresión figuraba 100% verificado
+porque se medía contra "el servicio está corriendo"; medido contra la cola, la vació 59 de 102
+veces. Limpiar la cola para probar puertos figuraba 0 de 20 porque se medía contra la salud de la
+cola antes de limpiarla. Las dos se verifican ahora con lo que quedó en la cola.
+
+No probado contra hardware: la sonda de 1,5 segundos y el veredicto de red, la limpieza que no se
+repite y el replug que manda a cambiar el cable salieron de la telemetría. Self-test: escenarios
+163 a 168.
+
 ## [3.50] - 2026-11-20
 
 **El motor le pregunta a Intercom antes de preguntarle al asesor.** Al cruzar los últimos 30

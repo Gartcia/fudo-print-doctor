@@ -21,14 +21,12 @@ El script **avisa** solo si está corriendo una versión vieja, y ofrece la opci
 actualizarse en el momento. `-CheckUpdate` compara contra la publicada y termina; `-NoUpdateCheck`
 desactiva el chequeo.
 
-**Por qué no se actualiza solo**: corre en la PC de un cliente y no está firmado digitalmente. Una
-actualización automática propagaría cualquier bug —o cualquier cambio malicioso en el repo— a todos
-los locales sin que nadie lo revise. Avisar y dejar la decisión a una persona cuesta un clic y evita
-convertir el repo en un canal de ejecución remota. La opción `A` valida lo que descarga (tamaño,
-firma y versión legible) y guarda un `.bak` antes de reemplazar.
+**El motor siempre corre en la última versión**: el `.cmd` baja la versión publicada del motor
+en cada corrida y la verifica antes de correrla (que esté completa y que parsee). Una copia vieja
+del motor no corre.
 
-Para trabajar en la PC de un cliente, copiale **dos archivos**: `FudoPrintDoctor.cmd` y
-`FudoPrintDoctor.ps1`. Si solo copiaste el `.cmd` y esa PC tiene internet, él baja el `.ps1` solo.
+Para trabajar en la PC de un cliente alcanza con **un archivo**: `FudoPrintDoctor.cmd`. Los
+asesores usan la copia interna, que es la que manda el reporte de cada corrida.
 
 **Brasil (Deli):** los asesores de Deli usan `PrintDoctor.cmd` en lugar de `FudoPrintDoctor.cmd`.
 Es el mismo launcher en portugués, y corre el motor con `-Idioma pt-BR`: el ticket de prueba sale en
@@ -38,10 +36,16 @@ portugués, las colas que quedan en Windows se llaman `DELI-*` / `Impressora Del
 
 ## Uso rápido (asesores)
 
-Copiar la carpeta a la PC del cliente y **doble clic en `FudoPrintDoctor.cmd`**. Eso es todo.
+Casi siempre lo corre el asesor, conectado a la PC del cliente por TeamViewer o AnyDesk: pasar
+**`FudoPrintDoctor.cmd`** y doble clic. Eso es todo. La guía paso a paso está en
+[docs/guia-asesores.md](docs/guia-asesores.md).
 
-- Se eleva a administrador solo.
-- Muestra qué va a hacer y espera un Enter antes de tocar nada.
+- Pide permisos de administrador. Si no se aceptan, sigue sin ellos y avisa qué no pudo reparar.
+- Lo primero que pide es el número del caso (si se reabre en la misma PC dentro de las 2 horas,
+  ya viene escrito), y después cómo está conectada la impresora, con la opción que corresponde a
+  esa PC ya marcada.
+- **Impresora de red que no responde**: Print Doctor no le puede cambiar la IP a una impresora. Ir
+  directo a la utilidad del fabricante o a la página web de la impresora (ver la guía).
 - **Muestra el progreso en vivo**: una línea por etapa con `[n/9]`, el resultado y cuánto tardó,
   y el detalle de lo que está haciendo mientras corre (buscando la Nativa, consultando el
   antivirus, escaneando la subred, enviando el ticket…).
