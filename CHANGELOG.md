@@ -2,6 +2,43 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.50] - 2026-11-20
+
+**El motor le pregunta a Intercom antes de preguntarle al asesor.** Al cruzar los últimos 30
+casos (19 y 20/11) con Intercom, el campo "Version nativa impresoras" de la conversación (1 o 2)
+coincidió con lo que contestó el asesor sobre los pasos del asistente en 7 de 7 casos, y tenía la
+respuesta en los 2 donde el asesor puso "no sé". Y en 11 de 22 chats la cuenta usaba una App
+Nativa anterior a la 0.0.41 (tres con la 0.0.18) que el motor no miró porque el modo elegido
+era USB o Red; 6 de esos casos quedaron sin resolver.
+
+Ahora, apenas se carga el caseId, el motor consulta un servicio aparte (el motor es público y no
+puede llevar el token de Intercom) que devuelve solo datos de la cuenta: tipo de cuenta, versión
+de la Nativa y de la extensión. Con eso:
+
+- **El tipo de cuenta sale de Intercom** y la pregunta de los 3 o 2 pasos no aparece. Queda
+  `origen: intercom` en `cuentaFudo`.
+- **Si la Nativa de la cuenta es vieja y en la corrida no se revisó a fondo**, se avisa
+  (informativo: Intercom anota la versión de la última PC desde la que la cuenta abrió Fudo).
+- En WhatsApp la conversación no trae esos campos: el servicio busca otro contacto de la misma
+  cuenta que sí haya usado el chat.
+- La consulta viaja en la telemetría (`casoIntercom`), y si el servicio no está configurado o no
+  responde en 5 segundos, la corrida sigue exactamente como antes. La URL y la clave van en el
+  launcher interno (`FUDO_CASO_URL`, `FUDO_CASO_KEY`), nunca en el repo.
+
+**El disco lleno se avisa al arrancar.** Joel (canal, 16/11): en una PC con el disco lleno, Print
+Doctor se quedó dando vueltas al buscar las impresoras sin avisar nada, y la corrida no llegó a
+mandar telemetría. Windows guarda cada impresión en el disco antes de mandarla, así que sin
+espacio la cola se traba. Ahora se mira el espacio libre al principio: con menos de 500 MB es
+falla y causa raíz, con menos de 2 GB es aviso, y el dato viaja en `discoSistema`.
+
+**El tipo de cuenta viaja en todas las corridas de la sesión.** Al revisar con la telemetría las
+PCs donde falta la extensión de Fudo desde la 3.45 (pedido de CX para el levantamiento de E5,
+16/11), 7 de las 23 llegaron sin saber qué había contestado el asesor sobre los pasos del
+asistente. Eran corridas de "volver a revisar" en la misma sesión: la pregunta se hace una sola
+vez y la respuesta se seguía usando, pero el registro se borraba al empezar la corrida nueva, así
+que `cuentaFudo` llegaba vacío. Ahora la corrida siguiente lo vuelve a mandar, con lo que contestó
+el asesor y `deCorridaAnterior: true`. El comportamiento del motor no cambia.
+
 ## [3.49] - 2026-11-12
 
 **La carpeta del servicio de impresión llena de trabajos que no son de ninguna cola.** Andrés

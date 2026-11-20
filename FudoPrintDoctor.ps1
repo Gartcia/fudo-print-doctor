@@ -525,7 +525,7 @@ $script:Producto    = 'Fudo'
 $script:PrefijoCola = 'FUDO-'
 $script:NombreCola  = 'Impresora Fudo'
 $script:ReglasTexto = @()
-$script:SchemaVersion = '3.49'
+$script:SchemaVersion = '3.50'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -1564,6 +1564,9 @@ $script:NativeInstallerUrlLegacy = 'https://fu.do/downloads/fudo_native_app_win.
 # Lo confirmo el equipo de la Nativa el 27/10: v1 -> el link de arriba (hoy la 0.0.41), v2 ->
 # este. Este link lleva la version en la ruta: cuando salga otra hay que cambiarlo aca.
 $script:NativeInstallerUrlV2 = 'https://fu.do/downloads/auto-update/win/builds/fudo_native_extension_0.0.43.exe'
+# v3.50: lo que Intercom sabe de la cuenta del caso (tipo de cuenta, version de la Nativa). Lo
+# trae Get-CasoIntercom al arrancar; $null si no hay servicio configurado o no respondio.
+$script:CasoIntercom = $null
 # 'v1', 'v2', 'nose', o '' si todavia no se pregunto. Ver Get-TipoCuentaFudo. No se llama
 # $script:CuentaFudo a proposito: ese es el parametro, y asignarlo lo borraria (ver S148).
 $script:TipoCuentaFudo = ''
@@ -3383,6 +3386,9 @@ function Test-Layer0-Environment {
     Add-Check -Id 'env.admin' -Layer 0 -Name 'Privilegios de administrador' -Status $(if($isAdmin){'ok'}else{'warn'}) `
         -Evidence @{ isAdmin = $isAdmin } `
         -Recommendation $(if($isAdmin){''}else{'Sin admin algunas remediaciones (spooler, drivers) pueden fallar.'})
+
+    # 0.25 v3.50: espacio en el disco de Windows (ver Test-DiscoSistema).
+    try { Test-DiscoSistema } catch {}
 
     # 0.3 Servicio Spooler
     $spooler = $null
@@ -11844,6 +11850,8 @@ function Invoke-FudoPrintDoctor {
     if ($envOk -and $script:AbortByMode -and -not $script:NativaRevisada) {
         $null = Invoke-Step -Name 'layer0b.nativeApp' -Body { Test-Layer0b-NativeApp }
     }
+    # v3.50: lo que dice Intercom de la Nativa de la cuenta, si aca no se reviso a fondo.
+    if ($envOk) { $null = Invoke-Step -Name 'intercom.nativaCuenta' -Body { Test-NativaCuentaIntercom } }
 
     # Colas temporales: SE BORRAN salvo que hayan servido para algo (una cola de prueba que
     # no imprimio solo ensucia el panel del cliente: se llegaron a ver 10 impresoras con
@@ -12583,6 +12591,7 @@ function Invoke-SelfTest {
         # v3.45: los escenarios anteriores estan escritos para una cuenta con extension, que era
         # el unico comportamiento. Los del escenario 156 ponen el tipo de cuenta explicito.
         $script:TipoCuentaFudo = 'v1'
+        $script:CasoIntercom = $null
     }
 
     # Foto de las funciones que existen ANTES de que el self-test defina un solo mock: todo lo
@@ -15960,7 +15969,7 @@ public class FudoFakeEndpoint {
     $script:Diagnostics['nativaDescarga'] = [ordered]@{ firmaOk = $true; bytes = 1 }
     $script:Diagnostics['modoImpresionProtegido'] = [ordered]@{ activo = $false; origen = '' }
     $x134 = Get-TelemetryDiagnosticsExtra
-    Assert-Eq 'S134 viajan las cinco claves (y las de los escenarios 135, 141, 143, 144 y 151, y 159)' 'nativaDescarga,eleccionImpresora,eleccionPuerto,modoImpresionProtegido,usbSinEnumerar,extensionAbierta,purgaTemprana,uiApertura,uiCarga,colasSinRespuesta,consolaSinEdicionRapida,despuesNativa,limpiezaSpooler,cuentaFudo,nativaLog,nativaRegistro,navegadorPredeterminado,spoolCarpeta,nativaBloqueadaPorAV,tiempos,hardware' (@($x134.Keys) -join ',')
+    Assert-Eq 'S134 viajan las cinco claves (y las de los escenarios 135, 141, 143, 144 y 151, y 159)' 'nativaDescarga,eleccionImpresora,eleccionPuerto,modoImpresionProtegido,usbSinEnumerar,extensionAbierta,purgaTemprana,uiApertura,uiCarga,colasSinRespuesta,consolaSinEdicionRapida,despuesNativa,limpiezaSpooler,cuentaFudo,nativaLog,nativaRegistro,navegadorPredeterminado,spoolCarpeta,nativaBloqueadaPorAV,casoIntercom,discoSistema,tiempos,hardware' (@($x134.Keys) -join ',')
     Assert-Eq 'S134 con su contenido' $true ([bool]$x134['nativaDescarga'].firmaOk)
     Assert-Eq 'S134 Send-Telemetry las pone en el payload' $true ([bool]((Get-Command Send-Telemetry).ScriptBlock.ToString() -match 'Get-TelemetryDiagnosticsExtra'))
     Reset-State
@@ -18034,6 +18043,102 @@ public class FudoFakeEndpoint {
     Reset-Mocks
     Reset-State
 
+    # Escenario 160 (v3.50): el tipo de cuenta viaja tambien en la corrida siguiente de la misma
+    # sesion. Se pregunta una sola vez, y Reset-RunState vaciaba el registro: 7 de 23 PCs con la
+    # extension faltante (desde la 3.45) llegaron sin saber que habia contestado el asesor.
+    Reset-State
+    $script:TipoCuentaFudo = 'nose'
+    $script:Diagnostics['cuentaFudo'] = [ordered]@{ tipo = 'nose'; origen = 'asesor'; motivo = 'falta la extension' }
+    Reset-RunState
+    $x160 = Get-TelemetryDiagnosticsExtra
+    Assert-Eq 'S160a la corrida siguiente manda el tipo de cuenta' 'nose' ([string]$x160['cuentaFudo'].tipo)
+    Assert-Eq 'S160a con lo que contesto el asesor' 'asesor|falta la extension|True' ([string]$x160['cuentaFudo'].origen + '|' + [string]$x160['cuentaFudo'].motivo + '|' + [string]$x160['cuentaFudo'].deCorridaAnterior)
+    Reset-RunState
+    Assert-Eq 'S160b y la de despues tambien' 'nose' ([string](Get-TelemetryDiagnosticsExtra)['cuentaFudo'].tipo)
+    Reset-State
+    $script:TipoCuentaFudo = ''
+    Reset-RunState
+    Assert-Eq 'S160c sin preguntar no se inventa' $null ((Get-TelemetryDiagnosticsExtra)['cuentaFudo'])
+    Reset-State
+
+    # Escenario 161 (v3.50): lo que sabe Intercom de la cuenta. En los 30 casos del 19-20/11 el
+    # tipo de cuenta de Intercom coincidio con el asesor en 7 de 7 y tenia la respuesta en los
+    # 2 "no se"; en 11 de 22 chats la Nativa de la cuenta era anterior a la 0.0.41.
+    Reset-State
+    function Get-CasoIntercomConfig { @{ url = 'https://ejemplo.invalid/api/caso'; key = 'k' } }
+    function Invoke-CasoIntercomRequest { param($Url, $Key, $TimeoutSec) $script:url161 = $Url
+        [pscustomobject]@{ tipoCuenta = 'V2'; versionNativa = '0.0.18'; versionExtension = 'x;rm'; fuenteNativa = 'contacto'; canal = 'conversation' } }
+    $c161 = Get-CasoIntercom -CaseId '215476928517727'
+    Assert-Eq 'S161a pide el caso por su id' 'https://ejemplo.invalid/api/caso?id=215476928517727' ([string]$script:url161)
+    Assert-Eq 'S161a trae el tipo de cuenta y la version' 'v2|0.0.18' ([string]$c161.tipoCuenta + '|' + [string]$c161.versionNativa)
+    Assert-Eq 'S161a lo que no es una version no pasa' '' ([string]$c161.versionExtension)
+    Assert-Eq 'S161a y viaja en la telemetria' $true ([bool](Get-TelemetryDiagnosticsExtra)['casoIntercom'].ok)
+    $script:TipoCuentaFudo = ''
+    Assert-Eq 'S161b con Intercom no se pregunta el tipo de cuenta' 'v2' (Get-TipoCuentaFudo -Motivo 'falta la extension')
+    Assert-Eq 'S161b y queda que vino de Intercom' 'intercom' ([string]$script:Diagnostics['cuentaFudo'].origen)
+    # (c) Nativa vieja segun Intercom, solo si aca no se reviso a fondo.
+    Reset-State
+    $script:CasoIntercom = [ordered]@{ tipoCuenta = 'v1'; versionNativa = '0.0.18'; fuenteNativa = 'contacto' }
+    $script:NativaRevisada = $false
+    Test-NativaCuentaIntercom
+    $k161 = Get-CheckById 'intercom.nativaCuenta'
+    Assert-Eq 'S161c avisa la Nativa vieja de la cuenta' 'warn' ([string]$k161.status)
+    Assert-Eq 'S161c sin ser causa raiz' $false ([bool]$k161.rootCauseCandidate)
+    Reset-State
+    $script:CasoIntercom = [ordered]@{ tipoCuenta = 'v1'; versionNativa = '0.0.18' }
+    $script:NativaRevisada = $true
+    Test-NativaCuentaIntercom
+    Assert-Eq 'S161c si se reviso a fondo no repite' $null (Get-CheckById 'intercom.nativaCuenta')
+    Reset-State
+    $script:CasoIntercom = [ordered]@{ tipoCuenta = 'v1'; versionNativa = '0.0.41' }
+    $script:NativaRevisada = $false
+    Test-NativaCuentaIntercom
+    Assert-Eq 'S161c con la recomendada no dice nada' $null (Get-CheckById 'intercom.nativaCuenta')
+    $script:NativaRevisada = $false
+    # (d) Si el servicio falla o no esta, la corrida sigue como siempre.
+    Reset-State
+    function Invoke-CasoIntercomRequest { param($Url, $Key, $TimeoutSec) throw 'timeout' }
+    Assert-Eq 'S161d si falla no hay datos' $null (Get-CasoIntercom -CaseId '215476928517727')
+    Assert-Eq 'S161d y queda por que' 'timeout' ([string]$script:Diagnostics['casoIntercom'].motivo)
+    $script:TipoCuentaFudo = ''
+    $CuentaFudo = 'nose'
+    Assert-Eq 'S161d y el tipo de cuenta sale como antes' 'nose' (Get-TipoCuentaFudo)
+    $CuentaFudo = ''
+    Reset-State
+    function Get-CasoIntercomConfig { @{ url = ''; key = '' } }
+    $script:url161 = ''
+    Assert-Eq 'S161d sin servicio no se consulta' $null (Get-CasoIntercom -CaseId '215476928517727')
+    Assert-Eq 'S161d ni se llama' '' ([string]$script:url161)
+    # (e) La consulta sobrevive a volver a revisar.
+    Reset-State
+    $script:Diagnostics['casoIntercom'] = [ordered]@{ ok = $true; tipoCuenta = 'v1' }
+    Reset-RunState
+    Assert-Eq 'S161e la consulta viaja en la corrida siguiente' 'v1' ([string](Get-TelemetryDiagnosticsExtra)['casoIntercom'].tipoCuenta)
+    Reset-Mocks
+    Reset-State
+
+    # Escenario 162 (v3.50, canal Joel 16/11): el disco lleno se avisa antes de buscar impresoras.
+    Reset-State
+    function Get-DiscoSistemaLibre { @{ ok = $true; unidad = 'C:'; libreMB = 120; totalMB = 60000 } }
+    Test-DiscoSistema
+    $k162 = Get-CheckById 'env.disco'
+    Assert-Eq 'S162a disco lleno es falla y causa' 'fail|True' ([string]$k162.status + '|' + [string]$k162.rootCauseCandidate)
+    Assert-Eq 'S162a y viaja' 120 ([int](Get-TelemetryDiagnosticsExtra)['discoSistema'].libreMB)
+    Reset-State
+    function Get-DiscoSistemaLibre { @{ ok = $true; unidad = 'C:'; libreMB = 1500; totalMB = 60000 } }
+    Test-DiscoSistema
+    Assert-Eq 'S162b poco espacio es aviso' 'warn' ([string](Get-CheckById 'env.disco').status)
+    Reset-State
+    function Get-DiscoSistemaLibre { @{ ok = $true; unidad = 'C:'; libreMB = 50000; totalMB = 60000 } }
+    Test-DiscoSistema
+    Assert-Eq 'S162c con espacio esta bien' 'ok' ([string](Get-CheckById 'env.disco').status)
+    Reset-State
+    function Get-DiscoSistemaLibre { @{ ok = $false } }
+    Test-DiscoSistema
+    Assert-Eq 'S162d si no se puede leer no inventa' $null (Get-CheckById 'env.disco')
+    Reset-Mocks
+    Reset-State
+
     Write-Host ("SELF-TEST: {0} PASS / {1} FAIL" -f $script:__p, $script:__f)
     # Salida explicita en los dos casos: si el script termina con 'return', $LASTEXITCODE
     # queda sin definir y cualquier automatizacion lo interpreta como fallo.
@@ -18047,6 +18152,10 @@ public class FudoFakeEndpoint {
 # ---------------------------------------------------------------------------
 function Reset-RunState {
     <# Deja todo listo para una corrida nueva dentro de la misma sesion. #>
+    # v3.50: el tipo de cuenta se pregunta una vez por sesion ($script:TipoCuentaFudo sobrevive),
+    # pero su registro vivia en $script:Diagnostics, que se vacia aca. Las corridas siguientes
+    # llegaban sin cuentaFudo: 7 de las 23 PCs con la extension faltante desde la 3.45.
+    $cuentaPrev = $(if ($script:Diagnostics -and $script:Diagnostics.Contains('cuentaFudo')) { $script:Diagnostics['cuentaFudo'] } else { $null })
     $script:Checks      = New-Object System.Collections.ArrayList
     $script:Actions     = New-Object System.Collections.ArrayList
     # $script:GestionesPendientes NO se limpia: viaja en la telemetria de esta corrida nueva.
@@ -18054,7 +18163,14 @@ function Reset-RunState {
     $script:OrigenAccion = 'auto'
     $script:Errors      = New-Object System.Collections.ArrayList
     $script:Log         = New-Object System.Collections.ArrayList
+    $casoPrev = $(if ($script:Diagnostics -and $script:Diagnostics.Contains('casoIntercom')) { $script:Diagnostics['casoIntercom'] } else { $null })
     $script:Diagnostics = [ordered]@{}
+    # v3.50: la consulta a Intercom se hace una vez por sesion; viaja en todas sus corridas.
+    if ($casoPrev) { $script:Diagnostics['casoIntercom'] = $casoPrev }
+    if ([string]$script:TipoCuentaFudo -and $cuentaPrev) {
+        $script:Diagnostics['cuentaFudo'] = [ordered]@{ tipo = [string]$script:TipoCuentaFudo; origen = [string]$cuentaPrev.origen
+                                                        motivo = [string]$cuentaPrev.motivo; deCorridaAnterior = $true }
+    }
     $script:StartTime   = Get-Date
     $script:StepIndex   = 0
     $script:StepTimes   = [ordered]@{}
@@ -19445,6 +19561,132 @@ function Test-LauncherFreshness {
     return [bool]$viejo
 }
 
+function Get-CasoIntercomConfig {
+    <#
+      v3.50: donde esta el servicio que consulta Intercom. Igual que la telemetria, la URL y la
+      clave viven en el launcher interno (FUDO_CASO_URL, FUDO_CASO_KEY) o en las variables del
+      usuario, nunca en el repo. Sin URL no se consulta nada y la corrida sigue como siempre.
+    #>
+    $url = [string]$env:FUDO_CASO_URL
+    if (-not $url) { try { $url = [string][Environment]::GetEnvironmentVariable('FUDO_CASO_URL', 'User') } catch {} }
+    $key = [string]$env:FUDO_CASO_KEY
+    if (-not $key) { try { $key = [string][Environment]::GetEnvironmentVariable('FUDO_CASO_KEY', 'User') } catch {} }
+    return @{ url = ([string]$url).Trim(); key = ([string]$key).Trim() }
+}
+
+function Invoke-CasoIntercomRequest {
+    <# La llamada HTTP sola, aparte para que el self-test la reemplace sin tocar la red. #>
+    param([string]$Url, [string]$Key, [int]$TimeoutSec = 5)
+    try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
+    return Invoke-RestMethod -Uri $Url -Headers @{ 'x-fpd-key' = $Key } -TimeoutSec $TimeoutSec -UseBasicParsing -ErrorAction Stop
+}
+
+function Get-CasoIntercom {
+    <#
+      v3.50: le pregunta al servicio de casos que sabe Intercom de la cuenta de este caseId.
+      Motivo: en los 30 casos del 19-20/11, el campo "Version nativa impresoras" de Intercom
+      (1 o 2) coincidio con lo que contesto el asesor en 7 de 7, y tenia la respuesta en los 2
+      "no se". Y en 11 de 22 chats la cuenta tenia una Nativa anterior a la 0.0.41 que el motor
+      no miro porque el modo era USB o Red. Solo vuelven datos de la cuenta, nada personal.
+      Nunca frena la corrida: 5 segundos como mucho, y cualquier falla queda en 'motivo'.
+    #>
+    param([string]$CaseId)
+    $out = [ordered]@{ consultado = $false; ok = $false; motivo = ''; ms = 0
+                       tipoCuenta = ''; versionNativa = ''; versionExtension = ''; fuenteNativa = ''; canal = '' }
+    $script:CasoIntercom = $null
+    $cfg = Get-CasoIntercomConfig
+    if (-not [string]$cfg.url) { $out.motivo = 'sin servicio configurado' }
+    elseif ([string]$CaseId -notmatch '^\d{6,20}$') { $out.motivo = 'sin caseId' }
+    else {
+        $out.consultado = $true
+        $sw = [Diagnostics.Stopwatch]::StartNew()
+        try {
+            $sep = $(if (([string]$cfg.url).Contains('?')) { '&' } else { '?' })
+            $r = Invoke-CasoIntercomRequest -Url ([string]$cfg.url + $sep + 'id=' + [string]$CaseId) -Key ([string]$cfg.key) -TimeoutSec 5
+            if ($null -eq $r) { throw 'respuesta vacia' }
+            $tipo = ([string]$r.tipoCuenta).Trim().ToLower()
+            if ($tipo -in @('v1', 'v2')) { $out.tipoCuenta = $tipo }
+            $vn = ([string]$r.versionNativa).Trim()
+            if ($vn -match '^\d+(\.\d+){1,3}$') { $out.versionNativa = $vn }
+            $ve = ([string]$r.versionExtension).Trim()
+            if ($ve -match '^\d+(\.\d+){1,3}$') { $out.versionExtension = $ve }
+            $f = ([string]$r.fuenteNativa).Trim()
+            if ($f -match '^[A-Za-z]{1,40}$') { $out.fuenteNativa = $f }
+            $cn = ([string]$r.canal).Trim()
+            if ($cn -match '^[A-Za-z_]{1,30}$') { $out.canal = $cn }
+            $out.ok = $true
+        } catch {
+            $m = [string]$_.Exception.Message
+            $out.motivo = $(if ($m.Length -gt 120) { $m.Substring(0, 120) } else { $m })
+        }
+        $out.ms = [int]$sw.ElapsedMilliseconds
+    }
+    $script:Diagnostics['casoIntercom'] = $out
+    if ([bool]$out.ok) { $script:CasoIntercom = $out }
+    return $script:CasoIntercom
+}
+
+function Test-NativaCuentaIntercom {
+    <#
+      v3.50: si en esta corrida no se reviso la Nativa a fondo (modos USB y Red) e Intercom dice
+      que la cuenta usa una vieja, se avisa. Es informativo: Intercom anota la version de la
+      ultima PC desde la que la cuenta abrio Fudo, que puede no ser esta.
+    #>
+    $c = $script:CasoIntercom
+    if (-not $c -or -not [string]$c.versionNativa) { return }
+    if ([bool]$script:NativaRevisada) { return }
+    $rec = [string](Get-NativaVersionRecomendada)
+    $vieja = $false
+    try { $vieja = ([version][string]$c.versionNativa -lt [version]$rec) } catch { return }
+    if (-not $vieja) { return }
+    Add-Check -Id 'intercom.nativaCuenta' -Layer 0 `
+        -Name ('Segun Intercom, la cuenta usa la App Nativa v' + [string]$c.versionNativa + ' (la recomendada es la v' + $rec + ')') `
+        -Status 'warn' -RootCauseCandidate $false -Informativo $true -Plane 'fudo_config' `
+        -Evidence @{ versionCuenta = [string]$c.versionNativa; recomendada = $rec; tipoCuenta = [string]$c.tipoCuenta; fuente = [string]$c.fuenteNativa } `
+        -Recommendation ('Intercom anota la version de la App Nativa de la ultima PC desde la que la cuenta abrio Fudo, que puede no ser esta. ' +
+                         'En esta corrida no se reviso la Nativa a fondo: si la comanda no sale, elegir "Solo la App Nativa" para que el motor la revise y la actualice.')
+}
+
+function Get-DiscoSistemaLibre {
+    <# v3.50: espacio libre del disco de Windows, en MB. Aparte para que el self-test lo simule. #>
+    try {
+        $u = ([string]$env:SystemDrive).TrimEnd('\')
+        if (-not $u) { $u = 'C:' }
+        $d = New-Object System.IO.DriveInfo($u + '\')
+        return @{ ok = $true; unidad = $u; libreMB = [int64]($d.AvailableFreeSpace / 1MB); totalMB = [int64]($d.TotalSize / 1MB) }
+    } catch { return @{ ok = $false } }
+}
+
+function Test-DiscoSistema {
+    <#
+      v3.50 (canal, Joel 16/11): una PC con el disco lleno dejo a Print Doctor dando vueltas al
+      buscar las impresoras, sin avisar nada, y la corrida no llego a mandar telemetria. Windows
+      escribe cada impresion en el disco antes de mandarla, asi que sin espacio la cola se traba.
+      Se mira al principio: leer el espacio libre no toca nada.
+    #>
+    $d = Get-DiscoSistemaLibre
+    if (-not [bool]$d.ok) { return }
+    $libre = [int64]$d.libreMB
+    $script:Diagnostics['discoSistema'] = [ordered]@{ unidad = [string]$d.unidad; libreMB = $libre; totalMB = [int64]$d.totalMB }
+    $texto = $(if ($libre -lt 1024) { [string]$libre + ' MB' } else { ('{0:N1} GB' -f ($libre / 1024.0)) })
+    $rec = ('Windows guarda cada impresion en el disco antes de mandarla a la impresora: sin espacio, la cola se traba, la App Nativa puede no arrancar y Print Doctor puede quedar trabado. ' +
+            'Liberar espacio en ' + [string]$d.unidad + ' (vaciar la papelera, borrar descargas, o "Liberar espacio en disco" de Windows) hasta tener al menos 2 GB libres, y volver a correr Print Doctor.')
+    if ($libre -lt 500) {
+        Add-Check -Id 'env.disco' -Layer 0 -Name ('El disco de Windows esta lleno: quedan ' + $texto) -Status 'fail' `
+            -RootCauseCandidate $true -Plane 'os' -Evidence @{ libreMB = $libre; totalMB = [int64]$d.totalMB } -Recommendation $rec
+        if (Test-IsInteractiveConsole) {
+            Write-Host ''
+            Write-Host ('  ATENCION: el disco de Windows esta lleno (quedan ' + $texto + '). Hay que liberar espacio antes de seguir.') -ForegroundColor Red
+        }
+    } elseif ($libre -lt 2048) {
+        Add-Check -Id 'env.disco' -Layer 0 -Name ('Queda poco espacio en el disco de Windows: ' + $texto) -Status 'warn' `
+            -RootCauseCandidate $false -Plane 'os' -Evidence @{ libreMB = $libre; totalMB = [int64]$d.totalMB } -Recommendation $rec
+    } else {
+        Add-Check -Id 'env.disco' -Layer 0 -Name ('Espacio en el disco de Windows: ' + $texto + ' libres') -Status 'ok' `
+            -Evidence @{ libreMB = $libre; totalMB = [int64]$d.totalMB }
+    }
+}
+
 function Get-TipoCuentaFudo {
     <#
       v3.45: la cuenta de Fudo de este cliente imprime con la extension del navegador (v1) o sin
@@ -19466,6 +19708,8 @@ function Get-TipoCuentaFudo {
     $origen = ''
     $param = ([string]$CuentaFudo).Trim().ToLower()
     if ($param -in @('v1', 'v2', 'nose')) { $tipo = $param; $origen = 'parametro' }
+    # v3.50: si Intercom ya lo sabe, no se pregunta (ver Get-CasoIntercom).
+    elseif ($script:CasoIntercom -and ([string]$script:CasoIntercom.tipoCuenta -in @('v1', 'v2'))) { $tipo = [string]$script:CasoIntercom.tipoCuenta; $origen = 'intercom' }
     elseif (-not (Test-HayHumano)) { $origen = 'sin nadie a quien preguntarle' }
     elseif (Test-UiWeb) {
         $r = Request-UiAnswer -Id 'cuentaFudo' -Clase 'modo' -SoloAsesor -TimeoutSec $script:UiTimeoutOpcional `
@@ -20358,7 +20602,7 @@ function Get-TelemetryDiagnosticsExtra {
       pueda ver las claves sin mandar nada.
     #>
     $out = [ordered]@{}
-    foreach ($k in @('nativaDescarga', 'eleccionImpresora', 'eleccionPuerto', 'modoImpresionProtegido', 'usbSinEnumerar', 'extensionAbierta', 'purgaTemprana', 'uiApertura', 'uiCarga', 'colasSinRespuesta', 'consolaSinEdicionRapida', 'despuesNativa', 'limpiezaSpooler', 'cuentaFudo', 'nativaLog', 'nativaRegistro', 'navegadorPredeterminado', 'spoolCarpeta', 'nativaBloqueadaPorAV')) {
+    foreach ($k in @('nativaDescarga', 'eleccionImpresora', 'eleccionPuerto', 'modoImpresionProtegido', 'usbSinEnumerar', 'extensionAbierta', 'purgaTemprana', 'uiApertura', 'uiCarga', 'colasSinRespuesta', 'consolaSinEdicionRapida', 'despuesNativa', 'limpiezaSpooler', 'cuentaFudo', 'nativaLog', 'nativaRegistro', 'navegadorPredeterminado', 'spoolCarpeta', 'nativaBloqueadaPorAV', 'casoIntercom', 'discoSistema')) {
         $out[$k] = $(if ($script:Diagnostics.Contains($k)) { $script:Diagnostics[$k] } else { $null })
     }
     # v3.32: cuanto tardo cada paso (ver StepTimes).
@@ -20827,6 +21071,8 @@ try {
         exit 7
     }
     $CaseId = Resolve-CaseIdObligatorio -Actual $CaseId
+    # v3.50: lo que Intercom sabe de la cuenta, antes de cualquier pregunta (ver Get-CasoIntercom).
+    try { $null = Get-CasoIntercom -CaseId $CaseId } catch {}
     # dryRun viaja a la interfaz: en modo diagnostico las gestiones del menu no aplican nada,
     # y si no se dice, el asesor toca 'esperar la reconexion del USB' y parece que se colgo.
     Push-UiEvent -Tipo 'caso' -Datos @{ caseId = $CaseId; host = $env:COMPUTERNAME
