@@ -28,7 +28,7 @@ REM      avisa y sigue por consola. La interfaz no puede ser condicion
 REM      para diagnosticar en la PC de un cliente que ya tiene un
 REM      problema.
 REM ================================================================
-REM  LAUNCHER-VERSION: 8   <- subir esto cuando cambie este archivo. El
+REM  LAUNCHER-VERSION: 10  <- subir esto cuando cambie este archivo. El
 REM  updater no lo pisa (lleva la URL de telemetria), asi que hoy la copia
 REM  interna se distribuye a mano. El marcador queda para que el updater
 REM  pueda comparar y refrescarlo preservando la URL.
@@ -44,6 +44,11 @@ REM  extra que olvidarse. El repositorio publico lo deja vacio: para
 REM  armar la copia interna, usar tools\Configurar-Telemetria.cmd.
 REM ----------------------------------------------------------------
 set "FUDO_TELEMETRY_URL="
+REM  v3.51: el servicio que le dice al motor que sabe Intercom de la cuenta del caso
+REM  (tipo de cuenta, version de la Nativa). Vacio = no se consulta. Igual que la de arriba,
+REM  solo en la copia interna.
+set "FUDO_CASO_URL="
+set "FUDO_CASO_KEY="
 
 set "FPD_MOTOR=%~dp0PrintDoctor.ps1"
 set "FPD_JSON=%~dp0resultado.json"
@@ -79,8 +84,16 @@ goto admin_ok
 
 :elevar
 echo  Pedindo permissao de administrador...
-powershell -NoProfile -Command "Start-Process -FilePath '%~f0' -Verb RunAs"
-exit /b
+REM  Launcher 10 (20/11/2026): si el permiso se rechaza (o por TeamViewer nadie lo puede
+REM  aceptar), antes se cerraba sin decir nada y no se revisaba nada. El motor sabe correr sin
+REM  administrador: revisa todo y avisa lo que no pudo reparar.
+powershell -NoProfile -Command "try { Start-Process -FilePath '%~f0' -Verb RunAs -ErrorAction Stop; exit 0 } catch { exit 1 }"
+if not errorlevel 1 exit /b
+echo.
+echo  As permissoes de administrador nao foram aceitas. Sigo sem elas:
+echo  da para revisar tudo, mas alguns reparos nao vao poder ser feitos.
+echo.
+goto admin_ok
 
 :admin_ok
 REM  Launcher 7 (01/10/2026): apagar la "edicion rapida" de ESTA ventana. Con ella activada,
@@ -131,12 +144,34 @@ goto motor_ok
 :bajar_motor
 echo  Baixando o motor...
 echo.
+REM  Launcher 9: se borra antes de bajar, para que la descarga nunca escriba sobre
+REM  lo que haya quedado (ver el chequeo de abajo).
+del /q "%FPD_MOTOR%" >nul 2>&1
 powershell -NoProfile -ExecutionPolicy Bypass -Command "try { iex ([Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($env:FPD_QE))) } catch {}; try { [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12 } catch {}; Invoke-WebRequest -Uri '%FPD_RAW%/FudoPrintDoctor.ps1' -UseBasicParsing -TimeoutSec 90 -OutFile '%FPD_MOTOR%'"
 if not exist "%FPD_MOTOR%" goto sin_motor
 
 :motor_ok
 findstr /c:"FudoPrintDoctor" "%FPD_MOTOR%" >nul
 if errorlevel 1 goto motor_invalido
+
+REM  Launcher 9 (14/10/2026): el motor tiene que parsear antes de correrlo. En una PC
+REM  de un cliente (motor en el escritorio de OneDrive) el .ps1 quedo con el motor
+REM  entero y, pegado atras, el comienzo de otra copia: PowerShell corto con "Falta el
+REM  terminador '#>'" y no diagnostico nada. El chequeo de version no lo vio, porque
+REM  el texto de la version estaba en la primera copia. Si no parsea se borra y se
+REM  baja una vez mas; si vuelve a llegar roto, o no hay internet, no se corre.
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$t=$null; $e=$null; try { [void][System.Management.Automation.Language.Parser]::ParseFile($env:FPD_MOTOR, [ref]$t, [ref]$e) } catch { exit 1 }; if (@($e).Count -gt 0) { exit 1 }; exit 0" >nul 2>&1
+if not errorlevel 1 goto motor_sano
+del /q "%FPD_MOTOR%" >nul 2>&1
+if defined FPD_REBAJADO goto motor_roto
+if not defined FPD_PUB goto motor_roto
+set "FPD_REBAJADO=1"
+echo.
+echo  O motor desta pasta estava incompleto ou danificado.
+echo  Baixando de novo...
+goto bajar_motor
+
+:motor_sano
 
 echo.
 echo  ================================================================
@@ -193,7 +228,7 @@ REM  URL de reporte, por eso no se pisa-, asi que hay asesores con launchers vie
 REM  no habia forma de saber quienes: una corrida que no arranca no reporta nada, y un
 REM  launcher anterior al 10/09/2026 puede escribir RESUELTO sin que el motor corra.
 REM  Al publicar un .cmd nuevo, actualizar esta fecha.
-set "FPD_STAMP=2026-10-05"
+set "FPD_STAMP=2026-11-20"
 powershell -NoProfile -ExecutionPolicy Bypass -File "%FPD_MOTOR%" -Idioma pt-BR -Ui web -NoNativaKitCheck -LauncherStamp "%FPD_STAMP%" -JsonOut "%FPD_JSON%"
 set FPD_EXIT=%errorlevel%
 
@@ -238,9 +273,18 @@ REM  era la pagina (se arreglo en el motor 3.40); la otra era esta ventana, que 
 REM  quedaba esperando una tecla. Si la revision termino, se cierra sola. Si el
 REM  motor fallo, sigue esperando: el error en rojo hay que poder leerlo. Con N
 REM  queda abierta, por si la revision siguio por esta consola y falta leer algo.
+REM  Launcher 10 (20/11/2026): con 2 (quedan pasos) ya no se cierra sola: se cerraba a los 15
+REM  segundos justo cuando la ventana decia que mirara QUE HACER AHORA.
 if "%FPD_EXIT%"=="0" goto cierre_solo
-if "%FPD_EXIT%"=="2" goto cierre_solo
+if "%FPD_EXIT%"=="2" goto quedan_pasos
 goto fin
+
+:quedan_pasos
+echo.
+echo  Ainda ha coisas a fazer: leia O QUE FAZER AGORA aqui em cima (ou na
+echo  pagina). Quando terminar, aperte uma tecla para fechar esta janela.
+pause >nul
+exit /b %FPD_EXIT%
 
 :cierre_solo
 echo.
@@ -301,6 +345,21 @@ echo.
 echo  Nao foi possivel baixar e nao esta na pasta. Este PC pode estar
 echo  sem internet. Copie tambem o arquivo PrintDoctor.ps1
 echo  junto com este .cmd e tente de novo.
+echo.
+pause
+exit /b 1
+
+:motor_roto
+echo.
+echo  ================================================================
+echo   O MOTOR BAIXADO CHEGOU QUEBRADO
+echo  ================================================================
+echo   Foi baixado duas vezes e chegou incompleto ou danificado, ou nao
+echo   ha internet para baixar de novo. Nada foi executado.
+echo.
+echo   O que fazer: abrir este arquivo de novo. Se acontecer de novo, tire
+echo   um print desta janela e escreva em #fudo-print-doctor.
+echo  ================================================================
 echo.
 pause
 exit /b 1

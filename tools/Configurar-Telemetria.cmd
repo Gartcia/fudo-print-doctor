@@ -8,6 +8,8 @@ REM  Por que existe: el .cmd del repositorio publico deja la URL vacia
 REM  a proposito, y la URL no puede vivir en el repositorio. Este
 REM  archivo la pega en una copia, sin escribirla en ningun otro lado.
 REM  El resultado (FudoPrintDoctor-interno.cmd) NO se commitea.
+REM  v3.51: si estan definidas FUDO_CASO_URL y FUDO_CASO_KEY (el servicio de casos de
+REM  Intercom), tambien se cargan en la copia interna. La clave nunca va al repositorio.
 REM
 REM  Uso:
 REM   - doble clic, y pega la URL cuando la pida; o
@@ -64,7 +66,7 @@ if not defined FPD_URL goto sin_url
 :generar
 REM  Validacion y sustitucion en PowerShell: la URL viaja por variable
 REM  de entorno para no pelear con las comillas de cmd.
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$u=$env:FPD_URL; if ($u -notmatch '^https://' -or $u -notmatch '/exec$') { exit 3 }; $q=[char]34; $base=[IO.File]::ReadAllText($env:FPD_BASE); $buscar='set ' + $q + 'FUDO_TELEMETRY_URL=' + $q; $poner='set ' + $q + 'FUDO_TELEMETRY_URL=' + $u + $q; if ($base -notlike ('*' + $buscar + '*')) { exit 4 }; $nuevo=$base.Replace($buscar, $poner); [IO.File]::WriteAllText($env:FPD_OUT, $nuevo); exit 0"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$u=$env:FPD_URL; if ($u -notmatch '^https://' -or $u -notmatch '/exec$') { exit 3 }; $q=[char]34; $base=[IO.File]::ReadAllText($env:FPD_BASE); $buscar='set ' + $q + 'FUDO_TELEMETRY_URL=' + $q; $poner='set ' + $q + 'FUDO_TELEMETRY_URL=' + $u + $q; if ($base -notlike ('*' + $buscar + '*')) { exit 4 }; $nuevo=$base.Replace($buscar, $poner); foreach ($n in 'FUDO_CASO_URL','FUDO_CASO_KEY') { $v=[Environment]::GetEnvironmentVariable($n); if ($v) { $nuevo=$nuevo.Replace('set ' + $q + $n + '=' + $q, 'set ' + $q + $n + '=' + $v + $q) } }; [IO.File]::WriteAllText($env:FPD_OUT, $nuevo); exit 0"
 if errorlevel 4 goto sin_marcador
 if errorlevel 3 goto url_invalida
 if errorlevel 1 goto fallo
@@ -82,7 +84,7 @@ set "FPD_BASE_BR=%~dp0..\PrintDoctor.cmd"
 if not exist "%FPD_BASE_BR%" set "FPD_BASE_BR=%~dp0PrintDoctor.cmd"
 if not exist "%FPD_BASE_BR%" goto listo
 set "FPD_OUT_BR=%~dp0PrintDoctor-interno.cmd"
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$u=$env:FPD_URL; $q=[char]34; $base=[IO.File]::ReadAllText($env:FPD_BASE_BR); $buscar='set ' + $q + 'FUDO_TELEMETRY_URL=' + $q; $poner='set ' + $q + 'FUDO_TELEMETRY_URL=' + $u + $q; if ($base -notlike ('*' + $buscar + '*')) { exit 4 }; [IO.File]::WriteAllText($env:FPD_OUT_BR, $base.Replace($buscar, $poner)); exit 0"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$u=$env:FPD_URL; $q=[char]34; $base=[IO.File]::ReadAllText($env:FPD_BASE_BR); $buscar='set ' + $q + 'FUDO_TELEMETRY_URL=' + $q; $poner='set ' + $q + 'FUDO_TELEMETRY_URL=' + $u + $q; if ($base -notlike ('*' + $buscar + '*')) { exit 4 }; $nuevo=$base.Replace($buscar, $poner); foreach ($n in 'FUDO_CASO_URL','FUDO_CASO_KEY') { $v=[Environment]::GetEnvironmentVariable($n); if ($v) { $nuevo=$nuevo.Replace('set ' + $q + $n + '=' + $q, 'set ' + $q + $n + '=' + $v + $q) } }; [IO.File]::WriteAllText($env:FPD_OUT_BR, $nuevo); exit 0"
 findstr /c:"FUDO_TELEMETRY_URL=http" "%FPD_OUT_BR%" >nul 2>&1
 if errorlevel 1 set "FPD_OUT_BR="
 
@@ -98,6 +100,8 @@ echo   Nativa firmada: el motor lo baja solo, el .msi no.
 if defined FPD_OUT_BR echo   El de Deli se renombra a PrintDoctor.cmd y va a los asesores de Brasil.
 echo.
 echo   NO lo commitees: la URL no va al repositorio.
+if defined FUDO_CASO_URL echo   Incluye el servicio de casos de Intercom (FUDO_CASO_URL y FUDO_CASO_KEY).
+if not defined FUDO_CASO_URL echo   SIN servicio de casos: defini FUDO_CASO_URL y FUDO_CASO_KEY y volve a correrlo.
 echo  ----------------------------------------------------------------
 echo.
 pause
