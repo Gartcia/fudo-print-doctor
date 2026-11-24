@@ -2,6 +2,33 @@
 
 Formato: [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Versionado del `schemaVersion` del JSON.
 
+## [3.52] - 2026-11-24
+
+**Buscar impresoras en la red dice qué es cada una, y se puede volver a correr sola.** Franco
+(canal, 19 y 20/11): en un cambio de IP, Print Doctor aportaba poco y terminaban en CMD con ping,
+arp e ipconfig para saber qué era cada equipo, en qué red estaba la PC y si la impresora ya
+contestaba en la IP nueva. Pidió escanear la red, ver IP y MAC, ver las placas de red de la PC,
+probar el 9100 y actualizar sin correr todo de nuevo. Escanear y probar el 9100 ya lo hacía la
+herramienta (desde la 3.43); el resto se agrega:
+
+- **Marca, modelo y MAC de cada impresora encontrada.** Ya se sacaban, pero solo para la que
+  estaba en otra red. Con la marca se dice qué utilidad abrir para cambiarle la IP (y su ruta, si
+  está en la PC), además de la página web de la impresora. Viajan en `red.busqueda`.
+- **Las placas de red de la PC**, con IP, red, máscara (si no es la /24 de siempre) y router, sin
+  las virtuales. Si la PC está en dos redes distintas, se avisa. Viaja `placasRed`.
+- **Se busca primero en las redes reales.** Con una VPN o una máquina virtual, el corte en tres
+  redes podía dejar afuera la del local.
+- **La N del menú ("Buscar impresoras en la red") corre la herramienta sola.** Antes escribía el
+  resultado en la consola, que con la página no se ve. Ahora es una vuelta de unos segundos con el
+  resultado en la página, y "Revisar de nuevo" vuelve a lo que se había elegido. El veredicto de
+  "la impresora de red no contesta" y los pasos para cambiar la IP dicen que se confirma así, en
+  vez de "volver a correr el diagnóstico".
+
+No se agrega listar todos los equipos de la red (celulares, televisores, el router): es ruido
+para el asesor, tarda más y es lo que suele hacer saltar a los antivirus. Print Doctor sigue sin
+poder cambiarle la IP a una impresora. No probado contra hardware: la identificación por la
+impresora (GS I) y la MAC por ARP en la red local. Self-test: escenario 169.
+
 ## [3.51] - 2026-11-20
 
 **Menos tiempo del asesor: lo que encontraron diez revisiones de cómo se usa Print Doctor.** El

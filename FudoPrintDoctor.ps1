@@ -525,7 +525,7 @@ $script:Producto    = 'Fudo'
 $script:PrefijoCola = 'FUDO-'
 $script:NombreCola  = 'Impresora Fudo'
 $script:ReglasTexto = @()
-$script:SchemaVersion = '3.51'
+$script:SchemaVersion = '3.52'
 # Que se revisa en esta corrida: USB | Red | Ambos. Lo resuelve Resolve-RunMode al arrancar
 # (pregunta al asesor si hay consola; en modo agente queda en 'Ambos').
 $script:RunMode = 'Ambos'
@@ -542,6 +542,9 @@ $script:ModosHerramienta = @('Cola', 'BuscarRed', 'Bluetooth', 'Identificar')
 $script:ModosPuntuales = @('Nativa', 'Cola', 'BuscarRed', 'Bluetooth', 'Identificar')
 # 'Completo' o 'Soporte'. Sobrevive a Reset-RunState, igual que ModoElegido.
 $script:PerfilElegido = ''
+# v3.52: modo para la proxima vuelta solamente (la N del menu corre la busqueda de red sola y
+# despues "Revisar de nuevo" vuelve a lo que se habia elegido).
+$script:ModoUnaVez = ''
 # v3.37: la App Nativa ya se reviso en esta corrida (modo "Solo la App Nativa").
 $script:NativaRevisada = $false
 # Hay una linea de progreso abierta (escrita con `r, sin salto)? Ver Suspend-LiveStatus.
@@ -2718,6 +2721,7 @@ function Resolve-RunMode {
       PC no hay nada por USB. Preguntarlo al arrancar evita ese diagnostico enganoso.
       'auto' = preguntar si hay un humano; en modo agente equivale a 'Ambos' (historico).
     #>
+    if ($script:ModoUnaVez) { $m1 = [string]$script:ModoUnaVez; $script:ModoUnaVez = ''; return $m1 }
     if ($Modo -notin @('auto', 'Soporte')) { return $Modo }
     # Segunda vuelta o posterior: ya se eligio en esta sesion.
     if ($script:ModoElegido) { return $script:ModoElegido }
@@ -8510,6 +8514,17 @@ function Invoke-HerramientaBuscarRed {
       asesor quiere instala una y manda un ticket de prueba.
     #>
     $prefijos = @(Get-LocalSubnetPrefixes)
+    # v3.52: las placas de la PC, para mostrarlas y para buscar primero en las reales: con una
+    # VPN o una maquina virtual, el corte en 3 redes podia dejar afuera la red del local.
+    $placas = @()
+    try { $placas = @(Get-LocalNetworkInterfaces) } catch {}
+    $script:Diagnostics['placasRed'] = @($placas)
+    $reales = @(@($placas | Where-Object { [string]$_.tipo -ne 'virtual' }) | ForEach-Object { [string]$_.red })
+    if (@($reales).Count -gt 0) {
+        $prefijos = @(@($prefijos | Where-Object { $reales -contains $_ }) + @($prefijos | Where-Object { $reales -notcontains $_ }))
+    }
+    $placasTxt = Format-InterfacesRed -Placas $placas
+    $placasPre = $(if ($placasTxt) { $placasTxt + ' ' } else { '' })
     if (@($prefijos).Count -eq 0) {
         Add-Check -Id 'red.busqueda' -Layer 3 -Name 'No se pudo saber en que red esta esta computadora' -Status 'warn' -RootCauseCandidate $true -Plane 'os' `
             -Evidence @{ prefijos = @() } `
@@ -8529,29 +8544,46 @@ function Invoke-HerramientaBuscarRed {
         $enOtra = $false
         try { $enOtra = [bool](Test-ForeignSubnetPrinters -TcpPort $Port) } catch {}
         Add-Check -Id 'red.busqueda' -Layer 3 -Name ('No se encontro ninguna impresora en la red (' + $redes + ')') -Status 'warn' -RootCauseCandidate (-not $enOtra) -Plane 'hardware' `
-            -Evidence @{ prefijos = @($prefijos); puerto = $Port } `
+            -Evidence @{ prefijos = @($prefijos); puerto = $Port; placas = @($placas) } `
             -ArticleRef 'https://soporte.fu.do/es/articles/11730816' `
-            -Recommendation ('Nada contesto en el puerto ' + $Port + ' en ' + $redes + '. Revisar que la impresora este encendida y con el cable de red puesto. ' +
+            -Recommendation ($placasPre + 'Nada contesto en el puerto ' + $Port + ' en ' + $redes + '. Revisar que la impresora este encendida y con el cable de red puesto. ' +
                              'Para saber su IP: apagarla, mantener FEED apretado y encenderla (imprime su configuracion). ' +
                              'Si la IP es de otra red que la de esta computadora, hay que cambiarle la IP a la impresora o conectarla a la misma red.' +
                              $(if ($enOtra) { ' Aparecio una en otra red: ver el paso siguiente.' } else { '' }))
         return
     }
     $filas = @()
+    $nId = 0
     foreach ($e in $enc) {
         $ya = @($inst | Where-Object { [string]$_.ip -eq [string]$e.ip })
         $colasYa = @(@($ya | ForEach-Object { @($_.colas) }) | Where-Object { $_ })
-        $filas += [ordered]@{ ip = [string]$e.ip; puerto = [int]$e.puerto; tipo = [string]$e.tipo; colas = @($colasYa) }
+        # v3.52: marca, modelo y MAC de cada una (hasta 8: cada una lleva un segundo).
+        $id = [ordered]@{ mac = ''; oui = ''; marca = ''; modelo = ''; herramienta = '' }
+        if ($nId -lt 8) {
+            Write-StepDetail ('identificando ' + [string]$e.ip)
+            try { $id = Get-NetworkPrinterIdentity -Ip ([string]$e.ip) -TcpPort ([int]$e.puerto) } catch {}
+            $nId++
+        }
+        $filas += [ordered]@{ ip = [string]$e.ip; puerto = [int]$e.puerto; tipo = [string]$e.tipo; colas = @($colasYa)
+                              mac = [string]$id.mac; oui = [string]$id.oui; marca = [string]$id.marca; modelo = [string]$id.modelo; herramienta = [string]$id.herramienta }
     }
-    $txt = (@($filas | ForEach-Object { [string]$_.ip + ':' + [string]$_.puerto + $(if (@($_.colas).Count -gt 0) { " (cola '" + (@($_.colas) -join "', '") + "')" } else { ' (sin cola en Windows)' }) }) -join '; ')
+    $txt = (@($filas | ForEach-Object {
+        $quien = (@(@([string]$_.marca, [string]$_.modelo) | Where-Object { $_ }) -join ' ')
+        [string]$_.ip + ':' + [string]$_.puerto +
+        $(if ($quien) { ' ' + $quien } else { '' }) +
+        $(if ($_.mac) { ', MAC ' + [string]$_.mac } else { '' }) +
+        $(if (@($_.colas).Count -gt 0) { " (cola '" + (@($_.colas) -join "', '") + "')" } else { ' (sin cola en Windows)' }) }) -join '; ')
+    $utils = @(@($filas | Where-Object { $_.marca -and $_.herramienta } | ForEach-Object { [string]$_.marca + ': ' + [string]$_.herramienta }) | Select-Object -Unique)
+    $ipTxt = ' Para cambiarle la IP a una: la utilidad de su marca' + $(if (@($utils).Count -gt 0) { ' (' + ($utils -join '; ') + ')' } else { '' }) +
+             ' o su pagina web (abrir http://<su IP> en el navegador). Despues de cambiarla, la opcion "Buscar impresoras en la red" del menu vuelve a buscar en segundos, sin revisar todo.'
     Set-StepNote ('encontradas: ' + @($filas).Count)
     Add-Check -Id 'red.busqueda' -Layer 3 -Name ('Impresoras encontradas en la red: ' + @($filas).Count) -Status 'ok' -Plane 'hardware' `
-        -Evidence @{ prefijos = @($prefijos); encontradas = @($filas) } `
-        -Recommendation ('Contestaron: ' + $txt + '. Para usarlas desde Fudo con Directo Ethernet alcanza con cargar la IP y el puerto en Administracion > Impresoras. ' +
-                         'Para usarlas como impresora del sistema, tienen que tener cola en Windows.')
+        -Evidence @{ prefijos = @($prefijos); encontradas = @($filas); placas = @($placas) } `
+        -Recommendation ($placasPre + 'Contestaron: ' + $txt + '. Para usarlas desde Fudo con Directo Ethernet alcanza con cargar la IP y el puerto en Administracion > Impresoras. ' +
+                         'Para usarlas como impresora del sistema, tienen que tener cola en Windows.' + $ipTxt)
     $sinCola = @($filas | Where-Object { @($_.colas).Count -eq 0 })
     if (@($sinCola).Count -eq 0) { return }
-    $items = @($sinCola | ForEach-Object { @{ l = ([string]$_.ip + ':' + [string]$_.puerto); detalle = [string]$_.tipo } })
+    $items = @($sinCola | ForEach-Object { @{ l = ([string]$_.ip + ':' + [string]$_.puerto); detalle = $(if ($_.marca) { (@(@([string]$_.marca, [string]$_.modelo) | Where-Object { $_ }) -join ' ') + ' - ' + [string]$_.tipo } else { [string]$_.tipo }) } })
     $idx = Request-ElegirDeLista -Id 'redInstalar' -Titulo 'Instalamos alguna en Windows?' -Items $items `
         -Texto 'Hace falta si en Fudo se usa como impresora del sistema. Para Directo Ethernet no hace falta.' -Cancelar 'No, ninguna'
     if ($null -eq $idx -or $idx -lt 0) { return }
@@ -10112,7 +10144,7 @@ function Resolve-NetworkPrinterPlan {
                    '(apagar, mantener FEED, encender) y cambiarla por la utilidad del fabricante o su pagina web.')
     }
     # v3.51: el motor no reapunta la cola de Windows a la IP nueva (nunca lo hizo): se dice que hacer.
-    $pasos += ('Cuando este cambiada, cargar la IP nueva en Fudo (Administracion > Impresoras). Si hay una cola de Windows para esa impresora, cambiarle el puerto a la IP nueva. Despues, volver a correr el diagnostico para confirmar que responde.')
+    $pasos += ('Cuando este cambiada, cargar la IP nueva en Fudo (Administracion > Impresoras). Si hay una cola de Windows para esa impresora, cambiarle el puerto a la IP nueva. Despues, la opcion "Buscar impresoras en la red" del menu confirma en segundos que contesta, sin revisar todo.')
     $plan.pasos = @($pasos)
     return $plan
 }
@@ -10176,6 +10208,80 @@ function Get-MacForIp {
         }
     } catch {}
     return ''
+}
+
+function Get-NetworkPrinterIdentity {
+    <#
+      v3.52 (canal, Franco 20/11): en un cambio de IP el asesor terminaba en CMD con ping y arp
+      para saber que era cada cosa. La MAC, la marca y la utilidad de la marca ya se sacaban, pero
+      solo para la impresora que estaba en OTRA red: ahora tambien para las que contestan en la
+      red de la PC. Con la marca se sabe que utilidad abrir; la MAC no cambia aunque cambie la IP.
+      Devuelve @{ mac; oui; marca; modelo; herramienta }
+    #>
+    param([string]$Ip, [int]$TcpPort = 9100)
+    $out = [ordered]@{ mac = ''; oui = ''; marca = ''; modelo = ''; herramienta = '' }
+    if (-not $Ip) { return $out }
+    $mac = ''
+    try { $mac = [string](Get-MacForIp -Ip $Ip) } catch {}
+    $oui = Get-OuiBrand -Mac $mac
+    $ident = [ordered]@{ fabricante = ''; modelo = ''; marca = '' }
+    try { $ident = Get-EscPosIdentity -Ip $Ip -TcpPort $TcpPort } catch {}
+    $out.mac = $mac
+    $out.oui = [string]$oui.oui
+    $out.modelo = [string]$ident.modelo
+    $out.marca = [string]$ident.marca
+    if (-not $out.marca) { $out.marca = [string]$oui.marca }
+    if ($out.marca) {
+        $h = $null
+        try { $h = Find-NetConfigTool -Marca ([string]$out.marca) } catch {}
+        if ($h -and [bool]$h.encontrada) { $out.herramienta = [string]$h.ruta }
+        elseif ($h -and $h.exe) { $out.herramienta = [string]$h.exe }
+    }
+    return $out
+}
+
+function Get-LocalNetworkInterfaces {
+    <#
+      v3.52 (canal, Franco 20/11): las placas de red de la PC con su IP, mascara y router. El
+      asesor lo sacaba con ipconfig. Sirve sobre todo cuando la PC esta por wifi en una red y la
+      impresora por cable en otra. Las virtuales (VPN, maquinas virtuales) se marcan aparte.
+    #>
+    $out = @()
+    try {
+        foreach ($c in @(Get-CimInstance -ClassName Win32_NetworkAdapterConfiguration -Filter 'IPEnabled = TRUE' -ErrorAction Stop)) {
+            $ips = @($c.IPAddress)
+            $masks = @($c.IPSubnet)
+            $desc = [string]$c.Description
+            $tipo = $(if ($desc -match '(?i)virtual|vmware|hyper-v|vpn|tap-|tunnel|loopback|zerotier|hamachi|wintun|wireguard|vethernet') { 'virtual' }
+                      elseif ($desc -match '(?i)wi-?fi|wireless|wlan|802\.11') { 'wifi' } else { 'cable' })
+            $gw = [string](@(@($c.DefaultIPGateway) | Where-Object { [string]$_ -match '^\d{1,3}(\.\d{1,3}){3}$' }) | Select-Object -First 1)
+            for ($i = 0; $i -lt @($ips).Count; $i++) {
+                $a = [string]$ips[$i]
+                if ($a -notmatch '^\d{1,3}(\.\d{1,3}){3}$' -or $a -match '^(127\.|169\.254\.)') { continue }
+                $out += [ordered]@{ placa = $desc; tipo = $tipo; ip = $a
+                                    mascara = $(if ($i -lt @($masks).Count) { [string]$masks[$i] } else { '' })
+                                    router = $gw; red = (($a -split '\.')[0..2] -join '.') }
+            }
+        }
+    } catch {}
+    return @($out)
+}
+
+function Format-InterfacesRed {
+    <# v3.52: una linea para el asesor con las placas reales de la PC (sin las virtuales). #>
+    param($Placas)
+    $ps = @(@($Placas) | Where-Object { $_ -and [string]$_.tipo -ne 'virtual' })
+    if (@($ps).Count -eq 0) { return '' }
+    $partes = @()
+    foreach ($x in $ps) {
+        $n = $(if ([string]$x.tipo -eq 'wifi') { 'Wi-Fi' } else { 'Cable' })
+        $partes += ($n + ' ' + [string]$x.ip + ' (red ' + [string]$x.red + '.x' +
+                    $(if ($x.mascara -and [string]$x.mascara -ne '255.255.255.0') { ', mascara ' + [string]$x.mascara } else { '' }) +
+                    $(if ($x.router) { ', router ' + [string]$x.router } else { '' }) + ')')
+    }
+    $redes = @($ps | ForEach-Object { [string]$_.red } | Select-Object -Unique)
+    $extra = $(if (@($redes).Count -gt 1) { ' La PC esta en ' + @($redes).Count + ' redes distintas: la impresora tiene que estar en la misma red que la PC donde se usa Fudo.' } else { '' })
+    return ('Esta PC esta conectada por: ' + ($partes -join '; ') + '.' + $extra)
 }
 
 function Get-OuiBrand {
@@ -10533,7 +10639,8 @@ function Test-Layer3-Network {
     # marca lo hace con su utilidad o su pagina web- y de 97 revisiones con 'impresora de red
     # inalcanzable' no se resolvio ninguna. El veredicto es corto y dice que hacer afuera de Print
     # Doctor; la revision no sigue intentando cosas contra una IP que no contesta.
-    $noPuede = ' Print Doctor no puede cambiarle la IP a una impresora: eso se hace con la utilidad del fabricante o desde su pagina web.'
+    $noPuede = ' Print Doctor no puede cambiarle la IP a una impresora: eso se hace con la utilidad del fabricante o desde su pagina web.' +
+               ' Despues de cambiarla, la opcion "Buscar impresoras en la red" del menu confirma en segundos que contesta, sin revisar todo.'
     $rec = if (@($discovered).Count -eq 1) {
         "La impresora no responde en ${ip}. En la misma red hay un equipo nuevo con el puerto $Port abierto ($($discovered[0])): es probable que sea ella con otra IP. " +
         "Confirmarlo con el self-test de la impresora (apagar, mantener FEED, encender) y cargar esa IP en Fudo (Administracion > Impresoras), o devolverle a la impresora la ${ip}." + $noPuede
@@ -14807,7 +14914,7 @@ public class FudoFakeEndpoint {
     Assert-Eq 'S84 los pasos nombran la marca y el modelo' $true ([bool]($txt84 -match 'Epson' -and $txt84 -match 'TM-T20III'))
     Assert-Eq 'S84 dan la MAC, que no cambia con la IP' $true ([bool]($txt84 -match '00-26-ab-11-22-33'))
     Assert-Eq 'S84 dicen la ruta de la herramienta' $true ([bool]($txt84 -match 'ENConfig\.exe'))
-    Assert-Eq 'S84 y cierran diciendo que se verifica despues' $true ([bool]($txt84 -match 'volver a correr'))
+    Assert-Eq 'S84 y cierran diciendo como se verifica despues, sin revisar todo' $true ([bool]($txt84 -match 'Buscar impresoras en la red'))
 
     # Sin marca identificada el motor no puede inventar una herramienta, pero igual sirve: dice
     # donde esta, que ponerle y como leer la IP a mano.
@@ -17592,6 +17699,10 @@ public class FudoFakeEndpoint {
         @([ordered]@{ ip = '192.168.0.50'; puerto = 9100; tipo = 'impresora termica (responde ESC/POS)' },
           [ordered]@{ ip = '192.168.0.60'; puerto = 9100; tipo = 'impresora termica (responde ESC/POS)' }) }
     function Get-InstalledNetworkPrinters { @([ordered]@{ ip = '192.168.0.60'; puertoTcp = 9100; puertoWindows = 'IP_192.168.0.60'; colas = @('BARRA') }) }
+    # v3.52: sin estos mocks la identificacion le hablaria a la red real de quien corre el self-test.
+    function Get-MacForIp { param($Ip) '' }
+    function Get-EscPosIdentity { param($Ip, $TcpPort, $TimeoutMs) [ordered]@{ fabricante = ''; modelo = ''; marca = '' } }
+    function Get-LocalNetworkInterfaces { @() }
     $script:opc154 = @(); $script:creada154 = ''
     function Request-UiAnswer { param($Id, $Titulo, $Texto, $Texto2, $Opciones, $Clase, $Extra, $TimeoutSec, $ErrorPrevio, [switch]$SoloAsesor)
         if ($Id -eq 'redInstalar') { $script:opc154 = @($Opciones | ForEach-Object { [string]$_.l }); return '1' }
@@ -18220,6 +18331,7 @@ public class FudoFakeEndpoint {
     function Get-LocalSubnetPrefixes { @('192.168.0') }
     function Find-NetworkPrinters { param($Prefix, $TcpPort, $WaitMs) @() }
     function Get-InstalledNetworkPrinters { @() }
+    function Get-LocalNetworkInterfaces { @() }
     $script:fs158 = 0
     function Test-ForeignSubnetPrinters { param($TcpPort, $MaxSubredes) $script:fs158++; $true }
     Invoke-HerramientaBuscarRed
@@ -18738,6 +18850,69 @@ public class FudoFakeEndpoint {
     $null = Complete-AccionesSeguimiento -Historial ([ordered]@{ ultimasAcciones = '' })
     Assert-Eq 'S168b limpiar para probar puertos cuenta si la cola quedo vacia' $true ($script:AccionesDetalle[0].verificado)
     Assert-Eq 'S168c el reinicio del servicio se mide en los dos lugares' 2 ([regex]::Matches([System.IO.File]::ReadAllText($PSCommandPath), "Set-AccionVerificada -Tipo 'spooler\.restart' -Valor \(").Count)
+
+    # Escenario 169 (v3.52, canal, Franco 20/11): en un cambio de IP el asesor terminaba en CMD
+    # con ping, arp e ipconfig. La busqueda de red dice marca, modelo y MAC de cada una, muestra
+    # las placas de la PC, busca primero en las redes reales, y la N del menu la corre sola.
+    Reset-State
+    Reset-Mocks
+    $script:RunMode = 'BuscarRed'
+    function Test-UiWeb { $true }
+    function Test-HayHumano { $true }
+    $script:pref169 = @()
+    function Get-LocalSubnetPrefixes { @('192.168.56', '10.8.0', '172.16.5', '192.168.0') }
+    function Get-LocalNetworkInterfaces {
+        @([ordered]@{ placa = 'VirtualBox Host-Only Ethernet Adapter'; tipo = 'virtual'; ip = '192.168.56.1'; mascara = '255.255.255.0'; router = ''; red = '192.168.56' },
+          [ordered]@{ placa = 'Realtek PCIe GbE'; tipo = 'cable'; ip = '192.168.0.10'; mascara = '255.255.255.0'; router = '192.168.0.1'; red = '192.168.0' },
+          [ordered]@{ placa = 'Intel Wi-Fi 6 AX201'; tipo = 'wifi'; ip = '172.16.5.20'; mascara = '255.255.0.0'; router = '172.16.5.1'; red = '172.16.5' }) }
+    function Find-NetworkPrinters { param($Prefix, $TcpPort, $WaitMs)
+        $script:pref169 += [string]$Prefix
+        if ($Prefix -eq '192.168.0') { @([ordered]@{ ip = '192.168.0.50'; puerto = 9100; tipo = 'impresora termica (responde ESC/POS)' }) } else { @() } }
+    function Get-InstalledNetworkPrinters { @() }
+    function Get-MacForIp { param($Ip) '00-26-ab-11-22-33' }
+    function Get-EscPosIdentity { param($Ip, $TcpPort, $TimeoutMs) [ordered]@{ fabricante = 'EPSON'; modelo = 'TM-T20III'; marca = 'Epson' } }
+    function Request-UiAnswer { param($Id, $Titulo, $Texto, $Texto2, $Opciones, $Clase, $Extra, $TimeoutSec, $ErrorPrevio, [switch]$SoloAsesor) $null }
+    Invoke-HerramientaBuscarRed
+    $c169 = Get-CheckById 'red.busqueda'
+    $r169 = [string]$c169.recommendation
+    Assert-Eq 'S169a encuentra la impresora' 'ok' ([string]$c169.status)
+    Assert-Eq 'S169a dice la marca y el modelo' $true ([bool]($r169 -match 'Epson TM-T20III'))
+    Assert-Eq 'S169a y la MAC' $true ([bool]($r169 -match '00-26-ab-11-22-33'))
+    Assert-Eq 'S169a la MAC viaja en la evidencia' '00-26-ab-11-22-33' ([string]@($c169.evidence.encontradas)[0].mac)
+    Assert-Eq 'S169a muestra las placas reales de la PC' $true ([bool]($r169 -match 'Cable 192\.168\.0\.10 \(red 192\.168\.0\.x, router 192\.168\.0\.1\)'))
+    Assert-Eq 'S169a con la mascara cuando no es la de siempre' $true ([bool]($r169 -match 'Wi-Fi 172\.16\.5\.20 \(red 172\.16\.5\.x, mascara 255\.255\.0\.0'))
+    Assert-Eq 'S169a sin la placa virtual' $false ([bool]($r169 -match '192\.168\.56\.1'))
+    Assert-Eq 'S169a avisa que la PC esta en dos redes' $true ([bool]($r169 -match '2 redes distintas'))
+    Assert-Eq 'S169a dice como cambiarle la IP y como confirmar sin revisar todo' $true ([bool]($r169 -match 'http://<su IP>' -and $r169 -match 'Buscar impresoras en la red'))
+    Assert-Eq 'S169b busca primero en las redes reales' '172.16.5,192.168.0,192.168.56' (@($script:pref169) -join ',')
+
+    Reset-State
+    $script:RunMode = 'BuscarRed'
+    function Find-NetworkPrinters { param($Prefix, $TcpPort, $WaitMs) @() }
+    function Test-ForeignSubnetPrinters { param($TcpPort, $MaxSubredes) $false }
+    Invoke-HerramientaBuscarRed
+    Assert-Eq 'S169c sin hallazgos tambien muestra las placas' $true ([bool]([string](Get-CheckById 'red.busqueda').recommendation -match '^Esta PC esta conectada por: Cable 192\.168\.0\.10'))
+
+    # La N del menu corre la herramienta una vez y despues vuelve a lo elegido.
+    $script:ModoElegido = 'USB'
+    $script:ModoUnaVez = ''
+    Assert-Eq 'S169d la N pide volver a correr' $true ([bool](Invoke-MenuAction -Op 'N'))
+    Assert-Eq 'S169d y corre la busqueda de red sola' 'BuscarRed' (Resolve-RunMode)
+    Assert-Eq 'S169d una sola vez: despues vuelve a lo elegido' 'USB' (Resolve-RunMode)
+    $script:ModoElegido = ''
+
+    # Placas: tipo por la descripcion, sin loopback ni APIPA.
+    Reset-Mocks
+    function Get-CimInstance { param($ClassName, $Filter, $ErrorAction)
+        @([pscustomobject]@{ Description = 'Intel(R) Wi-Fi 6 AX201 160MHz'; IPAddress = @('192.168.1.34', 'fe80::1'); IPSubnet = @('255.255.255.0', '64'); DefaultIPGateway = @('192.168.1.1') },
+          [pscustomobject]@{ Description = 'TAP-Windows Adapter V9'; IPAddress = @('10.8.0.6'); IPSubnet = @('255.255.255.0'); DefaultIPGateway = $null },
+          [pscustomobject]@{ Description = 'Realtek PCIe GbE Family Controller'; IPAddress = @('169.254.10.2'); IPSubnet = @('255.255.0.0'); DefaultIPGateway = $null }) }
+    $p169 = @(Get-LocalNetworkInterfaces)
+    Assert-Eq 'S169e sin la APIPA ni la IPv6' 2 @($p169).Count
+    Assert-Eq 'S169e el wifi es wifi' 'wifi' ([string]@($p169)[0].tipo)
+    Assert-Eq 'S169e con su router' '192.168.1.1' ([string]@($p169)[0].router)
+    Assert-Eq 'S169e la VPN es virtual' 'virtual' ([string]@($p169)[1].tipo)
+    Reset-Mocks
     Reset-Mocks
     Reset-State
 
@@ -18828,7 +19003,7 @@ function Get-MenuOptions {
         $ops += [ordered]@{ k = 'L'; t = ("Limpiar la cola de '" + [string]$c0.nombre + "' (" + [string]$c0.trabajos + ' trabajos)'); target = [string]$c0.nombre }
     }
 
-    $ops += [ordered]@{ k = 'N'; t = 'Buscar impresoras en la red (por IP)' }
+    $ops += [ordered]@{ k = 'N'; t = 'Buscar impresoras en la red (solo eso, unos segundos: sirve para confirmar despues de cambiar una IP)' }
     $enRed = @()
     if ($script:Diagnostics.Contains('impresorasEnRed')) { $enRed = @($script:Diagnostics['impresorasEnRed']) }
     if (@($enRed).Count -gt 0) { $ops += [ordered]@{ k = 'P'; t = 'Instalar una de las impresoras de red encontradas' } }
@@ -19046,7 +19221,7 @@ function Get-MenuCatalogo {
                     d = 'Cuando hay hardware conectado sin cola en Windows: instala el driver generico de texto y crea la cola.'
                     na = 'no hay hardware conectado sin cola en Windows' }
         [ordered]@{ k = 'N'; t = 'Buscar impresoras en la red'
-                    d = 'Barre la red buscando algo que conteste en el puerto 9100 y saca la marca de la MAC.'
+                    d = 'Busca lo que contesta en el puerto 9100 y dice marca, modelo y MAC de cada una, y las placas de red de la PC. Corre sola, sin revisar todo: sirve para confirmar despues de cambiarle la IP a una impresora.'
                     na = '' }
         [ordered]@{ k = 'P'; t = 'Instalar una impresora de red'
                     d = 'Crea la cola de Windows apuntando a la IP de alguna de las que se encontraron.'
@@ -19303,29 +19478,13 @@ function Invoke-MenuAction {
         }
 
         'N' {
-            $prefijos = @(Get-LocalSubnetPrefixes)
-            if (@($prefijos).Count -eq 0) { Write-Host '  No se pudo determinar la red local.' -ForegroundColor Yellow; return $false }
-            Write-Host ''
-            Write-Host ("  Buscando impresoras en " + (@($prefijos | ForEach-Object { $_ + '.0/24' }) -join ', ') + " ... (puede tardar unos segundos)") -ForegroundColor Cyan
-            $enc = @()
-            foreach ($pref in @($prefijos | Select-Object -First 2)) { $enc += @(Find-NetworkPrinters -Prefix $pref -TcpPort $Port) }
-            $script:Diagnostics['impresorasEnRed'] = @($enc)
-            $inst = @(Get-InstalledNetworkPrinters)
-            $script:Diagnostics['impresorasRedInstaladas'] = @($inst)
-            Write-Host ''
-            if (@($enc).Count -eq 0) {
-                Write-Host '  No se encontraron impresoras por IP en la red.' -ForegroundColor Yellow
-                Write-Host '  Revisar que la comandera este encendida, con cable de red, y hacer su' -ForegroundColor DarkGray
-                Write-Host '  self-test (apagar, mantener FEED, encender) para leer la IP que tiene.' -ForegroundColor DarkGray
-            } else {
-                Write-Host ("  Encontradas: " + @($enc).Count) -ForegroundColor Green
-                foreach ($e in $enc) {
-                    $ya = @($inst | Where-Object { [string]$_.ip -eq [string]$e.ip })
-                    $extra = $(if (@($ya).Count -gt 0) { '  -> hay cola de Windows: ' + ((@($ya | ForEach-Object { @($_.colas) }) | Where-Object { $_ }) -join ', ') } else { '  -> sin cola en Windows' })
-                    Write-Host ("    - " + [string]$e.ip + ':' + [string]$e.puerto + '  ' + [string]$e.tipo + $extra)
-                }
-            }
-            return $false
+            # v3.52 (canal, Franco 20/11): "actualizar los resultados despues de modificar una IP,
+            # sin ejecutar nuevamente todo el diagnostico". Antes la N escribia en la consola, que
+            # con la pagina no se ve. Ahora corre la herramienta "Buscar impresoras en la red"
+            # una vez, con su resultado en la pagina (marca, MAC, placas) y su telemetria; despues,
+            # "Revisar de nuevo" vuelve a lo que se habia elegido.
+            $script:ModoUnaVez = 'BuscarRed'
+            return $true
         }
 
         'P' {
